@@ -1,8 +1,8 @@
-//! Load `.env` from typical working directories so `cargo run` matches npm/Liquibase.
+//! Load `.env` from typical working directories so `cargo run` finds service config.
 //!
 //! `dotenvy::dotenv()` only reads `./.env` from the process cwd. Developers often run
-//! `cargo run -p kabipay-auth` from the workspace root, while `kabipay-svc/.env` or
-//! `kabipay-database/.env` (see `kabipay-database/load-env.cjs`) holds `POSTGRES_*`.
+//! `cargo run -p kabipay-auth` from the workspace root while `kabipay-svc/.env`
+//! holds runtime `POSTGRES_*`.
 //! Without this, services fall back to defaults (e.g. port 15432) and fail to connect
 //! even though migrate works.
 
@@ -14,7 +14,7 @@ fn try_load(path: &Path) -> bool {
 
 /// Load the first `.env` found by walking up from [`std::env::current_dir`].
 ///
-/// At each directory, tries `./.env`, `./kabipay-svc/.env`, then `./kabipay-database/.env`.
+/// At each directory, tries `./.env`, then `./kabipay-svc/.env`.
 /// Falls back to `dotenvy::dotenv()` so a cwd-local `.env` still works.
 pub fn load_dotenv() {
     if let Ok(cwd) = std::env::current_dir() {
@@ -25,9 +25,6 @@ pub fn load_dotenv() {
                     return;
                 }
                 if try_load(&d.join("kabipay-svc").join(".env")) {
-                    return;
-                }
-                if try_load(&d.join("kabipay-database").join(".env")) {
                     return;
                 }
             }

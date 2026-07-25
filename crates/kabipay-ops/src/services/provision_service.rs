@@ -1,4 +1,4 @@
-//! Tenant provisioning (ops plane) — aligns with `scripts/provision-tenant.ps1`.
+//! Tenant metadata provisioning (ops plane). Database migrations and seed data are owned by kabipay-database scripts.
 
 use chrono::Utc;
 use kabipay_common::{
@@ -6,10 +6,7 @@ use kabipay_common::{
     deterministic_tenant_database_row_uuid, deterministic_tenant_uuid, KabiPayError, KabiPayResult,
 };
 use kabipay_db_entities::ops::{tenant, tenant_database};
-use sea_orm::{
-    ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseConnection, EntityTrait, QueryFilter,
-    Set, TransactionTrait,
-};
+use sea_orm::{ConnectionTrait, DatabaseConnection, EntityTrait, Set, TransactionTrait};
 use uuid::Uuid;
 
 fn validate_tenant_code(code: &str) -> KabiPayResult<()> {
@@ -57,73 +54,6 @@ fn validate_schema_override(schema: &str) -> KabiPayResult<()> {
         return Err(KabiPayError::Validation(
             "schema name may only contain a-z, 0-9, underscore after tenant_".into(),
         ));
-    }
-    Ok(())
-}
-
-async fn invoke_tenant_liquibase(schema_name: &str) -> KabiPayResult<()> {
-    let db_dir = std::env::var("KABIPAY_DATABASE_DIR").map_err(|_| {
-        KabiPayError::Validation(
-            "KABIPAY_DATABASE_DIR must point at the kabipay-database repo to run Liquibase".into(),
-        )
-    })?;
-    if db_dir.is_empty() {
-        return Err(KabiPayError::Validation(
-            "KABIPAY_DATABASE_DIR is empty".into(),
-        ));
-    }
-
-    let host = std::env::var("POSTGRES_HOST").unwrap_or_else(|_| "localhost".into());
-    let port = std::env::var("POSTGRES_PORT").unwrap_or_else(|_| "5432".into());
-    let db = std::env::var("POSTGRES_DB").unwrap_or_else(|_| "kabipay_dev".into());
-    let user = std::env::var("POSTGRES_USER").unwrap_or_else(|_| "kabipay".into());
-    let pass = std::env::var("POSTGRES_PASSWORD").unwrap_or_else(|_| "changeme".into());
-    let ssl = std::env::var("POSTGRES_SSLMODE").unwrap_or_default();
-
-    let mut jdbc = format!("jdbc:postgresql://{host}:{port}/{db}");
-    if ssl == "require" {
-        jdbc.push_str(if jdbc.contains('?') {
-            "&sslmode=require"
-        } else {
-            "?sslmode=require"
-        });
-    }
-
-    let tracking = format!("{schema_name}_databasechangelog");
-    let props_name = format!(".generated-tenant-{schema_name}.properties");
-    let props_path = std::path::Path::new(&db_dir).join(&props_name);
-    let props_body = format!(
-        "changeLogFile=changelog/tenant.changelog-master.xml\n\
-         url={jdbc}\n\
-         username={user}\n\
-         password={pass}\n\
-         driver=org.postgresql.Driver\n\
-         logLevel=INFO\n\
-         defaultSchemaName={schema_name}\n\
-         databaseChangeLogTableName={tracking}\n\
-         parameter.schema={schema_name}\n\
-         liquibase.hub.mode=off\n"
-    );
-
-    tokio::fs::write(&props_path, props_body)
-        .await
-        .map_err(|e| KabiPayError::Internal(format!("write liquibase props: {e}")))?;
-
-    let status = tokio::process::Command::new("node")
-        .arg("run-liquibase.cjs")
-        .arg(format!("--defaults-file={props_name}"))
-        .arg("update")
-        .current_dir(&db_dir)
-        .status()
-        .await
-        .map_err(|e| KabiPayError::Internal(format!("liquibase spawn: {e}")))?;
-
-    let _ = tokio::fs::remove_file(&props_path).await;
-
-    if !status.success() {
-        return Err(KabiPayError::Internal(format!(
-            "Liquibase tenant update failed (exit {status}). Check node, kabipay-database npm install, and DB connectivity."
-        )));
     }
     Ok(())
 }
@@ -255,31 +185,11 @@ pub async fn provision_tenant(
 
     cache.invalidate(tenant_id);
 
-    let mut migrations_ran = false;
-    let mut detail: Option<String> = None;
-
-    if run_migrations {
-        match invoke_tenant_liquibase(&schema_name).await {
-            Ok(()) => {
-                migrations_ran = true;
-                let row = tenant::Entity::find_by_id(tenant_id)
-                    .one(db)
-                    .await?
-                    .ok_or_else(|| KabiPayError::Internal("tenant row missing".into()))?;
-                let mut am: tenant::ActiveModel = row.into();
-                am.status = Set("ACTIVE".into());
-                am.updated_at = Set(Utc::now());
-                am.update(db).await?;
-            }
-            Err(e) => {
-                detail = Some(format!("{e}"));
-            }
-        }
+    let detail = Some(if run_migrations {
+        "runMigrations is ignored by kabipay-svc; run tenant provisioning or migrations from kabipay-database/scripts".into()
     } else {
-        detail = Some(
-            "runMigrations was false; tenant remains PROVISIONING until migrations run".into(),
-        );
-    }
+        "tenant remains PROVISIONING until database provisioning/migrations run from kabipay-database/scripts".into()
+    });
 
     let tenant_row = tenant::Entity::find_by_id(tenant_id)
         .one(db)
@@ -289,57 +199,18 @@ pub async fn provision_tenant(
     Ok(ProvisionOutcome {
         tenant: tenant_row,
         schema_name,
-        migrations_ran,
+        migrations_ran: false,
         detail,
     })
 }
 
-/// Run Liquibase for an existing tenant (retry path).
+/// Tenant migrations are managed from the database repo, not from the service process.
 pub async fn run_tenant_migrations(
-    db: &DatabaseConnection,
-    cache: &TenantDbCache,
+    _db: &DatabaseConnection,
+    _cache: &TenantDbCache,
     tenant_id: Uuid,
 ) -> KabiPayResult<ProvisionOutcome> {
-    let t = tenant::Entity::find_by_id(tenant_id)
-        .one(db)
-        .await?
-        .ok_or_else(|| KabiPayError::NotFound {
-            entity: "tenant",
-            id: tenant_id.to_string(),
-        })?;
-    if t.status == "TERMINATED" {
-        return Err(KabiPayError::Conflict(
-            "terminated tenant cannot run migrations".into(),
-        ));
-    }
-
-    let db_row = tenant_database::Entity::find()
-        .filter(tenant_database::Column::TenantId.eq(tenant_id))
-        .filter(tenant_database::Column::IsActive.eq(true))
-        .one(db)
-        .await?
-        .ok_or_else(|| {
-            KabiPayError::NotFound {
-                entity: "tenant_database",
-                id: tenant_id.to_string(),
-            }
-        })?;
-
-    let schema_name = db_row.schema_name.clone();
-    invoke_tenant_liquibase(&schema_name).await?;
-
-    let now = Utc::now();
-    let mut active: tenant::ActiveModel = t.into();
-    active.status = Set("ACTIVE".into());
-    active.updated_at = Set(now);
-    let tenant_row = active.update(db).await?;
-
-    cache.invalidate(tenant_id);
-
-    Ok(ProvisionOutcome {
-        tenant: tenant_row,
-        schema_name,
-        migrations_ran: true,
-        detail: None,
-    })
+    Err(KabiPayError::Validation(format!(
+        "tenant migrations are managed from kabipay-database/scripts; run update-tenant-liquibase.ps1 for tenant {tenant_id}"
+    )))
 }

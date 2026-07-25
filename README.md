@@ -22,7 +22,6 @@ Rust workspace for **kabipay-auth** (REST, JWT), **kabipay-ops** (unified ops Gr
 | **Windows MSVC linker** | Default **`windows-msvc`** needs **`link.exe`** — install **[Visual Studio Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/)** workload **Desktop development with C++**. **`link.exe` not found** → add this before `cargo build`. |
 | **PostgreSQL 16** | **Ops** schema `kabipay_ops` + per-**tenant** schemas; apply migrations with **kabipay-database** (Liquibase). |
 | **Environment** | Copy `.env.example` → `.env`. Managed DBs: TLS + pooler URL as above. |
-| **Node.js** (for scripts) | `provision-tenant.ps1` / `seed-demo-data.ps1` invoke `kabipay-database` (bundled Liquibase + `pg`). |
 
 Optional:
 
@@ -90,12 +89,10 @@ The script starts **debug** binaries under `target\debug\kabipay-*.exe`: **ops**
 
 | Script | Purpose |
 |--------|---------|
-| `scripts\provision-tenant.ps1` | Ops rows + tenant schema + Liquibase tenant migrations (Node + `kabipay-database` `npm install`). |
-| `scripts\update-tenant-liquibase.ps1` | Re-run tenant migrations for an existing schema. |
-| `scripts\seed-demo-data.ps1` | Demo seed data (requires DB + tenant already provisioned). |
+| `scripts\start-subgraphs.ps1` | Starts the Rust subgraph binaries for local service runtime. |
 | `cargo run -p kabipay-outbox-worker` | Outbox poller (same DB as subgraphs; configure `OUTBOX_*` in `.env.example`). |
 
-Adjust paths inside scripts if **kabipay-database** is not a sibling folder.
+Database setup, tenant provisioning, tenant Liquibase updates, and demo seed data are owned by **kabipay-database**.
 
 ## Services and ports (defaults)
 

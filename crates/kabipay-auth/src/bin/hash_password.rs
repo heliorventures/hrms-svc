@@ -3,7 +3,7 @@
 //! Usage:
 //!   cargo run -p kabipay-auth --bin kabipay-auth-hash -- <password>
 //!
-//! Used by `scripts/seed-demo-data.ps1` (and manual ops) so we never check in
+//! Used by `kabipay-database/scripts/seed-demo-data.ps1` (and manual ops) so we never check in
 //! fabricated hashes that won't verify.
 
 use argon2::password_hash::{rand_core::OsRng, PasswordHasher, SaltString};

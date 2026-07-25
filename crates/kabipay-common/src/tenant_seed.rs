@@ -1,4 +1,4 @@
-//! Deterministic tenant UUIDs — must match `provision-tenant.ps1` (`New-DeterministicUuid`).
+//! Deterministic tenant UUIDs; must match `kabipay-database/scripts/provision-tenant.ps1` (`New-DeterministicUuid`).
 
 use sha1::{Digest, Sha1};
 use uuid::Uuid;
@@ -33,7 +33,7 @@ mod tests {
         assert_eq!(
             id.to_string(),
             "342205fc-98b1-5421-8a11-b30821c86aa0",
-            "must stay aligned with scripts/provision-tenant.ps1"
+            "must stay aligned with kabipay-database/scripts/provision-tenant.ps1"
         );
     }
 }

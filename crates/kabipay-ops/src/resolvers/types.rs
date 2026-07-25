@@ -134,7 +134,7 @@ pub struct ProvisionTenantInput {
     pub country: Option<String>,
     pub currency: Option<String>,
     pub schema_name_override: Option<String>,
-    #[graphql(default = true)]
+    #[graphql(default = false)]
     pub run_migrations: bool,
 }
 
