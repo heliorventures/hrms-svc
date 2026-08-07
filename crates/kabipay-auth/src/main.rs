@@ -92,6 +92,10 @@ async fn main() -> anyhow::Result<()> {
         .route("/auth/ops/refresh", post(handlers::ops_refresh))
         .route("/auth/ops/logout", post(handlers::ops_logout))
         // Client plane
+        .route(
+            "/auth/client/tenants/:slug",
+            get(handlers::resolve_client_tenant),
+        )
         .route("/auth/client/login", post(handlers::client_login))
         .route("/auth/client/mfa", post(handlers::client_mfa))
         .route("/auth/client/refresh", post(handlers::client_refresh))

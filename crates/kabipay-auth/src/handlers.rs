@@ -22,7 +22,12 @@
 //! MFA endpoints are still scaffolded 501 — we wire them once the MFA
 //! enrolment flow is designed.
 
-use axum::{extract::State, http::HeaderMap, http::StatusCode, Json};
+use axum::{
+    extract::{Path, State},
+    http::HeaderMap,
+    http::StatusCode,
+    Json,
+};
 use chrono::{Duration, Utc};
 use kabipay_common::{
     db::resolve_tenant_db,
@@ -31,7 +36,7 @@ use kabipay_common::{
     password,
 };
 use kabipay_db_entities::{
-    ops::{operator_session, operator_user},
+    ops::{operator_session, operator_user, tenant},
     tenant::d0005_auth_rbac::{user, user_session},
     tenant::d0007_employee_core::employee,
 };
@@ -95,6 +100,18 @@ pub struct TokenPair {
     pub email: String,
     #[serde(rename = "userId")]
     pub user_id: Uuid,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ResolvedTenant {
+    pub id: Uuid,
+    pub name: String,
+    pub status: String,
+    pub subdomain: String,
+    #[serde(rename = "logoUrl", skip_serializing_if = "Option::is_none")]
+    pub logo_url: Option<String>,
+    #[serde(rename = "primaryColor", skip_serializing_if = "Option::is_none")]
+    pub primary_color: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -178,13 +195,51 @@ pub async fn ops_mfa(Json(_body): Json<MfaInput>) -> impl axum::response::IntoRe
 // Client plane
 // ---------------------------------------------------------------------------
 
+fn normalize_tenant_slug(raw: &str) -> KabiPayResult<String> {
+    let slug = raw.trim().to_lowercase();
+    let valid = slug.len() >= 2
+        && slug.len() <= 63
+        && slug
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+        && !slug.starts_with('-')
+        && !slug.ends_with('-');
+    if !valid {
+        return Err(KabiPayError::Validation("tenant slug is invalid".into()));
+    }
+    Ok(slug)
+}
+
+pub async fn resolve_client_tenant(
+    State(state): State<AppState>,
+    Path(slug): Path<String>,
+) -> Result<Json<ResolvedTenant>, KabiPayError> {
+    let row = find_tenant_by_slug(&state.ops_db, &slug).await?;
+
+    Ok(Json(ResolvedTenant {
+        id: row.id,
+        name: row.name,
+        status: row.status,
+        subdomain: row.subdomain.unwrap_or_else(|| normalize_tenant_slug(&slug).unwrap_or(slug)),
+        logo_url: row.logo_url,
+        primary_color: row.primary_color,
+    }))
+}
+
 pub async fn client_login(
     State(state): State<AppState>,
     Json(body): Json<ClientLoginInput>,
 ) -> Result<Json<TokenPair>, KabiPayError> {
-    let tenant_id = body
-        .tenant_id
-        .ok_or_else(|| KabiPayError::Validation("tenantId is required".into()))?;
+    let tenant_id = match body.tenant_id {
+        Some(id) => id,
+        None => {
+            let slug = body
+                .subdomain
+                .as_deref()
+                .ok_or_else(|| KabiPayError::Validation("tenantId or subdomain is required".into()))?;
+            find_tenant_by_slug(&state.ops_db, slug).await?.id
+        }
+    };
 
     let tenant_conn = resolve_tenant_db(
         tenant_id,
@@ -365,6 +420,16 @@ pub async fn client_change_password(
 fn peek_tenant_from_refresh(refresh: &str) -> Option<Uuid> {
     let (head, _) = refresh.split_once('.')?;
     Uuid::parse_str(head).ok()
+}
+
+async fn find_tenant_by_slug(db: &DatabaseConnection, raw_slug: &str) -> KabiPayResult<tenant::Model> {
+    let slug = normalize_tenant_slug(raw_slug)?;
+    tenant::Entity::find()
+        .filter(tenant::Column::IsDeleted.eq(false))
+        .filter(tenant::Column::Subdomain.eq(Some(slug.clone())))
+        .one(db)
+        .await?
+        .ok_or_else(|| KabiPayError::TenantNotFound(slug))
 }
 
 async fn issue_ops_tokens(

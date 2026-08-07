@@ -2,7 +2,7 @@
 //!
 //! Call `init_tracing()` once at the top of every service's `main()`.
 
-use tracing_subscriber::{fmt, prelude::*, EnvFilter};
+use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
 /// Initialise `tracing` with an `EnvFilter` from `RUST_LOG` (default `info,kabipay=debug`)
 /// and JSON output for production log ingestion. Dev builds get a pretty compact format.

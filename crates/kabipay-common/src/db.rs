@@ -66,7 +66,7 @@ fn tenant_pool_max_connections() -> u32 {
         .ok()
         .and_then(|s| s.parse().ok())
         .filter(|&n| n > 0)
-        .unwrap_or(10)
+        .unwrap_or(2)
 }
 
 /// Resolved view of a single tenant's database. Kept around the pooled
@@ -344,9 +344,9 @@ pub async fn connect_ops_db(dsn: &str) -> KabiPayResult<DatabaseConnection> {
     }
 
     let mut opts = ConnectOptions::new(dsn.to_string());
-    // Default 5 per process; raise for a single high-traffic service. For ~20 subgraphs on
-    // a small managed DB, set KABIPAY_DB_POOL_MAX=1 (see scripts/start-subgraphs.ps1).
-    opts.max_connections(pool_max_connections(5))
+    // Default 2 per process so 18-20 local subgraphs stay below a 100-connection DB cap.
+    // Raise KABIPAY_DB_POOL_MAX only for consolidated or independently scaled services.
+    opts.max_connections(pool_max_connections(2))
         .min_connections(0)
         .connect_timeout(pool_connect_timeout())
         .acquire_timeout(pool_acquire_timeout())
