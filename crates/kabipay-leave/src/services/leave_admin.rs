@@ -6,8 +6,7 @@ use kabipay_db_entities::tenant::d0007_employee_core::employee;
 use kabipay_db_entities::tenant::d0011_leave::{leave_balance, leave_policy, leave_type};
 use rust_decimal::Decimal;
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseConnection, EntityTrait, QueryFilter,
-    QuerySelect, Set,
+    ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, QuerySelect, Set,
 };
 use std::collections::HashSet;
 use uuid::Uuid;
@@ -182,6 +181,20 @@ pub async fn upsert_leave_policy(
 
     let now = Utc::now();
 
+    let duplicate = leave_policy::Entity::find()
+        .filter(leave_policy::Column::TenantId.eq(tenant_id))
+        .filter(leave_policy::Column::LeaveTypeId.eq(lt.id))
+        .all(db)
+        .await
+        .map_err(KabiPayError::from)?
+        .into_iter()
+        .any(|policy| id.map(|pid| pid != policy.id).unwrap_or(true));
+    if duplicate {
+        return Err(KabiPayError::Validation(
+            "only one leave policy is allowed per leave type".into(),
+        ));
+    }
+
     if let Some(pid) = id {
         let row = leave_policy::Entity::find_by_id(pid)
             .filter(leave_policy::Column::TenantId.eq(tenant_id))
@@ -256,75 +269,6 @@ pub fn entitled_days_from_policy(pol: &leave_policy::Model) -> Option<Decimal> {
         return Some(per * Decimal::from(12));
     }
     None
-}
-
-/// When an employee has no `leave_balance` row yet for `(leave_type_id, year)`, insert one from the
-/// first matching **ALL** policy (same entitlement rules as bulk provisioning). Self-service submit then succeeds without HR manually provisioning each hire.
-pub async fn ensure_leave_balance_for_submit<C: ConnectionTrait>(
-    db: &C,
-    tenant_id: Uuid,
-    employee_id: Uuid,
-    leave_type_id: Uuid,
-    year: i32,
-) -> KabiPayResult<()> {
-    let existing = leave_balance::Entity::find()
-        .filter(leave_balance::Column::TenantId.eq(tenant_id))
-        .filter(leave_balance::Column::EmployeeId.eq(employee_id))
-        .filter(leave_balance::Column::LeaveTypeId.eq(leave_type_id))
-        .filter(leave_balance::Column::Year.eq(year))
-        .one(db)
-        .await
-        .map_err(KabiPayError::from)?;
-    if existing.is_some() {
-        return Ok(());
-    }
-
-    let policies = leave_policy::Entity::find()
-        .filter(leave_policy::Column::TenantId.eq(tenant_id))
-        .filter(leave_policy::Column::LeaveTypeId.eq(leave_type_id))
-        .all(db)
-        .await
-        .map_err(KabiPayError::from)?;
-
-    let pol = policies.into_iter().find(|p| match &p.applicable_to {
-        None => true,
-        Some(s) => {
-            let t = s.trim().to_ascii_uppercase();
-            t.is_empty() || t == "ALL" || t == "*"
-        }
-    });
-
-    let Some(pol) = pol else {
-        return Ok(());
-    };
-
-    let Some(target_entitled) = entitled_days_from_policy(&pol) else {
-        return Ok(());
-    };
-    if target_entitled <= Decimal::ZERO {
-        return Ok(());
-    }
-
-    let balance_days =
-        compute_balance_days(target_entitled, Decimal::ZERO, Decimal::ZERO, Decimal::ZERO)?;
-    let now = Utc::now();
-    let new_id = Uuid::new_v4();
-    let am = leave_balance::ActiveModel {
-        id: Set(new_id),
-        tenant_id: Set(tenant_id),
-        employee_id: Set(employee_id),
-        leave_type_id: Set(leave_type_id),
-        year: Set(year),
-        entitled_days: Set(target_entitled),
-        used_days: Set(Decimal::ZERO),
-        pending_days: Set(Decimal::ZERO),
-        carried_forward_days: Set(Decimal::ZERO),
-        balance_days: Set(balance_days),
-        created_at: Set(now),
-        updated_at: Set(now),
-    };
-    am.insert(db).await.map_err(KabiPayError::from)?;
-    Ok(())
 }
 
 /// For every active employee and each distinct leave type policy (first policy row wins per type),

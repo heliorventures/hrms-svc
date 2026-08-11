@@ -8,10 +8,10 @@ use kabipay_common::client_data_scope::employee_model_in_scope;
 use kabipay_common::context::ClientViewerEmployee;
 use kabipay_common::context::ScopeType;
 use kabipay_common::{KabiPayError, KabiPayResult};
-use kabipay_db_entities::tenant::d0005_auth_rbac::{role, user, user_role};
+use kabipay_db_entities::tenant::d0005_auth_rbac::{role, user, user_role, user_session};
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait, DatabaseConnection, EntityTrait,
-    QueryFilter, QueryOrder, QuerySelect, Set,
+    QueryFilter, QueryOrder, QuerySelect, Set, TransactionTrait,
 };
 use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
@@ -86,6 +86,95 @@ pub async fn create_provisional_login_user<C: ConnectionTrait>(
     }
 
     Ok(user_id)
+}
+
+fn normalize_login_email(login_email: &str) -> KabiPayResult<String> {
+    let email = login_email.trim().to_lowercase();
+    if email.is_empty() || !email.contains('@') {
+        return Err(KabiPayError::Validation(
+            "loginEmail must be a valid email address".into(),
+        ));
+    }
+    Ok(email)
+}
+
+fn employee_login_is_active(status: &str) -> bool {
+    matches!(
+        status.trim().to_ascii_uppercase().as_str(),
+        "ACTIVE" | "PROBATION"
+    )
+}
+
+async fn set_linked_user_email<C: ConnectionTrait>(
+    db: &C,
+    tenant_id: Uuid,
+    user_id: Uuid,
+    login_email: &str,
+) -> KabiPayResult<()> {
+    let email = normalize_login_email(login_email)?;
+    let found = user::Entity::find_by_id(user_id)
+        .filter(user::Column::TenantId.eq(tenant_id))
+        .filter(user::Column::IsDeleted.eq(false))
+        .one(db)
+        .await?
+        .ok_or_else(|| KabiPayError::NotFound {
+            entity: "user",
+            id: user_id.to_string(),
+        })?;
+    if found.email == email {
+        return Ok(());
+    }
+    if user::Entity::find()
+        .filter(user::Column::TenantId.eq(tenant_id))
+        .filter(user::Column::Email.eq(&email))
+        .filter(user::Column::IsDeleted.eq(false))
+        .filter(user::Column::Id.ne(user_id))
+        .one(db)
+        .await?
+        .is_some()
+    {
+        return Err(KabiPayError::Conflict(format!(
+            "a user with email {email} already exists in this tenant"
+        )));
+    }
+    let mut am: user::ActiveModel = found.into();
+    am.email = Set(email);
+    am.updated_at = Set(Utc::now());
+    am.update(db).await?;
+    Ok(())
+}
+
+async fn sync_linked_user_status<C: ConnectionTrait>(
+    db: &C,
+    tenant_id: Uuid,
+    user_id: Option<Uuid>,
+    employee_status: &str,
+) -> KabiPayResult<()> {
+    let Some(user_id) = user_id else {
+        return Ok(());
+    };
+    let should_be_active = employee_login_is_active(employee_status);
+    let Some(found) = user::Entity::find_by_id(user_id)
+        .filter(user::Column::TenantId.eq(tenant_id))
+        .filter(user::Column::IsDeleted.eq(false))
+        .one(db)
+        .await?
+    else {
+        return Ok(());
+    };
+    if found.is_active != should_be_active {
+        let mut am: user::ActiveModel = found.into();
+        am.is_active = Set(should_be_active);
+        am.updated_at = Set(Utc::now());
+        am.update(db).await?;
+    }
+    if !should_be_active {
+        user_session::Entity::delete_many()
+            .filter(user_session::Column::UserId.eq(user_id))
+            .exec(db)
+            .await?;
+    }
+    Ok(())
 }
 
 /// `new_manager` must exist, differ from `subject_employee_id`, and must not create a reporting loop.
@@ -408,6 +497,7 @@ pub struct EmployeePatch {
     pub employment_type: Option<String>,
     pub status: Option<String>,
     pub user_id: Option<Uuid>,
+    pub login_email: Option<String>,
 }
 
 pub async fn update(
@@ -416,12 +506,26 @@ pub async fn update(
     employee_id: Uuid,
     patch: EmployeePatch,
 ) -> KabiPayResult<employee::Model> {
-    let existing = find_by_id(db, tenant_id, employee_id)
+    let txn = db.begin().await?;
+    let existing = find_by_id(&txn, tenant_id, employee_id)
         .await?
         .ok_or_else(|| KabiPayError::NotFound {
             entity: "employee",
             id: employee_id.to_string(),
         })?;
+    let mut final_user_id = existing.user_id;
+    if let Some(v) = patch.user_id {
+        final_user_id = Some(v);
+    }
+    if let Some(email) = patch.login_email.as_ref().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        if let Some(user_id) = final_user_id {
+            set_linked_user_email(&txn, tenant_id, user_id, email).await?;
+        } else {
+            final_user_id = Some(create_provisional_login_user(&txn, tenant_id, email).await?);
+        }
+    }
+
+    let mut final_status = existing.status.clone();
     let mut am: employee::ActiveModel = existing.into();
     if let Some(v) = patch.first_name {
         am.first_name = Set(v);
@@ -441,7 +545,7 @@ pub async fn update(
                 am.reporting_manager_id = Set(None);
             }
             Some(mgr) => {
-                assert_valid_reporting_manager(db, tenant_id, employee_id, mgr).await?;
+                assert_valid_reporting_manager(&txn, tenant_id, employee_id, mgr).await?;
                 am.reporting_manager_id = Set(Some(mgr));
             }
         }
@@ -450,16 +554,18 @@ pub async fn update(
         am.employment_type = Set(Some(v));
     }
     if let Some(v) = patch.status {
+        final_status = v.clone();
         am.status = Set(v);
     }
-    if let Some(v) = patch.user_id {
-        am.user_id = Set(Some(v));
-    }
+    am.user_id = Set(final_user_id);
     am.updated_at = Set(Utc::now());
-    am.update(db).await?;
-    find_by_id(db, tenant_id, employee_id)
+    am.update(&txn).await?;
+    sync_linked_user_status(&txn, tenant_id, final_user_id, &final_status).await?;
+    let updated = find_by_id(&txn, tenant_id, employee_id)
         .await?
-        .ok_or_else(|| KabiPayError::Internal("updated employee not found".into()))
+        .ok_or_else(|| KabiPayError::Internal("updated employee not found".into()))?;
+    txn.commit().await?;
+    Ok(updated)
 }
 
 /// Demographics + emergency contact (self-service or HR). Does not change org assignment.

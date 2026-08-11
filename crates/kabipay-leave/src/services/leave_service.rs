@@ -23,8 +23,6 @@ use sea_orm::{
 use std::collections::HashSet;
 use uuid::Uuid;
 
-use crate::services::leave_admin;
-
 pub async fn list_types(
     db: &DatabaseConnection,
     tenant_id: Uuid,
@@ -151,8 +149,8 @@ pub async fn list_balances_for_employee(
         .map_err(KabiPayError::from)
 }
 
-/// Submit a leave request in one transaction: validate leave type, ensure a
-/// balance row exists, check remaining `balance_days`, insert `leave_request`
+/// Submit a leave request in one transaction: validate leave type, require a
+/// provisioned balance row, check remaining `balance_days`, insert `leave_request`
 /// with status `PENDING`, and increase `pending_days` on the balance.
 pub async fn submit_leave_request(
     db: &DatabaseConnection,
@@ -211,10 +209,8 @@ pub async fn submit_leave_request(
     }
 
     let year = from_date.year();
-    leave_admin::ensure_leave_balance_for_submit(&txn, tenant_id, employee_id, leave_type_id, year)
-        .await?;
-
-    let bal = leave_balance::Entity::find()
+    let bal = if lt.is_paid {
+        let bal = leave_balance::Entity::find()
         .filter(leave_balance::Column::TenantId.eq(tenant_id))
         .filter(leave_balance::Column::EmployeeId.eq(employee_id))
         .filter(leave_balance::Column::LeaveTypeId.eq(leave_type_id))
@@ -228,11 +224,15 @@ pub async fn submit_leave_request(
             )
         })?;
 
-    if bal.balance_days < days {
-        return Err(KabiPayError::Validation(
-            "insufficient leave balance for this request".into(),
-        ));
-    }
+        if bal.balance_days < days {
+            return Err(KabiPayError::Validation(
+                "insufficient leave balance for this request".into(),
+            ));
+        }
+        Some(bal)
+    } else {
+        None
+    };
 
     let req_id = Uuid::new_v4();
     let now = Utc::now();
@@ -263,12 +263,14 @@ pub async fn submit_leave_request(
 
     try_attach_leave_workflow(&txn, tenant_id, req_id, now).await?;
 
-    let new_pending = bal.pending_days + days;
-    let new_balance = bal.balance_days - days;
-    let mut am_bal: leave_balance::ActiveModel = bal.into();
-    am_bal.pending_days = Set(new_pending);
-    am_bal.balance_days = Set(new_balance);
-    am_bal.update(&txn).await?;
+    if let Some(bal) = bal {
+        let new_pending = bal.pending_days + days;
+        let new_balance = bal.balance_days - days;
+        let mut am_bal: leave_balance::ActiveModel = bal.into();
+        am_bal.pending_days = Set(new_pending);
+        am_bal.balance_days = Set(new_balance);
+        am_bal.update(&txn).await?;
+    }
 
     let model = leave_request::Entity::find_by_id(req_id)
         .one(&txn)
@@ -378,30 +380,34 @@ async fn load_balance_for_request(
         })
 }
 
-/// Final approval: leave row APPROVED, balance pending→used, **`outbox_event`** (M6).
+async fn request_uses_leave_balance(
+    txn: &impl ConnectionTrait,
+    tenant_id: Uuid,
+    model: &leave_request::Model,
+) -> KabiPayResult<bool> {
+    let lt = leave_type::Entity::find_by_id(model.leave_type_id)
+        .filter(leave_type::Column::TenantId.eq(tenant_id))
+        .filter(leave_type::Column::IsDeleted.eq(false))
+        .one(txn)
+        .await?
+        .ok_or_else(|| KabiPayError::NotFound {
+            entity: "leave_type",
+            id: model.leave_type_id.to_string(),
+        })?;
+    Ok(lt.is_paid)
+}
+
+/// Final approval: leave row APPROVED, paid-leave balance movement when applicable, and outbox event.
 async fn finalize_leave_approval(
     txn: &impl ConnectionTrait,
     tenant_id: Uuid,
     model: &leave_request::Model,
-    bal: &leave_balance::Model,
+    bal: Option<&leave_balance::Model>,
     approver_user_id: Uuid,
     now: chrono::DateTime<Utc>,
     request_id: Uuid,
 ) -> KabiPayResult<()> {
     let days = model.days_requested;
-    let consume_pending = bal.pending_days.min(days);
-    if consume_pending != days {
-        tracing::warn!(
-            tenant_id = %tenant_id,
-            employee_id = %model.employee_id,
-            leave_request_id = %request_id,
-            pending_days = %bal.pending_days,
-            days_requested = %days,
-            "leave balance pending_days below days_requested on approve; applying partial pending consumption"
-        );
-    }
-    let new_pending = bal.pending_days - consume_pending;
-    let new_used = bal.used_days + days;
 
     let mut am_req: leave_request::ActiveModel = model.clone().into();
     am_req.status = Set(STATUS_APPROVED.into());
@@ -410,11 +416,27 @@ async fn finalize_leave_approval(
     am_req.updated_at = Set(now);
     am_req.update(txn).await?;
 
-    let mut am_bal: leave_balance::ActiveModel = bal.clone().into();
-    am_bal.pending_days = Set(new_pending);
-    am_bal.used_days = Set(new_used);
-    am_bal.updated_at = Set(now);
-    am_bal.update(txn).await?;
+    if let Some(bal) = bal {
+        let consume_pending = bal.pending_days.min(days);
+        if consume_pending != days {
+            tracing::warn!(
+                tenant_id = %tenant_id,
+                employee_id = %model.employee_id,
+                leave_request_id = %request_id,
+                pending_days = %bal.pending_days,
+                days_requested = %days,
+                "leave balance pending_days below days_requested on approve; applying partial pending consumption"
+            );
+        }
+        let new_pending = bal.pending_days - consume_pending;
+        let new_used = bal.used_days + days;
+
+        let mut am_bal: leave_balance::ActiveModel = bal.clone().into();
+        am_bal.pending_days = Set(new_pending);
+        am_bal.used_days = Set(new_used);
+        am_bal.updated_at = Set(now);
+        am_bal.update(txn).await?;
+    }
 
     let out = leave_request::Entity::find_by_id(request_id)
         .one(txn)
@@ -545,12 +567,16 @@ pub async fn approve_leave_request(
         am_inst.updated_at = Set(now);
         am_inst.update(&txn).await?;
 
-        let bal = load_balance_for_request(&txn, tenant_id, &model).await?;
+        let bal = if request_uses_leave_balance(&txn, tenant_id, &model).await? {
+            Some(load_balance_for_request(&txn, tenant_id, &model).await?)
+        } else {
+            None
+        };
         finalize_leave_approval(
             &txn,
             tenant_id,
             &model,
-            &bal,
+            bal.as_ref(),
             approver_user_id,
             now,
             request_id,
@@ -571,12 +597,16 @@ pub async fn approve_leave_request(
                     .into(),
             ));
         }
-        let bal = load_balance_for_request(&txn, tenant_id, &model).await?;
+        let bal = if request_uses_leave_balance(&txn, tenant_id, &model).await? {
+            Some(load_balance_for_request(&txn, tenant_id, &model).await?)
+        } else {
+            None
+        };
         finalize_leave_approval(
             &txn,
             tenant_id,
             &model,
-            &bal,
+            bal.as_ref(),
             approver_user_id,
             now,
             request_id,
@@ -679,9 +709,11 @@ pub async fn reject_leave_request(
         }
     }
 
-    let year = model.from_date.year();
-    let days = model.days_requested;
-    let bal = leave_balance::Entity::find()
+    let now = Utc::now();
+    if request_uses_leave_balance(&txn, tenant_id, &model).await? {
+        let year = model.from_date.year();
+        let days = model.days_requested;
+        let bal = leave_balance::Entity::find()
         .filter(leave_balance::Column::TenantId.eq(tenant_id))
         .filter(leave_balance::Column::EmployeeId.eq(model.employee_id))
         .filter(leave_balance::Column::LeaveTypeId.eq(model.leave_type_id))
@@ -707,19 +739,19 @@ pub async fn reject_leave_request(
     let new_pending = bal.pending_days - release_pending;
     let new_balance = bal.balance_days + days;
 
-    let now = Utc::now();
+        let mut am_bal: leave_balance::ActiveModel = bal.into();
+        am_bal.pending_days = Set(new_pending);
+        am_bal.balance_days = Set(new_balance);
+        am_bal.updated_at = Set(now);
+        am_bal.update(&txn).await?;
+    }
+
     let mut am_req: leave_request::ActiveModel = model.clone().into();
     am_req.status = Set(STATUS_REJECTED.into());
     am_req.rejection_reason = Set(rejection_reason);
     am_req.approved_by = Set(None);
     am_req.updated_at = Set(now);
     am_req.update(&txn).await?;
-
-    let mut am_bal: leave_balance::ActiveModel = bal.into();
-    am_bal.pending_days = Set(new_pending);
-    am_bal.balance_days = Set(new_balance);
-    am_bal.updated_at = Set(now);
-    am_bal.update(&txn).await?;
 
     let out = leave_request::Entity::find_by_id(request_id)
         .one(&txn)
@@ -769,9 +801,10 @@ pub async fn cancel_leave_request(
         }
     }
 
-    let year = model.from_date.year();
-    let days = model.days_requested;
-    let bal = leave_balance::Entity::find()
+    if request_uses_leave_balance(&txn, tenant_id, &model).await? {
+        let year = model.from_date.year();
+        let days = model.days_requested;
+        let bal = leave_balance::Entity::find()
         .filter(leave_balance::Column::TenantId.eq(tenant_id))
         .filter(leave_balance::Column::EmployeeId.eq(model.employee_id))
         .filter(leave_balance::Column::LeaveTypeId.eq(model.leave_type_id))
@@ -797,18 +830,19 @@ pub async fn cancel_leave_request(
     let new_pending = bal.pending_days - release_pending;
     let new_balance = bal.balance_days + days;
 
+        let mut am_bal: leave_balance::ActiveModel = bal.into();
+        am_bal.pending_days = Set(new_pending);
+        am_bal.balance_days = Set(new_balance);
+        am_bal.updated_at = Set(now);
+        am_bal.update(&txn).await?;
+    }
+
     let mut am_req: leave_request::ActiveModel = model.clone().into();
     am_req.status = Set(STATUS_CANCELLED.into());
     am_req.rejection_reason = Set(None);
     am_req.approved_by = Set(None);
     am_req.updated_at = Set(now);
     am_req.update(&txn).await?;
-
-    let mut am_bal: leave_balance::ActiveModel = bal.into();
-    am_bal.pending_days = Set(new_pending);
-    am_bal.balance_days = Set(new_balance);
-    am_bal.updated_at = Set(now);
-    am_bal.update(&txn).await?;
 
     let out = leave_request::Entity::find_by_id(request_id)
         .one(&txn)

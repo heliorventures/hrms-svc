@@ -83,6 +83,15 @@ pub struct AddManualAttendanceSegmentInput {
     pub check_out_time: NaiveTime,
 }
 
+/// Update an existing completed attendance segment after client-side review.
+#[derive(InputObject, Clone, Debug)]
+pub struct UpdateManualAttendanceSegmentInput {
+    pub id: ID,
+    pub work_date: NaiveDate,
+    pub check_in_time: NaiveTime,
+    pub check_out_time: NaiveTime,
+}
+
 /// One work day: all punch segments + sum of completed segment lengths (minutes).
 #[derive(SimpleObject, Clone, Debug)]
 #[graphql(name = "PunchDaySummary")]

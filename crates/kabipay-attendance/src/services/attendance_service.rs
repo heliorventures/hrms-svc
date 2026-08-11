@@ -23,6 +23,12 @@ use uuid::Uuid;
 
 use crate::services::{hrms_master_service, timesheet_policy};
 
+const ATTENDANCE_STATUS_COMPLETE: &str = "COMPLETE";
+const MANUAL_ATTENDANCE_SOURCE: &str = "WEB+MANUAL";
+const MANUAL_SELF_REPORTED: &str = "SELF_REPORTED";
+const MANUAL_REGULARIZED: &str = "REGULARIZED";
+const MAX_DAY_MINUTES: i32 = 24 * 60;
+
 pub async fn list_shifts(
     db: &DatabaseConnection,
     tenant_id: Uuid,
@@ -111,6 +117,80 @@ fn segment_minutes(t_in: chrono::NaiveTime, t_out: chrono::NaiveTime) -> i32 {
         return 0;
     }
     (d / 60) as i32
+}
+
+fn manual_segment_minutes(
+    check_in_time: NaiveTime,
+    check_out_time: NaiveTime,
+) -> KabiPayResult<i32> {
+    if check_in_time >= check_out_time {
+        return Err(KabiPayError::Validation(
+            "checkInTime must be before checkOutTime (same-day segment only)".into(),
+        ));
+    }
+    Ok(segment_minutes(check_in_time, check_out_time))
+}
+
+async fn assert_manual_attendance_segment_allowed(
+    db: &DatabaseConnection,
+    tenant_id: Uuid,
+    employee_id: Uuid,
+    work_date: NaiveDate,
+    check_in_time: NaiveTime,
+    check_out_time: NaiveTime,
+    excluded_attendance_id: Option<Uuid>,
+    privileged_regularize: bool,
+) -> KabiPayResult<()> {
+    let today = Utc::now().date_naive();
+    if work_date > today {
+        return Err(KabiPayError::Validation(
+            "workDate cannot be in the future".into(),
+        ));
+    }
+
+    let requested_minutes = manual_segment_minutes(check_in_time, check_out_time)?;
+    let policy = hrms_master_service::load_attendance_adjustment_policy(db, tenant_id).await?;
+    let days_since = today.signed_duration_since(work_date).num_days();
+    let window = policy.max_self_adjust_days.max(0);
+    if days_since > window && !privileged_regularize {
+        return Err(KabiPayError::Forbidden(format!(
+            "manual attendance is limited to the last {} calendar days unless you hold attendance regularization permission",
+            window
+        )));
+    }
+
+    let existing = list_employee_attendance_on_date(db, tenant_id, employee_id, work_date).await?;
+    let mut total_minutes = requested_minutes;
+    for row in existing {
+        if excluded_attendance_id == Some(row.id) {
+            continue;
+        }
+        match (row.check_in_time, row.check_out_time) {
+            (Some(existing_in), Some(existing_out)) => {
+                if check_in_time < existing_out && check_out_time > existing_in {
+                    return Err(KabiPayError::Validation(
+                        "manual attendance overlaps with an existing segment for this day".into(),
+                    ));
+                }
+                total_minutes += segment_minutes(existing_in, existing_out);
+            }
+            (Some(_), None) => {
+                return Err(KabiPayError::Validation(
+                    "complete the open punch before adjusting manual attendance for this day"
+                        .into(),
+                ));
+            }
+            _ => {}
+        }
+    }
+
+    if total_minutes > MAX_DAY_MINUTES {
+        return Err(KabiPayError::Validation(
+            "total attendance for a day cannot exceed 24 hours".into(),
+        ));
+    }
+
+    Ok(())
 }
 
 /// All attendance rows (segments) for one employee on one work day, ordered oldest first.
@@ -266,26 +346,17 @@ pub async fn add_manual_attendance_segment(
     check_out_time: NaiveTime,
     privileged_regularize: bool,
 ) -> KabiPayResult<attendance::Model> {
-    let today = Utc::now().date_naive();
-    if work_date > today {
-        return Err(KabiPayError::Validation(
-            "workDate cannot be in the future".into(),
-        ));
-    }
-    if check_in_time >= check_out_time {
-        return Err(KabiPayError::Validation(
-            "checkInTime must be before checkOutTime (same-day segment only)".into(),
-        ));
-    }
-    let policy = hrms_master_service::load_attendance_adjustment_policy(db, tenant_id).await?;
-    let days_since = today.signed_duration_since(work_date).num_days();
-    let window = policy.max_self_adjust_days.max(0);
-    if days_since > window && !privileged_regularize {
-        return Err(KabiPayError::Forbidden(format!(
-            "manual attendance is limited to the last {} calendar days unless you hold attendance regularization permission",
-            window
-        )));
-    }
+    assert_manual_attendance_segment_allowed(
+        db,
+        tenant_id,
+        employee_id,
+        work_date,
+        check_in_time,
+        check_out_time,
+        None,
+        privileged_regularize,
+    )
+    .await?;
     let now_ts = Utc::now();
     let id = Uuid::new_v4();
     let am = attendance::ActiveModel {
@@ -300,9 +371,9 @@ pub async fn add_manual_attendance_segment(
         check_in_lng: Set(None),
         check_out_lat: Set(None),
         check_out_lng: Set(None),
-        source: Set(Some("WEB+MANUAL".into())),
-        status: Set(Some("COMPLETE".into())),
-        regularization_status: Set(Some("SELF_REPORTED".into())),
+        source: Set(Some(MANUAL_ATTENDANCE_SOURCE.into())),
+        status: Set(Some(ATTENDANCE_STATUS_COMPLETE.into())),
+        regularization_status: Set(Some(MANUAL_SELF_REPORTED.into())),
         biometric_ref: Set(None),
         overtime_hours: Set(None),
         late_minutes: Set(None),
@@ -315,6 +386,70 @@ pub async fn add_manual_attendance_segment(
         .one(db)
         .await?
         .ok_or_else(|| KabiPayError::Internal("inserted attendance row not found".into()))
+}
+
+pub async fn update_manual_attendance_segment(
+    db: &DatabaseConnection,
+    tenant_id: Uuid,
+    attendance_id: Uuid,
+    requesting_employee_id: Uuid,
+    work_date: NaiveDate,
+    check_in_time: NaiveTime,
+    check_out_time: NaiveTime,
+    privileged_regularize: bool,
+) -> KabiPayResult<attendance::Model> {
+    let row = attendance::Entity::find_by_id(attendance_id)
+        .filter(attendance::Column::TenantId.eq(tenant_id))
+        .one(db)
+        .await?
+        .ok_or_else(|| KabiPayError::NotFound {
+            entity: "attendance",
+            id: attendance_id.to_string(),
+        })?;
+
+    if row.employee_id != requesting_employee_id && !privileged_regularize {
+        return Err(KabiPayError::Forbidden(
+            "attendance segment belongs to another employee".into(),
+        ));
+    }
+
+    assert_manual_attendance_segment_allowed(
+        db,
+        tenant_id,
+        row.employee_id,
+        work_date,
+        check_in_time,
+        check_out_time,
+        Some(attendance_id),
+        privileged_regularize,
+    )
+    .await?;
+
+    let mut am: attendance::ActiveModel = row.into();
+    am.work_date = Set(work_date);
+    am.check_in_time = Set(Some(check_in_time));
+    am.check_out_time = Set(Some(check_out_time));
+    am.check_in_lat = Set(None);
+    am.check_in_lng = Set(None);
+    am.check_out_lat = Set(None);
+    am.check_out_lng = Set(None);
+    am.source = Set(Some(MANUAL_ATTENDANCE_SOURCE.into()));
+    am.status = Set(Some(ATTENDANCE_STATUS_COMPLETE.into()));
+    am.regularization_status = Set(Some(
+        if privileged_regularize {
+            MANUAL_REGULARIZED
+        } else {
+            MANUAL_SELF_REPORTED
+        }
+        .into(),
+    ));
+    am.updated_at = Set(Utc::now());
+    am.update(db).await?;
+
+    attendance::Entity::find_by_id(attendance_id)
+        .one(db)
+        .await?
+        .ok_or_else(|| KabiPayError::Internal("updated attendance row not found".into()))
 }
 
 pub async fn list_timesheet_entries(
@@ -358,6 +493,22 @@ pub async fn create_timesheet_entry(
         ));
     }
     timesheet_policy::assert_work_date_allowed_for_entry(db, tenant_id, work_date).await?;
+    timesheet_policy::assert_week_has_no_active_submission(
+        db,
+        tenant_id,
+        employee_id,
+        work_date,
+    )
+    .await?;
+    timesheet_policy::assert_week_hours_with_entry_change(
+        db,
+        tenant_id,
+        employee_id,
+        work_date,
+        None,
+        hours_worked,
+    )
+    .await?;
     crate::services::timesheet_project_assignment_service::assert_project_allowed_for_employee(
         db,
         tenant_id,
@@ -459,6 +610,22 @@ pub async fn update_timesheet_entry(
     }
     timesheet_policy::assert_entry_mut_allowed(db, tenant_id, &row).await?;
     timesheet_policy::assert_work_date_allowed_for_entry(db, tenant_id, work_date).await?;
+    timesheet_policy::assert_week_has_no_active_submission(
+        db,
+        tenant_id,
+        employee_id,
+        work_date,
+    )
+    .await?;
+    timesheet_policy::assert_week_hours_with_entry_change(
+        db,
+        tenant_id,
+        employee_id,
+        work_date,
+        Some(entry_id),
+        hours_worked,
+    )
+    .await?;
     crate::services::timesheet_project_assignment_service::assert_project_allowed_for_employee(
         db,
         tenant_id,

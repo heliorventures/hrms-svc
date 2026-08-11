@@ -14,7 +14,8 @@ use crate::resolvers::types::{
     AddManualAttendanceSegmentInput, AttendanceAdjustmentPolicyDto, AttendanceDto,
     AttendancePunchPolicyDto, CreateTimesheetEntryInput, HolidayCalendarDto, HolidayDayDto,
     PunchTodayInput, TimesheetEntryDto, TimesheetLockPolicyDto, TimesheetWeekBatchDto,
-    UpdateTimesheetEntryInput, UpsertAttendanceAdjustmentPolicyInput,
+    UpdateManualAttendanceSegmentInput, UpdateTimesheetEntryInput,
+    UpsertAttendanceAdjustmentPolicyInput,
     UpsertAttendancePunchPolicyInput, UpsertHolidayCalendarInput, UpsertHolidayDayInput,
     UpsertTimesheetLockPolicyInput,
 };
@@ -151,6 +152,43 @@ impl MutationRoot {
         let m = attendance_service::add_manual_attendance_segment(
             &db,
             tenant_id,
+            employee_id,
+            input.work_date,
+            input.check_in_time,
+            input.check_out_time,
+            privileged,
+        )
+        .await
+        .map_err(KabiPayError::into_graphql)?;
+        Ok(AttendanceDto::from(m))
+    }
+
+    /// Update an existing manual attendance segment with server-side overlap and daily-cap checks.
+    async fn update_manual_attendance_segment(
+        &self,
+        ctx: &Context<'_>,
+        input: UpdateManualAttendanceSegmentInput,
+    ) -> Result<AttendanceDto> {
+        let tenant_id = require_tenant_id(ctx)?;
+        let claims = require_client_claims(ctx)?;
+        if !claims.can_record_own_attendance_punches() {
+            return Err(
+                KabiPayError::Forbidden(
+                    "attendance:punch_self or employee directory permission required".into(),
+                )
+                .into_graphql(),
+            );
+        }
+        let db = tenant_db(ctx, tenant_id).await?;
+        let employee_id = resolve_client_employee_id(ctx, &db, tenant_id)
+            .await
+            .map_err(KabiPayError::into_graphql)?;
+        let attendance_id = parse_uuid(&input.id, "id")?;
+        let privileged = claims.can_regularize_attendance_records();
+        let m = attendance_service::update_manual_attendance_segment(
+            &db,
+            tenant_id,
+            attendance_id,
             employee_id,
             input.work_date,
             input.check_in_time,

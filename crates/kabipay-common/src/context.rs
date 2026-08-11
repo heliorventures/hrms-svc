@@ -288,7 +288,7 @@ impl ClientClaims {
             return true;
         }
         // Same baseline as approvers + accounting — finance often overlaps with expense approval.
-        self.can_approve_expense()
+        false
     }
 
     /// Approve or reject **tax deduction proof** lines (documented actuals).

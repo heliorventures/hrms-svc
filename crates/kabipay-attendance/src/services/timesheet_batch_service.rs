@@ -29,6 +29,7 @@ pub const WF_ENTITY_TIMESHEET_WEEK_BATCH: &str = "TIMESHEET_WEEK_BATCH";
 
 const BATCH_PENDING: &str = "PENDING";
 const BATCH_APPROVED: &str = "APPROVED";
+const BATCH_REJECTED: &str = "REJECTED";
 
 const ENTRY_DRAFT: &str = "DRAFT";
 const ENTRY_SUBMITTED: &str = "SUBMITTED";
@@ -116,7 +117,7 @@ async fn try_attach_timesheet_workflow(
     Ok(())
 }
 
-/// Employee submits all draft rows Mon–Sun `week_start`; starts workflow when configured.
+/// Employee submits all draft rows Mon-Sun `week_start`; starts workflow when configured.
 pub async fn submit_timesheet_week(
     db: &DatabaseConnection,
     tenant_id: Uuid,
@@ -127,11 +128,16 @@ pub async fn submit_timesheet_week(
     let (mon, sun) = week_monday_sunday(week_start);
 
     timesheet_policy::assert_work_date_allowed_for_entry(db, tenant_id, sun).await?;
+    timesheet_policy::assert_week_hours_for_submission(db, tenant_id, employee_id, mon).await?;
 
     let dup = timesheet_week_batch::Entity::find()
         .filter(timesheet_week_batch::Column::TenantId.eq(tenant_id))
         .filter(timesheet_week_batch::Column::EmployeeId.eq(employee_id))
         .filter(timesheet_week_batch::Column::WeekStartDate.eq(mon))
+        .filter(timesheet_week_batch::Column::Status.is_in(vec![
+            BATCH_PENDING.to_string(),
+            BATCH_APPROVED.to_string(),
+        ]))
         .one(db)
         .await?;
     if dup.is_some() {
@@ -481,9 +487,32 @@ pub async fn reject_timesheet_week_batch(
         am.update(&txn).await?;
     }
 
-    timesheet_week_batch::Entity::delete_by_id(batch_id)
-        .exec(&txn)
-        .await?;
+    let rejected_employee_id = batch.employee_id;
+    let rejected_week_start = batch.week_start_date;
+    let sanitized_reason = rejection_reason.clone().and_then(|reason| {
+        let trimmed = reason.trim().to_string();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed)
+        }
+    });
+
+    let mut am_batch: timesheet_week_batch::ActiveModel = batch.into();
+    am_batch.status = Set(BATCH_REJECTED.into());
+    am_batch.rejection_reason = Set(sanitized_reason.clone());
+    am_batch.updated_at = Set(now);
+    am_batch.update(&txn).await?;
+
+    crate::services::timesheet_notification_service::notify_employee_timesheet_rejected(
+        &txn,
+        tenant_id,
+        rejected_employee_id,
+        rejected_week_start,
+        sanitized_reason.as_deref(),
+        now,
+    )
+    .await?;
 
     txn.commit().await?;
     Ok(true)

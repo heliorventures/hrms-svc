@@ -360,6 +360,8 @@ pub struct UpdateEmployeeInput {
     pub employment_type: Option<String>,
     pub status: Option<String>,
     pub user_id: Option<ID>,
+    #[graphql(name = "loginEmail")]
+    pub login_email: Option<String>,
 }
 
 #[derive(InputObject, Clone, Debug)]

@@ -220,6 +220,17 @@ impl MutationRoot {
             Some(None) => Some(None),
             Some(Some(ref id)) => Some(Some(parse_uuid(id, "reportingManagerId")?)),
         };
+        let login_email = input
+            .login_email
+            .as_ref()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        if input.user_id.is_some() && login_email.is_some() {
+            return Err(
+                KabiPayError::Validation("provide either userId or loginEmail, not both".into())
+                    .into_graphql(),
+            );
+        }
         let patch = EmployeePatch {
             first_name: input.first_name,
             last_name: input.last_name,
@@ -229,6 +240,7 @@ impl MutationRoot {
             employment_type: input.employment_type,
             status: input.status,
             user_id: opt_uuid(&input.user_id, "userId")?,
+            login_email,
         };
         let m = employee_service::update(&db, tenant_id, eid, patch)
             .await

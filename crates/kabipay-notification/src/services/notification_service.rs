@@ -3,11 +3,14 @@
 
 use chrono::{DateTime, Utc};
 use kabipay_common::{KabiPayError, KabiPayResult};
+use kabipay_db_entities::tenant::d0005_auth_rbac::{role, user, user_role};
+use kabipay_db_entities::tenant::d0007_employee_core::employee;
 use kabipay_db_entities::tenant::d0027_communication_audit::{announcement, notification};
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, Condition, DatabaseConnection, EntityTrait, QueryFilter, QueryOrder,
     QuerySelect, Set,
 };
+use std::collections::HashSet;
 use uuid::Uuid;
 
 use crate::services::notification_preference;
@@ -85,6 +88,88 @@ pub fn announcement_visible_to_viewer(
         }
     }
     true
+}
+
+fn announcement_role_target(m: &announcement::Model) -> Option<String> {
+    let value = m.target_audience.as_ref()?.trim();
+    let upper = value.to_ascii_uppercase();
+    upper
+        .strip_prefix("ROLE:")
+        .map(|role| role.trim().to_string())
+        .filter(|role| !role.is_empty())
+}
+
+async fn active_user_ids(db: &DatabaseConnection, tenant_id: Uuid) -> KabiPayResult<HashSet<Uuid>> {
+    let rows = user::Entity::find()
+        .filter(user::Column::TenantId.eq(tenant_id))
+        .filter(user::Column::IsActive.eq(true))
+        .filter(user::Column::IsDeleted.eq(false))
+        .all(db)
+        .await
+        .map_err(KabiPayError::from)?;
+    Ok(rows.into_iter().map(|row| row.id).collect())
+}
+
+async fn role_target_user_ids(
+    db: &DatabaseConnection,
+    tenant_id: Uuid,
+    role_code: &str,
+) -> KabiPayResult<HashSet<Uuid>> {
+    let Some(role_row) = role::Entity::find()
+        .filter(role::Column::TenantId.eq(tenant_id))
+        .filter(role::Column::Name.eq(role_code))
+        .filter(role::Column::IsDeleted.eq(false))
+        .one(db)
+        .await
+        .map_err(KabiPayError::from)?
+    else {
+        return Ok(HashSet::new());
+    };
+    let rows = user_role::Entity::find()
+        .filter(user_role::Column::RoleId.eq(role_row.id))
+        .all(db)
+        .await
+        .map_err(KabiPayError::from)?;
+    Ok(rows.into_iter().map(|row| row.user_id).collect())
+}
+
+async fn employee_target_user_ids(
+    db: &DatabaseConnection,
+    tenant_id: Uuid,
+    department_id: Option<Uuid>,
+    location_id: Option<Uuid>,
+) -> KabiPayResult<HashSet<Uuid>> {
+    let mut query = employee::Entity::find()
+        .filter(employee::Column::TenantId.eq(tenant_id))
+        .filter(employee::Column::IsDeleted.eq(false))
+        .filter(employee::Column::UserId.is_not_null());
+    if let Some(department_id) = department_id {
+        query = query.filter(employee::Column::DepartmentId.eq(Some(department_id)));
+    }
+    if let Some(location_id) = location_id {
+        query = query.filter(employee::Column::LocationId.eq(Some(location_id)));
+    }
+    let rows = query.all(db).await.map_err(KabiPayError::from)?;
+    Ok(rows.into_iter().filter_map(|row| row.user_id).collect())
+}
+
+async fn announcement_recipient_user_ids(
+    db: &DatabaseConnection,
+    tenant_id: Uuid,
+    m: &announcement::Model,
+) -> KabiPayResult<Vec<Uuid>> {
+    let mut recipients = active_user_ids(db, tenant_id).await?;
+    if let Some(role_code) = announcement_role_target(m) {
+        let role_users = role_target_user_ids(db, tenant_id, &role_code).await?;
+        recipients.retain(|user_id| role_users.contains(user_id));
+    }
+    if m.target_department_id.is_some() || m.target_location_id.is_some() {
+        let employee_users =
+            employee_target_user_ids(db, tenant_id, m.target_department_id, m.target_location_id)
+                .await?;
+        recipients.retain(|user_id| employee_users.contains(user_id));
+    }
+    Ok(recipients.into_iter().collect())
 }
 
 /// Full list for admins (includes scheduled / expired rows; caller still scopes by tenant).
@@ -226,10 +311,26 @@ pub async fn create_announcement(
         updated_at: Set(now),
     };
     am.insert(db).await.map_err(KabiPayError::from)?;
-    announcement::Entity::find_by_id(id)
+    let row = announcement::Entity::find_by_id(id)
         .one(db)
         .await?
-        .ok_or_else(|| KabiPayError::Internal("announcement missing after insert".into()))
+        .ok_or_else(|| KabiPayError::Internal("announcement missing after insert".into()))?;
+    let visible_now = row.publish_at.map(|t| t <= now).unwrap_or(true)
+        && row.expires_at.map(|t| t > now).unwrap_or(true);
+    if visible_now {
+        let recipients = announcement_recipient_user_ids(db, tenant_id, &row).await?;
+        insert_notifications_for_users(
+            db,
+            tenant_id,
+            recipients,
+            Some("ANNOUNCEMENT".into()),
+            Some(row.title.clone()),
+            row.body.clone(),
+            Some("/notifications".into()),
+        )
+        .await?;
+    }
+    Ok(row)
 }
 
 pub struct AnnouncementUpdate {
@@ -341,6 +442,21 @@ pub async fn create_notifications_for_users(
         return Err(KabiPayError::Validation(
             "too many recipients (max 500)".into(),
         ));
+    }
+    insert_notifications_for_users(db, tenant_id, user_ids, kind, title, message, action_url).await
+}
+
+async fn insert_notifications_for_users(
+    db: &DatabaseConnection,
+    tenant_id: Uuid,
+    user_ids: Vec<Uuid>,
+    kind: Option<String>,
+    title: Option<String>,
+    message: Option<String>,
+    action_url: Option<String>,
+) -> KabiPayResult<u64> {
+    if user_ids.is_empty() {
+        return Ok(0);
     }
     let now = Utc::now();
     let mut n = 0u64;
