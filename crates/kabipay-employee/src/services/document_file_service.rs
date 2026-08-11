@@ -14,14 +14,15 @@ use sea_orm::{
 use uuid::Uuid;
 
 use super::object_store::{
-    FileStorageMode, S3CompatSettings, ensure_tenant_bucket, s3_operator_for_bucket, s3_put, s3_read,
-    tenant_bucket_name, PROVIDER_S3_COMPAT,
+    FileStorageMode, S3CompatSettings, ensure_tenant_bucket, s3_delete, s3_operator_for_bucket,
+    s3_put, s3_read, tenant_bucket_name, PROVIDER_S3_COMPAT,
 };
 use crate::entities::d0008_document_system::employee_document;
 use crate::entities::d0029_file_storage::file_storage;
 
 const PROVIDER_LOCAL: &str = "LOCAL";
 const MAX_BYTES: usize = 6 * 1024 * 1024;
+const ALLOWED_DOCUMENT_MIME_TYPES: &[&str] = &["application/pdf", "image/jpeg", "image/png"];
 
 pub fn local_file_root() -> PathBuf {
     let root =
@@ -85,6 +86,7 @@ pub async fn upload_employee_document(
     hr_auto_approve: bool,
 ) -> KabiPayResult<employee_document::Model> {
     validate_upload_bytes(&bytes)?;
+    validate_supported_upload_type(&mime_type, &bytes, "document")?;
 
     let mode = FileStorageMode::from_env();
     match mode {
@@ -129,7 +131,7 @@ pub async fn upload_employee_document(
                 mime_type.as_deref().filter(|s| !s.is_empty()),
             )
             .await?;
-            insert_fs_doc(
+            let inserted = insert_fs_doc(
                 db,
                 tenant_id,
                 employee_id,
@@ -141,11 +143,15 @@ pub async fn upload_employee_document(
                 doc_id,
                 now,
                 Some(bucket),
-                storage_path,
+                storage_path.clone(),
                 sz,
                 hr_auto_approve,
             )
-            .await
+            .await;
+            if inserted.is_err() {
+                s3_delete(&op, &storage_path).await;
+            }
+            inserted
         }
         FileStorageMode::AzureBlob => Err(KabiPayError::Validation(
             "KABIPAY_FILE_STORAGE_MODE=azure is not implemented yet. Use local, or s3_compat for R2/S3/MinIO."
@@ -165,6 +171,7 @@ pub async fn upload_tenant_file(
     bytes: Vec<u8>,
 ) -> KabiPayResult<file_storage::Model> {
     validate_upload_bytes(&bytes)?;
+    validate_supported_upload_type(&mime_type, &bytes, "tenant file")?;
 
     let mode = FileStorageMode::from_env();
     match mode {
@@ -181,7 +188,7 @@ pub async fn upload_tenant_file(
             tokio::fs::write(&path, &bytes)
                 .await
                 .map_err(|e| KabiPayError::Internal(format!("write local file: {e}")))?;
-            insert_file_storage(
+            let inserted = insert_file_storage(
                 db,
                 tenant_id,
                 uploader_user_id,
@@ -193,7 +200,11 @@ pub async fn upload_tenant_file(
                 rel,
                 bytes.len() as i64,
             )
-            .await
+            .await;
+            if inserted.is_err() {
+                let _ = tokio::fs::remove_file(&path).await;
+            }
+            inserted
         }
         FileStorageMode::S3Compat => {
             let cfg = S3CompatSettings::from_env()?;
@@ -221,7 +232,7 @@ pub async fn upload_tenant_file(
                 mime_type.as_deref().filter(|s| !s.is_empty()),
             )
             .await?;
-            insert_file_storage(
+            let inserted = insert_file_storage(
                 db,
                 tenant_id,
                 uploader_user_id,
@@ -230,10 +241,14 @@ pub async fn upload_tenant_file(
                 file_id,
                 now,
                 Some(bucket),
-                storage_path,
+                storage_path.clone(),
                 size,
             )
-            .await
+            .await;
+            if inserted.is_err() {
+                s3_delete(&op, &storage_path).await;
+            }
+            inserted
         }
         FileStorageMode::AzureBlob => Err(KabiPayError::Validation(
             "KABIPAY_FILE_STORAGE_MODE=azure is not implemented yet. Use local, or s3_compat for R2/S3/MinIO."
@@ -252,6 +267,35 @@ fn validate_upload_bytes(bytes: &[u8]) -> KabiPayResult<()> {
         return Err(KabiPayError::Validation(format!(
             "file exceeds max size of {} bytes",
             MAX_BYTES
+        )));
+    }
+    Ok(())
+}
+
+fn validate_supported_upload_type(
+    mime_type: &Option<String>,
+    bytes: &[u8],
+    label: &str,
+) -> KabiPayResult<()> {
+    let mime = mime_type
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if !ALLOWED_DOCUMENT_MIME_TYPES.contains(&mime.as_str()) {
+        return Err(KabiPayError::Validation(format!(
+            "{label} must be a PDF, JPG, or PNG file"
+        )));
+    }
+    let matches_magic = match mime.as_str() {
+        "application/pdf" => bytes.starts_with(b"%PDF-"),
+        "image/jpeg" => bytes.starts_with(&[0xFF, 0xD8, 0xFF]),
+        "image/png" => bytes.starts_with(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]),
+        _ => false,
+    };
+    if !matches_magic {
+        return Err(KabiPayError::Validation(format!(
+            "{label} content does not match its declared file type"
         )));
     }
     Ok(())
@@ -283,7 +327,7 @@ async fn upload_local(
         .map_err(|e| KabiPayError::Internal(format!("write local file: {e}")))?;
     let sz = bytes.len() as i64;
 
-    insert_fs_doc(
+    let inserted = insert_fs_doc(
         db,
         tenant_id,
         employee_id,
@@ -299,7 +343,11 @@ async fn upload_local(
         sz,
         hr_auto_approve,
     )
-    .await
+    .await;
+    if inserted.is_err() {
+        let _ = tokio::fs::remove_file(&path).await;
+    }
+    inserted
 }
 
 async fn insert_fs_doc(

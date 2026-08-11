@@ -257,13 +257,7 @@ impl MutationRoot {
             .into_graphql());
         }
 
-        let uploader = if let Some(c) = ctx.data_opt::<ClientClaims>() {
-            Some(c.sub)
-        } else if std::env::var("KABIPAY_EMPLOYEE_MUTATION_HEADER_OK").as_deref() == Ok("1") {
-            None
-        } else {
-            return Err(KabiPayError::Unauthorised.into_graphql());
-        };
+        let uploader = Some(require_client_claims(ctx)?.sub);
 
         let hr_auto = ctx
             .data_opt::<ClientClaims>()
@@ -298,13 +292,7 @@ impl MutationRoot {
     ) -> Result<UploadedTenantFileDto> {
         let tenant_id = require_tenant_id(ctx)?;
         let db = tenant_db(ctx, tenant_id).await?;
-        let uploader = if let Some(c) = ctx.data_opt::<ClientClaims>() {
-            Some(c.sub)
-        } else if std::env::var("KABIPAY_EMPLOYEE_MUTATION_HEADER_OK").as_deref() == Ok("1") {
-            None
-        } else {
-            return Err(KabiPayError::Unauthorised.into_graphql());
-        };
+        let uploader = Some(require_client_claims(ctx)?.sub);
         let bytes = STANDARD
             .decode(input.content_base64.as_bytes())
             .map_err(|e| KabiPayError::Validation(format!("contentBase64: {e}")).into_graphql())?;

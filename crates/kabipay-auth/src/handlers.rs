@@ -170,9 +170,12 @@ pub async fn ops_refresh(
         return Err(KabiPayError::Unauthorised);
     }
 
-    operator_session::Entity::delete_by_id(session.id)
+    let consumed = operator_session::Entity::delete_by_id(session.id)
         .exec(&state.ops_db)
         .await?;
+    if consumed.rows_affected != 1 {
+        return Err(KabiPayError::Unauthorised);
+    }
 
     let pair = issue_ops_tokens(&state, user_row.id, &user_row.email).await?;
     Ok(Json(pair))
@@ -328,9 +331,12 @@ pub async fn client_refresh(
         return Err(KabiPayError::Unauthorised);
     }
 
-    user_session::Entity::delete_by_id(session.id)
+    let consumed = user_session::Entity::delete_by_id(session.id)
         .exec(&tenant_conn)
         .await?;
+    if consumed.rows_affected != 1 {
+        return Err(KabiPayError::Unauthorised);
+    }
 
     let pair = issue_client_tokens(
         &state,

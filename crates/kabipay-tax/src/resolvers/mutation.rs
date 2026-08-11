@@ -177,6 +177,7 @@ impl MutationRoot {
         ctx: &Context<'_>,
         input: SubmitTaxProofLineInput,
     ) -> Result<TaxProofLineDto> {
+        let claims = require_client_claims(ctx)?;
         let tenant_id = require_tenant_id(ctx)?;
         let db = tenant_db(ctx, tenant_id).await?;
         let employee_id = resolve_client_employee_id(ctx, &db, tenant_id)
@@ -187,15 +188,12 @@ impl MutationRoot {
             .map_err(|_| KabiPayError::Validation("invalid declaredAmount".into()))?;
         let actual = Decimal::from_str(input.actual_amount.trim())
             .map_err(|_| KabiPayError::Validation("invalid actualAmount".into()))?;
-        let fid = input
-            .file_storage_id
-            .as_ref()
-            .map(|id| parse_uuid(id, "fileStorageId"))
-            .transpose()?;
+        let fid = parse_uuid(&input.file_storage_id, "fileStorageId")?;
         let m = tax_service::submit_tax_proof_line(
             &db,
             tenant_id,
             employee_id,
+            claims.sub,
             tid,
             input.fiscal_year,
             input.section_code,

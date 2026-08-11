@@ -6,6 +6,7 @@ use kabipay_db_entities::tenant::d0007_employee_core::employee;
 use kabipay_db_entities::tenant::d0013_tax_statutory::{
     tax_computation, tax_configuration_version, tax_section_definition, tax_slab,
 };
+use kabipay_db_entities::tenant::d0029_file_storage::file_storage;
 use kabipay_db_entities::tenant::d0027_communication_audit::notification;
 use kabipay_db_entities::tenant::d0031_tax_proof::tax_proof_line;
 use rust_decimal::Decimal;
@@ -156,6 +157,7 @@ pub fn opt_decimal(s: &Option<String>) -> KabiPayResult<Option<Decimal>> {
 const PROOF_PENDING: &str = "PENDING";
 const PROOF_APPROVED: &str = "APPROVED";
 const PROOF_REJECTED: &str = "REJECTED";
+const TAX_PROOF_ALLOWED_MIME_TYPES: &[&str] = &["application/pdf", "image/jpeg", "image/png"];
 
 /// If the tenant maintains an active **`tax_section_definition`** catalogue, `section_code` must exist there.
 pub async fn enforce_proof_section_catalog_match(
@@ -225,12 +227,13 @@ pub async fn submit_tax_proof_line(
     db: &DatabaseConnection,
     tenant_id: Uuid,
     employee_id: Uuid,
+    submitting_user_id: Uuid,
     tax_config_version_id: Uuid,
     fiscal_year: i32,
     section_code: String,
     declared_amount: Decimal,
     actual_amount: Decimal,
-    file_storage_id: Option<Uuid>,
+    file_storage_id: Uuid,
 ) -> KabiPayResult<tax_proof_line::Model> {
     if declared_amount < Decimal::ZERO || actual_amount < Decimal::ZERO {
         return Err(KabiPayError::Validation(
@@ -243,6 +246,7 @@ pub async fn submit_tax_proof_line(
     }
     enforce_proof_section_catalog_match(db, tenant_id, &sc, declared_amount.max(actual_amount))
         .await?;
+    assert_tax_proof_file(db, tenant_id, file_storage_id, Some(submitting_user_id)).await?;
 
     let _ver = tax_configuration_version::Entity::find()
         .filter(tax_configuration_version::Column::Id.eq(tax_config_version_id))
@@ -273,7 +277,7 @@ pub async fn submit_tax_proof_line(
         let mut am: tax_proof_line::ActiveModel = row.into();
         am.declared_amount = Set(declared_amount);
         am.actual_amount = Set(actual_amount);
-        am.file_storage_id = Set(file_storage_id);
+        am.file_storage_id = Set(Some(file_storage_id));
         am.status = Set(PROOF_PENDING.into());
         am.rejection_reason = Set(None);
         am.approved_by = Set(None);
@@ -295,7 +299,7 @@ pub async fn submit_tax_proof_line(
             section_code: Set(sc),
             declared_amount: Set(declared_amount),
             actual_amount: Set(actual_amount),
-            file_storage_id: Set(file_storage_id),
+            file_storage_id: Set(Some(file_storage_id)),
             status: Set(PROOF_PENDING.into()),
             rejection_reason: Set(None),
             approved_by: Set(None),
@@ -351,6 +355,10 @@ pub async fn approve_tax_proof_line(
     approver_user_id: Uuid,
 ) -> KabiPayResult<tax_proof_line::Model> {
     let model = load_pending_tax_proof(db, tenant_id, line_id).await?;
+    let file_storage_id = model.file_storage_id.ok_or_else(|| {
+        KabiPayError::Validation("tax proof file is required before approval".into())
+    })?;
+    assert_tax_proof_file(db, tenant_id, file_storage_id, None).await?;
     let tid = model.tax_config_version_id;
     let eid = model.employee_id;
     let fy = model.fiscal_year;
@@ -376,6 +384,53 @@ pub async fn approve_tax_proof_line(
     )
     .await;
     Ok(out)
+}
+
+async fn assert_tax_proof_file(
+    db: &DatabaseConnection,
+    tenant_id: Uuid,
+    file_storage_id: Uuid,
+    required_uploader_user_id: Option<Uuid>,
+) -> KabiPayResult<()> {
+    let file = file_storage::Entity::find_by_id(file_storage_id)
+        .filter(file_storage::Column::TenantId.eq(tenant_id))
+        .one(db)
+        .await?
+        .ok_or_else(|| KabiPayError::NotFound {
+            entity: "file_storage",
+            id: file_storage_id.to_string(),
+        })?;
+
+    if let Some(expected_uploader) = required_uploader_user_id {
+        if file.uploaded_by != Some(expected_uploader) {
+            return Err(KabiPayError::Validation(
+                "tax proof file must be uploaded by the submitting user".into(),
+            ));
+        }
+    }
+
+    match file.file_size_bytes {
+        Some(size) if size > 0 => {}
+        _ => {
+            return Err(KabiPayError::Validation(
+                "tax proof file must not be empty".into(),
+            ));
+        }
+    }
+
+    let mime = file
+        .mime_type
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if !TAX_PROOF_ALLOWED_MIME_TYPES.contains(&mime.as_str()) {
+        return Err(KabiPayError::Validation(
+            "tax proof file must be a PDF, JPG, or PNG file".into(),
+        ));
+    }
+
+    Ok(())
 }
 
 pub async fn reject_tax_proof_line(

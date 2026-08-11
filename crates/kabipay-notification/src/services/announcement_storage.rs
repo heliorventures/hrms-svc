@@ -9,12 +9,22 @@ use sea_orm::{ActiveModelTrait, ActiveValue::Set, DatabaseConnection};
 use uuid::Uuid;
 
 use super::object_store::{
-    FileStorageMode, S3CompatSettings, ensure_tenant_bucket, s3_operator_for_bucket, s3_put,
+    FileStorageMode, S3CompatSettings, ensure_tenant_bucket, s3_delete, s3_operator_for_bucket, s3_put,
     tenant_bucket_name, PROVIDER_S3_COMPAT,
 };
 
 const PROVIDER_LOCAL: &str = "LOCAL";
 const MAX_BYTES: usize = 6 * 1024 * 1024;
+const ALLOWED_ANNOUNCEMENT_MIME_TYPES: &[&str] = &[
+    "application/pdf",
+    "application/msword",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "image/gif",
+    "image/jpeg",
+    "image/png",
+    "image/webp",
+    "text/plain",
+];
 
 pub fn local_file_root() -> PathBuf {
     let root =
@@ -49,6 +59,7 @@ pub async fn store_blob(
             MAX_BYTES
         )));
     }
+    validate_supported_upload_type(&mime_type, &bytes)?;
 
     let mode = FileStorageMode::from_env();
     match mode {
@@ -89,7 +100,7 @@ pub async fn store_blob(
                 mime_type.as_deref().filter(|s| !s.is_empty()),
             )
             .await?;
-            insert_fs_row(
+            let inserted = insert_fs_row(
                 db,
                 tenant_id,
                 uploaded_by,
@@ -98,10 +109,14 @@ pub async fn store_blob(
                 file_id,
                 now,
                 Some(bucket),
-                storage_path,
+                storage_path.clone(),
                 sz,
             )
-            .await
+            .await;
+            if inserted.is_err() {
+                s3_delete(&op, &storage_path).await;
+            }
+            inserted
         }
         FileStorageMode::AzureBlob => Err(KabiPayError::Validation(
             "KABIPAY_FILE_STORAGE_MODE=azure is not implemented yet.".into(),
@@ -130,7 +145,7 @@ async fn upload_local(
         .await
         .map_err(|e| KabiPayError::Internal(format!("write local file: {e}")))?;
     let sz = bytes.len() as i64;
-    insert_fs_row(
+    let inserted = insert_fs_row(
         db,
         tenant_id,
         uploaded_by,
@@ -142,7 +157,43 @@ async fn upload_local(
         rel,
         sz,
     )
-    .await
+    .await;
+    if inserted.is_err() {
+        let _ = tokio::fs::remove_file(&path).await;
+    }
+    inserted
+}
+
+fn validate_supported_upload_type(mime_type: &Option<String>, bytes: &[u8]) -> KabiPayResult<()> {
+    let mime = mime_type
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if !ALLOWED_ANNOUNCEMENT_MIME_TYPES.contains(&mime.as_str()) {
+        return Err(KabiPayError::Validation(
+            "announcement attachment file type is not allowed".into(),
+        ));
+    }
+    let matches_magic = match mime.as_str() {
+        "application/pdf" => bytes.starts_with(b"%PDF-"),
+        "application/msword" => bytes.starts_with(&[0xD0, 0xCF, 0x11, 0xE0]),
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document" => {
+            bytes.starts_with(b"PK\x03\x04")
+        }
+        "image/gif" => bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a"),
+        "image/jpeg" => bytes.starts_with(&[0xFF, 0xD8, 0xFF]),
+        "image/png" => bytes.starts_with(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]),
+        "image/webp" => bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP",
+        "text/plain" => std::str::from_utf8(bytes).is_ok(),
+        _ => false,
+    };
+    if !matches_magic {
+        return Err(KabiPayError::Validation(
+            "announcement attachment content does not match its declared file type".into(),
+        ));
+    }
+    Ok(())
 }
 
 async fn insert_fs_row(

@@ -52,7 +52,7 @@ pub async fn list_attendance(
     from_date: Option<NaiveDate>,
     to_date: Option<NaiveDate>,
 ) -> KabiPayResult<Vec<attendance::Model>> {
-    let limit = limit.clamp(1, 500);
+    let limit = limit.clamp(1, 1000);
     match scope_filter {
         EmployeeScopeFilter::Empty => return Ok(vec![]),
         EmployeeScopeFilter::EmployeeIds(ids) if ids.is_empty() => return Ok(vec![]),

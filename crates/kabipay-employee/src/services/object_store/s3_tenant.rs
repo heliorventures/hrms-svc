@@ -129,6 +129,12 @@ pub async fn s3_put(
     Ok(())
 }
 
+pub async fn s3_delete(op: &Operator, key: &str) {
+    if let Err(e) = op.delete(key).await {
+        tracing::warn!(error = %e, key, "S3 delete_object cleanup failed");
+    }
+}
+
 /// Read an object in full (fits employee doc max size).
 pub async fn s3_read(op: &Operator, key: &str) -> KabiPayResult<Vec<u8>> {
     let b = op

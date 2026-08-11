@@ -145,8 +145,8 @@ pub struct SubmitTaxProofLineInput {
     pub declared_amount: String,
     /// Submitted **actual** from proof (string decimal); must be approved to count in `tax_computation`.
     pub actual_amount: String,
-    /// Optional `file_storage` id after upload.
-    pub file_storage_id: Option<ID>,
+    /// Required `file_storage` id after uploading the proof file.
+    pub file_storage_id: ID,
 }
 
 impl From<tax_slab::Model> for TaxSlabDto {
