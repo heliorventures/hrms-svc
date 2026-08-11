@@ -49,12 +49,6 @@ pub async fn assert_employee_in_data_scope(
 /// Tenant RBAC admin APIs (`role:manage` or HR / tenant admin roles). Mirrors [`ClientClaims::can_manage_tenant_rbac`].
 pub fn require_tenant_rbac_admin(ctx: &Context<'_>) -> async_graphql::Result<()> {
     let claims = require_client_claims(ctx)?;
-    if std::env::var("KABIPAY_INSECURE_ALLOW_EMPTY_RBAC").as_deref() == Ok("1")
-        && claims.roles.is_empty()
-        && claims.permissions.is_empty()
-    {
-        return Ok(());
-    }
     if !claims.can_manage_tenant_rbac() {
         return Err(KabiPayError::Forbidden(
             "role:manage or HR_ADMIN / TENANT_ADMIN / ORG_ADMIN required".into(),

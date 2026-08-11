@@ -60,8 +60,7 @@ pub struct OpsLoginInput {
 
 #[derive(Debug, Deserialize)]
 pub struct ClientLoginInput {
-    pub username: Option<String>,
-    pub email: Option<String>,
+    pub username: String,
     pub password: String,
     #[serde(rename = "tenantId")]
     pub tenant_id: Option<Uuid>,
@@ -255,12 +254,10 @@ pub async fn client_login(
     )
     .await?;
 
-    let login_username = body
-        .username
-        .or(body.email)
-        .map(|s| s.trim().to_lowercase())
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| KabiPayError::Validation("username is required".into()))?;
+    let login_username = body.username.trim().to_lowercase();
+    if login_username.is_empty() {
+        return Err(KabiPayError::Validation("username is required".into()));
+    }
 
     let row = user::Entity::find()
         .filter(user::Column::Username.eq(login_username))

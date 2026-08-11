@@ -86,8 +86,6 @@ fn opt_uuid(id: &Option<ID>, field: &'static str) -> Result<Option<Uuid>> {
 ///   `HR_ADMIN` / `TENANT_ADMIN` / `ORG_ADMIN` (from loaded `user_role` at login).
 /// - **Dev only:** set `KABIPAY_EMPLOYEE_MUTATION_HEADER_OK=1` to allow unauthenticated
 ///   `x-tenant-id` (no claims) for local automation — never in production.
-/// - **Insecure back-compat:** `KABIPAY_INSECURE_ALLOW_EMPTY_RBAC=1` allows a JWT with empty
-///   `roles` + `permissions` (forces re-seed in real deployments).
 fn require_employee_mutation_rbac(ctx: &Context<'_>) -> Result<()> {
     if ctx.data_opt::<ClientClaims>().is_none() {
         if std::env::var("KABIPAY_EMPLOYEE_MUTATION_HEADER_OK").as_deref() == Ok("1") {
@@ -96,12 +94,6 @@ fn require_employee_mutation_rbac(ctx: &Context<'_>) -> Result<()> {
         return Err(KabiPayError::Unauthorised.into_graphql());
     }
     let claims = require_client_claims(ctx)?;
-    if std::env::var("KABIPAY_INSECURE_ALLOW_EMPTY_RBAC").as_deref() == Ok("1")
-        && claims.roles.is_empty()
-        && claims.permissions.is_empty()
-    {
-        return Ok(());
-    }
     if !claims.can_manage_employee_directory() {
         return Err(KabiPayError::Forbidden(
             "employee:write, employee:manage, or HR_ADMIN / TENANT_ADMIN role required".into(),
@@ -120,12 +112,6 @@ fn require_offboarding_hr_mutation(ctx: &Context<'_>) -> Result<()> {
         return Err(KabiPayError::Unauthorised.into_graphql());
     }
     let claims = require_client_claims(ctx)?;
-    if std::env::var("KABIPAY_INSECURE_ALLOW_EMPTY_RBAC").as_deref() == Ok("1")
-        && claims.roles.is_empty()
-        && claims.permissions.is_empty()
-    {
-        return Ok(());
-    }
     if claims.can_manage_employee_directory() || claims.can_manage_onboarding_tenant() {
         return Ok(());
     }
