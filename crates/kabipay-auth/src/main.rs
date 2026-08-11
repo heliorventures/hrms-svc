@@ -18,6 +18,7 @@
 //!   GET  /healthz                                          → 200 "ok"
 
 use axum::{
+    middleware::from_fn,
     routing::{get, post},
     Router,
 };
@@ -29,10 +30,12 @@ use kabipay_common::{
 };
 use std::net::SocketAddr;
 use tokio::signal;
-use tower_http::{cors::CorsLayer, trace::TraceLayer};
+use tower_http::cors::CorsLayer;
 
 mod handlers;
 mod jwt;
+mod password_tasks;
+mod request_metrics;
 mod rbac;
 mod state;
 mod tokens;
@@ -108,7 +111,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/auth/introspect", post(handlers::introspect))
         .with_state(app_state)
         .layer(CorsLayer::permissive())
-        .layer(TraceLayer::new_for_http());
+        .layer(from_fn(request_metrics::record_request));
 
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
     tracing::info!(%addr, "kabipay-auth binding TCP listener");

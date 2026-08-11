@@ -10,7 +10,7 @@
 //! CLIENT LOGIN:
 //!   1. Require `tenant_id` in the body (subdomain-based resolution is
 //!      deferred to the tenant service).
-//!   2. Resolve the tenant pool via `kabipay_common::db::resolve_tenant_db`,
+//!   2. Resolve the tenant pool via `kabipay_common::db::resolve_required_tenant_db`,
 //!      then look up `user` by email.
 //!   3. Issue client JWT (iss=kabipay-client, tenant_id claim) + refresh.
 //!      Persist refresh digest in `user_session`.
@@ -30,10 +30,9 @@ use axum::{
 };
 use chrono::{Duration, Utc};
 use kabipay_common::{
-    db::resolve_tenant_db,
+    db::resolve_required_tenant_db,
     error::{KabiPayError, KabiPayResult},
     jwt::{decode_client_jwt, extract_bearer},
-    password,
 };
 use kabipay_db_entities::{
     ops::{operator_session, operator_user, tenant},
@@ -44,9 +43,12 @@ use sea_orm::{
     ActiveModelTrait, ActiveValue, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter,
 };
 use serde::{Deserialize, Serialize};
+use std::time::Instant;
 use uuid::Uuid;
 
-use crate::{jwt::JwtConfig, not_implemented, rbac, state::AppState, tokens};
+use crate::{
+    jwt::JwtConfig, not_implemented, password_tasks, rbac, request_metrics, state::AppState, tokens,
+};
 
 // ---------------------------------------------------------------------------
 // DTOs
@@ -133,7 +135,7 @@ pub async fn ops_login(
     if !row.is_active || row.is_deleted {
         return Err(KabiPayError::Unauthorised);
     }
-    if !password::verify(&body.password, &row.password_hash)? {
+    if !password_tasks::verify(body.password, row.password_hash.clone()).await? {
         return Err(KabiPayError::Unauthorised);
     }
 
@@ -242,48 +244,61 @@ pub async fn client_login(
                 .subdomain
                 .as_deref()
                 .ok_or_else(|| KabiPayError::Validation("tenantId or subdomain is required".into()))?;
-            find_tenant_by_slug(&state.ops_db, slug).await?.id
+            let started = Instant::now();
+            let row = find_tenant_by_slug(&state.ops_db, slug).await;
+            request_metrics::record_phase("tenant_lookup", None, started);
+            row?.id
         }
     };
 
-    let tenant_conn = resolve_tenant_db(
+    let started = Instant::now();
+    let tenant_conn = resolve_required_tenant_db(
         tenant_id,
         &state.ops_db,
         &state.tenant_cache,
         &state.tenant_fallback,
     )
-    .await?;
+    .await;
+    request_metrics::record_phase("tenant_pool", Some(tenant_id), started);
+    let tenant_conn = tenant_conn?;
 
     let login_username = body.username.trim().to_lowercase();
     if login_username.is_empty() {
         return Err(KabiPayError::Validation("username is required".into()));
     }
 
+    let started = Instant::now();
     let row = user::Entity::find()
         .filter(user::Column::Username.eq(login_username))
         .filter(user::Column::TenantId.eq(tenant_id))
         .one(&tenant_conn)
-        .await?
+        .await
+        .map_err(|error| KabiPayError::from_tenant_db(tenant_id, error));
+    request_metrics::record_phase("user_lookup", Some(tenant_id), started);
+    let row = row?
         .ok_or(KabiPayError::Unauthorised)?;
 
     if !row.is_active || row.is_deleted {
         return Err(KabiPayError::Unauthorised);
     }
-    if !password::verify(&body.password, &row.password_hash)? {
+    let started = Instant::now();
+    let password_matches = password_tasks::verify(body.password, row.password_hash.clone()).await;
+    request_metrics::record_phase("password_verify", Some(tenant_id), started);
+    if !password_matches? {
         return Err(KabiPayError::Unauthorised);
     }
 
-    touch_user_last_login(&tenant_conn, row.id).await?;
-
-    let pair = issue_client_tokens(
+    let last_login = touch_user_last_login(&tenant_conn, tenant_id, row.id);
+    let tokens = issue_client_tokens(
         &state,
         &tenant_conn,
         row.id,
         tenant_id,
         &row.username,
         row.email.as_deref(),
-    )
-    .await?;
+    );
+    let (_, pair) = tokio::join!(last_login, tokens);
+    let pair = pair?;
     Ok(Json(pair))
 }
 
@@ -299,38 +314,55 @@ pub async fn client_refresh(
     let tenant_id = peek_tenant_from_refresh(&body.refresh)
         .ok_or_else(|| KabiPayError::Validation("refresh token is not tenant-scoped".into()))?;
 
-    let tenant_conn = resolve_tenant_db(
+    let started = Instant::now();
+    let tenant_conn = resolve_required_tenant_db(
         tenant_id,
         &state.ops_db,
         &state.tenant_cache,
         &state.tenant_fallback,
     )
-    .await?;
+    .await;
+    request_metrics::record_phase("tenant_pool", Some(tenant_id), started);
+    let tenant_conn = tenant_conn?;
 
+    let started = Instant::now();
     let session = user_session::Entity::find()
         .filter(user_session::Column::TokenHash.eq(hash.clone()))
         .one(&tenant_conn)
-        .await?
+        .await
+        .map_err(|error| KabiPayError::from_tenant_db(tenant_id, error));
+    request_metrics::record_phase("session_lookup", Some(tenant_id), started);
+    let session = session?
         .ok_or(KabiPayError::Unauthorised)?;
 
     if session.expires_at < Utc::now() {
+        let started = Instant::now();
         let _ = user_session::Entity::delete_by_id(session.id)
             .exec(&tenant_conn)
-            .await;
+            .await
+            .map_err(|error| KabiPayError::from_tenant_db(tenant_id, error))?;
+        request_metrics::record_phase("session_persist", Some(tenant_id), started);
         return Err(KabiPayError::Unauthorised);
     }
 
+    let started = Instant::now();
     let user_row = user::Entity::find_by_id(session.user_id)
         .one(&tenant_conn)
-        .await?
+        .await
+        .map_err(|error| KabiPayError::from_tenant_db(tenant_id, error));
+    request_metrics::record_phase("user_lookup", Some(tenant_id), started);
+    let user_row = user_row?
         .ok_or(KabiPayError::Unauthorised)?;
     if !user_row.is_active || user_row.is_deleted {
         return Err(KabiPayError::Unauthorised);
     }
 
+    let started = Instant::now();
     let consumed = user_session::Entity::delete_by_id(session.id)
         .exec(&tenant_conn)
-        .await?;
+        .await
+        .map_err(|error| KabiPayError::from_tenant_db(tenant_id, error))?;
+    request_metrics::record_phase("session_persist", Some(tenant_id), started);
     if consumed.rows_affected != 1 {
         return Err(KabiPayError::Unauthorised);
     }
@@ -354,14 +386,16 @@ pub async fn client_logout(
     let Some(tenant_id) = peek_tenant_from_refresh(&body.refresh) else {
         return StatusCode::NO_CONTENT;
     };
-    let Ok(tenant_conn) = resolve_tenant_db(
+    let started = Instant::now();
+    let tenant_conn = resolve_required_tenant_db(
         tenant_id,
         &state.ops_db,
         &state.tenant_cache,
         &state.tenant_fallback,
     )
-    .await
-    else {
+    .await;
+    request_metrics::record_phase("tenant_pool", Some(tenant_id), started);
+    let Ok(tenant_conn) = tenant_conn else {
         return StatusCode::NO_CONTENT;
     };
     let hash = tokens::hash_refresh(&body.refresh);
@@ -393,46 +427,69 @@ pub async fn client_change_password(
     let tenant_id = claims.tenant_id;
     let user_id = claims.sub;
 
-    let new_pw = body.new_password.trim();
+    let new_password = body.new_password;
+    let current_password = body.current_password;
+    let new_pw = new_password.trim();
     if new_pw.len() < MIN_LEN {
         return Err(KabiPayError::Validation(format!(
             "newPassword must be at least {MIN_LEN} characters"
         )));
     }
-    if new_pw == body.current_password {
+    if new_pw == current_password {
         return Err(KabiPayError::Validation(
             "newPassword must differ from current password".into(),
         ));
     }
 
-    let tenant_conn = resolve_tenant_db(
+    let started = Instant::now();
+    let tenant_conn = resolve_required_tenant_db(
         tenant_id,
         &state.ops_db,
         &state.tenant_cache,
         &state.tenant_fallback,
     )
-    .await?;
+    .await;
+    request_metrics::record_phase("tenant_pool", Some(tenant_id), started);
+    let tenant_conn = tenant_conn?;
 
+    let started = Instant::now();
     let user_row = user::Entity::find_by_id(user_id)
         .one(&tenant_conn)
-        .await?
+        .await
+        .map_err(|error| KabiPayError::from_tenant_db(tenant_id, error));
+    request_metrics::record_phase("user_lookup", Some(tenant_id), started);
+    let user_row = user_row?
         .ok_or(KabiPayError::Unauthorised)?;
     if user_row.tenant_id != tenant_id || !user_row.is_active || user_row.is_deleted {
         return Err(KabiPayError::Unauthorised);
     }
-    if !password::verify(&body.current_password, &user_row.password_hash)? {
+    let started = Instant::now();
+    let password_matches = password_tasks::verify(current_password, user_row.password_hash.clone()).await;
+    request_metrics::record_phase("password_verify", Some(tenant_id), started);
+    if !password_matches? {
         return Err(KabiPayError::Unauthorised);
     }
 
-    let new_hash = password::hash(new_pw)?;
+    let started = Instant::now();
+    let new_hash = password_tasks::hash(new_pw.to_owned()).await;
+    request_metrics::record_phase("password_hash", Some(tenant_id), started);
+    let new_hash = new_hash?;
     let mut active: user::ActiveModel = user_row.into();
     active.password_hash = ActiveValue::Set(new_hash);
-    active.update(&tenant_conn).await?;
+    let started = Instant::now();
+    active
+        .update(&tenant_conn)
+        .await
+        .map_err(|error| KabiPayError::from_tenant_db(tenant_id, error))?;
+    request_metrics::record_phase("session_persist", Some(tenant_id), started);
 
+    let started = Instant::now();
     user_session::Entity::delete_many()
         .filter(user_session::Column::UserId.eq(user_id))
         .exec(&tenant_conn)
-        .await?;
+        .await
+        .map_err(|error| KabiPayError::from_tenant_db(tenant_id, error))?;
+    request_metrics::record_phase("session_persist", Some(tenant_id), started);
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -499,24 +556,35 @@ async fn issue_client_tokens(
     username: &str,
     email: Option<&str>,
 ) -> KabiPayResult<TokenPair> {
-    let employee_id = employee::Entity::find()
-        .filter(employee::Column::TenantId.eq(tenant_id))
-        .filter(employee::Column::UserId.eq(user_id))
-        .filter(employee::Column::IsDeleted.eq(false))
-        .one(tenant_conn)
-        .await?
-        .map(|e| e.id);
-    let (roles, permissions) = rbac::load_client_rbac(tenant_conn, user_id).await?;
-    let resource_scopes = rbac::load_client_resource_scopes(tenant_conn, tenant_id, user_id).await?;
+    let employee_lookup = async {
+        let started = Instant::now();
+        let result = employee::Entity::find()
+            .filter(employee::Column::TenantId.eq(tenant_id))
+            .filter(employee::Column::UserId.eq(user_id))
+            .filter(employee::Column::IsDeleted.eq(false))
+            .one(tenant_conn)
+            .await
+            .map_err(|error| KabiPayError::from_tenant_db(tenant_id, error))
+            .map(|row| row.map(|employee| employee.id));
+        request_metrics::record_phase("employee_lookup", Some(tenant_id), started);
+        result
+    };
+    let authorization_lookup = async {
+        let started = Instant::now();
+        let result = rbac::load_client_authorization(tenant_conn, tenant_id, user_id).await;
+        request_metrics::record_phase("authorization", Some(tenant_id), started);
+        result
+    };
+    let (employee_id, authorization) = tokio::try_join!(employee_lookup, authorization_lookup)?;
     let display_email = email.unwrap_or(username);
     let access = state.jwt.issue_client_access(
         user_id,
         tenant_id,
         display_email,
         employee_id,
-        roles,
-        permissions,
-        resource_scopes,
+        authorization.roles,
+        authorization.permissions,
+        authorization.resource_scopes,
     )?;
     // Prefix refresh with tenant id so `client_refresh` / `client_logout`
     // can look up the correct tenant schema without keeping a separate
@@ -534,7 +602,12 @@ async fn issue_client_tokens(
         created_at: ActiveValue::Set(Utc::now()),
         expires_at: ActiveValue::Set(expires_at),
     };
-    session.insert(tenant_conn).await?;
+    let started = Instant::now();
+    session
+        .insert(tenant_conn)
+        .await
+        .map_err(|error| KabiPayError::from_tenant_db(tenant_id, error))?;
+    request_metrics::record_phase("session_persist", Some(tenant_id), started);
 
     Ok(TokenPair {
         access,
@@ -558,13 +631,19 @@ async fn touch_operator_last_login(db: &DatabaseConnection, id: Uuid) -> KabiPay
     Ok(())
 }
 
-async fn touch_user_last_login(db: &DatabaseConnection, id: Uuid) -> KabiPayResult<()> {
+async fn touch_user_last_login(
+    db: &DatabaseConnection,
+    tenant_id: Uuid,
+    id: Uuid,
+) -> KabiPayResult<()> {
     let am = user::ActiveModel {
         id: ActiveValue::Unchanged(id),
         last_login_at: ActiveValue::Set(Some(Utc::now())),
         ..Default::default()
     };
-    let _ = am.update(db).await;
+    am.update(db)
+        .await
+        .map_err(|error| KabiPayError::from_tenant_db(tenant_id, error))?;
     Ok(())
 }
 

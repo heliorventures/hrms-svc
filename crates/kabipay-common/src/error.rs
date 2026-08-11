@@ -47,6 +47,9 @@ pub enum KabiPayError {
     #[error("database error: {0}")]
     Database(#[from] sea_orm::DbErr),
 
+    #[error("organization workspace is temporarily unavailable: {0}")]
+    TenantDatabaseUnavailable(Uuid),
+
     #[error("JWT error: {0}")]
     Jwt(#[from] jsonwebtoken::errors::Error),
 
@@ -58,6 +61,17 @@ pub enum KabiPayError {
 }
 
 impl KabiPayError {
+    /// Classify tenant-schema database errors without exposing transient pool
+    /// failures as generic internal errors to callers.
+    pub fn from_tenant_db(tenant_id: Uuid, error: sea_orm::DbErr) -> Self {
+        match error {
+            sea_orm::DbErr::ConnectionAcquire(sea_orm::ConnAcquireErr::Timeout) => {
+                Self::TenantDatabaseUnavailable(tenant_id)
+            }
+            other => Self::Database(other),
+        }
+    }
+
     /// Stable error code exposed in GraphQL responses.
     /// Frontend clients MUST switch on this, never on the message.
     pub fn code(&self) -> &'static str {
@@ -72,6 +86,7 @@ impl KabiPayError {
             Self::Validation(_) => "VALIDATION_ERROR",
             Self::Conflict(_) => "CONFLICT",
             Self::Database(_) => "DATABASE_ERROR",
+            Self::TenantDatabaseUnavailable(_) => "TENANT_DATABASE_UNAVAILABLE",
             Self::Jwt(_) => "UNAUTHENTICATED",
             Self::Json(_) => "INVALID_JSON",
             Self::Internal(_) => "INTERNAL_ERROR",
@@ -90,6 +105,7 @@ impl KabiPayError {
             Self::Forbidden(_) => S::FORBIDDEN,
             Self::Validation(_) | Self::Json(_) => S::BAD_REQUEST,
             Self::Conflict(_) => S::CONFLICT,
+            Self::TenantDatabaseUnavailable(_) => S::SERVICE_UNAVAILABLE,
             Self::Database(_) | Self::Internal(_) => S::INTERNAL_SERVER_ERROR,
         }
     }
@@ -119,5 +135,35 @@ impl axum::response::IntoResponse for KabiPayError {
             }
         }));
         (status, body).into_response()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tenant_database_unavailable_is_retryable_without_internal_details() {
+        let tenant_id = Uuid::parse_str("e6d4fc13-feb8-52a0-93bd-f66c795969b1").unwrap();
+        let err = KabiPayError::TenantDatabaseUnavailable(tenant_id);
+        assert_eq!(err.code(), "TENANT_DATABASE_UNAVAILABLE");
+        assert_eq!(
+            err.http_status(),
+            axum::http::StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            err.to_string(),
+            "organization workspace is temporarily unavailable: e6d4fc13-feb8-52a0-93bd-f66c795969b1"
+        );
+
+        let timeout = KabiPayError::from_tenant_db(
+            tenant_id,
+            sea_orm::DbErr::ConnectionAcquire(sea_orm::ConnAcquireErr::Timeout),
+        );
+        assert_eq!(timeout.code(), "TENANT_DATABASE_UNAVAILABLE");
+        assert_eq!(
+            timeout.http_status(),
+            axum::http::StatusCode::SERVICE_UNAVAILABLE
+        );
     }
 }

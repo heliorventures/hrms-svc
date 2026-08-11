@@ -1,93 +1,133 @@
-//! Resolve tenant RBAC for JWT claims: `user_role` + `role` + `role_permission` + `permission`.
+//! Resolve tenant RBAC for JWT claims: roles, permissions, and resource scopes.
 
 use std::collections::{BTreeSet, HashMap};
 
 use kabipay_common::context::ScopeType;
-use kabipay_common::KabiPayResult;
+use kabipay_common::{KabiPayError, KabiPayResult};
 use kabipay_db_entities::tenant::d0005_auth_rbac::{
     permission, permission_scope, role, role_permission, user_role,
 };
 use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter};
 use uuid::Uuid;
 
-/// Returns `(role_names, permission_codes)` for `user_id` in the tenant `DatabaseConnection`
-/// (already schema-scoped). Permission codes are `resource:action` for JWT claims.
-pub async fn load_client_rbac(
-    db: &DatabaseConnection,
-    user_id: Uuid,
-) -> KabiPayResult<(Vec<String>, Vec<String>)> {
-    let urs = user_role::Entity::find()
-        .filter(user_role::Column::UserId.eq(user_id))
-        .all(db)
-        .await?;
-    if urs.is_empty() {
-        return Ok((vec![], vec![]));
-    }
-    let role_ids: Vec<Uuid> = urs.iter().map(|r| r.role_id).collect();
-
-    let role_rows = role::Entity::find()
-        .filter(role::Column::Id.is_in(role_ids.clone()))
-        .filter(role::Column::IsDeleted.eq(false))
-        .all(db)
-        .await?;
-    let role_names: Vec<String> = role_rows.into_iter().map(|r| r.name).collect();
-
-    let rps = role_permission::Entity::find()
-        .filter(role_permission::Column::RoleId.is_in(role_ids))
-        .all(db)
-        .await?;
-    let perm_ids: Vec<Uuid> = rps.iter().map(|p| p.permission_id).collect();
-    if perm_ids.is_empty() {
-        return Ok((role_names, vec![]));
-    }
-    let perm_rows = permission::Entity::find()
-        .filter(permission::Column::Id.is_in(perm_ids))
-        .all(db)
-        .await?;
-    let set: BTreeSet<String> = perm_rows
-        .into_iter()
-        .map(|p| format!("{}:{}", p.resource, p.action))
-        .collect();
-    Ok((role_names, set.into_iter().collect()))
+pub struct ClientAuthorization {
+    pub roles: Vec<String>,
+    pub permissions: Vec<String>,
+    pub resource_scopes: HashMap<String, String>,
 }
 
-/// Merge `permission_scope` rows for the user's roles into a map: `resource` → widest
-/// `ScopeType` (wire string for the JWT `resource_scopes` claim).
-pub async fn load_client_resource_scopes(
+fn merge_resource_scope(
+    best: &mut HashMap<String, ScopeType>,
+    resource: String,
+    candidate: ScopeType,
+) {
+    best.entry(resource)
+        .and_modify(|current| {
+            if candidate.rank() > current.rank() {
+                *current = candidate;
+            }
+        })
+        .or_insert(candidate);
+}
+
+/// Resolve all client authorization claims for `user_id` with one user-role
+/// read. The connection is already schema-scoped; tenant filters are still
+/// applied where the table carries `tenant_id`.
+pub async fn load_client_authorization(
     db: &DatabaseConnection,
     tenant_id: Uuid,
     user_id: Uuid,
-) -> KabiPayResult<HashMap<String, String>> {
-    let urs = user_role::Entity::find()
+) -> KabiPayResult<ClientAuthorization> {
+    let user_roles = user_role::Entity::find()
         .filter(user_role::Column::UserId.eq(user_id))
         .all(db)
-        .await?;
-    if urs.is_empty() {
-        return Ok(HashMap::new());
+        .await
+        .map_err(|error| KabiPayError::from_tenant_db(tenant_id, error))?;
+    if user_roles.is_empty() {
+        return Ok(ClientAuthorization {
+            roles: vec![],
+            permissions: vec![],
+            resource_scopes: HashMap::new(),
+        });
     }
-    let role_ids: Vec<Uuid> = urs.iter().map(|r| r.role_id).collect();
 
-    let rows = permission_scope::Entity::find()
+    let role_ids: Vec<Uuid> = user_roles.iter().map(|row| row.role_id).collect();
+
+    let role_rows = role::Entity::find()
+        .filter(role::Column::TenantId.eq(tenant_id))
+        .filter(role::Column::Id.is_in(role_ids.clone()))
+        .filter(role::Column::IsDeleted.eq(false))
+        .all(db);
+    let role_permissions = role_permission::Entity::find()
+        .filter(role_permission::Column::RoleId.is_in(role_ids.clone()))
+        .all(db);
+    let permission_scope_rows = permission_scope::Entity::find()
         .filter(permission_scope::Column::TenantId.eq(tenant_id))
         .filter(permission_scope::Column::RoleId.is_in(role_ids))
-        .all(db)
-        .await?;
+        .all(db);
 
-    let mut best: HashMap<String, ScopeType> = HashMap::new();
-    for r in rows {
-        let Some(s) = ScopeType::parse_loose(&r.scope_type) else {
+    let (role_rows, role_permissions, permission_scope_rows) =
+        tokio::try_join!(role_rows, role_permissions, permission_scope_rows)
+            .map_err(|error| KabiPayError::from_tenant_db(tenant_id, error))?;
+
+    let roles = role_rows
+        .into_iter()
+        .map(|row| row.name)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+
+    let permission_ids = role_permissions
+        .iter()
+        .map(|row| row.permission_id)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let permissions = if permission_ids.is_empty() {
+        vec![]
+    } else {
+        permission::Entity::find()
+            .filter(permission::Column::Id.is_in(permission_ids))
+            .all(db)
+            .await
+            .map_err(|error| KabiPayError::from_tenant_db(tenant_id, error))?
+            .into_iter()
+            .map(|row| format!("{}:{}", row.resource, row.action))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    };
+
+    let mut best_scopes: HashMap<String, ScopeType> = HashMap::new();
+    for row in permission_scope_rows {
+        let Some(scope) = ScopeType::parse_loose(&row.scope_type) else {
             continue;
         };
-        best.entry(r.resource)
-            .and_modify(|e| {
-                if s.rank() > e.rank() {
-                    *e = s;
-                }
-            })
-            .or_insert(s);
+        merge_resource_scope(&mut best_scopes, row.resource, scope);
     }
-    Ok(best
+
+    let resource_scopes = best_scopes
         .into_iter()
-        .map(|(k, v)| (k, v.to_wire().to_string()))
-        .collect())
+        .map(|(resource, scope)| (resource, scope.to_wire().to_string()))
+        .collect();
+
+    Ok(ClientAuthorization {
+        roles,
+        permissions,
+        resource_scopes,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resource_scope_keeps_widest_value() {
+        let mut scopes = HashMap::new();
+        merge_resource_scope(&mut scopes, "employee".into(), ScopeType::Self_);
+        merge_resource_scope(&mut scopes, "employee".into(), ScopeType::All);
+        merge_resource_scope(&mut scopes, "employee".into(), ScopeType::Team);
+        assert_eq!(scopes.get("employee"), Some(&ScopeType::All));
+    }
 }

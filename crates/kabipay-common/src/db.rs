@@ -90,6 +90,12 @@ pub struct TenantDbCache {
     inner: Arc<DashMap<Uuid, TenantDbHandle>>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MissingTenantDbPolicy {
+    DerivedFallback,
+    FailClosed,
+}
+
 impl TenantDbCache {
     pub fn new() -> Self {
         Self::default()
@@ -225,9 +231,35 @@ pub async fn resolve_tenant_db(
     cache: &TenantDbCache,
     fallback_cfg: &TenantDbConfig,
 ) -> KabiPayResult<DatabaseConnection> {
-    resolve_tenant_handle(tenant_id, ops_db, cache, fallback_cfg)
+    resolve_tenant_handle_with_policy(
+        tenant_id,
+        ops_db,
+        cache,
+        fallback_cfg,
+        MissingTenantDbPolicy::DerivedFallback,
+    )
         .await
         .map(|h| h.conn)
+}
+
+/// Resolve a tenant database only when it has an active control-plane mapping.
+/// Authentication uses this to prevent stale or unknown tenant IDs from opening
+/// a derived-schema fallback pool.
+pub async fn resolve_required_tenant_db(
+    tenant_id: Uuid,
+    ops_db: &DatabaseConnection,
+    cache: &TenantDbCache,
+    fallback_cfg: &TenantDbConfig,
+) -> KabiPayResult<DatabaseConnection> {
+    resolve_tenant_handle_with_policy(
+        tenant_id,
+        ops_db,
+        cache,
+        fallback_cfg,
+        MissingTenantDbPolicy::FailClosed,
+    )
+    .await
+    .map(|handle| handle.conn)
 }
 
 /// Like [`resolve_tenant_db`] but exposes the full [`TenantDbHandle`] (handy
@@ -239,8 +271,27 @@ pub async fn resolve_tenant_handle(
     cache: &TenantDbCache,
     fallback_cfg: &TenantDbConfig,
 ) -> KabiPayResult<TenantDbHandle> {
-    if let Some(handle) = cache.inner.get(&tenant_id) {
-        return Ok(handle.clone());
+    resolve_tenant_handle_with_policy(
+        tenant_id,
+        ops_db,
+        cache,
+        fallback_cfg,
+        MissingTenantDbPolicy::DerivedFallback,
+    )
+    .await
+}
+
+async fn resolve_tenant_handle_with_policy(
+    tenant_id: Uuid,
+    ops_db: &DatabaseConnection,
+    cache: &TenantDbCache,
+    fallback_cfg: &TenantDbConfig,
+    policy: MissingTenantDbPolicy,
+) -> KabiPayResult<TenantDbHandle> {
+    if policy == MissingTenantDbPolicy::DerivedFallback {
+        if let Some(handle) = cache.inner.get(&tenant_id) {
+            return Ok(handle.clone());
+        }
     }
 
     let row = tenant_database::Entity::find()
@@ -251,6 +302,13 @@ pub async fn resolve_tenant_handle(
 
     let (db_host, db_name, schema_name, from_ops_row) = match row {
         Some(r) => (r.db_host, r.db_name, r.schema_name, true),
+        None if policy == MissingTenantDbPolicy::FailClosed => {
+            tracing::warn!(
+                %tenant_id,
+                "no active kabipay_ops.tenant_database row for required tenant database"
+            );
+            return Err(KabiPayError::TenantDatabaseUnavailable(tenant_id));
+        }
         None => {
             let schema = derive_tenant_schema_name(tenant_id);
             tracing::warn!(
@@ -275,12 +333,38 @@ pub async fn resolve_tenant_handle(
         db_host.clone()
     };
 
+    if policy == MissingTenantDbPolicy::FailClosed {
+        if let Some(handle) = cache.inner.get(&tenant_id) {
+            if handle.from_ops_row
+                && handle.schema_name == schema_name
+                && handle.db_host == effective_host
+                && handle.db_name == db_name
+            {
+                return Ok(handle.clone());
+            }
+            cache.inner.remove(&tenant_id);
+        }
+    } else if let Some(handle) = cache.inner.get(&tenant_id) {
+        return Ok(handle.clone());
+    }
+
     let url = fallback_cfg.url_for(&effective_host, &db_name);
-    let conn = connect_tenant_pool(&url, &schema_name).await.map_err(|e| {
-        KabiPayError::Internal(format!(
-            "failed to open tenant pool ({schema_name}@{effective_host}/{db_name}): {e}"
-        ))
-    })?;
+    let conn = match connect_tenant_pool(&url, &schema_name).await {
+        Ok(conn) => conn,
+        Err(error) if policy == MissingTenantDbPolicy::FailClosed => {
+            tracing::error!(
+                %tenant_id,
+                error = %error,
+                "failed to open required tenant database pool"
+            );
+            return Err(KabiPayError::TenantDatabaseUnavailable(tenant_id));
+        }
+        Err(error) => {
+            return Err(KabiPayError::Internal(format!(
+                "failed to open tenant pool ({schema_name}@{effective_host}/{db_name}): {error}"
+            )));
+        }
+    };
 
     let handle = TenantDbHandle {
         conn,
