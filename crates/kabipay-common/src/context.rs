@@ -503,19 +503,9 @@ impl ClientClaims {
         })
     }
 
-    /// Own-device punches (`attendance:punch_self`) or directory admins who act as employees.
+    /// Own-device punches require the explicit `attendance:punch_self` permission.
     pub fn can_record_own_attendance_punches(&self) -> bool {
-        if self.has_any_permission(&[
-            PERM_ATTENDANCE_PUNCH_SELF,
-            PERM_EMPLOYEE_WRITE,
-            PERM_EMPLOYEE_MANAGE,
-        ]) {
-            return true;
-        }
-        self.roles.iter().any(|r| {
-            let u = r.to_ascii_uppercase();
-            u == "HR_ADMIN" || u == "TENANT_ADMIN" || u == "ORG_ADMIN"
-        })
+        self.has_any_permission(&[PERM_ATTENDANCE_PUNCH_SELF])
     }
 
     /// Manual attendance corrections beyond the configured employee window (`attendance:regularize`).
@@ -575,5 +565,49 @@ impl ClientClaims {
             .get(resource)
             .and_then(|s| ScopeType::parse_loose(s))
             .unwrap_or(ScopeType::Self_)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn client_claims(roles: &[&str], permissions: &[&str]) -> ClientClaims {
+        ClientClaims {
+            sub: Uuid::nil(),
+            iss: CLIENT_JWT_ISSUER.to_string(),
+            exp: 0,
+            iat: 0,
+            tenant_id: Uuid::nil(),
+            email: String::new(),
+            employee_id: None,
+            roles: roles.iter().map(|role| (*role).to_string()).collect(),
+            permissions: permissions
+                .iter()
+                .map(|permission| (*permission).to_string())
+                .collect(),
+            resource_scopes: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn self_punch_permission_grants_own_attendance_punch_access() {
+        let claims = client_claims(&[], &[PERM_ATTENDANCE_PUNCH_SELF]);
+
+        assert!(claims.can_record_own_attendance_punches());
+    }
+
+    #[test]
+    fn administrator_role_does_not_replace_self_punch_permission() {
+        let claims = client_claims(&["HR_ADMIN"], &[]);
+
+        assert!(!claims.can_record_own_attendance_punches());
+    }
+
+    #[test]
+    fn employee_directory_permission_does_not_replace_self_punch_permission() {
+        let claims = client_claims(&[], &[PERM_EMPLOYEE_WRITE]);
+
+        assert!(!claims.can_record_own_attendance_punches());
     }
 }

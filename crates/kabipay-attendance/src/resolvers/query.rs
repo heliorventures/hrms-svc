@@ -98,7 +98,7 @@ impl QueryRoot {
         if !claims.can_record_own_attendance_punches() {
             return Err(
                 KabiPayError::Forbidden(
-                    "attendance:punch_self or employee directory permission required".into(),
+                    "attendance:punch_self permission required".into(),
                 )
                 .into_graphql(),
             );
