@@ -84,17 +84,7 @@ pub async fn upload_employee_document(
     bytes: Vec<u8>,
     hr_auto_approve: bool,
 ) -> KabiPayResult<employee_document::Model> {
-    if bytes.is_empty() {
-        return Err(KabiPayError::Validation(
-            "upload file content must not be empty".into(),
-        ));
-    }
-    if bytes.len() > MAX_BYTES {
-        return Err(KabiPayError::Validation(format!(
-            "file exceeds max size of {} bytes",
-            MAX_BYTES
-        )));
-    }
+    validate_upload_bytes(&bytes)?;
 
     let mode = FileStorageMode::from_env();
     match mode {
@@ -162,6 +152,109 @@ pub async fn upload_employee_document(
                 .into(),
         )),
     }
+}
+
+/// Persist a tenant-scoped file without attaching it to an employee document. This is used by
+/// HRMS modules that store a `file_storage_id` directly, such as expense receipts and tax proofs.
+pub async fn upload_tenant_file(
+    db: &DatabaseConnection,
+    tenant_id: Uuid,
+    uploader_user_id: Option<Uuid>,
+    original_filename: String,
+    mime_type: Option<String>,
+    bytes: Vec<u8>,
+) -> KabiPayResult<file_storage::Model> {
+    validate_upload_bytes(&bytes)?;
+
+    let mode = FileStorageMode::from_env();
+    match mode {
+        FileStorageMode::Local => {
+            let file_id = Uuid::new_v4();
+            let now = Utc::now();
+            let rel = format!("{}/{}", tenant_id, file_id);
+            let path = absolute_storage_path(tenant_id, file_id);
+            if let Some(parent) = path.parent() {
+                tokio::fs::create_dir_all(parent).await.map_err(|e: std::io::Error| {
+                    KabiPayError::Internal(format!("create_dir_all: {e}"))
+                })?;
+            }
+            tokio::fs::write(&path, &bytes)
+                .await
+                .map_err(|e| KabiPayError::Internal(format!("write local file: {e}")))?;
+            insert_file_storage(
+                db,
+                tenant_id,
+                uploader_user_id,
+                original_filename,
+                mime_type,
+                file_id,
+                now,
+                None,
+                rel,
+                bytes.len() as i64,
+            )
+            .await
+        }
+        FileStorageMode::S3Compat => {
+            let cfg = S3CompatSettings::from_env()?;
+            let file_id = Uuid::new_v4();
+            let now = Utc::now();
+            let (bucket, storage_path): (String, String) = if cfg.per_tenant_bucket {
+                let b = tenant_bucket_name(tenant_id, &cfg.bucket_prefix);
+                ensure_tenant_bucket(&cfg, &b).await?;
+                (b, file_id.to_string())
+            } else {
+                let b = cfg
+                    .default_bucket
+                    .as_ref()
+                    .expect("validated in S3CompatSettings::from_env")
+                    .clone();
+                ensure_tenant_bucket(&cfg, &b).await?;
+                (b, format!("{}/{}", tenant_id, file_id))
+            };
+            let size = bytes.len() as i64;
+            let op = s3_operator_for_bucket(&cfg, &bucket)?;
+            s3_put(
+                &op,
+                &storage_path,
+                bytes,
+                mime_type.as_deref().filter(|s| !s.is_empty()),
+            )
+            .await?;
+            insert_file_storage(
+                db,
+                tenant_id,
+                uploader_user_id,
+                original_filename,
+                mime_type,
+                file_id,
+                now,
+                Some(bucket),
+                storage_path,
+                size,
+            )
+            .await
+        }
+        FileStorageMode::AzureBlob => Err(KabiPayError::Validation(
+            "KABIPAY_FILE_STORAGE_MODE=azure is not implemented yet. Use local, or s3_compat for R2/S3/MinIO."
+                .into(),
+        )),
+    }
+}
+
+fn validate_upload_bytes(bytes: &[u8]) -> KabiPayResult<()> {
+    if bytes.is_empty() {
+        return Err(KabiPayError::Validation(
+            "upload file content must not be empty".into(),
+        ));
+    }
+    if bytes.len() > MAX_BYTES {
+        return Err(KabiPayError::Validation(format!(
+            "file exceeds max size of {} bytes",
+            MAX_BYTES
+        )));
+    }
+    Ok(())
 }
 
 async fn upload_local(
@@ -300,4 +393,38 @@ pub fn download_claims(
 /// Build a time-limited HMAC download URL (HTTP GET) for a stored file.
 pub fn public_download_url(claims: &kabipay_common::file_download_token::FileDownloadClaims) -> String {
     public_employee_file_download_url(claims)
+}
+
+async fn insert_file_storage(
+    db: &DatabaseConnection,
+    tenant_id: Uuid,
+    uploader_user_id: Option<Uuid>,
+    original_filename: String,
+    mime_type: Option<String>,
+    file_id: Uuid,
+    now: chrono::DateTime<Utc>,
+    bucket: Option<String>,
+    storage_path: String,
+    size: i64,
+) -> KabiPayResult<file_storage::Model> {
+    let provider = if bucket.is_some() {
+        PROVIDER_S3_COMPAT.into()
+    } else {
+        PROVIDER_LOCAL.into()
+    };
+    let fs_am = file_storage::ActiveModel {
+        id: Set(file_id),
+        tenant_id: Set(tenant_id),
+        provider: Set(provider),
+        bucket: Set(bucket),
+        storage_path: Set(storage_path),
+        original_filename: Set(Some(original_filename)),
+        mime_type: Set(mime_type),
+        file_size_bytes: Set(Some(size)),
+        is_public: Set(false),
+        uploaded_by: Set(uploader_user_id),
+        created_at: Set(now),
+        updated_at: Set(now),
+    };
+    fs_am.insert(db).await.map_err(KabiPayError::from)
 }

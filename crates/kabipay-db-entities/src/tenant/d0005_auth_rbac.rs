@@ -9,7 +9,8 @@ pub mod user {
         #[sea_orm(primary_key, auto_increment = false)]
         pub id: Uuid,
         pub tenant_id: Uuid,
-        pub email: String,
+        pub username: String,
+        pub email: Option<String>,
         pub password_hash: String,
         pub is_active: bool,
         pub mfa_enabled: bool,

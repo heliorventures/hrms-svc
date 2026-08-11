@@ -47,11 +47,27 @@ pub async fn list_requests(
     limit: u64,
     scope: ScopeType,
     viewer: Option<ClientViewerEmployee>,
+    from_date: Option<NaiveDate>,
+    to_date: Option<NaiveDate>,
 ) -> KabiPayResult<Vec<leave_request::Model>> {
+    if let (Some(from), Some(to)) = (from_date, to_date) {
+        if from > to {
+            return Err(KabiPayError::Validation(
+                "fromDate must be on or before toDate".into(),
+            ));
+        }
+    }
     let limit = limit.clamp(1, 200);
     let mut q = leave_request::Entity::find()
         .filter(leave_request::Column::TenantId.eq(tenant_id))
         .filter(leave_request::Column::IsDeleted.eq(false));
+
+    if let Some(from) = from_date {
+        q = q.filter(leave_request::Column::ToDate.gte(from));
+    }
+    if let Some(to) = to_date {
+        q = q.filter(leave_request::Column::FromDate.lte(to));
+    }
 
     match scope {
         ScopeType::All => {}

@@ -622,7 +622,7 @@ pub(crate) async fn enrich_employee_dtos(
     let desig_map = org_service::map_designation_titles(db, tenant_id, &desig_ids)
         .await
         .map_err(KabiPayError::into_graphql)?;
-    let user_map = rbac_admin_service::map_user_emails_by_ids(db, tenant_id, &user_ids)
+    let user_map = rbac_admin_service::map_user_login_labels_by_ids(db, tenant_id, &user_ids)
         .await
         .map_err(KabiPayError::into_graphql)?;
     let mgr_map = employee_service::map_full_names(db, tenant_id, &mgr_ids)

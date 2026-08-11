@@ -9,6 +9,7 @@ use crate::entities::d0007_employee_core::{
     employee, employee_aadhaar, employee_bank, employee_pan, employment_history,
 };
 use crate::entities::d0008_document_system::{document_type, employee_document};
+use crate::entities::d0029_file_storage::file_storage;
 use crate::entities::d0017_onboarding_offboarding::{
     clearance_checklist, fnf_settlement, onboarding_checklist, separation,
 };
@@ -52,6 +53,9 @@ pub struct EmployeeDto {
     /// Linked login email when `user_id` is set.
     #[graphql(name = "linkedUserEmail")]
     pub linked_user_email: Option<String>,
+    /// Linked login username when `user_id` is set. This is the sign-in identifier.
+    #[graphql(name = "linkedUserUsername")]
+    pub linked_user_username: Option<String>,
     #[graphql(name = "reportingManagerName")]
     pub reporting_manager_name: Option<String>,
     pub created_at: DateTime<Utc>,
@@ -340,12 +344,6 @@ pub struct CreateEmployeeInput {
     /// Defaults to `ACTIVE` when omitted.
     pub status: Option<String>,
     pub user_id: Option<ID>,
-    /// When set, creates a tenant login with a provisional password (`ChangeMe!123`). Cannot be combined with `userId`.
-    ///
-    /// TODO(invite-flow): Replace provisional password + optional DEMO_STAFF assignment with email invite,
-    /// magic-link enrolment, or admin-triggered reset-password flow (see `employee_service::create_provisional_login_user`).
-    #[graphql(name = "loginEmail")]
-    pub login_email: Option<String>,
 }
 
 #[derive(InputObject, Clone, Debug)]
@@ -360,8 +358,6 @@ pub struct UpdateEmployeeInput {
     pub employment_type: Option<String>,
     pub status: Option<String>,
     pub user_id: Option<ID>,
-    #[graphql(name = "loginEmail")]
-    pub login_email: Option<String>,
 }
 
 #[derive(InputObject, Clone, Debug)]
@@ -582,6 +578,38 @@ pub struct UploadEmployeeDocumentInput {
     pub content_base64: String,
 }
 
+#[derive(InputObject, Clone, Debug)]
+pub struct UploadTenantFileInput {
+    pub file_name: String,
+    pub mime_type: Option<String>,
+    /// Standard base64 (not data-URL). Max ~6MB decoded.
+    pub content_base64: String,
+}
+
+#[derive(SimpleObject, Clone, Debug)]
+#[graphql(name = "UploadedTenantFile")]
+pub struct UploadedTenantFileDto {
+    pub id: ID,
+    pub tenant_id: ID,
+    pub original_file_name: Option<String>,
+    pub mime_type: Option<String>,
+    pub file_size_bytes: Option<i32>,
+    pub created_at: DateTime<Utc>,
+}
+
+impl From<file_storage::Model> for UploadedTenantFileDto {
+    fn from(m: file_storage::Model) -> Self {
+        Self {
+            id: ID(m.id.to_string()),
+            tenant_id: ID(m.tenant_id.to_string()),
+            original_file_name: m.original_filename,
+            mime_type: m.mime_type,
+            file_size_bytes: m.file_size_bytes.and_then(|size| i32::try_from(size).ok()),
+            created_at: m.created_at,
+        }
+    }
+}
+
 impl From<employee::Model> for EmployeeDto {
     fn from(m: employee::Model) -> Self {
         let full_name = format!("{} {}", m.first_name.trim(), m.last_name.trim())
@@ -611,6 +639,7 @@ impl From<employee::Model> for EmployeeDto {
             department_name: None,
             designation_title: None,
             linked_user_email: None,
+            linked_user_username: None,
             reporting_manager_name: None,
             created_at: m.created_at,
             updated_at: m.updated_at,
@@ -623,7 +652,7 @@ impl EmployeeDto {
         mut self,
         dept_map: &std::collections::HashMap<Uuid, String>,
         desig_map: &std::collections::HashMap<Uuid, String>,
-        user_email_map: &std::collections::HashMap<Uuid, String>,
+        user_login_map: &std::collections::HashMap<Uuid, (String, Option<String>)>,
         mgr_name_map: &std::collections::HashMap<Uuid, String>,
     ) -> Self {
         fn opt_uuid(id: &Option<ID>) -> Option<Uuid> {
@@ -631,7 +660,10 @@ impl EmployeeDto {
         }
         self.department_name = opt_uuid(&self.department_id).and_then(|u| dept_map.get(&u).cloned());
         self.designation_title = opt_uuid(&self.designation_id).and_then(|u| desig_map.get(&u).cloned());
-        self.linked_user_email = opt_uuid(&self.user_id).and_then(|u| user_email_map.get(&u).cloned());
+        if let Some((username, email)) = opt_uuid(&self.user_id).and_then(|u| user_login_map.get(&u)) {
+            self.linked_user_username = Some(username.clone());
+            self.linked_user_email = email.clone();
+        }
         self.reporting_manager_name =
             opt_uuid(&self.reporting_manager_id).and_then(|u| mgr_name_map.get(&u).cloned());
         self
@@ -642,7 +674,8 @@ impl EmployeeDto {
 #[graphql(name = "TenantDirectoryUser")]
 pub struct TenantDirectoryUserDto {
     pub id: ID,
-    pub email: String,
+    pub username: String,
+    pub email: Option<String>,
     pub is_active: bool,
 }
 
@@ -650,6 +683,7 @@ impl From<user::Model> for TenantDirectoryUserDto {
     fn from(m: user::Model) -> Self {
         Self {
             id: ID(m.id.to_string()),
+            username: m.username,
             email: m.email,
             is_active: m.is_active,
         }

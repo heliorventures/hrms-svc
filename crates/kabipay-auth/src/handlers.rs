@@ -60,7 +60,8 @@ pub struct OpsLoginInput {
 
 #[derive(Debug, Deserialize)]
 pub struct ClientLoginInput {
-    pub email: String,
+    pub username: Option<String>,
+    pub email: Option<String>,
     pub password: String,
     #[serde(rename = "tenantId")]
     pub tenant_id: Option<Uuid>,
@@ -97,6 +98,8 @@ pub struct TokenPair {
     pub expires_in: i64,
     #[serde(rename = "tenantId", skip_serializing_if = "Option::is_none")]
     pub tenant_id: Option<Uuid>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
     pub email: String,
     #[serde(rename = "userId")]
     pub user_id: Uuid,
@@ -249,8 +252,15 @@ pub async fn client_login(
     )
     .await?;
 
+    let login_username = body
+        .username
+        .or(body.email)
+        .map(|s| s.trim().to_lowercase())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| KabiPayError::Validation("username is required".into()))?;
+
     let row = user::Entity::find()
-        .filter(user::Column::Email.eq(body.email.to_lowercase()))
+        .filter(user::Column::Username.eq(login_username))
         .filter(user::Column::TenantId.eq(tenant_id))
         .one(&tenant_conn)
         .await?
@@ -265,7 +275,15 @@ pub async fn client_login(
 
     touch_user_last_login(&tenant_conn, row.id).await?;
 
-    let pair = issue_client_tokens(&state, &tenant_conn, row.id, tenant_id, &row.email).await?;
+    let pair = issue_client_tokens(
+        &state,
+        &tenant_conn,
+        row.id,
+        tenant_id,
+        &row.username,
+        row.email.as_deref(),
+    )
+    .await?;
     Ok(Json(pair))
 }
 
@@ -314,8 +332,15 @@ pub async fn client_refresh(
         .exec(&tenant_conn)
         .await?;
 
-    let pair = issue_client_tokens(&state, &tenant_conn, user_row.id, tenant_id, &user_row.email)
-        .await?;
+    let pair = issue_client_tokens(
+        &state,
+        &tenant_conn,
+        user_row.id,
+        tenant_id,
+        &user_row.username,
+        user_row.email.as_deref(),
+    )
+    .await?;
     Ok(Json(pair))
 }
 
@@ -457,6 +482,7 @@ async fn issue_ops_tokens(
         token_type: "Bearer",
         expires_in: state.jwt.ops_access_ttl_secs,
         tenant_id: None,
+        username: None,
         email: email.into(),
         user_id,
     })
@@ -467,7 +493,8 @@ async fn issue_client_tokens(
     tenant_conn: &DatabaseConnection,
     user_id: Uuid,
     tenant_id: Uuid,
-    email: &str,
+    username: &str,
+    email: Option<&str>,
 ) -> KabiPayResult<TokenPair> {
     let employee_id = employee::Entity::find()
         .filter(employee::Column::TenantId.eq(tenant_id))
@@ -478,10 +505,11 @@ async fn issue_client_tokens(
         .map(|e| e.id);
     let (roles, permissions) = rbac::load_client_rbac(tenant_conn, user_id).await?;
     let resource_scopes = rbac::load_client_resource_scopes(tenant_conn, tenant_id, user_id).await?;
+    let display_email = email.unwrap_or(username);
     let access = state.jwt.issue_client_access(
         user_id,
         tenant_id,
-        email,
+        display_email,
         employee_id,
         roles,
         permissions,
@@ -511,7 +539,8 @@ async fn issue_client_tokens(
         token_type: "Bearer",
         expires_in: state.jwt.client_access_ttl_secs,
         tenant_id: Some(tenant_id),
-        email: email.into(),
+        username: Some(username.into()),
+        email: display_email.into(),
         user_id,
     })
 }

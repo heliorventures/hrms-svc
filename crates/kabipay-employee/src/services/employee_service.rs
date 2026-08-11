@@ -8,7 +8,7 @@ use kabipay_common::client_data_scope::employee_model_in_scope;
 use kabipay_common::context::ClientViewerEmployee;
 use kabipay_common::context::ScopeType;
 use kabipay_common::{KabiPayError, KabiPayResult};
-use kabipay_db_entities::tenant::d0005_auth_rbac::{role, user, user_role, user_session};
+use kabipay_db_entities::tenant::d0005_auth_rbac::{user, user_session};
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait, DatabaseConnection, EntityTrait,
     QueryFilter, QueryOrder, QuerySelect, Set, TransactionTrait,
@@ -18,130 +18,12 @@ use uuid::Uuid;
 
 use crate::entities::d0007_employee_core::employee;
 
-/// TODO(invite-flow): Remove this provisional bootstrap password once enrolment uses invite links or an admin/API reset flow.
-pub(crate) const DEFAULT_NEW_EMPLOYEE_LOGIN_PASSWORD: &str = "ChangeMe!123";
-
-/// Creates `user` (+ optional `user_role` for `DEMO_STAFF` when that role exists). Caller should run inside a transaction with `employee::create`.
-///
-/// TODO(invite-flow): Replace with invite-only signup, OTP, or forced password reset on first login — never ship static passwords for production tenants.
-pub async fn create_provisional_login_user<C: ConnectionTrait>(
-    db: &C,
-    tenant_id: Uuid,
-    login_email: &str,
-) -> KabiPayResult<Uuid> {
-    let email = login_email.trim().to_lowercase();
-    if email.is_empty() || !email.contains('@') {
-        return Err(KabiPayError::Validation(
-            "loginEmail must be a valid email address".into(),
-        ));
-    }
-    if user::Entity::find()
-        .filter(user::Column::TenantId.eq(tenant_id))
-        .filter(user::Column::Email.eq(&email))
-        .filter(user::Column::IsDeleted.eq(false))
-        .one(db)
-        .await?
-        .is_some()
-    {
-        return Err(KabiPayError::Conflict(format!(
-            "a user with email {email} already exists in this tenant"
-        )));
-    }
-
-    let password_hash = kabipay_common::password::hash(DEFAULT_NEW_EMPLOYEE_LOGIN_PASSWORD)?;
-    let user_id = Uuid::new_v4();
-    let now = Utc::now();
-    user::ActiveModel {
-        id: Set(user_id),
-        tenant_id: Set(tenant_id),
-        email: Set(email),
-        password_hash: Set(password_hash),
-        is_active: Set(true),
-        mfa_enabled: Set(false),
-        mfa_secret: Set(None),
-        last_login_at: Set(None),
-        is_deleted: Set(false),
-        deleted_at: Set(None),
-        deleted_by: Set(None),
-        created_at: Set(now),
-        updated_at: Set(now),
-    }
-    .insert(db)
-    .await?;
-
-    if let Some(role_row) = role::Entity::find()
-        .filter(role::Column::TenantId.eq(tenant_id))
-        .filter(role::Column::Name.eq("DEMO_STAFF"))
-        .filter(role::Column::IsDeleted.eq(false))
-        .one(db)
-        .await?
-    {
-        user_role::ActiveModel {
-            user_id: Set(user_id),
-            role_id: Set(role_row.id),
-            assigned_at: Set(now),
-        }
-        .insert(db)
-        .await?;
-    }
-
-    Ok(user_id)
-}
-
-fn normalize_login_email(login_email: &str) -> KabiPayResult<String> {
-    let email = login_email.trim().to_lowercase();
-    if email.is_empty() || !email.contains('@') {
-        return Err(KabiPayError::Validation(
-            "loginEmail must be a valid email address".into(),
-        ));
-    }
-    Ok(email)
-}
-
+/// Keep an already linked auth user enabled only for active employee statuses.
 fn employee_login_is_active(status: &str) -> bool {
     matches!(
         status.trim().to_ascii_uppercase().as_str(),
         "ACTIVE" | "PROBATION"
     )
-}
-
-async fn set_linked_user_email<C: ConnectionTrait>(
-    db: &C,
-    tenant_id: Uuid,
-    user_id: Uuid,
-    login_email: &str,
-) -> KabiPayResult<()> {
-    let email = normalize_login_email(login_email)?;
-    let found = user::Entity::find_by_id(user_id)
-        .filter(user::Column::TenantId.eq(tenant_id))
-        .filter(user::Column::IsDeleted.eq(false))
-        .one(db)
-        .await?
-        .ok_or_else(|| KabiPayError::NotFound {
-            entity: "user",
-            id: user_id.to_string(),
-        })?;
-    if found.email == email {
-        return Ok(());
-    }
-    if user::Entity::find()
-        .filter(user::Column::TenantId.eq(tenant_id))
-        .filter(user::Column::Email.eq(&email))
-        .filter(user::Column::IsDeleted.eq(false))
-        .filter(user::Column::Id.ne(user_id))
-        .one(db)
-        .await?
-        .is_some()
-    {
-        return Err(KabiPayError::Conflict(format!(
-            "a user with email {email} already exists in this tenant"
-        )));
-    }
-    let mut am: user::ActiveModel = found.into();
-    am.email = Set(email);
-    am.updated_at = Set(Utc::now());
-    am.update(db).await?;
-    Ok(())
 }
 
 async fn sync_linked_user_status<C: ConnectionTrait>(
@@ -497,7 +379,6 @@ pub struct EmployeePatch {
     pub employment_type: Option<String>,
     pub status: Option<String>,
     pub user_id: Option<Uuid>,
-    pub login_email: Option<String>,
 }
 
 pub async fn update(
@@ -516,13 +397,6 @@ pub async fn update(
     let mut final_user_id = existing.user_id;
     if let Some(v) = patch.user_id {
         final_user_id = Some(v);
-    }
-    if let Some(email) = patch.login_email.as_ref().map(|s| s.trim()).filter(|s| !s.is_empty()) {
-        if let Some(user_id) = final_user_id {
-            set_linked_user_email(&txn, tenant_id, user_id, email).await?;
-        } else {
-            final_user_id = Some(create_provisional_login_user(&txn, tenant_id, email).await?);
-        }
     }
 
     let mut final_status = existing.status.clone();

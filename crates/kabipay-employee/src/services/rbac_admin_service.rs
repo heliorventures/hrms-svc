@@ -38,12 +38,12 @@ pub async fn list_users(db: &DatabaseConnection, tenant_id: Uuid, limit: u64) ->
     Ok(rows)
 }
 
-/// Login emails for linked user references on employee rows (directory labels).
-pub async fn map_user_emails_by_ids(
+/// Login usernames and optional contact emails for linked user references on employee rows.
+pub async fn map_user_login_labels_by_ids(
     db: &DatabaseConnection,
     tenant_id: Uuid,
     ids: &[Uuid],
-) -> KabiPayResult<HashMap<Uuid, String>> {
+) -> KabiPayResult<HashMap<Uuid, (String, Option<String>)>> {
     if ids.is_empty() {
         return Ok(HashMap::new());
     }
@@ -53,7 +53,10 @@ pub async fn map_user_emails_by_ids(
         .filter(user::Column::Id.is_in(ids.to_vec()))
         .all(db)
         .await?;
-    Ok(rows.into_iter().map(|r| (r.id, r.email)).collect())
+    Ok(rows
+        .into_iter()
+        .map(|r| (r.id, (r.username, r.email)))
+        .collect())
 }
 
 async fn ensure_role_in_tenant(

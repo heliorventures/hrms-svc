@@ -1,6 +1,7 @@
 //! Root query resolvers for kabipay-leave.
 
 use async_graphql::{Context, Object, Result, ID};
+use chrono::NaiveDate;
 use kabipay_common::client_data_scope::{
     data_scope_from_context, resolve_employee_scope_filter, resolve_viewer_employee,
 };
@@ -58,12 +59,22 @@ impl QueryRoot {
         &self,
         ctx: &Context<'_>,
         #[graphql(default = 50)] limit: u64,
+        from_date: Option<NaiveDate>,
+        to_date: Option<NaiveDate>,
     ) -> Result<Vec<LeaveRequestDto>> {
         let tenant_id = require_tenant_id(ctx)?;
         let db = tenant_db(ctx, tenant_id).await?;
         let scope = data_scope_from_context(ctx, SCOPE_RES_LEAVE);
         let viewer = resolve_viewer_employee(ctx, &db, tenant_id).await?;
-        let rows = leave_service::list_requests(&db, tenant_id, limit, scope, viewer)
+        let rows = leave_service::list_requests(
+            &db,
+            tenant_id,
+            limit,
+            scope,
+            viewer,
+            from_date,
+            to_date,
+        )
             .await
             .map_err(KabiPayError::into_graphql)?;
         Ok(rows.into_iter().map(LeaveRequestDto::from).collect())
