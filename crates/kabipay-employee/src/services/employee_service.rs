@@ -8,7 +8,7 @@ use kabipay_common::client_data_scope::employee_model_in_scope;
 use kabipay_common::context::ClientViewerEmployee;
 use kabipay_common::context::ScopeType;
 use kabipay_common::{KabiPayError, KabiPayResult};
-use kabipay_db_entities::tenant::d0005_auth_rbac::{user, user_session};
+use kabipay_db_entities::tenant::d0005_auth_rbac::{role, user, user_role, user_session};
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait, DatabaseConnection, EntityTrait,
     QueryFilter, QueryOrder, QuerySelect, Set, TransactionTrait,
@@ -307,6 +307,140 @@ pub struct NewEmployee {
     pub user_id: Option<Uuid>,
 }
 
+pub struct NewLoginAccount {
+    pub username: String,
+    pub email: Option<String>,
+    pub password_hash: String,
+    pub role_ids: Vec<Uuid>,
+}
+
+fn normalize_username(raw: &str) -> KabiPayResult<String> {
+    let username = raw.trim().to_lowercase();
+    if username.is_empty() {
+        return Err(KabiPayError::Validation("username is required".into()));
+    }
+    Ok(username)
+}
+
+fn normalize_email(raw: Option<String>) -> Option<String> {
+    raw.and_then(|value| {
+        let trimmed = value.trim().to_lowercase();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed)
+        }
+    })
+}
+
+async fn ensure_role_ids_in_tenant<C: ConnectionTrait>(
+    db: &C,
+    tenant_id: Uuid,
+    role_ids: &[Uuid],
+) -> KabiPayResult<Vec<Uuid>> {
+    let unique: Vec<Uuid> = role_ids
+        .iter()
+        .copied()
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect();
+    for role_id in &unique {
+        let role_exists = role::Entity::find_by_id(*role_id)
+            .filter(role::Column::TenantId.eq(tenant_id))
+            .filter(role::Column::IsDeleted.eq(false))
+            .one(db)
+            .await?
+            .is_some();
+        if !role_exists {
+            return Err(KabiPayError::NotFound {
+                entity: "role",
+                id: role_id.to_string(),
+            });
+        }
+    }
+    Ok(unique)
+}
+
+async fn assign_roles<C: ConnectionTrait>(
+    db: &C,
+    tenant_id: Uuid,
+    user_id: Uuid,
+    role_ids: &[Uuid],
+) -> KabiPayResult<()> {
+    let roles = ensure_role_ids_in_tenant(db, tenant_id, role_ids).await?;
+    let now = Utc::now();
+    for role_id in roles {
+        user_role::ActiveModel {
+            user_id: Set(user_id),
+            role_id: Set(role_id),
+            assigned_at: Set(now),
+        }
+        .insert(db)
+        .await?;
+    }
+    Ok(())
+}
+
+async fn insert_login_user<C: ConnectionTrait>(
+    db: &C,
+    tenant_id: Uuid,
+    account: NewLoginAccount,
+    employee_status: &str,
+) -> KabiPayResult<Uuid> {
+    let username = normalize_username(&account.username)?;
+    let email = normalize_email(account.email);
+    let password_hash = account.password_hash;
+    let role_ids = account.role_ids;
+    if user::Entity::find()
+        .filter(user::Column::TenantId.eq(tenant_id))
+        .filter(user::Column::Username.eq(&username))
+        .one(db)
+        .await?
+        .is_some()
+    {
+        return Err(KabiPayError::Conflict(
+            "username is already in use in this tenant".into(),
+        ));
+    }
+    if let Some(ref email_value) = email {
+        if user::Entity::find()
+            .filter(user::Column::TenantId.eq(tenant_id))
+            .filter(user::Column::Email.eq(email_value))
+            .one(db)
+            .await?
+            .is_some()
+        {
+            return Err(KabiPayError::Conflict(
+                "email is already in use in this tenant".into(),
+            ));
+        }
+    }
+
+    let id = Uuid::new_v4();
+    let now = Utc::now();
+    user::ActiveModel {
+        id: Set(id),
+        tenant_id: Set(tenant_id),
+        username: Set(username),
+        email: Set(email),
+        password_hash: Set(password_hash),
+        must_change_password: Set(true),
+        is_active: Set(employee_login_is_active(employee_status)),
+        mfa_enabled: Set(false),
+        mfa_secret: Set(None),
+        last_login_at: Set(None),
+        is_deleted: Set(false),
+        deleted_at: Set(None),
+        deleted_by: Set(None),
+        created_at: Set(now),
+        updated_at: Set(now),
+    }
+    .insert(db)
+    .await?;
+    assign_roles(db, tenant_id, id, &role_ids).await?;
+    Ok(id)
+}
+
 pub async fn create<C: ConnectionTrait>(
     db: &C,
     tenant_id: Uuid,
@@ -379,6 +513,93 @@ pub struct EmployeePatch {
     pub employment_type: Option<String>,
     pub status: Option<String>,
     pub user_id: Option<Uuid>,
+}
+
+pub async fn create_with_login(
+    db: &DatabaseConnection,
+    tenant_id: Uuid,
+    mut data: NewEmployee,
+    account: NewLoginAccount,
+) -> KabiPayResult<employee::Model> {
+    if data.user_id.is_some() {
+        return Err(KabiPayError::Validation(
+            "userId cannot be supplied when loginAccount is used".into(),
+        ));
+    }
+    let txn = db.begin().await?;
+    let user_id = insert_login_user(&txn, tenant_id, account, &data.status).await?;
+    data.user_id = Some(user_id);
+    let created = create(&txn, tenant_id, data).await?;
+    txn.commit().await?;
+    Ok(created)
+}
+
+pub async fn provision_login(
+    db: &DatabaseConnection,
+    tenant_id: Uuid,
+    employee_id: Uuid,
+    account: NewLoginAccount,
+) -> KabiPayResult<employee::Model> {
+    let txn = db.begin().await?;
+    let existing = find_by_id(&txn, tenant_id, employee_id)
+        .await?
+        .ok_or_else(|| KabiPayError::NotFound {
+            entity: "employee",
+            id: employee_id.to_string(),
+        })?;
+    if existing.user_id.is_some() {
+        return Err(KabiPayError::Conflict(
+            "employee already has a linked login user".into(),
+        ));
+    }
+    let user_id = insert_login_user(&txn, tenant_id, account, &existing.status).await?;
+    let mut am: employee::ActiveModel = existing.into();
+    am.user_id = Set(Some(user_id));
+    am.updated_at = Set(Utc::now());
+    am.update(&txn).await?;
+    let updated = find_by_id(&txn, tenant_id, employee_id)
+        .await?
+        .ok_or_else(|| KabiPayError::Internal("updated employee not found".into()))?;
+    txn.commit().await?;
+    Ok(updated)
+}
+
+pub async fn reset_linked_user_password(
+    db: &DatabaseConnection,
+    tenant_id: Uuid,
+    employee_id: Uuid,
+    password_hash: String,
+) -> KabiPayResult<()> {
+    let txn = db.begin().await?;
+    let employee = find_by_id(&txn, tenant_id, employee_id)
+        .await?
+        .ok_or_else(|| KabiPayError::NotFound {
+            entity: "employee",
+            id: employee_id.to_string(),
+        })?;
+    let user_id = employee.user_id.ok_or_else(|| {
+        KabiPayError::Validation("employee does not have a linked login user".into())
+    })?;
+    let user_row = user::Entity::find_by_id(user_id)
+        .filter(user::Column::TenantId.eq(tenant_id))
+        .filter(user::Column::IsDeleted.eq(false))
+        .one(&txn)
+        .await?
+        .ok_or_else(|| KabiPayError::NotFound {
+            entity: "user",
+            id: user_id.to_string(),
+        })?;
+    let mut am: user::ActiveModel = user_row.into();
+    am.password_hash = Set(password_hash);
+    am.must_change_password = Set(true);
+    am.updated_at = Set(Utc::now());
+    am.update(&txn).await?;
+    user_session::Entity::delete_many()
+        .filter(user_session::Column::UserId.eq(user_id))
+        .exec(&txn)
+        .await?;
+    txn.commit().await?;
+    Ok(())
 }
 
 pub async fn update(
@@ -493,7 +714,11 @@ pub async fn update_personal_profile(
     }
     if let Some(bg) = patch.blood_group {
         let t = bg.trim();
-        am.blood_group = Set(if t.is_empty() { None } else { Some(t.to_string()) });
+        am.blood_group = Set(if t.is_empty() {
+            None
+        } else {
+            Some(t.to_string())
+        });
     }
     if let Some(v) = patch.emergency_contact_name {
         am.emergency_contact_name = Set(Some(v));

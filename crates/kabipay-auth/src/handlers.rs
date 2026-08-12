@@ -104,6 +104,8 @@ pub struct TokenPair {
     pub email: String,
     #[serde(rename = "userId")]
     pub user_id: Uuid,
+    #[serde(rename = "mustChangePassword")]
+    pub must_change_password: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -227,7 +229,9 @@ pub async fn resolve_client_tenant(
         id: row.id,
         name: row.name,
         status: row.status,
-        subdomain: row.subdomain.unwrap_or_else(|| normalize_tenant_slug(&slug).unwrap_or(slug)),
+        subdomain: row
+            .subdomain
+            .unwrap_or_else(|| normalize_tenant_slug(&slug).unwrap_or(slug)),
         logo_url: row.logo_url,
         primary_color: row.primary_color,
     }))
@@ -240,10 +244,9 @@ pub async fn client_login(
     let tenant_id = match body.tenant_id {
         Some(id) => id,
         None => {
-            let slug = body
-                .subdomain
-                .as_deref()
-                .ok_or_else(|| KabiPayError::Validation("tenantId or subdomain is required".into()))?;
+            let slug = body.subdomain.as_deref().ok_or_else(|| {
+                KabiPayError::Validation("tenantId or subdomain is required".into())
+            })?;
             let started = Instant::now();
             let row = find_tenant_by_slug(&state.ops_db, slug).await;
             request_metrics::record_phase("tenant_lookup", None, started);
@@ -275,8 +278,7 @@ pub async fn client_login(
         .await
         .map_err(|error| KabiPayError::from_tenant_db(tenant_id, error));
     request_metrics::record_phase("user_lookup", Some(tenant_id), started);
-    let row = row?
-        .ok_or(KabiPayError::Unauthorised)?;
+    let row = row?.ok_or(KabiPayError::Unauthorised)?;
 
     if !row.is_active || row.is_deleted {
         return Err(KabiPayError::Unauthorised);
@@ -296,6 +298,7 @@ pub async fn client_login(
         tenant_id,
         &row.username,
         row.email.as_deref(),
+        row.must_change_password,
     );
     let (_, pair) = tokio::join!(last_login, tokens);
     let pair = pair?;
@@ -332,8 +335,7 @@ pub async fn client_refresh(
         .await
         .map_err(|error| KabiPayError::from_tenant_db(tenant_id, error));
     request_metrics::record_phase("session_lookup", Some(tenant_id), started);
-    let session = session?
-        .ok_or(KabiPayError::Unauthorised)?;
+    let session = session?.ok_or(KabiPayError::Unauthorised)?;
 
     if session.expires_at < Utc::now() {
         let started = Instant::now();
@@ -351,8 +353,7 @@ pub async fn client_refresh(
         .await
         .map_err(|error| KabiPayError::from_tenant_db(tenant_id, error));
     request_metrics::record_phase("user_lookup", Some(tenant_id), started);
-    let user_row = user_row?
-        .ok_or(KabiPayError::Unauthorised)?;
+    let user_row = user_row?.ok_or(KabiPayError::Unauthorised)?;
     if !user_row.is_active || user_row.is_deleted {
         return Err(KabiPayError::Unauthorised);
     }
@@ -374,6 +375,7 @@ pub async fn client_refresh(
         tenant_id,
         &user_row.username,
         user_row.email.as_deref(),
+        user_row.must_change_password,
     )
     .await?;
     Ok(Json(pair))
@@ -458,13 +460,13 @@ pub async fn client_change_password(
         .await
         .map_err(|error| KabiPayError::from_tenant_db(tenant_id, error));
     request_metrics::record_phase("user_lookup", Some(tenant_id), started);
-    let user_row = user_row?
-        .ok_or(KabiPayError::Unauthorised)?;
+    let user_row = user_row?.ok_or(KabiPayError::Unauthorised)?;
     if user_row.tenant_id != tenant_id || !user_row.is_active || user_row.is_deleted {
         return Err(KabiPayError::Unauthorised);
     }
     let started = Instant::now();
-    let password_matches = password_tasks::verify(current_password, user_row.password_hash.clone()).await;
+    let password_matches =
+        password_tasks::verify(current_password, user_row.password_hash.clone()).await;
     request_metrics::record_phase("password_verify", Some(tenant_id), started);
     if !password_matches? {
         return Err(KabiPayError::Unauthorised);
@@ -476,6 +478,8 @@ pub async fn client_change_password(
     let new_hash = new_hash?;
     let mut active: user::ActiveModel = user_row.into();
     active.password_hash = ActiveValue::Set(new_hash);
+    active.must_change_password = ActiveValue::Set(false);
+    active.updated_at = ActiveValue::Set(Utc::now());
     let started = Instant::now();
     active
         .update(&tenant_conn)
@@ -507,7 +511,10 @@ fn peek_tenant_from_refresh(refresh: &str) -> Option<Uuid> {
     Uuid::parse_str(head).ok()
 }
 
-async fn find_tenant_by_slug(db: &DatabaseConnection, raw_slug: &str) -> KabiPayResult<tenant::Model> {
+async fn find_tenant_by_slug(
+    db: &DatabaseConnection,
+    raw_slug: &str,
+) -> KabiPayResult<tenant::Model> {
     let slug = normalize_tenant_slug(raw_slug)?;
     tenant::Entity::find()
         .filter(tenant::Column::IsDeleted.eq(false))
@@ -545,6 +552,7 @@ async fn issue_ops_tokens(
         username: None,
         email: email.into(),
         user_id,
+        must_change_password: false,
     })
 }
 
@@ -555,6 +563,7 @@ async fn issue_client_tokens(
     tenant_id: Uuid,
     username: &str,
     email: Option<&str>,
+    must_change_password: bool,
 ) -> KabiPayResult<TokenPair> {
     let employee_lookup = async {
         let started = Instant::now();
@@ -582,6 +591,7 @@ async fn issue_client_tokens(
         tenant_id,
         display_email,
         employee_id,
+        must_change_password,
         authorization.roles,
         authorization.permissions,
         authorization.resource_scopes,
@@ -618,6 +628,7 @@ async fn issue_client_tokens(
         username: Some(username.into()),
         email: display_email.into(),
         user_id,
+        must_change_password,
     })
 }
 

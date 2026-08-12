@@ -12,6 +12,7 @@ pub mod user {
         pub username: String,
         pub email: Option<String>,
         pub password_hash: String,
+        pub must_change_password: bool,
         pub is_active: bool,
         pub mfa_enabled: bool,
         pub mfa_secret: Option<String>,

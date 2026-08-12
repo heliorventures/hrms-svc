@@ -160,6 +160,8 @@ pub struct ClientClaims {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub employee_id: Option<Uuid>,
     #[serde(default)]
+    pub must_change_password: bool,
+    #[serde(default)]
     pub roles: Vec<String>,
     #[serde(default)]
     pub permissions: Vec<String>,
@@ -581,6 +583,7 @@ mod tests {
             tenant_id: Uuid::nil(),
             email: String::new(),
             employee_id: None,
+            must_change_password: false,
             roles: roles.iter().map(|role| (*role).to_string()).collect(),
             permissions: permissions
                 .iter()

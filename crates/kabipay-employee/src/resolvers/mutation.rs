@@ -3,9 +3,8 @@
 use async_graphql::{Context, Object, Result, ID};
 use kabipay_common::{
     context::ClientClaims,
-    subgraph::{
-        require_client_claims, require_tenant_id, resolve_client_employee_id, tenant_db,
-    },
+    password,
+    subgraph::{require_client_claims, require_tenant_id, resolve_client_employee_id, tenant_db},
     KabiPayError,
 };
 use uuid::Uuid;
@@ -13,15 +12,17 @@ use uuid::Uuid;
 use crate::resolvers::query::enrich_employee_dtos;
 use crate::resolvers::scope::{assert_employee_in_data_scope, require_tenant_rbac_admin};
 use crate::resolvers::types::{
-    ClearanceChecklistItemDto, CreateEmployeeInput, EmployeeAadhaarRecordDto, EmployeeBankAccountDto,
-    EmployeeDocumentDto, EmployeeDto, EmployeePanRecordDto, EmploymentHistoryRecordDto,
-    FnfSettlementDto, OnboardingChecklistItemDto, PermissionScopeAssignmentInput, SeparationDto,
-    SetEmployeeCompensationInput, SubmitSeparationInput, UpdateEmployeeInput,
-    UpdateEmployeePersonalProfileInput, UploadEmployeeDocumentInput, UploadedTenantFileDto,
-    UploadTenantFileInput, UpsertEmployeePrimaryAadhaarInput, UpsertEmployeePrimaryBankInput,
+    ClearanceChecklistItemDto, CreateEmployeeInput, EmployeeAadhaarRecordDto,
+    EmployeeBankAccountDto, EmployeeDocumentDto, EmployeeDto, EmployeePanRecordDto,
+    EmploymentHistoryRecordDto, FnfSettlementDto, OnboardingChecklistItemDto,
+    PermissionScopeAssignmentInput, ProvisionEmployeeLoginInput, ResetEmployeePasswordInput,
+    SeparationDto, SetEmployeeCompensationInput, SubmitSeparationInput, UpdateEmployeeInput,
+    UpdateEmployeePersonalProfileInput, UploadEmployeeDocumentInput, UploadTenantFileInput,
+    UploadedTenantFileDto, UpsertEmployeePrimaryAadhaarInput, UpsertEmployeePrimaryBankInput,
     UpsertEmployeePrimaryPanInput, UpsertFnfSettlementInput,
 };
 use crate::services::document_file_service;
+use crate::services::document_service;
 use crate::services::employee_service::{self, EmployeePatch, NewEmployee, PersonalProfilePatch};
 use crate::services::employment_history_service;
 use crate::services::offboarding_fnf_service;
@@ -29,7 +30,6 @@ use crate::services::onboarding_service;
 use crate::services::profile_extras_service;
 use crate::services::rbac_admin_service;
 use crate::services::separation_service;
-use crate::services::document_service;
 use rust_decimal::Decimal;
 
 use crate::entities::d0008_document_system::{document_type, employee_document};
@@ -80,6 +80,36 @@ fn opt_uuid(id: &Option<ID>, field: &'static str) -> Result<Option<Uuid>> {
     }
 }
 
+const MIN_PASSWORD_LEN: usize = 8;
+
+fn validate_admin_password(raw: String, field: &'static str) -> Result<String> {
+    let trimmed = raw.trim().to_string();
+    if trimmed.len() < MIN_PASSWORD_LEN {
+        return Err(KabiPayError::Validation(format!(
+            "{field} must be at least {MIN_PASSWORD_LEN} characters"
+        ))
+        .into_graphql());
+    }
+    Ok(trimmed)
+}
+
+fn parse_role_ids(role_ids: Option<Vec<ID>>) -> Result<Vec<Uuid>> {
+    let mut parsed = Vec::new();
+    for id in role_ids.unwrap_or_default() {
+        parsed.push(parse_uuid(&id, "roleId")?);
+    }
+    Ok(parsed)
+}
+
+async fn hash_password_async(plaintext: String) -> Result<String> {
+    tokio::task::spawn_blocking(move || password::hash(&plaintext))
+        .await
+        .map_err(|error| {
+            KabiPayError::Internal(format!("password hashing task failed: {error}")).into_graphql()
+        })?
+        .map_err(KabiPayError::into_graphql)
+}
+
 /// Enforce RBAC for directory-changing employee writes.
 ///
 /// - Valid **client JWT** must include `employee:write` or `employee:manage`, **or** role
@@ -115,10 +145,10 @@ fn require_offboarding_hr_mutation(ctx: &Context<'_>) -> Result<()> {
     if claims.can_manage_employee_directory() || claims.can_manage_onboarding_tenant() {
         return Ok(());
     }
-    Err(KabiPayError::Forbidden(
-        "employee:write or onboarding:manage required".into(),
+    Err(
+        KabiPayError::Forbidden("employee:write or onboarding:manage required".into())
+            .into_graphql(),
     )
-    .into_graphql())
 }
 
 pub struct MutationRoot;
@@ -133,6 +163,11 @@ impl MutationRoot {
         require_employee_mutation_rbac(ctx)?;
         let tenant_id = require_tenant_id(ctx)?;
         let db = tenant_db(ctx, tenant_id).await?;
+
+        let login_account = input.login_account;
+        if login_account.is_some() {
+            require_tenant_rbac_admin(ctx)?;
+        }
 
         let data = NewEmployee {
             employee_code: input.employee_code,
@@ -150,10 +185,75 @@ impl MutationRoot {
             user_id: opt_uuid(&input.user_id, "userId")?,
         };
 
-        let m = employee_service::create(&db, tenant_id, data)
+        let m = if let Some(login) = login_account {
+            let initial_password =
+                validate_admin_password(login.initial_password, "initialPassword")?;
+            let password_hash = hash_password_async(initial_password).await?;
+            let role_ids = parse_role_ids(login.role_ids)?;
+            employee_service::create_with_login(
+                &db,
+                tenant_id,
+                data,
+                employee_service::NewLoginAccount {
+                    username: login.username,
+                    email: login.email,
+                    password_hash,
+                    role_ids,
+                },
+            )
+            .await
+            .map_err(KabiPayError::into_graphql)?
+        } else {
+            employee_service::create(&db, tenant_id, data)
+                .await
+                .map_err(KabiPayError::into_graphql)?
+        };
+        Ok(EmployeeDto::from(m))
+    }
+
+    async fn provision_employee_login(
+        &self,
+        ctx: &Context<'_>,
+        input: ProvisionEmployeeLoginInput,
+    ) -> Result<EmployeeDto> {
+        require_tenant_rbac_admin(ctx)?;
+        let tenant_id = require_tenant_id(ctx)?;
+        let db = tenant_db(ctx, tenant_id).await?;
+        let employee_id = parse_uuid(&input.employee_id, "employeeId")?;
+        let initial_password = validate_admin_password(input.initial_password, "initialPassword")?;
+        let password_hash = hash_password_async(initial_password).await?;
+        let role_ids = parse_role_ids(input.role_ids)?;
+        let m = employee_service::provision_login(
+            &db,
+            tenant_id,
+            employee_id,
+            employee_service::NewLoginAccount {
+                username: input.username,
+                email: input.email,
+                password_hash,
+                role_ids,
+            },
+        )
+        .await
+        .map_err(KabiPayError::into_graphql)?;
+        Ok(EmployeeDto::from(m))
+    }
+
+    async fn reset_employee_password(
+        &self,
+        ctx: &Context<'_>,
+        input: ResetEmployeePasswordInput,
+    ) -> Result<bool> {
+        require_tenant_rbac_admin(ctx)?;
+        let tenant_id = require_tenant_id(ctx)?;
+        let db = tenant_db(ctx, tenant_id).await?;
+        let employee_id = parse_uuid(&input.employee_id, "employeeId")?;
+        let new_password = validate_admin_password(input.new_password, "newPassword")?;
+        let password_hash = hash_password_async(new_password).await?;
+        employee_service::reset_linked_user_password(&db, tenant_id, employee_id, password_hash)
             .await
             .map_err(KabiPayError::into_graphql)?;
-        Ok(EmployeeDto::from(m))
+        Ok(true)
     }
 
     async fn update_employee(
@@ -384,14 +484,9 @@ impl MutationRoot {
             )
             .into_graphql());
         }
-        let m = profile_extras_service::upsert_primary_pan(
-            &db,
-            tenant_id,
-            eid,
-            input.pan_number,
-        )
-        .await
-        .map_err(KabiPayError::into_graphql)?;
+        let m = profile_extras_service::upsert_primary_pan(&db, tenant_id, eid, input.pan_number)
+            .await
+            .map_err(KabiPayError::into_graphql)?;
         Ok(EmployeePanRecordDto::from_model(&m))
     }
 
@@ -451,11 +546,7 @@ impl MutationRoot {
             })?;
         assert_employee_in_data_scope(ctx, &db, tenant_id, existing.employee_id).await?;
         let m = document_service::resolve_employee_document_status(
-            &db,
-            tenant_id,
-            doc_id,
-            approved,
-            claims.sub,
+            &db, tenant_id, doc_id, approved, claims.sub,
         )
         .await
         .map_err(KabiPayError::into_graphql)?;
@@ -489,8 +580,8 @@ impl MutationRoot {
         let viewer = resolve_client_employee_id(ctx, &db, tenant_id)
             .await
             .map_err(KabiPayError::into_graphql)?;
-        let hr_or_onboarding = claims.can_manage_employee_directory()
-            || claims.can_manage_onboarding_tenant();
+        let hr_or_onboarding =
+            claims.can_manage_employee_directory() || claims.can_manage_onboarding_tenant();
         if hr_or_onboarding {
             assert_employee_in_data_scope(ctx, &db, tenant_id, row.employee_id).await?;
         } else if claims.can_use_onboarding_self_service() {
@@ -525,12 +616,10 @@ impl MutationRoot {
             if claims.can_manage_employee_directory() || claims.can_manage_onboarding_tenant() {
                 e
             } else {
-                return Err(
-                    KabiPayError::Forbidden(
-                        "only HR can file separation for another employee".into(),
-                    )
-                    .into_graphql(),
-                );
+                return Err(KabiPayError::Forbidden(
+                    "only HR can file separation for another employee".into(),
+                )
+                .into_graphql());
             }
         } else {
             if !claims.can_use_onboarding_self_service() {
@@ -568,7 +657,11 @@ impl MutationRoot {
     }
 
     /// Approve a pending separation (HR / directory roles — same gate as `createEmployee`).
-    async fn approve_separation(&self, ctx: &Context<'_>, separation_id: ID) -> Result<SeparationDto> {
+    async fn approve_separation(
+        &self,
+        ctx: &Context<'_>,
+        separation_id: ID,
+    ) -> Result<SeparationDto> {
         require_offboarding_hr_mutation(ctx)?;
         let claims = require_client_claims(ctx)?;
         let tenant_id = require_tenant_id(ctx)?;
@@ -581,7 +674,11 @@ impl MutationRoot {
     }
 
     /// Reject a pending separation (HR / directory roles).
-    async fn reject_separation(&self, ctx: &Context<'_>, separation_id: ID) -> Result<SeparationDto> {
+    async fn reject_separation(
+        &self,
+        ctx: &Context<'_>,
+        separation_id: ID,
+    ) -> Result<SeparationDto> {
         require_offboarding_hr_mutation(ctx)?;
         let claims = require_client_claims(ctx)?;
         let tenant_id = require_tenant_id(ctx)?;
@@ -663,11 +760,7 @@ impl MutationRoot {
         let db = tenant_db(ctx, tenant_id).await?;
         let cid = parse_uuid(&clearance_id, "clearanceId")?;
         let m = offboarding_fnf_service::set_clearance_cleared(
-            &db,
-            tenant_id,
-            cid,
-            is_cleared,
-            claims.sub,
+            &db, tenant_id, cid, is_cleared, claims.sub,
         )
         .await
         .map_err(KabiPayError::into_graphql)?;

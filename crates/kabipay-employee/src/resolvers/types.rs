@@ -9,10 +9,10 @@ use crate::entities::d0007_employee_core::{
     employee, employee_aadhaar, employee_bank, employee_pan, employment_history,
 };
 use crate::entities::d0008_document_system::{document_type, employee_document};
-use crate::entities::d0029_file_storage::file_storage;
 use crate::entities::d0017_onboarding_offboarding::{
     clearance_checklist, fnf_settlement, onboarding_checklist, separation,
 };
+use crate::entities::d0029_file_storage::file_storage;
 use kabipay_db_entities::tenant::d0005_auth_rbac::{permission, permission_scope, role, user};
 
 /// Federated `Employee` type. `id` is the canonical cross-service identifier (Gap A).
@@ -95,11 +95,7 @@ fn mask_pan_static(pan: &str) -> String {
     if t.len() < 5 {
         return "••••".to_string();
     }
-    format!(
-        "{}••••{}",
-        &t[..2],
-        &t[t.len().saturating_sub(4)..]
-    )
+    format!("{}••••{}", &t[..2], &t[t.len().saturating_sub(4)..])
 }
 
 #[derive(SimpleObject, Clone, Debug)]
@@ -120,7 +116,11 @@ pub struct EmployeeBankAccountDto {
 
 impl EmployeeBankAccountDto {
     pub fn from_model(m: &employee_bank::Model) -> Self {
-        let digits: String = m.account_number.chars().filter(|c| c.is_ascii_digit()).collect();
+        let digits: String = m
+            .account_number
+            .chars()
+            .filter(|c| c.is_ascii_digit())
+            .collect();
         let masked = if digits.len() >= 4 {
             format!("••••{}", &digits[digits.len().saturating_sub(4)..])
         } else {
@@ -344,6 +344,38 @@ pub struct CreateEmployeeInput {
     /// Defaults to `ACTIVE` when omitted.
     pub status: Option<String>,
     pub user_id: Option<ID>,
+    #[graphql(name = "loginAccount")]
+    pub login_account: Option<EmployeeLoginAccountInput>,
+}
+
+#[derive(InputObject, Clone, Debug)]
+pub struct EmployeeLoginAccountInput {
+    pub username: String,
+    pub email: Option<String>,
+    #[graphql(name = "initialPassword")]
+    pub initial_password: String,
+    #[graphql(name = "roleIds")]
+    pub role_ids: Option<Vec<ID>>,
+}
+
+#[derive(InputObject, Clone, Debug)]
+pub struct ProvisionEmployeeLoginInput {
+    #[graphql(name = "employeeId")]
+    pub employee_id: ID,
+    pub username: String,
+    pub email: Option<String>,
+    #[graphql(name = "initialPassword")]
+    pub initial_password: String,
+    #[graphql(name = "roleIds")]
+    pub role_ids: Option<Vec<ID>>,
+}
+
+#[derive(InputObject, Clone, Debug)]
+pub struct ResetEmployeePasswordInput {
+    #[graphql(name = "employeeId")]
+    pub employee_id: ID,
+    #[graphql(name = "newPassword")]
+    pub new_password: String,
 }
 
 #[derive(InputObject, Clone, Debug)]
@@ -656,11 +688,16 @@ impl EmployeeDto {
         mgr_name_map: &std::collections::HashMap<Uuid, String>,
     ) -> Self {
         fn opt_uuid(id: &Option<ID>) -> Option<Uuid> {
-            id.as_ref().and_then(|raw| Uuid::parse_str(raw.as_str()).ok())
+            id.as_ref()
+                .and_then(|raw| Uuid::parse_str(raw.as_str()).ok())
         }
-        self.department_name = opt_uuid(&self.department_id).and_then(|u| dept_map.get(&u).cloned());
-        self.designation_title = opt_uuid(&self.designation_id).and_then(|u| desig_map.get(&u).cloned());
-        if let Some((username, email)) = opt_uuid(&self.user_id).and_then(|u| user_login_map.get(&u)) {
+        self.department_name =
+            opt_uuid(&self.department_id).and_then(|u| dept_map.get(&u).cloned());
+        self.designation_title =
+            opt_uuid(&self.designation_id).and_then(|u| desig_map.get(&u).cloned());
+        if let Some((username, email)) =
+            opt_uuid(&self.user_id).and_then(|u| user_login_map.get(&u))
+        {
             self.linked_user_username = Some(username.clone());
             self.linked_user_email = email.clone();
         }

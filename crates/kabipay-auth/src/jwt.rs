@@ -90,6 +90,7 @@ impl JwtConfig {
         tenant_id: Uuid,
         email: &str,
         employee_id: Option<Uuid>,
+        must_change_password: bool,
         roles: Vec<String>,
         permissions: Vec<String>,
         resource_scopes: HashMap<String, String>,
@@ -103,6 +104,7 @@ impl JwtConfig {
             iat: now.timestamp(),
             tenant_id,
             employee_id,
+            must_change_password,
             roles,
             permissions,
             resource_scopes,
@@ -165,7 +167,16 @@ mod tests {
         let user = Uuid::new_v4();
         let tenant = Uuid::new_v4();
         let token = cfg
-            .issue_client_access(user, tenant, "user@example.com", None, vec![], vec![], HashMap::new())
+            .issue_client_access(
+                user,
+                tenant,
+                "user@example.com",
+                None,
+                false,
+                vec![],
+                vec![],
+                HashMap::new(),
+            )
             .unwrap();
         let claims = decode_client_jwt(&token, &cfg.secret).unwrap();
         assert_eq!(claims.sub, user);
