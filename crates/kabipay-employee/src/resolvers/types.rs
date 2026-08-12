@@ -9,6 +9,9 @@ use crate::entities::d0007_employee_core::{
     employee, employee_aadhaar, employee_bank, employee_pan, employment_history,
 };
 use crate::entities::d0008_document_system::{document_type, employee_document};
+use crate::entities::d0050_employee_self_service::{
+    employee_education, employee_profile_change_request, employee_work_experience,
+};
 use crate::entities::d0017_onboarding_offboarding::{
     clearance_checklist, fnf_settlement, onboarding_checklist, separation,
 };
@@ -45,6 +48,12 @@ pub struct EmployeeDto {
     pub emergency_contact_relation: Option<String>,
     #[graphql(name = "bloodGroup")]
     pub blood_group: Option<String>,
+    #[graphql(name = "personalPhone")]
+    pub personal_phone: Option<String>,
+    #[graphql(name = "currentAddress")]
+    pub current_address: Option<String>,
+    #[graphql(name = "permanentAddress")]
+    pub permanent_address: Option<String>,
     /// Department display name when `department_id` is set (batch-resolved for directory queries).
     #[graphql(name = "departmentName")]
     pub department_name: Option<String>,
@@ -62,6 +71,72 @@ pub struct EmployeeDto {
     pub updated_at: DateTime<Utc>,
 }
 
+/// Explicitly allow-listed employee information visible in the tenant directory.
+#[derive(SimpleObject, Clone, Debug)]
+#[graphql(name = "EmployeeDirectoryEntry")]
+pub struct EmployeeDirectoryEntryDto {
+    pub employee_id: ID,
+    pub employee_code: String,
+    pub full_name: String,
+    pub department_name: Option<String>,
+    pub designation_title: Option<String>,
+    pub reporting_manager_id: Option<ID>,
+    pub reporting_manager_name: Option<String>,
+    pub employment_type: Option<String>,
+    pub date_of_joining: NaiveDate,
+    pub status: String,
+}
+
+#[derive(SimpleObject, Clone, Debug)]
+#[graphql(name = "EmployeeDirectoryPage")]
+pub struct EmployeeDirectoryPageDto {
+    pub rows: Vec<EmployeeDirectoryEntryDto>,
+    pub next_cursor: Option<String>,
+    pub has_more: bool,
+}
+
+#[derive(SimpleObject, Clone, Debug)]
+#[graphql(name = "EmployeeProfileAccess")]
+pub struct EmployeeProfileAccessDto {
+    pub directory_entry: EmployeeDirectoryEntryDto,
+    pub is_self: bool,
+    pub can_view_private_profile: bool,
+    pub can_edit_personal_profile: bool,
+    pub can_manage_organization_fields: bool,
+    pub can_review_profile_changes: bool,
+}
+
+impl EmployeeDirectoryEntryDto {
+    pub fn from_model(
+        model: employee::Model,
+        dept_map: &std::collections::HashMap<Uuid, String>,
+        desig_map: &std::collections::HashMap<Uuid, String>,
+        manager_map: &std::collections::HashMap<Uuid, String>,
+    ) -> Self {
+        let full_name = format!("{} {}", model.first_name.trim(), model.last_name.trim())
+            .trim()
+            .to_string();
+        Self {
+            employee_id: ID(model.id.to_string()),
+            employee_code: model.employee_code,
+            full_name,
+            department_name: model.department_id.and_then(|id| dept_map.get(&id).cloned()),
+            designation_title: model
+                .designation_id
+                .and_then(|id| desig_map.get(&id).cloned()),
+            reporting_manager_id: model
+                .reporting_manager_id
+                .map(|id| ID(id.to_string())),
+            reporting_manager_name: model
+                .reporting_manager_id
+                .and_then(|id| manager_map.get(&id).cloned()),
+            employment_type: model.employment_type,
+            date_of_joining: model.date_of_joining,
+            status: model.status,
+        }
+    }
+}
+
 #[derive(SimpleObject, Clone, Debug)]
 #[graphql(name = "DocumentType")]
 pub struct DocumentTypeDto {
@@ -69,6 +144,7 @@ pub struct DocumentTypeDto {
     pub tenant_id: ID,
     pub name: String,
     pub category: Option<String>,
+    pub system_key: Option<String>,
     pub is_required: bool,
     pub expiry_alert_days: Option<i32>,
     pub created_at: DateTime<Utc>,
@@ -82,6 +158,7 @@ impl From<document_type::Model> for DocumentTypeDto {
             tenant_id: ID(m.tenant_id.to_string()),
             name: m.name,
             category: m.category,
+            system_key: m.system_key,
             is_required: m.is_required,
             expiry_alert_days: m.expiry_alert_days,
             created_at: m.created_at,
@@ -408,6 +485,235 @@ pub struct UpdateEmployeePersonalProfileInput {
 }
 
 #[derive(InputObject, Clone, Debug)]
+pub struct UpdateEmployeeSelfServiceProfileInput {
+    pub employee_id: ID,
+    pub personal_phone: Option<String>,
+    pub current_address: Option<String>,
+    pub permanent_address: Option<String>,
+    pub gender: Option<String>,
+    pub nationality: Option<String>,
+    #[graphql(name = "bloodGroup")]
+    pub blood_group: Option<String>,
+    pub emergency_contact_name: Option<String>,
+    pub emergency_contact_phone: Option<String>,
+    pub emergency_contact_relation: Option<String>,
+}
+
+#[derive(InputObject, Clone, Debug)]
+pub struct SubmitEmployeeProfileChangeInput {
+    pub employee_id: ID,
+    pub request_type: String,
+    pub first_name: Option<String>,
+    pub last_name: Option<String>,
+    pub date_of_birth: Option<NaiveDate>,
+    #[graphql(name = "panNumber")]
+    pub pan_number: Option<String>,
+    #[graphql(name = "aadhaarNumber")]
+    pub aadhaar_number: Option<String>,
+    pub bank_name: Option<String>,
+    pub account_number: Option<String>,
+    pub ifsc_code: Option<String>,
+    pub account_type: Option<String>,
+    pub supporting_document_id: Option<ID>,
+}
+
+#[derive(SimpleObject, Clone, Debug)]
+#[graphql(name = "EmployeeProfileChangeRequest")]
+pub struct EmployeeProfileChangeRequestDto {
+    pub id: ID,
+    pub employee_id: ID,
+    pub request_type: String,
+    pub status: String,
+    pub requested_summary: String,
+    pub supporting_document_id: Option<ID>,
+    pub reviewed_by: Option<ID>,
+    pub reviewed_at: Option<DateTime<Utc>>,
+    pub rejection_reason: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+impl From<employee_profile_change_request::Model> for EmployeeProfileChangeRequestDto {
+    fn from(model: employee_profile_change_request::Model) -> Self {
+        let summary = match model.request_type.as_str() {
+            "LEGAL_NAME_OR_DOB" => "Legal name or date-of-birth change".to_string(),
+            "PAN" => model
+                .requested_payload
+                .get("pan_number")
+                .and_then(serde_json::Value::as_str)
+                .map(|value| {
+                    let tail = value.chars().rev().take(4).collect::<String>();
+                    format!("PAN ending {}", tail.chars().rev().collect::<String>())
+                })
+                .unwrap_or_else(|| "PAN change".into()),
+            "AADHAAR" => model
+                .requested_payload
+                .get("aadhaar_last4")
+                .and_then(serde_json::Value::as_str)
+                .map(|value| format!("Aadhaar ending {value}"))
+                .unwrap_or_else(|| "Aadhaar change".into()),
+            "BANK_ACCOUNT" => model
+                .requested_payload
+                .get("account_number")
+                .and_then(serde_json::Value::as_str)
+                .map(|value| {
+                    let tail = value.chars().rev().take(4).collect::<String>();
+                    format!("Bank account ending {}", tail.chars().rev().collect::<String>())
+                })
+                .unwrap_or_else(|| "Bank account change".into()),
+            _ => "Profile change".into(),
+        };
+        Self {
+            id: ID(model.id.to_string()),
+            employee_id: ID(model.employee_id.to_string()),
+            request_type: model.request_type,
+            status: model.status,
+            requested_summary: summary,
+            supporting_document_id: model
+                .supporting_document_id
+                .map(|id| ID(id.to_string())),
+            reviewed_by: model.reviewed_by.map(|id| ID(id.to_string())),
+            reviewed_at: model.reviewed_at,
+            rejection_reason: model.rejection_reason,
+            created_at: model.created_at,
+            updated_at: model.updated_at,
+        }
+    }
+}
+
+#[derive(SimpleObject, Clone, Debug)]
+#[graphql(name = "EmployeeEducation")]
+pub struct EmployeeEducationDto {
+    pub id: ID,
+    pub employee_id: ID,
+    pub education_level: String,
+    pub qualification: String,
+    pub field_of_study: Option<String>,
+    pub institution: String,
+    pub board_university: Option<String>,
+    pub start_date: Option<NaiveDate>,
+    pub completion_year: i32,
+    pub grade_score: Option<String>,
+    pub description: Option<String>,
+    pub verification_status: String,
+    pub evidence_document_ids: Vec<ID>,
+    pub reviewed_by: Option<ID>,
+    pub reviewed_at: Option<DateTime<Utc>>,
+    pub rejection_reason: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+impl EmployeeEducationDto {
+    pub fn from_model(model: employee_education::Model, evidence_document_ids: Vec<Uuid>) -> Self {
+        Self {
+            id: ID(model.id.to_string()),
+            employee_id: ID(model.employee_id.to_string()),
+            education_level: model.education_level,
+            qualification: model.qualification,
+            field_of_study: model.field_of_study,
+            institution: model.institution,
+            board_university: model.board_university,
+            start_date: model.start_date,
+            completion_year: model.completion_year,
+            grade_score: model.grade_score,
+            description: model.description,
+            verification_status: model.verification_status,
+            evidence_document_ids: evidence_document_ids
+                .into_iter()
+                .map(|id| ID(id.to_string()))
+                .collect(),
+            reviewed_by: model.reviewed_by.map(|id| ID(id.to_string())),
+            reviewed_at: model.reviewed_at,
+            rejection_reason: model.rejection_reason,
+            created_at: model.created_at,
+            updated_at: model.updated_at,
+        }
+    }
+}
+
+#[derive(InputObject, Clone, Debug)]
+pub struct UpsertEmployeeEducationInput {
+    pub id: Option<ID>,
+    pub employee_id: ID,
+    pub education_level: String,
+    pub qualification: String,
+    pub field_of_study: Option<String>,
+    pub institution: String,
+    pub board_university: Option<String>,
+    pub start_date: Option<NaiveDate>,
+    pub completion_year: i32,
+    pub grade_score: Option<String>,
+    pub description: Option<String>,
+}
+
+#[derive(SimpleObject, Clone, Debug)]
+#[graphql(name = "EmployeeWorkExperience")]
+pub struct EmployeeWorkExperienceDto {
+    pub id: ID,
+    pub employee_id: ID,
+    pub company: String,
+    pub role_title: String,
+    pub employment_type: Option<String>,
+    pub location: Option<String>,
+    pub start_date: NaiveDate,
+    pub end_date: Option<NaiveDate>,
+    pub is_current: bool,
+    pub description: Option<String>,
+    pub verification_status: String,
+    pub evidence_document_ids: Vec<ID>,
+    pub reviewed_by: Option<ID>,
+    pub reviewed_at: Option<DateTime<Utc>>,
+    pub rejection_reason: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+impl EmployeeWorkExperienceDto {
+    pub fn from_model(
+        model: employee_work_experience::Model,
+        evidence_document_ids: Vec<Uuid>,
+    ) -> Self {
+        Self {
+            id: ID(model.id.to_string()),
+            employee_id: ID(model.employee_id.to_string()),
+            company: model.company,
+            role_title: model.role_title,
+            employment_type: model.employment_type,
+            location: model.location,
+            start_date: model.start_date,
+            end_date: model.end_date,
+            is_current: model.is_current,
+            description: model.description,
+            verification_status: model.verification_status,
+            evidence_document_ids: evidence_document_ids
+                .into_iter()
+                .map(|id| ID(id.to_string()))
+                .collect(),
+            reviewed_by: model.reviewed_by.map(|id| ID(id.to_string())),
+            reviewed_at: model.reviewed_at,
+            rejection_reason: model.rejection_reason,
+            created_at: model.created_at,
+            updated_at: model.updated_at,
+        }
+    }
+}
+
+#[derive(InputObject, Clone, Debug)]
+pub struct UpsertEmployeeWorkExperienceInput {
+    pub id: Option<ID>,
+    pub employee_id: ID,
+    pub company: String,
+    pub role_title: String,
+    pub employment_type: Option<String>,
+    pub location: Option<String>,
+    pub start_date: NaiveDate,
+    pub end_date: Option<NaiveDate>,
+    pub is_current: bool,
+    pub description: Option<String>,
+}
+
+#[derive(InputObject, Clone, Debug)]
 pub struct UpsertEmployeePrimaryBankInput {
     pub employee_id: ID,
     pub bank_name: String,
@@ -668,6 +974,9 @@ impl From<employee::Model> for EmployeeDto {
             emergency_contact_phone: m.emergency_contact_phone,
             emergency_contact_relation: m.emergency_contact_relation,
             blood_group: m.blood_group,
+            personal_phone: m.personal_phone,
+            current_address: m.current_address,
+            permanent_address: m.permanent_address,
             department_name: None,
             designation_title: None,
             linked_user_email: None,

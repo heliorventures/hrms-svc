@@ -11,6 +11,7 @@ pub mod document_type {
         pub tenant_id: Uuid,
         pub name: String,
         pub category: Option<String>,
+        pub system_key: Option<String>,
         pub is_required: bool,
         pub expiry_alert_days: Option<i32>,
         pub is_deleted: bool,

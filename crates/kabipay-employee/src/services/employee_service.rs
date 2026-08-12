@@ -487,6 +487,9 @@ pub async fn create<C: ConnectionTrait>(
         emergency_contact_name: Set(None),
         emergency_contact_phone: Set(None),
         emergency_contact_relation: Set(None),
+        personal_phone: Set(None),
+        current_address: Set(None),
+        permanent_address: Set(None),
         uan_number: Set(None),
         esic_number: Set(None),
         is_deleted: Set(false),
@@ -734,4 +737,72 @@ pub async fn update_personal_profile(
     find_by_id(db, tenant_id, employee_id)
         .await?
         .ok_or_else(|| KabiPayError::Internal("updated employee not found".into()))
+}
+
+/// Fields employees may update directly without changing legal identity or organization assignment.
+pub struct SelfServiceProfilePatch {
+    pub personal_phone: Option<String>,
+    pub current_address: Option<String>,
+    pub permanent_address: Option<String>,
+    pub gender: Option<String>,
+    pub nationality: Option<String>,
+    pub blood_group: Option<String>,
+    pub emergency_contact_name: Option<String>,
+    pub emergency_contact_phone: Option<String>,
+    pub emergency_contact_relation: Option<String>,
+}
+
+fn trimmed_optional(value: String) -> Option<String> {
+    let value = value.trim();
+    (!value.is_empty()).then(|| value.to_string())
+}
+
+pub async fn update_self_service_profile(
+    db: &DatabaseConnection,
+    tenant_id: Uuid,
+    employee_id: Uuid,
+    patch: SelfServiceProfilePatch,
+) -> KabiPayResult<employee::Model> {
+    let existing = find_by_id(db, tenant_id, employee_id)
+        .await?
+        .ok_or_else(|| KabiPayError::NotFound {
+            entity: "employee",
+            id: employee_id.to_string(),
+        })?;
+    let mut active: employee::ActiveModel = existing.into();
+    if let Some(value) = patch.personal_phone {
+        let value = trimmed_optional(value);
+        if value.as_ref().is_some_and(|phone| phone.len() > 50) {
+            return Err(KabiPayError::Validation(
+                "personalPhone must be 50 characters or fewer".into(),
+            ));
+        }
+        active.personal_phone = Set(value);
+    }
+    if let Some(value) = patch.current_address {
+        active.current_address = Set(trimmed_optional(value));
+    }
+    if let Some(value) = patch.permanent_address {
+        active.permanent_address = Set(trimmed_optional(value));
+    }
+    if let Some(value) = patch.gender {
+        active.gender = Set(trimmed_optional(value));
+    }
+    if let Some(value) = patch.nationality {
+        active.nationality = Set(trimmed_optional(value));
+    }
+    if let Some(value) = patch.blood_group {
+        active.blood_group = Set(trimmed_optional(value));
+    }
+    if let Some(value) = patch.emergency_contact_name {
+        active.emergency_contact_name = Set(trimmed_optional(value));
+    }
+    if let Some(value) = patch.emergency_contact_phone {
+        active.emergency_contact_phone = Set(trimmed_optional(value));
+    }
+    if let Some(value) = patch.emergency_contact_relation {
+        active.emergency_contact_relation = Set(trimmed_optional(value));
+    }
+    active.updated_at = Set(Utc::now());
+    active.update(db).await.map_err(KabiPayError::from)
 }

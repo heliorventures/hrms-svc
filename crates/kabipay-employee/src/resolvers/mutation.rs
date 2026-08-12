@@ -14,20 +14,30 @@ use crate::resolvers::scope::{assert_employee_in_data_scope, require_tenant_rbac
 use crate::resolvers::types::{
     ClearanceChecklistItemDto, CreateEmployeeInput, EmployeeAadhaarRecordDto,
     EmployeeBankAccountDto, EmployeeDocumentDto, EmployeeDto, EmployeePanRecordDto,
-    EmploymentHistoryRecordDto, FnfSettlementDto, OnboardingChecklistItemDto,
+    EmployeeEducationDto, EmployeeProfileChangeRequestDto, EmployeeWorkExperienceDto,
+    EmploymentHistoryRecordDto, FnfSettlementDto,
+    OnboardingChecklistItemDto,
     PermissionScopeAssignmentInput, ProvisionEmployeeLoginInput, ResetEmployeePasswordInput,
-    SeparationDto, SetEmployeeCompensationInput, SubmitSeparationInput, UpdateEmployeeInput,
-    UpdateEmployeePersonalProfileInput, UploadEmployeeDocumentInput, UploadTenantFileInput,
+    SeparationDto, SetEmployeeCompensationInput, SubmitEmployeeProfileChangeInput,
+    SubmitSeparationInput, UpdateEmployeeInput, UpdateEmployeePersonalProfileInput,
+    UpdateEmployeeSelfServiceProfileInput, UploadEmployeeDocumentInput, UploadTenantFileInput,
     UploadedTenantFileDto, UpsertEmployeePrimaryAadhaarInput, UpsertEmployeePrimaryBankInput,
-    UpsertEmployeePrimaryPanInput, UpsertFnfSettlementInput,
+    UpsertEmployeeEducationInput, UpsertEmployeePrimaryPanInput,
+    UpsertEmployeeWorkExperienceInput, UpsertFnfSettlementInput,
 };
 use crate::services::document_file_service;
 use crate::services::document_service;
-use crate::services::employee_service::{self, EmployeePatch, NewEmployee, PersonalProfilePatch};
+use crate::services::employee_service::{
+    self, EmployeePatch, NewEmployee, PersonalProfilePatch, SelfServiceProfilePatch,
+};
 use crate::services::employment_history_service;
 use crate::services::offboarding_fnf_service;
 use crate::services::onboarding_service;
 use crate::services::profile_extras_service;
+use crate::services::profile_change_service::{self, NewProfileChange};
+use crate::services::profile_record_service::{
+    self, EducationRecordInput, WorkExperienceRecordInput,
+};
 use crate::services::rbac_admin_service;
 use crate::services::separation_service;
 use rust_decimal::Decimal;
@@ -66,6 +76,28 @@ async fn enrich_employee_document_dto(
         dt.map(|d| d.name.clone()),
         dt.and_then(|d| d.category.clone()),
     ))
+}
+
+async fn education_dto(
+    db: &DatabaseConnection,
+    tenant_id: Uuid,
+    row: crate::entities::d0050_employee_self_service::employee_education::Model,
+) -> Result<EmployeeEducationDto> {
+    let evidence_ids = profile_record_service::education_evidence_ids(db, tenant_id, row.id)
+        .await
+        .map_err(KabiPayError::into_graphql)?;
+    Ok(EmployeeEducationDto::from_model(row, evidence_ids))
+}
+
+async fn work_experience_dto(
+    db: &DatabaseConnection,
+    tenant_id: Uuid,
+    row: crate::entities::d0050_employee_self_service::employee_work_experience::Model,
+) -> Result<EmployeeWorkExperienceDto> {
+    let evidence_ids = profile_record_service::work_evidence_ids(db, tenant_id, row.id)
+        .await
+        .map_err(KabiPayError::into_graphql)?;
+    Ok(EmployeeWorkExperienceDto::from_model(row, evidence_ids))
 }
 
 fn parse_uuid(id: &ID, field: &'static str) -> Result<Uuid> {
@@ -413,6 +445,18 @@ impl MutationRoot {
             )
             .into_graphql());
         }
+        if viewer == Some(eid)
+            && !claims.can_manage_employee_directory()
+            && (input.first_name.is_some()
+                || input.last_name.is_some()
+                || input.date_of_birth.is_some())
+        {
+            return Err(KabiPayError::Forbidden(
+                "legal name and date of birth changes require an HR-reviewed profile change request"
+                    .into(),
+            )
+            .into_graphql());
+        }
         let patch = PersonalProfilePatch {
             first_name: input.first_name,
             last_name: input.last_name,
@@ -434,12 +478,456 @@ impl MutationRoot {
         })
     }
 
+    /// Direct self-service fields that do not change legal identity or organization assignment.
+    async fn update_employee_self_service_profile(
+        &self,
+        ctx: &Context<'_>,
+        input: UpdateEmployeeSelfServiceProfileInput,
+    ) -> Result<EmployeeDto> {
+        let claims = require_client_claims(ctx)?;
+        let tenant_id = require_tenant_id(ctx)?;
+        let db = tenant_db(ctx, tenant_id).await?;
+        let employee_id = parse_uuid(&input.employee_id, "employeeId")?;
+        assert_employee_in_data_scope(ctx, &db, tenant_id, employee_id).await?;
+        let viewer_id = resolve_client_employee_id(ctx, &db, tenant_id).await.ok();
+        if viewer_id != Some(employee_id) && !claims.can_manage_employee_directory() {
+            return Err(KabiPayError::Forbidden(
+                "use your own employee id or employee:write".into(),
+            )
+            .into_graphql());
+        }
+        let updated = employee_service::update_self_service_profile(
+            &db,
+            tenant_id,
+            employee_id,
+            SelfServiceProfilePatch {
+                personal_phone: input.personal_phone,
+                current_address: input.current_address,
+                permanent_address: input.permanent_address,
+                gender: input.gender,
+                nationality: input.nationality,
+                blood_group: input.blood_group,
+                emergency_contact_name: input.emergency_contact_name,
+                emergency_contact_phone: input.emergency_contact_phone,
+                emergency_contact_relation: input.emergency_contact_relation,
+            },
+        )
+        .await
+        .map_err(KabiPayError::into_graphql)?;
+        let mut enriched = enrich_employee_dtos(&db, tenant_id, vec![EmployeeDto::from(updated)]).await?;
+        enriched.pop().ok_or_else(|| {
+            KabiPayError::Internal("updated employee profile missing".into()).into_graphql()
+        })
+    }
+
+    async fn submit_employee_profile_change(
+        &self,
+        ctx: &Context<'_>,
+        input: SubmitEmployeeProfileChangeInput,
+    ) -> Result<EmployeeProfileChangeRequestDto> {
+        let claims = require_client_claims(ctx)?;
+        let tenant_id = require_tenant_id(ctx)?;
+        let db = tenant_db(ctx, tenant_id).await?;
+        let employee_id = parse_uuid(&input.employee_id, "employeeId")?;
+        assert_employee_in_data_scope(ctx, &db, tenant_id, employee_id).await?;
+        let viewer_id = resolve_client_employee_id(ctx, &db, tenant_id).await.ok();
+        if viewer_id != Some(employee_id) && !claims.can_manage_employee_directory() {
+            return Err(KabiPayError::Forbidden(
+                "use your own employee id or employee:write".into(),
+            )
+            .into_graphql());
+        }
+        let supporting_document_id = input
+            .supporting_document_id
+            .as_ref()
+            .map(|id| parse_uuid(id, "supportingDocumentId"))
+            .transpose()?;
+        let row = profile_change_service::submit_request(
+            &db,
+            tenant_id,
+            employee_id,
+            claims.sub,
+            NewProfileChange {
+                request_type: input.request_type,
+                first_name: input.first_name,
+                last_name: input.last_name,
+                date_of_birth: input.date_of_birth,
+                pan_number: input.pan_number,
+                aadhaar_number: input.aadhaar_number,
+                bank_name: input.bank_name,
+                account_number: input.account_number,
+                ifsc_code: input.ifsc_code,
+                account_type: input.account_type,
+                supporting_document_id,
+            },
+        )
+        .await
+        .map_err(KabiPayError::into_graphql)?;
+        Ok(EmployeeProfileChangeRequestDto::from(row))
+    }
+
+    async fn cancel_employee_profile_change(
+        &self,
+        ctx: &Context<'_>,
+        request_id: ID,
+    ) -> Result<EmployeeProfileChangeRequestDto> {
+        let claims = require_client_claims(ctx)?;
+        let tenant_id = require_tenant_id(ctx)?;
+        let db = tenant_db(ctx, tenant_id).await?;
+        let request_id = parse_uuid(&request_id, "requestId")?;
+        let existing = profile_change_service::find_request(&db, tenant_id, request_id)
+            .await
+            .map_err(KabiPayError::into_graphql)?
+            .ok_or_else(|| KabiPayError::NotFound {
+                entity: "employeeProfileChangeRequest",
+                id: request_id.to_string(),
+            }
+            .into_graphql())?;
+        assert_employee_in_data_scope(ctx, &db, tenant_id, existing.employee_id).await?;
+        let row = profile_change_service::cancel_request(
+            &db,
+            tenant_id,
+            request_id,
+            claims.sub,
+            claims.can_manage_employee_directory(),
+        )
+        .await
+        .map_err(KabiPayError::into_graphql)?;
+        Ok(EmployeeProfileChangeRequestDto::from(row))
+    }
+
+    async fn resolve_employee_profile_change(
+        &self,
+        ctx: &Context<'_>,
+        request_id: ID,
+        approved: bool,
+        rejection_reason: Option<String>,
+    ) -> Result<EmployeeProfileChangeRequestDto> {
+        require_employee_mutation_rbac(ctx)?;
+        let claims = require_client_claims(ctx)?;
+        let tenant_id = require_tenant_id(ctx)?;
+        let db = tenant_db(ctx, tenant_id).await?;
+        let request_id = parse_uuid(&request_id, "requestId")?;
+        let existing = profile_change_service::find_request(&db, tenant_id, request_id)
+            .await
+            .map_err(KabiPayError::into_graphql)?
+            .ok_or_else(|| KabiPayError::NotFound {
+                entity: "employeeProfileChangeRequest",
+                id: request_id.to_string(),
+            }
+            .into_graphql())?;
+        assert_employee_in_data_scope(ctx, &db, tenant_id, existing.employee_id).await?;
+        let row = profile_change_service::resolve_request(
+            &db,
+            tenant_id,
+            request_id,
+            claims.sub,
+            approved,
+            rejection_reason,
+        )
+        .await
+        .map_err(KabiPayError::into_graphql)?;
+        Ok(EmployeeProfileChangeRequestDto::from(row))
+    }
+
+    async fn upsert_employee_education(
+        &self,
+        ctx: &Context<'_>,
+        input: UpsertEmployeeEducationInput,
+    ) -> Result<EmployeeEducationDto> {
+        let claims = require_client_claims(ctx)?;
+        let tenant_id = require_tenant_id(ctx)?;
+        let db = tenant_db(ctx, tenant_id).await?;
+        let employee_id = parse_uuid(&input.employee_id, "employeeId")?;
+        assert_employee_in_data_scope(ctx, &db, tenant_id, employee_id).await?;
+        let viewer_id = resolve_client_employee_id(ctx, &db, tenant_id).await.ok();
+        if viewer_id != Some(employee_id) && !claims.can_manage_employee_directory() {
+            return Err(KabiPayError::Forbidden(
+                "education records may only be changed by the employee or HR".into(),
+            )
+            .into_graphql());
+        }
+        let record_id = input
+            .id
+            .as_ref()
+            .map(|id| parse_uuid(id, "educationId"))
+            .transpose()?;
+        let row = profile_record_service::save_education(
+            &db,
+            tenant_id,
+            employee_id,
+            record_id,
+            EducationRecordInput {
+                education_level: input.education_level,
+                qualification: input.qualification,
+                field_of_study: input.field_of_study,
+                institution: input.institution,
+                board_university: input.board_university,
+                start_date: input.start_date,
+                completion_year: input.completion_year,
+                grade_score: input.grade_score,
+                description: input.description,
+            },
+        )
+        .await
+        .map_err(KabiPayError::into_graphql)?;
+        education_dto(&db, tenant_id, row).await
+    }
+
+    async fn delete_employee_education(
+        &self,
+        ctx: &Context<'_>,
+        employee_id: ID,
+        education_id: ID,
+    ) -> Result<bool> {
+        let claims = require_client_claims(ctx)?;
+        let tenant_id = require_tenant_id(ctx)?;
+        let db = tenant_db(ctx, tenant_id).await?;
+        let employee_id = parse_uuid(&employee_id, "employeeId")?;
+        assert_employee_in_data_scope(ctx, &db, tenant_id, employee_id).await?;
+        let viewer_id = resolve_client_employee_id(ctx, &db, tenant_id).await.ok();
+        if viewer_id != Some(employee_id) && !claims.can_manage_employee_directory() {
+            return Err(KabiPayError::Forbidden(
+                "education records may only be deleted by the employee or HR".into(),
+            )
+            .into_graphql());
+        }
+        profile_record_service::delete_education(
+            &db,
+            tenant_id,
+            employee_id,
+            parse_uuid(&education_id, "educationId")?,
+            claims.sub,
+        )
+        .await
+        .map_err(KabiPayError::into_graphql)
+    }
+
+    async fn link_employee_education_evidence(
+        &self,
+        ctx: &Context<'_>,
+        employee_id: ID,
+        education_id: ID,
+        employee_document_id: ID,
+    ) -> Result<EmployeeEducationDto> {
+        let claims = require_client_claims(ctx)?;
+        let tenant_id = require_tenant_id(ctx)?;
+        let db = tenant_db(ctx, tenant_id).await?;
+        let employee_id = parse_uuid(&employee_id, "employeeId")?;
+        assert_employee_in_data_scope(ctx, &db, tenant_id, employee_id).await?;
+        let viewer_id = resolve_client_employee_id(ctx, &db, tenant_id).await.ok();
+        if viewer_id != Some(employee_id) && !claims.can_manage_employee_directory() {
+            return Err(KabiPayError::Forbidden(
+                "education evidence may only be linked by the employee or HR".into(),
+            )
+            .into_graphql());
+        }
+        let row = profile_record_service::link_education_evidence(
+            &db,
+            tenant_id,
+            employee_id,
+            parse_uuid(&education_id, "educationId")?,
+            parse_uuid(&employee_document_id, "employeeDocumentId")?,
+        )
+        .await
+        .map_err(KabiPayError::into_graphql)?;
+        education_dto(&db, tenant_id, row).await
+    }
+
+    async fn resolve_employee_education(
+        &self,
+        ctx: &Context<'_>,
+        education_id: ID,
+        approved: bool,
+        rejection_reason: Option<String>,
+    ) -> Result<EmployeeEducationDto> {
+        require_employee_mutation_rbac(ctx)?;
+        let claims = require_client_claims(ctx)?;
+        let tenant_id = require_tenant_id(ctx)?;
+        let db = tenant_db(ctx, tenant_id).await?;
+        let education_id = parse_uuid(&education_id, "educationId")?;
+        let existing = profile_record_service::find_education(&db, tenant_id, education_id)
+            .await
+            .map_err(KabiPayError::into_graphql)?
+            .ok_or_else(|| KabiPayError::NotFound {
+                entity: "employeeEducation",
+                id: education_id.to_string(),
+            }
+            .into_graphql())?;
+        if resolve_client_employee_id(ctx, &db, tenant_id).await.ok() == Some(existing.employee_id) {
+            return Err(KabiPayError::Forbidden(
+                "employees cannot verify their own education evidence".into(),
+            )
+            .into_graphql());
+        }
+        assert_employee_in_data_scope(ctx, &db, tenant_id, existing.employee_id).await?;
+        let row = profile_record_service::review_education(
+            &db,
+            tenant_id,
+            education_id,
+            claims.sub,
+            approved,
+            rejection_reason,
+        )
+        .await
+        .map_err(KabiPayError::into_graphql)?;
+        education_dto(&db, tenant_id, row).await
+    }
+
+    async fn upsert_employee_work_experience(
+        &self,
+        ctx: &Context<'_>,
+        input: UpsertEmployeeWorkExperienceInput,
+    ) -> Result<EmployeeWorkExperienceDto> {
+        let claims = require_client_claims(ctx)?;
+        let tenant_id = require_tenant_id(ctx)?;
+        let db = tenant_db(ctx, tenant_id).await?;
+        let employee_id = parse_uuid(&input.employee_id, "employeeId")?;
+        assert_employee_in_data_scope(ctx, &db, tenant_id, employee_id).await?;
+        let viewer_id = resolve_client_employee_id(ctx, &db, tenant_id).await.ok();
+        if viewer_id != Some(employee_id) && !claims.can_manage_employee_directory() {
+            return Err(KabiPayError::Forbidden(
+                "work experience may only be changed by the employee or HR".into(),
+            )
+            .into_graphql());
+        }
+        let record_id = input
+            .id
+            .as_ref()
+            .map(|id| parse_uuid(id, "workExperienceId"))
+            .transpose()?;
+        let row = profile_record_service::save_work_experience(
+            &db,
+            tenant_id,
+            employee_id,
+            record_id,
+            WorkExperienceRecordInput {
+                company: input.company,
+                role_title: input.role_title,
+                employment_type: input.employment_type,
+                location: input.location,
+                start_date: input.start_date,
+                end_date: input.end_date,
+                is_current: input.is_current,
+                description: input.description,
+            },
+        )
+        .await
+        .map_err(KabiPayError::into_graphql)?;
+        work_experience_dto(&db, tenant_id, row).await
+    }
+
+    async fn delete_employee_work_experience(
+        &self,
+        ctx: &Context<'_>,
+        employee_id: ID,
+        work_experience_id: ID,
+    ) -> Result<bool> {
+        let claims = require_client_claims(ctx)?;
+        let tenant_id = require_tenant_id(ctx)?;
+        let db = tenant_db(ctx, tenant_id).await?;
+        let employee_id = parse_uuid(&employee_id, "employeeId")?;
+        assert_employee_in_data_scope(ctx, &db, tenant_id, employee_id).await?;
+        let viewer_id = resolve_client_employee_id(ctx, &db, tenant_id).await.ok();
+        if viewer_id != Some(employee_id) && !claims.can_manage_employee_directory() {
+            return Err(KabiPayError::Forbidden(
+                "work experience may only be deleted by the employee or HR".into(),
+            )
+            .into_graphql());
+        }
+        profile_record_service::delete_work_experience(
+            &db,
+            tenant_id,
+            employee_id,
+            parse_uuid(&work_experience_id, "workExperienceId")?,
+            claims.sub,
+        )
+        .await
+        .map_err(KabiPayError::into_graphql)
+    }
+
+    async fn link_employee_work_experience_evidence(
+        &self,
+        ctx: &Context<'_>,
+        employee_id: ID,
+        work_experience_id: ID,
+        employee_document_id: ID,
+    ) -> Result<EmployeeWorkExperienceDto> {
+        let claims = require_client_claims(ctx)?;
+        let tenant_id = require_tenant_id(ctx)?;
+        let db = tenant_db(ctx, tenant_id).await?;
+        let employee_id = parse_uuid(&employee_id, "employeeId")?;
+        assert_employee_in_data_scope(ctx, &db, tenant_id, employee_id).await?;
+        let viewer_id = resolve_client_employee_id(ctx, &db, tenant_id).await.ok();
+        if viewer_id != Some(employee_id) && !claims.can_manage_employee_directory() {
+            return Err(KabiPayError::Forbidden(
+                "work evidence may only be linked by the employee or HR".into(),
+            )
+            .into_graphql());
+        }
+        let row = profile_record_service::link_work_evidence(
+            &db,
+            tenant_id,
+            employee_id,
+            parse_uuid(&work_experience_id, "workExperienceId")?,
+            parse_uuid(&employee_document_id, "employeeDocumentId")?,
+        )
+        .await
+        .map_err(KabiPayError::into_graphql)?;
+        work_experience_dto(&db, tenant_id, row).await
+    }
+
+    async fn resolve_employee_work_experience(
+        &self,
+        ctx: &Context<'_>,
+        work_experience_id: ID,
+        approved: bool,
+        rejection_reason: Option<String>,
+    ) -> Result<EmployeeWorkExperienceDto> {
+        require_employee_mutation_rbac(ctx)?;
+        let claims = require_client_claims(ctx)?;
+        let tenant_id = require_tenant_id(ctx)?;
+        let db = tenant_db(ctx, tenant_id).await?;
+        let work_experience_id = parse_uuid(&work_experience_id, "workExperienceId")?;
+        let existing = profile_record_service::find_work_experience(
+            &db,
+            tenant_id,
+            work_experience_id,
+        )
+        .await
+        .map_err(KabiPayError::into_graphql)?
+        .ok_or_else(|| KabiPayError::NotFound {
+            entity: "employeeWorkExperience",
+            id: work_experience_id.to_string(),
+        }
+        .into_graphql())?;
+        if resolve_client_employee_id(ctx, &db, tenant_id).await.ok() == Some(existing.employee_id) {
+            return Err(KabiPayError::Forbidden(
+                "employees cannot verify their own work experience evidence".into(),
+            )
+            .into_graphql());
+        }
+        assert_employee_in_data_scope(ctx, &db, tenant_id, existing.employee_id).await?;
+        let row = profile_record_service::review_work_experience(
+            &db,
+            tenant_id,
+            work_experience_id,
+            claims.sub,
+            approved,
+            rejection_reason,
+        )
+        .await
+        .map_err(KabiPayError::into_graphql)?;
+        work_experience_dto(&db, tenant_id, row).await
+    }
+
     /// Upsert the primary bank row (self or **`employee:write`**).
     async fn upsert_employee_primary_bank(
         &self,
         ctx: &Context<'_>,
         input: UpsertEmployeePrimaryBankInput,
     ) -> Result<EmployeeBankAccountDto> {
+        require_employee_mutation_rbac(ctx)?;
         let claims = require_client_claims(ctx)?;
         let tenant_id = require_tenant_id(ctx)?;
         let db = tenant_db(ctx, tenant_id).await?;
@@ -472,6 +960,7 @@ impl MutationRoot {
         ctx: &Context<'_>,
         input: UpsertEmployeePrimaryPanInput,
     ) -> Result<EmployeePanRecordDto> {
+        require_employee_mutation_rbac(ctx)?;
         let claims = require_client_claims(ctx)?;
         let tenant_id = require_tenant_id(ctx)?;
         let db = tenant_db(ctx, tenant_id).await?;
@@ -496,6 +985,7 @@ impl MutationRoot {
         ctx: &Context<'_>,
         input: UpsertEmployeePrimaryAadhaarInput,
     ) -> Result<EmployeeAadhaarRecordDto> {
+        require_employee_mutation_rbac(ctx)?;
         let claims = require_client_claims(ctx)?;
         let tenant_id = require_tenant_id(ctx)?;
         let db = tenant_db(ctx, tenant_id).await?;

@@ -11,8 +11,10 @@ use uuid::Uuid;
 
 use crate::resolvers::types::{
     ClearanceChecklistItemDto, DepartmentDto, DesignationDto, DocumentTypeDto,
-    EmployeeAadhaarRecordDto, EmployeeBankAccountDto, EmployeeDocumentDto, EmployeeDto,
-    EmployeeIdentityProfileDto, EmployeePanRecordDto, EmploymentHistoryRecordDto,
+    EmployeeAadhaarRecordDto, EmployeeBankAccountDto, EmployeeDirectoryEntryDto,
+    EmployeeDirectoryPageDto, EmployeeDocumentDto, EmployeeDto, EmployeeIdentityProfileDto,
+    EmployeeEducationDto, EmployeePanRecordDto, EmployeeProfileAccessDto,
+    EmployeeProfileChangeRequestDto, EmployeeWorkExperienceDto, EmploymentHistoryRecordDto,
     FnfSettlementDto, OnboardingChecklistItemDto, OrgChartRowDto, SeparationDto,
     TenantCatalogPermissionDto, TenantDirectoryRoleDto, TenantDirectoryUserDto,
     TenantPermissionScopeDto,
@@ -25,8 +27,9 @@ use crate::resolvers::scope::{
 };
 use crate::services::document_file_service::{self, download_claims};
 use crate::services::{
-    document_service, employee_service, employment_history_service, offboarding_fnf_service,
-    onboarding_service, org_service, profile_extras_service, rbac_admin_service, separation_service,
+    directory_service, document_service, employee_service, employment_history_service,
+    offboarding_fnf_service, onboarding_service, org_service, profile_change_service,
+    profile_extras_service, profile_record_service, rbac_admin_service, separation_service,
 };
 use crate::entities::d0029_file_storage::file_storage;
 
@@ -37,6 +40,175 @@ impl QueryRoot {
     /// Liveness probe for this federated subgraph. Always returns `ok`.
     async fn employee_health(&self) -> &'static str {
         "ok"
+    }
+
+    /// Safe company directory available to every authenticated tenant employee.
+    async fn employee_directory_page(
+        &self,
+        ctx: &Context<'_>,
+        #[graphql(default = 100)] limit: u64,
+        after: Option<String>,
+    ) -> Result<EmployeeDirectoryPageDto> {
+        let _claims = require_client_claims(ctx)?;
+        let tenant_id = require_tenant_id(ctx)?;
+        let db = tenant_db(ctx, tenant_id).await?;
+        let page = directory_service::list_page(&db, tenant_id, limit, after.as_deref())
+            .await
+            .map_err(KabiPayError::into_graphql)?;
+        let rows = enrich_directory_entries(&db, tenant_id, page.rows).await?;
+        Ok(EmployeeDirectoryPageDto {
+            has_more: page.next_cursor.is_some(),
+            next_cursor: page.next_cursor,
+            rows,
+        })
+    }
+
+    /// Safe full reporting hierarchy for authenticated employees.
+    async fn organization_directory_chart(
+        &self,
+        ctx: &Context<'_>,
+    ) -> Result<Vec<EmployeeDirectoryEntryDto>> {
+        let _claims = require_client_claims(ctx)?;
+        let tenant_id = require_tenant_id(ctx)?;
+        let db = tenant_db(ctx, tenant_id).await?;
+        let rows = directory_service::list_hierarchy(&db, tenant_id)
+            .await
+            .map_err(KabiPayError::into_graphql)?;
+        enrich_directory_entries(&db, tenant_id, rows).await
+    }
+
+    /// Public profile projection plus server-derived private/edit capabilities.
+    async fn employee_profile_access(
+        &self,
+        ctx: &Context<'_>,
+        employee_id: ID,
+    ) -> Result<Option<EmployeeProfileAccessDto>> {
+        let claims = require_client_claims(ctx)?;
+        let tenant_id = require_tenant_id(ctx)?;
+        let target_id = parse_uuid(&employee_id, "employeeId")?;
+        let db = tenant_db(ctx, tenant_id).await?;
+        let Some(target) = directory_service::find_current_by_id(&db, tenant_id, target_id)
+            .await
+            .map_err(KabiPayError::into_graphql)?
+        else {
+            return Ok(None);
+        };
+        let viewer_id = resolve_client_employee_id(ctx, &db, tenant_id).await.ok();
+        let is_self = viewer_id == Some(target_id);
+        let viewer = resolve_viewer_employee(ctx, &db, tenant_id).await?;
+        let in_scope = employee_service::is_employee_in_scope(data_scope_employee(ctx), viewer, &target);
+        let can_manage = claims.can_manage_employee_directory() && in_scope;
+        let mut entries = enrich_directory_entries(&db, tenant_id, vec![target]).await?;
+        let directory_entry = entries.pop().ok_or_else(|| {
+            KabiPayError::Internal("profile directory entry missing".into()).into_graphql()
+        })?;
+        Ok(Some(EmployeeProfileAccessDto {
+            directory_entry,
+            is_self,
+            can_view_private_profile: is_self || can_manage,
+            can_edit_personal_profile: is_self || can_manage,
+            can_manage_organization_fields: can_manage,
+            can_review_profile_changes: can_manage,
+        }))
+    }
+
+    async fn employee_profile_change_requests(
+        &self,
+        ctx: &Context<'_>,
+        employee_id: ID,
+        status: Option<String>,
+    ) -> Result<Vec<EmployeeProfileChangeRequestDto>> {
+        let claims = require_client_claims(ctx)?;
+        let tenant_id = require_tenant_id(ctx)?;
+        let target_id = parse_uuid(&employee_id, "employeeId")?;
+        let db = tenant_db(ctx, tenant_id).await?;
+        let viewer_id = resolve_client_employee_id(ctx, &db, tenant_id).await.ok();
+        if viewer_id != Some(target_id) {
+            if !claims.can_manage_employee_directory() {
+                return Err(KabiPayError::Forbidden(
+                    "profile change requests are private to the employee and HR".into(),
+                )
+                .into_graphql());
+            }
+            assert_employee_in_data_scope(ctx, &db, tenant_id, target_id).await?;
+        }
+        let rows = profile_change_service::list_requests(
+            &db,
+            tenant_id,
+            target_id,
+            status.as_deref(),
+        )
+        .await
+        .map_err(KabiPayError::into_graphql)?;
+        Ok(rows.into_iter().map(EmployeeProfileChangeRequestDto::from).collect())
+    }
+
+    async fn employee_education_records(
+        &self,
+        ctx: &Context<'_>,
+        employee_id: ID,
+    ) -> Result<Vec<EmployeeEducationDto>> {
+        let claims = require_client_claims(ctx)?;
+        let tenant_id = require_tenant_id(ctx)?;
+        let employee_id = parse_uuid(&employee_id, "employeeId")?;
+        let db = tenant_db(ctx, tenant_id).await?;
+        let viewer_id = resolve_client_employee_id(ctx, &db, tenant_id).await.ok();
+        if viewer_id != Some(employee_id) {
+            if !claims.can_manage_employee_directory() {
+                return Err(KabiPayError::Forbidden(
+                    "education records are private to the employee and HR".into(),
+                )
+                .into_graphql());
+            }
+            assert_employee_in_data_scope(ctx, &db, tenant_id, employee_id).await?;
+        }
+        let rows = profile_record_service::list_education(&db, tenant_id, employee_id)
+            .await
+            .map_err(KabiPayError::into_graphql)?;
+        let mut output = Vec::with_capacity(rows.len());
+        for row in rows {
+            let evidence_ids = profile_record_service::education_evidence_ids(
+                &db,
+                tenant_id,
+                row.id,
+            )
+            .await
+            .map_err(KabiPayError::into_graphql)?;
+            output.push(EmployeeEducationDto::from_model(row, evidence_ids));
+        }
+        Ok(output)
+    }
+
+    async fn employee_work_experience_records(
+        &self,
+        ctx: &Context<'_>,
+        employee_id: ID,
+    ) -> Result<Vec<EmployeeWorkExperienceDto>> {
+        let claims = require_client_claims(ctx)?;
+        let tenant_id = require_tenant_id(ctx)?;
+        let employee_id = parse_uuid(&employee_id, "employeeId")?;
+        let db = tenant_db(ctx, tenant_id).await?;
+        let viewer_id = resolve_client_employee_id(ctx, &db, tenant_id).await.ok();
+        if viewer_id != Some(employee_id) {
+            if !claims.can_manage_employee_directory() {
+                return Err(KabiPayError::Forbidden(
+                    "work experience records are private to the employee and HR".into(),
+                )
+                .into_graphql());
+            }
+            assert_employee_in_data_scope(ctx, &db, tenant_id, employee_id).await?;
+        }
+        let rows = profile_record_service::list_work_experience(&db, tenant_id, employee_id)
+            .await
+            .map_err(KabiPayError::into_graphql)?;
+        let mut output = Vec::with_capacity(rows.len());
+        for row in rows {
+            let evidence_ids = profile_record_service::work_evidence_ids(&db, tenant_id, row.id)
+                .await
+                .map_err(KabiPayError::into_graphql)?;
+            output.push(EmployeeWorkExperienceDto::from_model(row, evidence_ids));
+        }
+        Ok(output)
     }
 
     /// Fetch one employee by UUID inside the caller's tenant.
@@ -556,6 +728,47 @@ impl QueryRoot {
             .map_err(KabiPayError::into_graphql)?;
         Ok(rows.into_iter().map(TenantPermissionScopeDto::from).collect())
     }
+}
+
+async fn enrich_directory_entries(
+    db: &DatabaseConnection,
+    tenant_id: Uuid,
+    rows: Vec<crate::entities::d0007_employee_core::employee::Model>,
+) -> Result<Vec<EmployeeDirectoryEntryDto>> {
+    let mut department_ids: Vec<Uuid> = rows.iter().filter_map(|row| row.department_id).collect();
+    department_ids.sort_unstable();
+    department_ids.dedup();
+    let mut designation_ids: Vec<Uuid> = rows.iter().filter_map(|row| row.designation_id).collect();
+    designation_ids.sort_unstable();
+    designation_ids.dedup();
+    let mut manager_ids: Vec<Uuid> = rows
+        .iter()
+        .filter_map(|row| row.reporting_manager_id)
+        .collect();
+    manager_ids.sort_unstable();
+    manager_ids.dedup();
+
+    let department_map = org_service::map_department_names(db, tenant_id, &department_ids)
+        .await
+        .map_err(KabiPayError::into_graphql)?;
+    let designation_map = org_service::map_designation_titles(db, tenant_id, &designation_ids)
+        .await
+        .map_err(KabiPayError::into_graphql)?;
+    let manager_map = employee_service::map_full_names(db, tenant_id, &manager_ids)
+        .await
+        .map_err(KabiPayError::into_graphql)?;
+
+    Ok(rows
+        .into_iter()
+        .map(|row| {
+            EmployeeDirectoryEntryDto::from_model(
+                row,
+                &department_map,
+                &designation_map,
+                &manager_map,
+            )
+        })
+        .collect())
 }
 
 async fn resolve_employee_dto(ctx: &Context<'_>, id: ID) -> Result<Option<EmployeeDto>> {
