@@ -1,6 +1,6 @@
 //! GraphQL output types for kabipay-employee.
 
-use async_graphql::{InputObject, SimpleObject, ID};
+use async_graphql::{InputObject, Json, SimpleObject, ID};
 use chrono::{DateTime, NaiveDate, Utc};
 use uuid::Uuid;
 
@@ -273,6 +273,7 @@ pub struct EmployeeDocumentDto {
     pub uploaded_at: DateTime<Utc>,
     #[graphql(name = "originalFileName")]
     pub original_file_name: Option<String>,
+    pub mime_type: Option<String>,
     #[graphql(name = "uploadedByUserId")]
     pub uploaded_by_user_id: Option<ID>,
     #[graphql(name = "documentTypeName")]
@@ -294,6 +295,7 @@ impl From<employee_document::Model> for EmployeeDocumentDto {
             expiry_date: m.expiry_date,
             uploaded_at: m.uploaded_at,
             original_file_name: None,
+            mime_type: None,
             uploaded_by_user_id: None,
             document_type_name: None,
             document_type_category: None,
@@ -307,11 +309,13 @@ impl EmployeeDocumentDto {
     pub fn with_file_and_type(
         mut self,
         original_file_name: Option<String>,
+        mime_type: Option<String>,
         uploaded_by_user_id: Option<Uuid>,
         document_type_name: Option<String>,
         document_type_category: Option<String>,
     ) -> Self {
         self.original_file_name = original_file_name;
+        self.mime_type = mime_type;
         self.uploaded_by_user_id = uploaded_by_user_id.map(|u| ID(u.to_string()));
         self.document_type_name = document_type_name;
         self.document_type_category = document_type_category;
@@ -539,7 +543,7 @@ impl From<employee_profile_change_request::Model> for EmployeeProfileChangeReque
             "LEGAL_NAME_OR_DOB" => "Legal name or date-of-birth change".to_string(),
             "PAN" => model
                 .requested_payload
-                .get("pan_number")
+                .get("last4")
                 .and_then(serde_json::Value::as_str)
                 .map(|value| {
                     let tail = value.chars().rev().take(4).collect::<String>();
@@ -548,13 +552,13 @@ impl From<employee_profile_change_request::Model> for EmployeeProfileChangeReque
                 .unwrap_or_else(|| "PAN change".into()),
             "AADHAAR" => model
                 .requested_payload
-                .get("aadhaar_last4")
+                .get("last4")
                 .and_then(serde_json::Value::as_str)
                 .map(|value| format!("Aadhaar ending {value}"))
                 .unwrap_or_else(|| "Aadhaar change".into()),
             "BANK_ACCOUNT" => model
                 .requested_payload
-                .get("account_number")
+                .get("last4")
                 .and_then(serde_json::Value::as_str)
                 .map(|value| {
                     let tail = value.chars().rev().take(4).collect::<String>();
@@ -579,6 +583,38 @@ impl From<employee_profile_change_request::Model> for EmployeeProfileChangeReque
             updated_at: model.updated_at,
         }
     }
+}
+
+#[derive(SimpleObject, Clone, Debug)]
+#[graphql(name = "EmployeeProfileReviewQueueItem")]
+pub struct EmployeeProfileReviewQueueItemDto {
+    pub request: EmployeeProfileChangeRequestDto,
+    pub employee_code: String,
+    pub employee_name: String,
+    pub has_supporting_document: bool,
+}
+
+#[derive(SimpleObject, Clone, Debug)]
+#[graphql(name = "EmployeeProfileChangeReviewDetail")]
+pub struct EmployeeProfileChangeReviewDetailDto {
+    pub request: EmployeeProfileChangeRequestDto,
+    pub employee_code: String,
+    pub employee_name: String,
+    pub current_values: Json<serde_json::Value>,
+    pub requested_values: Json<serde_json::Value>,
+}
+
+#[derive(SimpleObject, Clone, Debug)]
+#[graphql(name = "EmployeeEvidenceReviewQueueItem")]
+pub struct EmployeeEvidenceReviewQueueItemDto {
+    pub record_id: ID,
+    pub employee_id: ID,
+    pub employee_code: String,
+    pub employee_name: String,
+    pub evidence_type: String,
+    pub summary: String,
+    pub evidence_document_ids: Vec<ID>,
+    pub created_at: DateTime<Utc>,
 }
 
 #[derive(SimpleObject, Clone, Debug)]

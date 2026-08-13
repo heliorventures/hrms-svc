@@ -9,7 +9,8 @@ use kabipay_common::{
     KabiPayError, KabiPayResult,
 };
 use sea_orm::{
-    ActiveModelTrait, ActiveValue::Set, DatabaseConnection, EntityTrait, TransactionTrait,
+    ActiveModelTrait, ActiveValue::Set, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter,
+    TransactionTrait,
 };
 use uuid::Uuid;
 
@@ -158,6 +159,54 @@ pub async fn upload_employee_document(
                 .into(),
         )),
     }
+}
+
+/// Compensate a newly uploaded document when its owning business record could not be linked.
+/// This is only for same-request failures; callers must never use it as a general delete API.
+pub async fn cleanup_unlinked_employee_document(
+    db: &DatabaseConnection,
+    tenant_id: Uuid,
+    document_id: Uuid,
+) -> KabiPayResult<()> {
+    let document = employee_document::Entity::find_by_id(document_id)
+        .filter(employee_document::Column::TenantId.eq(tenant_id))
+        .one(db)
+        .await?
+        .ok_or_else(|| KabiPayError::NotFound {
+            entity: "employeeDocument",
+            id: document_id.to_string(),
+        })?;
+    let stored_file = match document.file_storage_id {
+        Some(file_id) => file_storage::Entity::find_by_id(file_id)
+            .filter(file_storage::Column::TenantId.eq(tenant_id))
+            .one(db)
+            .await?,
+        None => None,
+    };
+
+    let txn = db.begin().await?;
+    employee_document::Entity::delete_by_id(document.id).exec(&txn).await?;
+    if let Some(file_id) = document.file_storage_id {
+        file_storage::Entity::delete_by_id(file_id).exec(&txn).await?;
+    }
+    txn.commit().await?;
+
+    if let Some(stored_file) = stored_file {
+        if stored_file.provider == PROVIDER_LOCAL {
+            let root = local_file_root();
+            let full_path = root.join(&stored_file.storage_path);
+            if full_path.starts_with(&root) {
+                let _ = tokio::fs::remove_file(full_path).await;
+            }
+        } else if stored_file.provider == PROVIDER_S3_COMPAT {
+            if let (Ok(settings), Some(bucket)) = (S3CompatSettings::from_env(), stored_file.bucket) {
+                if let Ok(operator) = s3_operator_for_bucket(&settings, &bucket) {
+                    s3_delete(&operator, &stored_file.storage_path).await;
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Persist a tenant-scoped file without attaching it to an employee document. This is used by

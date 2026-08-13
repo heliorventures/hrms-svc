@@ -54,17 +54,18 @@ async fn enrich_employee_document_dto(
     m: employee_document::Model,
 ) -> Result<EmployeeDocumentDto> {
     let dto = EmployeeDocumentDto::from(m.clone());
-    let (ofn, ub) = if let Some(fid) = m.file_storage_id {
+    let (ofn, mime, ub) = if let Some(fid) = m.file_storage_id {
         let map = document_service::map_file_storage_rows(db, tenant_id, &[fid])
             .await
             .map_err(KabiPayError::into_graphql)?;
         let fs = map.get(&fid);
         (
             fs.and_then(|f| f.original_filename.clone()),
+            fs.and_then(|f| f.mime_type.clone()),
             fs.and_then(|f| f.uploaded_by),
         )
     } else {
-        (None, None)
+        (None, None, None)
     };
     let dt_map = document_service::map_document_type_rows(db, tenant_id, &[m.document_type_id])
         .await
@@ -72,10 +73,52 @@ async fn enrich_employee_document_dto(
     let dt = dt_map.get(&m.document_type_id);
     Ok(dto.with_file_and_type(
         ofn,
+        mime,
         ub,
         dt.map(|d| d.name.clone()),
         dt.and_then(|d| d.category.clone()),
     ))
+}
+
+async fn upload_profile_document(
+    db: &DatabaseConnection,
+    tenant_id: Uuid,
+    uploader_user_id: Uuid,
+    hr_auto_approve: bool,
+    input: UploadEmployeeDocumentInput,
+) -> Result<employee_document::Model> {
+    let employee_id = parse_uuid(&input.employee_id, "employeeId")?;
+    let document_type_id = parse_uuid(&input.document_type_id, "documentTypeId")?;
+    if document_type::Entity::find_by_id(document_type_id)
+        .filter(document_type::Column::TenantId.eq(tenant_id))
+        .filter(document_type::Column::IsDeleted.eq(false))
+        .one(db)
+        .await
+        .map_err(|error: sea_orm::DbErr| KabiPayError::from(error).into_graphql())?
+        .is_none()
+    {
+        return Err(KabiPayError::NotFound {
+            entity: "documentType",
+            id: document_type_id.to_string(),
+        }
+        .into_graphql());
+    }
+    let bytes = STANDARD
+        .decode(input.content_base64.as_bytes())
+        .map_err(|error| KabiPayError::Validation(format!("contentBase64: {error}")).into_graphql())?;
+    document_file_service::upload_employee_document(
+        db,
+        tenant_id,
+        employee_id,
+        document_type_id,
+        Some(uploader_user_id),
+        input.file_name,
+        input.mime_type,
+        bytes,
+        hr_auto_approve,
+    )
+    .await
+    .map_err(KabiPayError::into_graphql)
 }
 
 async fn education_dto(
@@ -357,48 +400,11 @@ impl MutationRoot {
         let tenant_id = require_tenant_id(ctx)?;
         let db = tenant_db(ctx, tenant_id).await?;
         let eid = parse_uuid(&input.employee_id, "employeeId")?;
-        let dtid = parse_uuid(&input.document_type_id, "documentTypeId")?;
         assert_employee_in_data_scope(ctx, &db, tenant_id, eid).await?;
-
-        if document_type::Entity::find_by_id(dtid)
-            .filter(document_type::Column::TenantId.eq(tenant_id))
-            .filter(document_type::Column::IsDeleted.eq(false))
-            .one(&db)
-            .await
-            .map_err(|e: sea_orm::DbErr| KabiPayError::from(e).into_graphql())?
-            .is_none()
-        {
-            return Err(KabiPayError::NotFound {
-                entity: "documentType",
-                id: dtid.to_string(),
-            }
-            .into_graphql());
-        }
-
-        let uploader = Some(require_client_claims(ctx)?.sub);
-
-        let hr_auto = ctx
-            .data_opt::<ClientClaims>()
-            .map(|c| c.can_manage_employee_directory())
-            .unwrap_or(false);
-
-        let bytes = STANDARD
-            .decode(input.content_base64.as_bytes())
-            .map_err(|e| KabiPayError::Validation(format!("contentBase64: {e}")).into_graphql())?;
-
-        let m = document_file_service::upload_employee_document(
-            &db,
-            tenant_id,
-            eid,
-            dtid,
-            uploader,
-            input.file_name,
-            input.mime_type,
-            bytes,
-            hr_auto,
-        )
-        .await
-        .map_err(KabiPayError::into_graphql)?;
+        let claims = require_client_claims(ctx)?;
+        let m = upload_profile_document(
+            &db, tenant_id, claims.sub, claims.can_manage_employee_directory(), input,
+        ).await?;
         enrich_employee_document_dto(&db, tenant_id, m).await
     }
 
@@ -734,6 +740,34 @@ impl MutationRoot {
         education_dto(&db, tenant_id, row).await
     }
 
+    async fn upload_employee_education_evidence(
+        &self,
+        ctx: &Context<'_>,
+        education_id: ID,
+        input: UploadEmployeeDocumentInput,
+    ) -> Result<EmployeeEducationDto> {
+        let claims = require_client_claims(ctx)?;
+        let tenant_id = require_tenant_id(ctx)?;
+        let db = tenant_db(ctx, tenant_id).await?;
+        let employee_id = parse_uuid(&input.employee_id, "employeeId")?;
+        assert_employee_in_data_scope(ctx, &db, tenant_id, employee_id).await?;
+        let viewer_id = resolve_client_employee_id(ctx, &db, tenant_id).await.ok();
+        if viewer_id != Some(employee_id) && !claims.can_manage_employee_directory() {
+            return Err(KabiPayError::Forbidden("education evidence may only be uploaded by the employee or HR".into()).into_graphql());
+        }
+        let record_id = parse_uuid(&education_id, "educationId")?;
+        let document = upload_profile_document(&db, tenant_id, claims.sub, claims.can_manage_employee_directory(), input).await?;
+        match profile_record_service::link_education_evidence(&db, tenant_id, employee_id, record_id, document.id).await {
+            Ok(row) => education_dto(&db, tenant_id, row).await,
+            Err(error) => {
+                if let Err(cleanup_error) = document_file_service::cleanup_unlinked_employee_document(&db, tenant_id, document.id).await {
+                    tracing::error!(%cleanup_error, employee_document_id = %document.id, "failed to compensate unlinked education evidence upload");
+                }
+                Err(error.into_graphql())
+            }
+        }
+    }
+
     async fn resolve_employee_education(
         &self,
         ctx: &Context<'_>,
@@ -875,6 +909,34 @@ impl MutationRoot {
         .await
         .map_err(KabiPayError::into_graphql)?;
         work_experience_dto(&db, tenant_id, row).await
+    }
+
+    async fn upload_employee_work_experience_evidence(
+        &self,
+        ctx: &Context<'_>,
+        work_experience_id: ID,
+        input: UploadEmployeeDocumentInput,
+    ) -> Result<EmployeeWorkExperienceDto> {
+        let claims = require_client_claims(ctx)?;
+        let tenant_id = require_tenant_id(ctx)?;
+        let db = tenant_db(ctx, tenant_id).await?;
+        let employee_id = parse_uuid(&input.employee_id, "employeeId")?;
+        assert_employee_in_data_scope(ctx, &db, tenant_id, employee_id).await?;
+        let viewer_id = resolve_client_employee_id(ctx, &db, tenant_id).await.ok();
+        if viewer_id != Some(employee_id) && !claims.can_manage_employee_directory() {
+            return Err(KabiPayError::Forbidden("work evidence may only be uploaded by the employee or HR".into()).into_graphql());
+        }
+        let record_id = parse_uuid(&work_experience_id, "workExperienceId")?;
+        let document = upload_profile_document(&db, tenant_id, claims.sub, claims.can_manage_employee_directory(), input).await?;
+        match profile_record_service::link_work_evidence(&db, tenant_id, employee_id, record_id, document.id).await {
+            Ok(row) => work_experience_dto(&db, tenant_id, row).await,
+            Err(error) => {
+                if let Err(cleanup_error) = document_file_service::cleanup_unlinked_employee_document(&db, tenant_id, document.id).await {
+                    tracing::error!(%cleanup_error, employee_document_id = %document.id, "failed to compensate unlinked work evidence upload");
+                }
+                Err(error.into_graphql())
+            }
+        }
     }
 
     async fn resolve_employee_work_experience(

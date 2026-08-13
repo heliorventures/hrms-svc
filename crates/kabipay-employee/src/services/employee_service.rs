@@ -113,6 +113,24 @@ pub async fn find_by_id<C: ConnectionTrait>(
         .map_err(KabiPayError::from)
 }
 
+/// Batch-load active tenant employees for review queues and other bounded enrichments.
+pub async fn find_by_ids<C: ConnectionTrait>(
+    db: &C,
+    tenant_id: Uuid,
+    employee_ids: &[Uuid],
+) -> KabiPayResult<Vec<employee::Model>> {
+    if employee_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    employee::Entity::find()
+        .filter(employee::Column::TenantId.eq(tenant_id))
+        .filter(employee::Column::Id.is_in(employee_ids.iter().copied()))
+        .filter(employee::Column::IsDeleted.eq(false))
+        .all(db)
+        .await
+        .map_err(KabiPayError::from)
+}
+
 /// Every employee in the reporting subtree under `root_employee_id` (including the root).
 /// Assumes an acyclic manager chain; terminates when no new direct reports appear.
 async fn collect_team_subtree_employee_ids(
@@ -182,6 +200,43 @@ pub fn is_employee_in_scope(
     target: &employee::Model,
 ) -> bool {
     employee_model_in_scope(scope, viewer, target)
+}
+
+/// Resolve all employee IDs visible to a caller for cross-record approval queues.
+/// `None` means unrestricted tenant scope; `Some([])` means no visible employees.
+pub async fn employee_ids_in_scope(
+    db: &DatabaseConnection,
+    tenant_id: Uuid,
+    scope: ScopeType,
+    viewer: Option<ClientViewerEmployee>,
+) -> KabiPayResult<Option<Vec<Uuid>>> {
+    let Some(viewer) = viewer else {
+        return Ok(match scope {
+            ScopeType::All => None,
+            _ => Some(Vec::new()),
+        });
+    };
+    let mut query = employee::Entity::find()
+        .filter(employee::Column::TenantId.eq(tenant_id))
+        .filter(employee::Column::IsDeleted.eq(false));
+    query = match scope {
+        ScopeType::All => return Ok(None),
+        ScopeType::Self_ => query.filter(employee::Column::Id.eq(viewer.employee_id)),
+        ScopeType::Team => query.filter(
+            Condition::any()
+                .add(employee::Column::Id.eq(viewer.employee_id))
+                .add(employee::Column::ReportingManagerId.eq(viewer.employee_id)),
+        ),
+        ScopeType::Department => match viewer.department_id {
+            Some(department_id) => query.filter(
+                Condition::any()
+                    .add(employee::Column::Id.eq(viewer.employee_id))
+                    .add(employee::Column::DepartmentId.eq(department_id)),
+            ),
+            None => query.filter(employee::Column::Id.eq(viewer.employee_id)),
+        },
+    };
+    Ok(Some(query.all(db).await?.into_iter().map(|row| row.id).collect()))
 }
 
 /// List the first `limit` non-deleted employees, filtered by the caller’s data scope

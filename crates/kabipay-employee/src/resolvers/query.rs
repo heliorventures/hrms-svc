@@ -15,6 +15,8 @@ use crate::resolvers::types::{
     EmployeeDirectoryPageDto, EmployeeDocumentDto, EmployeeDto, EmployeeIdentityProfileDto,
     EmployeeEducationDto, EmployeePanRecordDto, EmployeeProfileAccessDto,
     EmployeeProfileChangeRequestDto, EmployeeWorkExperienceDto, EmploymentHistoryRecordDto,
+    EmployeeProfileChangeReviewDetailDto, EmployeeProfileReviewQueueItemDto,
+    EmployeeEvidenceReviewQueueItemDto,
     FnfSettlementDto, OnboardingChecklistItemDto, OrgChartRowDto, SeparationDto,
     TenantCatalogPermissionDto, TenantDirectoryRoleDto, TenantDirectoryUserDto,
     TenantPermissionScopeDto,
@@ -143,6 +145,135 @@ impl QueryRoot {
         Ok(rows.into_iter().map(EmployeeProfileChangeRequestDto::from).collect())
     }
 
+    /// HR-only masked queue. Sensitive values require the separate detail query.
+    async fn employee_profile_review_queue(
+        &self,
+        ctx: &Context<'_>,
+        status: Option<String>,
+        #[graphql(default = 50)] limit: i32,
+    ) -> Result<Vec<EmployeeProfileReviewQueueItemDto>> {
+        let claims = require_client_claims(ctx)?;
+        if !claims.can_manage_employee_directory() {
+            return Err(KabiPayError::Forbidden("employee:write is required for the profile review queue".into()).into_graphql());
+        }
+        let tenant_id = require_tenant_id(ctx)?;
+        let db = tenant_db(ctx, tenant_id).await?;
+        let viewer = resolve_viewer_employee(ctx, &db, tenant_id).await?;
+        let scope = data_scope_employee(ctx);
+        let employee_ids = employee_service::employee_ids_in_scope(&db, tenant_id, scope, viewer)
+            .await.map_err(KabiPayError::into_graphql)?;
+        let rows = profile_change_service::list_review_queue(
+            &db,
+            tenant_id,
+            status.as_deref().or(Some("PENDING")),
+            (limit.clamp(1, 100) as u64).saturating_mul(4),
+            employee_ids.as_deref(),
+        )
+        .await
+        .map_err(KabiPayError::into_graphql)?;
+        let employee_ids = rows.iter().map(|row| row.employee_id).collect::<Vec<_>>();
+        let employees = employee_service::find_by_ids(&db, tenant_id, &employee_ids)
+            .await
+            .map_err(KabiPayError::into_graphql)?;
+        let employee_map = employees.into_iter().map(|row| (row.id, row)).collect::<std::collections::HashMap<_, _>>();
+        let mut output = Vec::new();
+        for row in rows {
+            let Some(employee) = employee_map.get(&row.employee_id) else { continue; };
+            if !employee_service::is_employee_in_scope(scope, viewer, employee) {
+                continue;
+            }
+            let has_supporting_document = row.supporting_document_id.is_some();
+            output.push(EmployeeProfileReviewQueueItemDto {
+                request: EmployeeProfileChangeRequestDto::from(row),
+                employee_code: employee.employee_code.clone(),
+                employee_name: format!("{} {}", employee.first_name, employee.last_name).trim().to_string(),
+                has_supporting_document,
+            });
+            if output.len() >= limit.clamp(1, 100) as usize { break; }
+        }
+        Ok(output)
+    }
+
+    /// HR-only, scope-checked request detail containing decrypted current and proposed values.
+    async fn employee_profile_change_review_detail(
+        &self,
+        ctx: &Context<'_>,
+        request_id: ID,
+    ) -> Result<EmployeeProfileChangeReviewDetailDto> {
+        let claims = require_client_claims(ctx)?;
+        if !claims.can_manage_employee_directory() {
+            return Err(KabiPayError::Forbidden("employee:write is required to inspect profile changes".into()).into_graphql());
+        }
+        let tenant_id = require_tenant_id(ctx)?;
+        let db = tenant_db(ctx, tenant_id).await?;
+        let request_id = parse_uuid(&request_id, "requestId")?;
+        let request = profile_change_service::find_request(&db, tenant_id, request_id)
+            .await
+            .map_err(KabiPayError::into_graphql)?
+            .ok_or_else(|| KabiPayError::NotFound { entity: "employeeProfileChangeRequest", id: request_id.to_string() }.into_graphql())?;
+        if request.status != "PENDING" {
+            return Err(KabiPayError::Conflict("protected values are available only while a request is pending".into()).into_graphql());
+        }
+        assert_employee_in_data_scope(ctx, &db, tenant_id, request.employee_id).await?;
+        let employee = employee_service::find_by_id(&db, tenant_id, request.employee_id)
+            .await
+            .map_err(KabiPayError::into_graphql)?
+            .ok_or_else(|| KabiPayError::NotFound { entity: "employee", id: request.employee_id.to_string() }.into_graphql())?;
+        let (current_values, requested_values) = profile_change_service::review_values(&db, &request)
+            .await
+            .map_err(KabiPayError::into_graphql)?;
+        Ok(EmployeeProfileChangeReviewDetailDto {
+            request: EmployeeProfileChangeRequestDto::from(request),
+            employee_code: employee.employee_code,
+            employee_name: format!("{} {}", employee.first_name, employee.last_name).trim().to_string(),
+            current_values: async_graphql::Json(current_values),
+            requested_values: async_graphql::Json(requested_values),
+        })
+    }
+
+    async fn employee_evidence_review_queue(
+        &self,
+        ctx: &Context<'_>,
+        #[graphql(default = 100)] limit: i32,
+    ) -> Result<Vec<EmployeeEvidenceReviewQueueItemDto>> {
+        let claims = require_client_claims(ctx)?;
+        if !claims.can_manage_employee_directory() {
+            return Err(KabiPayError::Forbidden("employee:write is required for evidence review".into()).into_graphql());
+        }
+        let tenant_id = require_tenant_id(ctx)?;
+        let db = tenant_db(ctx, tenant_id).await?;
+        let scope = data_scope_employee(ctx);
+        let viewer = resolve_viewer_employee(ctx, &db, tenant_id).await?;
+        let employee_ids = employee_service::employee_ids_in_scope(&db, tenant_id, scope, viewer)
+            .await.map_err(KabiPayError::into_graphql)?;
+        let records = profile_record_service::list_pending_evidence_reviews(&db, tenant_id, limit.clamp(1, 100) as u64, employee_ids.as_deref())
+            .await.map_err(KabiPayError::into_graphql)?;
+        let employee_ids = records.iter().map(|row| row.employee_id()).collect::<Vec<_>>();
+        let employees = employee_service::find_by_ids(&db, tenant_id, &employee_ids).await.map_err(KabiPayError::into_graphql)?;
+        let employee_map = employees.into_iter().map(|row| (row.id, row)).collect::<std::collections::HashMap<_, _>>();
+        let education_ids = records.iter().filter_map(|row| match row { profile_record_service::PendingEvidenceRecord::Education(row) => Some(row.id), _ => None }).collect::<Vec<_>>();
+        let work_ids = records.iter().filter_map(|row| match row { profile_record_service::PendingEvidenceRecord::Work(row) => Some(row.id), _ => None }).collect::<Vec<_>>();
+        let education_evidence = profile_record_service::education_evidence_ids_by_record(&db, tenant_id, &education_ids).await.map_err(KabiPayError::into_graphql)?;
+        let work_evidence = profile_record_service::work_evidence_ids_by_record(&db, tenant_id, &work_ids).await.map_err(KabiPayError::into_graphql)?;
+        let mut output = Vec::new();
+        for record in records {
+            let Some(employee) = employee_map.get(&record.employee_id()) else { continue; };
+            if !employee_service::is_employee_in_scope(scope, viewer, employee) { continue; }
+            let (evidence_type, summary, evidence_ids) = match &record {
+                profile_record_service::PendingEvidenceRecord::Education(row) => (
+                    "EDUCATION".to_string(), format!("{} · {}", row.qualification, row.institution), education_evidence.get(&row.id).cloned().unwrap_or_default()),
+                profile_record_service::PendingEvidenceRecord::Work(row) => (
+                    "WORK_EXPERIENCE".to_string(), format!("{} · {}", row.role_title, row.company), work_evidence.get(&row.id).cloned().unwrap_or_default()),
+            };
+            output.push(EmployeeEvidenceReviewQueueItemDto {
+                record_id: ID(record.record_id().to_string()), employee_id: ID(employee.id.to_string()),
+                employee_code: employee.employee_code.clone(), employee_name: format!("{} {}", employee.first_name, employee.last_name).trim().to_string(),
+                evidence_type, summary, evidence_document_ids: evidence_ids.into_iter().map(|id| ID(id.to_string())).collect(), created_at: record.created_at(),
+            });
+        }
+        Ok(output)
+    }
+
     async fn employee_education_records(
         &self,
         ctx: &Context<'_>,
@@ -165,15 +296,15 @@ impl QueryRoot {
         let rows = profile_record_service::list_education(&db, tenant_id, employee_id)
             .await
             .map_err(KabiPayError::into_graphql)?;
+        let record_ids = rows.iter().map(|row| row.id).collect::<Vec<_>>();
+        let evidence_by_record = profile_record_service::education_evidence_ids_by_record(
+            &db, tenant_id, &record_ids,
+        )
+        .await
+        .map_err(KabiPayError::into_graphql)?;
         let mut output = Vec::with_capacity(rows.len());
         for row in rows {
-            let evidence_ids = profile_record_service::education_evidence_ids(
-                &db,
-                tenant_id,
-                row.id,
-            )
-            .await
-            .map_err(KabiPayError::into_graphql)?;
+            let evidence_ids = evidence_by_record.get(&row.id).cloned().unwrap_or_default();
             output.push(EmployeeEducationDto::from_model(row, evidence_ids));
         }
         Ok(output)
@@ -201,11 +332,15 @@ impl QueryRoot {
         let rows = profile_record_service::list_work_experience(&db, tenant_id, employee_id)
             .await
             .map_err(KabiPayError::into_graphql)?;
+        let record_ids = rows.iter().map(|row| row.id).collect::<Vec<_>>();
+        let evidence_by_record = profile_record_service::work_evidence_ids_by_record(
+            &db, tenant_id, &record_ids,
+        )
+        .await
+        .map_err(KabiPayError::into_graphql)?;
         let mut output = Vec::with_capacity(rows.len());
         for row in rows {
-            let evidence_ids = profile_record_service::work_evidence_ids(&db, tenant_id, row.id)
-                .await
-                .map_err(KabiPayError::into_graphql)?;
+            let evidence_ids = evidence_by_record.get(&row.id).cloned().unwrap_or_default();
             output.push(EmployeeWorkExperienceDto::from_model(row, evidence_ids));
         }
         Ok(output)
@@ -330,6 +465,7 @@ impl QueryRoot {
                 let dt = dt_map.get(&m.document_type_id);
                 EmployeeDocumentDto::from(m).with_file_and_type(
                     fs.and_then(|f| f.original_filename.clone()),
+                    fs.and_then(|f| f.mime_type.clone()),
                     fs.and_then(|f| f.uploaded_by),
                     dt.map(|d| d.name.clone()),
                     dt.and_then(|d| d.category.clone()),

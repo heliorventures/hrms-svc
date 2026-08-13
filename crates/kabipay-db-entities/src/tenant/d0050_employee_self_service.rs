@@ -84,6 +84,8 @@ pub mod employee_profile_change_request {
         pub requested_by: Uuid,
         pub request_type: String,
         pub requested_payload: Json,
+        pub requested_payload_encrypted: Option<Vec<u8>>,
+        pub payload_encryption_version: Option<i16>,
         pub status: String,
         pub supporting_document_id: Option<Uuid>,
         pub reviewed_by: Option<Uuid>,
