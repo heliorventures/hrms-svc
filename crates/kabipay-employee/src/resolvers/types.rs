@@ -471,6 +471,9 @@ pub struct UpdateEmployeeInput {
     pub employment_type: Option<String>,
     pub status: Option<String>,
     pub user_id: Option<ID>,
+    /// Optional linked login email. Omit to leave unchanged; pass an empty string to clear it.
+    #[graphql(name = "linkedUserEmail")]
+    pub linked_user_email: Option<String>,
 }
 
 #[derive(InputObject, Clone, Debug)]

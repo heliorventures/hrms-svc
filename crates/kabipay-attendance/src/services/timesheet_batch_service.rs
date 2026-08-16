@@ -12,6 +12,7 @@ use kabipay_common::{
     },
     KabiPayError, KabiPayResult,
 };
+use kabipay_db_entities::tenant::d0007_employee_core::employee;
 use kabipay_db_entities::tenant::d0010_time_shift_roster::{timesheet_entry, timesheet_week_batch};
 use kabipay_db_entities::tenant::d0025_workflow::{
     workflow, workflow_action, workflow_instance, workflow_step,
@@ -117,6 +118,31 @@ async fn try_attach_timesheet_workflow(
     Ok(())
 }
 
+async fn assert_actor_is_not_subject_employee(
+    conn: &impl ConnectionTrait,
+    tenant_id: Uuid,
+    actor_user_id: Uuid,
+    subject_employee_id: Uuid,
+) -> KabiPayResult<()> {
+    let subject = employee::Entity::find_by_id(subject_employee_id)
+        .filter(employee::Column::TenantId.eq(tenant_id))
+        .filter(employee::Column::IsDeleted.eq(false))
+        .one(conn)
+        .await?
+        .ok_or_else(|| KabiPayError::NotFound {
+            entity: "employee",
+            id: subject_employee_id.to_string(),
+        })?;
+
+    if subject.user_id == Some(actor_user_id) {
+        return Err(KabiPayError::Forbidden(
+            "you cannot approve or reject your own timesheet submission".into(),
+        ));
+    }
+
+    Ok(())
+}
+
 /// Employee submits all draft rows Mon-Sun `week_start`; starts workflow when configured.
 pub async fn submit_timesheet_week(
     db: &DatabaseConnection,
@@ -165,21 +191,53 @@ pub async fn submit_timesheet_week(
 
     let txn = db.begin().await?;
     let now = Utc::now();
-    let batch_id = Uuid::new_v4();
+    let existing_batch = timesheet_week_batch::Entity::find()
+        .filter(timesheet_week_batch::Column::TenantId.eq(tenant_id))
+        .filter(timesheet_week_batch::Column::EmployeeId.eq(employee_id))
+        .filter(timesheet_week_batch::Column::WeekStartDate.eq(mon))
+        .lock_exclusive()
+        .one(&txn)
+        .await?;
 
-    let batch_am = timesheet_week_batch::ActiveModel {
-        id: Set(batch_id),
-        tenant_id: Set(tenant_id),
-        employee_id: Set(employee_id),
-        week_start_date: Set(mon),
-        status: Set(BATCH_PENDING.into()),
-        workflow_instance_id: Set(None),
-        submitted_at: Set(Some(now)),
-        rejection_reason: Set(None),
-        created_at: Set(now),
-        updated_at: Set(now),
+    let batch_id = if let Some(batch) = existing_batch {
+        let status = batch.status.trim().to_uppercase();
+        if status == BATCH_PENDING || status == BATCH_APPROVED {
+            return Err(KabiPayError::Validation(
+                "this week already has a submission".into(),
+            ));
+        }
+        if status != BATCH_REJECTED {
+            return Err(KabiPayError::Validation(format!(
+                "timesheet week cannot be resubmitted from status {}",
+                batch.status
+            )));
+        }
+        let batch_id = batch.id;
+        let mut batch_am: timesheet_week_batch::ActiveModel = batch.into();
+        batch_am.status = Set(BATCH_PENDING.into());
+        batch_am.workflow_instance_id = Set(None);
+        batch_am.submitted_at = Set(Some(now));
+        batch_am.rejection_reason = Set(None);
+        batch_am.updated_at = Set(now);
+        batch_am.update(&txn).await?;
+        batch_id
+    } else {
+        let batch_id = Uuid::new_v4();
+        let batch_am = timesheet_week_batch::ActiveModel {
+            id: Set(batch_id),
+            tenant_id: Set(tenant_id),
+            employee_id: Set(employee_id),
+            week_start_date: Set(mon),
+            status: Set(BATCH_PENDING.into()),
+            workflow_instance_id: Set(None),
+            submitted_at: Set(Some(now)),
+            rejection_reason: Set(None),
+            created_at: Set(now),
+            updated_at: Set(now),
+        };
+        batch_am.insert(&txn).await?;
+        batch_id
     };
-    batch_am.insert(&txn).await?;
 
     try_attach_timesheet_workflow(&txn, tenant_id, batch_id, employee_id, now).await?;
 
@@ -282,6 +340,8 @@ pub async fn approve_timesheet_week_batch(
             "only pending submissions can be approved".into(),
         ));
     }
+    assert_actor_is_not_subject_employee(&txn, tenant_id, approver_user_id, batch.employee_id)
+        .await?;
 
     let now = Utc::now();
 
@@ -409,6 +469,8 @@ pub async fn reject_timesheet_week_batch(
             "only pending submissions can be rejected".into(),
         ));
     }
+    assert_actor_is_not_subject_employee(&txn, tenant_id, rejector_user_id, batch.employee_id)
+        .await?;
 
     let now = Utc::now();
 
@@ -579,6 +641,17 @@ pub async fn timesheet_week_batch_viewer_may_approve(
     subject_employee_id: Uuid,
     workflow_instance_id: Option<Uuid>,
 ) -> KabiPayResult<bool> {
+    if let Some(subject) = employee::Entity::find_by_id(subject_employee_id)
+        .filter(employee::Column::TenantId.eq(tenant_id))
+        .filter(employee::Column::IsDeleted.eq(false))
+        .one(db)
+        .await?
+    {
+        if subject.user_id == Some(viewer_user_id) {
+            return Ok(false);
+        }
+    }
+
     workflow_inbox::viewer_may_approve_pending_row(
         db,
         tenant_id,

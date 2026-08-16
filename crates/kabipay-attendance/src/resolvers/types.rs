@@ -7,8 +7,10 @@ use kabipay_common::KabiPayError;
 use kabipay_db_entities::tenant::d0010_time_shift_roster::{
     attendance, holiday, holiday_calendar, shift, timesheet_entry, timesheet_week_batch,
 };
+use kabipay_db_entities::tenant::d0007_employee_core::employee;
 use kabipay_db_entities::tenant::d0032_attendance_punch_policy::attendance_punch_policy;
 use rust_decimal::prelude::ToPrimitive;
+use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
 use uuid::Uuid;
 
 use crate::resolvers::query::parse_uuid;
@@ -184,6 +186,35 @@ impl TimesheetWeekBatchDto {
         )
         .await
         .map_err(KabiPayError::into_graphql)
+    }
+
+    async fn employee_code(&self, ctx: &Context<'_>) -> Result<Option<String>> {
+        let tenant_id = require_tenant_id(ctx)?;
+        let db = tenant_db(ctx, tenant_id).await?;
+        let employee_id = parse_uuid(&self.employee_id, "employeeId")?;
+        let row = employee::Entity::find_by_id(employee_id)
+            .filter(employee::Column::TenantId.eq(tenant_id))
+            .filter(employee::Column::IsDeleted.eq(false))
+            .one(&db)
+            .await
+            .map_err(|error| KabiPayError::from(error).into_graphql())?
+            .map(|employee| employee.employee_code);
+        Ok(row)
+    }
+
+    async fn employee_name(&self, ctx: &Context<'_>) -> Result<Option<String>> {
+        let tenant_id = require_tenant_id(ctx)?;
+        let db = tenant_db(ctx, tenant_id).await?;
+        let employee_id = parse_uuid(&self.employee_id, "employeeId")?;
+        let row = employee::Entity::find_by_id(employee_id)
+            .filter(employee::Column::TenantId.eq(tenant_id))
+            .filter(employee::Column::IsDeleted.eq(false))
+            .one(&db)
+            .await
+            .map_err(|error| KabiPayError::from(error).into_graphql())?
+            .map(|employee| format!("{} {}", employee.first_name, employee.last_name).trim().to_string())
+            .filter(|name| !name.is_empty());
+        Ok(row)
     }
 }
 

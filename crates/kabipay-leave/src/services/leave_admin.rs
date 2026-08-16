@@ -1,6 +1,6 @@
 //! Tenant admin configuration: leave types, policies, and balances.
 
-use chrono::Utc;
+use chrono::{Datelike, NaiveDate, Utc};
 use kabipay_common::{KabiPayError, KabiPayResult};
 use kabipay_db_entities::tenant::d0007_employee_core::employee;
 use kabipay_db_entities::tenant::d0011_leave::{leave_balance, leave_policy, leave_type};
@@ -15,13 +15,22 @@ fn normalize_code(code: &str) -> String {
     code.trim().to_ascii_uppercase()
 }
 
+fn balance_days_from_components(
+    entitled: Decimal,
+    carried: Decimal,
+    used: Decimal,
+    pending: Decimal,
+) -> Decimal {
+    entitled + carried - used - pending
+}
+
 fn compute_balance_days(
     entitled: Decimal,
     carried: Decimal,
     used: Decimal,
     pending: Decimal,
 ) -> KabiPayResult<Decimal> {
-    let v = entitled + carried - used - pending;
+    let v = balance_days_from_components(entitled, carried, used, pending);
     if v < Decimal::ZERO {
         return Err(KabiPayError::Validation(
             "balance_days would be negative — check entitled, carried forward, used, and pending"
@@ -253,9 +262,56 @@ pub async fn delete_leave_policy(
     Ok(r.rows_affected > 0)
 }
 
-/// Effective annual entitlement from a policy row: uses `annual_entitlement` when set,
-/// otherwise `accrual_days * 12` when `accrual_frequency` is MONTHLY (case-insensitive).
+/// Effective entitlement from a policy row as of today. Fixed annual policies use
+/// `annual_entitlement`; monthly policies use earned months in the current year.
 pub fn entitled_days_from_policy(pol: &leave_policy::Model) -> Option<Decimal> {
+    let as_of = Utc::now().date_naive();
+    entitled_days_from_policy_as_of(pol, None, as_of.year(), as_of)
+}
+
+fn first_day_of_month(year: i32, month: u32) -> NaiveDate {
+    NaiveDate::from_ymd_opt(year, month, 1).expect("valid first day for a calendar month")
+}
+
+fn first_monthly_accrual_date(joining_date: NaiveDate) -> NaiveDate {
+    if joining_date.day() == 1 {
+        return joining_date;
+    }
+    if joining_date.month() == 12 {
+        first_day_of_month(joining_date.year() + 1, 1)
+    } else {
+        first_day_of_month(joining_date.year(), joining_date.month() + 1)
+    }
+}
+
+fn monthly_accrual_months(year: i32, joining_date: Option<NaiveDate>, as_of: NaiveDate) -> u32 {
+    let year_start = first_day_of_month(year, 1);
+    let year_end = NaiveDate::from_ymd_opt(year, 12, 31).expect("valid last day for December");
+    if as_of < year_start {
+        return 0;
+    }
+    let effective_as_of = if as_of > year_end { year_end } else { as_of };
+    let employee_start = joining_date.map(first_monthly_accrual_date).unwrap_or(year_start);
+    let start = if employee_start > year_start {
+        employee_start
+    } else {
+        year_start
+    };
+    if start > effective_as_of {
+        return 0;
+    }
+    ((effective_as_of.year() - start.year()) as u32 * 12)
+        + effective_as_of.month()
+        - start.month()
+        + 1
+}
+
+pub fn entitled_days_from_policy_as_of(
+    pol: &leave_policy::Model,
+    joining_date: Option<NaiveDate>,
+    year: i32,
+    as_of: NaiveDate,
+) -> Option<Decimal> {
     if let Some(a) = pol.annual_entitlement {
         return Some(Decimal::from(a));
     }
@@ -266,13 +322,15 @@ pub fn entitled_days_from_policy(pol: &leave_policy::Model) -> Option<Decimal> {
         .unwrap_or_default();
     if freq == "MONTHLY" {
         let per = pol.accrual_days.unwrap_or(Decimal::ZERO);
-        return Some(per * Decimal::from(12));
+        let months = monthly_accrual_months(year, joining_date, as_of);
+        return Some(per * Decimal::from(months));
     }
     None
 }
 
 /// For every active employee and each distinct leave type policy (first policy row wins per type),
-/// upsert `leave_balance` for `year` so `entitled_days` matches the policy entitlement.
+/// upsert `leave_balance` for `year` so `entitled_days` matches fixed annual entitlement or
+/// monthly earned entitlement as of today.
 /// Existing **used** / **pending** / **carried_forward** values are preserved; `balance_days` is recomputed.
 /// Skips policy rows whose `applicable_to` is set to anything other than ALL / * / empty.
 pub async fn provision_leave_balances_from_policies(
@@ -307,7 +365,10 @@ pub async fn provision_leave_balances_from_policies(
                     continue;
                 }
             }
-            let Some(target_entitled) = entitled_days_from_policy(pol) else {
+            let as_of = Utc::now().date_naive();
+            let Some(target_entitled) =
+                entitled_days_from_policy_as_of(pol, Some(emp.date_of_joining), year, as_of)
+            else {
                 continue;
             };
             if target_entitled <= Decimal::ZERO {
@@ -324,12 +385,12 @@ pub async fn provision_leave_balances_from_policies(
                 .map_err(KabiPayError::from)?;
 
             if let Some(row) = existing {
-                let balance_days = compute_balance_days(
+                let balance_days = balance_days_from_components(
                     target_entitled,
                     row.carried_forward_days,
                     row.used_days,
                     row.pending_days,
-                )?;
+                );
                 let mut am: leave_balance::ActiveModel = row.into();
                 am.entitled_days = Set(target_entitled);
                 am.balance_days = Set(balance_days);
@@ -502,4 +563,50 @@ pub async fn adjust_leave_balance_entitlement(
     am.balance_days = Set(balance);
     am.updated_at = Set(now);
     Ok(am.update(db).await.map_err(KabiPayError::from)?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn monthly_policy(days: Decimal) -> leave_policy::Model {
+        let now = Utc::now();
+        leave_policy::Model {
+            id: Uuid::nil(),
+            tenant_id: Uuid::nil(),
+            leave_type_id: Uuid::nil(),
+            applicable_to: None,
+            annual_entitlement: None,
+            accrual_frequency: Some("MONTHLY".into()),
+            accrual_days: Some(days),
+            max_consecutive_days: None,
+            min_notice_days: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    #[test]
+    fn monthly_policy_credits_only_elapsed_eligible_months() {
+        let policy = monthly_policy(Decimal::new(125, 2));
+        let joining = NaiveDate::from_ymd_opt(2025, 6, 1).unwrap();
+        let as_of = NaiveDate::from_ymd_opt(2026, 8, 16).unwrap();
+
+        assert_eq!(
+            entitled_days_from_policy_as_of(&policy, Some(joining), 2026, as_of),
+            Some(Decimal::new(1000, 2))
+        );
+    }
+
+    #[test]
+    fn monthly_policy_skips_partial_joining_month() {
+        let policy = monthly_policy(Decimal::new(125, 2));
+        let joining = NaiveDate::from_ymd_opt(2026, 3, 10).unwrap();
+        let as_of = NaiveDate::from_ymd_opt(2026, 8, 16).unwrap();
+
+        assert_eq!(
+            entitled_days_from_policy_as_of(&policy, Some(joining), 2026, as_of),
+            Some(Decimal::new(625, 2))
+        );
+    }
 }

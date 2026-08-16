@@ -151,7 +151,7 @@ impl QueryRoot {
                 .await
                 .map_err(KabiPayError::into_graphql)?
         };
-        let scope = data_scope_from_context(ctx, SCOPE_RES_ATTENDANCE);
+        let scope = data_scope_from_context(ctx, SCOPE_RES_TIMESHEET);
         let viewer = resolve_viewer_employee(ctx, &db, tenant_id).await?;
         let filt = resolve_employee_scope_filter(&db, tenant_id, scope, viewer)
             .await

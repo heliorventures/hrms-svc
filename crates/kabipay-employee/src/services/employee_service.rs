@@ -59,6 +59,45 @@ async fn sync_linked_user_status<C: ConnectionTrait>(
     Ok(())
 }
 
+async fn update_linked_user_email<C: ConnectionTrait>(
+    db: &C,
+    tenant_id: Uuid,
+    user_id: Option<Uuid>,
+    email: Option<String>,
+) -> KabiPayResult<()> {
+    let user_id = user_id.ok_or_else(|| {
+        KabiPayError::Validation("employee does not have a linked login user".into())
+    })?;
+    let normalized = normalize_email(email);
+    if let Some(ref email_value) = normalized {
+        let existing = user::Entity::find()
+            .filter(user::Column::TenantId.eq(tenant_id))
+            .filter(user::Column::Email.eq(email_value))
+            .filter(user::Column::Id.ne(user_id))
+            .one(db)
+            .await?;
+        if existing.is_some() {
+            return Err(KabiPayError::Conflict(
+                "email is already in use in this tenant".into(),
+            ));
+        }
+    }
+    let user_row = user::Entity::find_by_id(user_id)
+        .filter(user::Column::TenantId.eq(tenant_id))
+        .filter(user::Column::IsDeleted.eq(false))
+        .one(db)
+        .await?
+        .ok_or_else(|| KabiPayError::NotFound {
+            entity: "user",
+            id: user_id.to_string(),
+        })?;
+    let mut am: user::ActiveModel = user_row.into();
+    am.email = Set(normalized);
+    am.updated_at = Set(Utc::now());
+    am.update(db).await?;
+    Ok(())
+}
+
 /// `new_manager` must exist, differ from `subject_employee_id`, and must not create a reporting loop.
 pub async fn assert_valid_reporting_manager<C: ConnectionTrait>(
     db: &C,
@@ -571,6 +610,8 @@ pub struct EmployeePatch {
     pub employment_type: Option<String>,
     pub status: Option<String>,
     pub user_id: Option<Uuid>,
+    /// Omitted = leave unchanged; Some("") clears the optional linked login email.
+    pub linked_user_email: Option<String>,
 }
 
 pub async fn create_with_login(
@@ -710,9 +751,13 @@ pub async fn update(
         final_status = v.clone();
         am.status = Set(v);
     }
+    let linked_user_email = patch.linked_user_email;
     am.user_id = Set(final_user_id);
     am.updated_at = Set(Utc::now());
     am.update(&txn).await?;
+    if let Some(email) = linked_user_email {
+        update_linked_user_email(&txn, tenant_id, final_user_id, Some(email)).await?;
+    }
     sync_linked_user_status(&txn, tenant_id, final_user_id, &final_status).await?;
     let updated = find_by_id(&txn, tenant_id, employee_id)
         .await?

@@ -652,7 +652,7 @@ impl QueryRoot {
             })?;
         let ttl = ttl_seconds.clamp(60, 86_400) as i64;
         let claims = download_claims(tenant_id, file_id, fs_row.mime_type.clone(), ttl);
-        Ok(document_file_service::public_download_url(&claims))
+        document_file_service::public_download_url(&claims).map_err(KabiPayError::into_graphql)
     }
 
     /// Onboarding tasks for an employee. Omit `employeeId` for the JWT subject’s checklist.

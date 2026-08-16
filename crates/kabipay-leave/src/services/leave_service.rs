@@ -310,6 +310,7 @@ const WF_ENTITY_LEAVE: &str = "LEAVE_REQUEST";
 const WF_STATUS_IN_PROGRESS: &str = "IN_PROGRESS";
 const WF_STATUS_COMPLETED: &str = "COMPLETED";
 const WF_STATUS_CANCELLED: &str = "CANCELLED";
+const WF_STATUS_REJECTED: &str = "REJECTED";
 const WF_ACTION_APPROVE: &str = "APPROVE";
 const WF_ACTION_REJECT: &str = "REJECT";
 
@@ -717,7 +718,7 @@ pub async fn reject_leave_request(
                     act.insert(&txn).await?;
                 }
                 let mut am_inst: workflow_instance::ActiveModel = inst.into();
-                am_inst.status = Set(WF_STATUS_CANCELLED.into());
+                am_inst.status = Set(WF_STATUS_REJECTED.into());
                 am_inst.completed_at = Set(Some(now));
                 am_inst.updated_at = Set(now);
                 am_inst.update(&txn).await?;

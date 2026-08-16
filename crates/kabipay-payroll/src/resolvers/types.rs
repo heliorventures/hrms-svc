@@ -4,7 +4,8 @@ use async_graphql::{InputObject, SimpleObject, ID};
 use kabipay_db_entities::tenant::d0035_payroll_arrear::payroll_arrear;
 use chrono::{DateTime, NaiveDate, Utc};
 use kabipay_db_entities::tenant::d0012_payroll::{
-    payroll_compliance_setting, payroll_cycle, payslip, payslip_component, salary_component,
+    employee_salary_structure, payroll_compliance_setting, payroll_cycle, payslip,
+    payslip_component, salary_component, salary_structure, salary_structure_component,
 };
 
 #[derive(SimpleObject, Clone, Debug)]
@@ -18,6 +19,7 @@ pub struct SalaryComponentDto {
     pub is_taxable: bool,
     pub is_fixed: bool,
     pub is_active: bool,
+    pub formula_expression: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -33,10 +35,123 @@ impl From<salary_component::Model> for SalaryComponentDto {
             is_taxable: m.is_taxable,
             is_fixed: m.is_fixed,
             is_active: m.is_active,
+            formula_expression: m.formula_expression,
             created_at: m.created_at,
             updated_at: m.updated_at,
         }
     }
+}
+
+#[derive(SimpleObject, Clone, Debug)]
+#[graphql(name = "SalaryStructureComponent")]
+pub struct SalaryStructureComponentDto {
+    pub id: ID,
+    pub salary_component_id: ID,
+    pub component_name: String,
+    pub component_code: String,
+    pub component_type: String,
+    pub calculation_basis: String,
+    pub calculation_value: Option<String>,
+    pub display_order: i32,
+}
+
+impl SalaryStructureComponentDto {
+    pub fn from_parts(m: salary_structure_component::Model, component: salary_component::Model) -> Self {
+        Self {
+            id: ID(m.id.to_string()),
+            salary_component_id: ID(m.salary_component_id.to_string()),
+            component_name: component.name,
+            component_code: component.code,
+            component_type: component.r#type,
+            calculation_basis: m.calculation_basis,
+            calculation_value: m
+                .calculation_value
+                .or(m.percentage_of_basic)
+                .or(m.amount)
+                .map(|d| d.to_string()),
+            display_order: m.display_order,
+        }
+    }
+}
+
+#[derive(SimpleObject, Clone, Debug)]
+#[graphql(name = "SalaryStructure")]
+pub struct SalaryStructureDto {
+    pub id: ID,
+    pub tenant_id: ID,
+    pub name: String,
+    pub description: Option<String>,
+    pub components: Vec<SalaryStructureComponentDto>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+impl SalaryStructureDto {
+    pub fn from_head(m: salary_structure::Model, components: Vec<SalaryStructureComponentDto>) -> Self {
+        Self {
+            id: ID(m.id.to_string()),
+            tenant_id: ID(m.tenant_id.to_string()),
+            name: m.name,
+            description: m.description,
+            components,
+            created_at: m.created_at,
+            updated_at: m.updated_at,
+        }
+    }
+}
+
+#[derive(SimpleObject, Clone, Debug)]
+#[graphql(name = "EmployeeSalaryStructure")]
+pub struct EmployeeSalaryStructureDto {
+    pub id: ID,
+    pub employee_id: ID,
+    pub salary_structure_id: ID,
+    pub ctc: String,
+    pub effective_from: NaiveDate,
+    pub effective_to: Option<NaiveDate>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+impl From<employee_salary_structure::Model> for EmployeeSalaryStructureDto {
+    fn from(m: employee_salary_structure::Model) -> Self {
+        Self {
+            id: ID(m.id.to_string()),
+            employee_id: ID(m.employee_id.to_string()),
+            salary_structure_id: ID(m.salary_structure_id.to_string()),
+            ctc: m.ctc.to_string(),
+            effective_from: m.effective_from,
+            effective_to: m.effective_to,
+            created_at: m.created_at,
+            updated_at: m.updated_at,
+        }
+    }
+}
+
+#[derive(SimpleObject, Clone, Debug)]
+#[graphql(name = "SalaryBreakupLine")]
+pub struct SalaryBreakupLineDto {
+    pub salary_component_id: ID,
+    pub component_name: String,
+    pub component_code: String,
+    pub component_type: String,
+    pub calculation_basis: String,
+    pub calculation_value: String,
+    pub annual_amount: String,
+    pub monthly_amount: String,
+    pub is_override: bool,
+}
+
+#[derive(SimpleObject, Clone, Debug)]
+#[graphql(name = "SalaryBreakupPreview")]
+pub struct SalaryBreakupPreviewDto {
+    pub employee_id: ID,
+    pub employee_salary_structure_id: Option<ID>,
+    pub annual_ctc: String,
+    pub monthly_gross: String,
+    pub monthly_deductions: String,
+    pub monthly_net_before_statutory: String,
+    pub lines: Vec<SalaryBreakupLineDto>,
 }
 
 #[derive(SimpleObject, Clone, Debug)]
@@ -234,6 +349,53 @@ pub struct UpsertPayrollComplianceSettingInput {
     pub arrear_salary_component_code: Option<String>,
     pub payslip_header_title: Option<String>,
     pub payslip_logo_file_storage_id: Option<ID>,
+}
+
+#[derive(InputObject, Clone, Debug)]
+pub struct UpsertSalaryComponentInput {
+    pub id: Option<ID>,
+    pub name: String,
+    pub code: String,
+    pub component_type: String,
+    pub is_taxable: bool,
+    pub is_fixed: bool,
+    pub is_active: bool,
+    pub formula_expression: Option<String>,
+}
+
+#[derive(InputObject, Clone, Debug)]
+pub struct SalaryStructureComponentInput {
+    pub salary_component_id: ID,
+    pub calculation_basis: String,
+    pub calculation_value: String,
+    pub display_order: i32,
+}
+
+#[derive(InputObject, Clone, Debug)]
+pub struct UpsertSalaryStructureInput {
+    pub id: Option<ID>,
+    pub name: String,
+    pub description: Option<String>,
+    pub components: Vec<SalaryStructureComponentInput>,
+}
+
+#[derive(InputObject, Clone, Debug)]
+pub struct EmployeeSalaryComponentOverrideInput {
+    pub salary_component_id: ID,
+    pub calculation_basis: String,
+    pub calculation_value: String,
+    pub notes: Option<String>,
+    pub is_active: bool,
+}
+
+#[derive(InputObject, Clone, Debug)]
+pub struct AssignEmployeeSalaryStructureInput {
+    pub employee_id: ID,
+    pub salary_structure_id: ID,
+    pub annual_ctc: String,
+    pub effective_from: NaiveDate,
+    pub effective_to: Option<NaiveDate>,
+    pub overrides: Vec<EmployeeSalaryComponentOverrideInput>,
 }
 
 /// Create a new tenant payroll period row (`DRAFT`). One cycle per (tenant, month, year) in v1.

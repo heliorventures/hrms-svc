@@ -60,6 +60,8 @@ pub mod salary_structure_component {
         pub salary_component_id: Uuid,
         pub amount: Option<Decimal>,
         pub percentage_of_basic: Option<Decimal>,
+        pub calculation_basis: String,
+        pub calculation_value: Option<Decimal>,
         pub display_order: i32,
         pub created_at: DateTimeUtc,
         pub updated_at: DateTimeUtc,
@@ -85,6 +87,31 @@ pub mod employee_salary_structure {
         pub ctc: Decimal,
         pub effective_from: NaiveDate,
         pub effective_to: Option<NaiveDate>,
+        pub created_at: DateTimeUtc,
+        pub updated_at: DateTimeUtc,
+    }
+
+    impl ActiveModelBehavior for ActiveModel {}
+
+    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
+    pub enum Relation {}
+}
+
+pub mod employee_salary_component_override {
+    use crate::tenant::prelude::*;
+
+    #[derive(Clone, Debug, PartialEq, DeriveEntityModel)]
+    #[sea_orm(table_name = "employee_salary_component_override")]
+    pub struct Model {
+        #[sea_orm(primary_key, auto_increment = false)]
+        pub id: Uuid,
+        pub tenant_id: Uuid,
+        pub employee_salary_structure_id: Uuid,
+        pub salary_component_id: Uuid,
+        pub calculation_basis: String,
+        pub calculation_value: Decimal,
+        pub notes: Option<String>,
+        pub is_active: bool,
         pub created_at: DateTimeUtc,
         pub updated_at: DateTimeUtc,
     }

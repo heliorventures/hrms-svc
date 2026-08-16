@@ -85,7 +85,9 @@ impl AnnouncementDto {
                 .into_graphql()
             })?;
         let claims = file_download_claims(tenant_id, storage_id, fs_row.mime_type.clone(), 600);
-        Ok(Some(public_employee_file_download_url(&claims)))
+        public_employee_file_download_url(&claims)
+            .map(Some)
+            .map_err(KabiPayError::into_graphql)
     }
 }
 

@@ -9,6 +9,7 @@ use sha2::Sha256;
 use uuid::Uuid;
 
 use crate::jwt::jwt_secret_from_env;
+use crate::{KabiPayError, KabiPayResult};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -63,11 +64,83 @@ pub fn file_download_claims(
     }
 }
 
-/// Full URL for `GET /files/employee-document?token=…` on **kabipay-employee** (port from env).
-pub fn public_employee_file_download_url(claims: &FileDownloadClaims) -> String {
-    let base = std::env::var("KABIPAY_EMPLOYEE_PUBLIC_BASE")
-        .unwrap_or_else(|_| "http://127.0.0.1:4013".to_string());
+fn allow_local_download_base() -> bool {
+    cfg!(debug_assertions)
+        || std::env::var("KABIPAY_ALLOW_LOCAL_FILE_DOWNLOAD_BASE")
+            .map(|value| value.trim().eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+}
+
+fn host_from_http_base(base: &str) -> Option<&str> {
+    let after_scheme = base
+        .strip_prefix("http://")
+        .or_else(|| base.strip_prefix("https://"))?;
+    let authority = after_scheme.split('/').next().unwrap_or_default();
+    let host = authority
+        .strip_prefix('[')
+        .and_then(|rest| rest.split_once(']').map(|(host, _)| host))
+        .unwrap_or_else(|| authority.split(':').next().unwrap_or_default());
+    if host.is_empty() {
+        None
+    } else {
+        Some(host)
+    }
+}
+
+fn is_loopback_or_wildcard_host(host: &str) -> bool {
+    let lower = host.trim().to_ascii_lowercase();
+    lower == "localhost" || lower == "::1" || lower == "0.0.0.0" || lower.starts_with("127.")
+}
+
+pub fn public_employee_file_download_base_from_env() -> KabiPayResult<String> {
+    let base = std::env::var("KABIPAY_EMPLOYEE_PUBLIC_BASE").map_err(|_| {
+        KabiPayError::Validation(
+            "KABIPAY_EMPLOYEE_PUBLIC_BASE must be set to the public employee service URL".into(),
+        )
+    })?;
+    let base = base.trim().trim_end_matches('/').to_string();
+    if !base.starts_with("http://") && !base.starts_with("https://") {
+        return Err(KabiPayError::Validation(
+            "KABIPAY_EMPLOYEE_PUBLIC_BASE must start with http:// or https://".into(),
+        ));
+    }
+    let host = host_from_http_base(&base).ok_or_else(|| {
+        KabiPayError::Validation("KABIPAY_EMPLOYEE_PUBLIC_BASE must include a host".into())
+    })?;
+    if is_loopback_or_wildcard_host(host) && !allow_local_download_base() {
+        return Err(KabiPayError::Validation(
+            "KABIPAY_EMPLOYEE_PUBLIC_BASE cannot use localhost or loopback in production".into(),
+        ));
+    }
+    Ok(base)
+}
+
+/// Full URL for `GET /files/employee-document?token=...` on **kabipay-employee**.
+pub fn public_employee_file_download_url(claims: &FileDownloadClaims) -> KabiPayResult<String> {
+    let base = public_employee_file_download_base_from_env()?;
     let token = sign_download_token(claims);
     let encoded = urlencoding::encode(&token);
-    format!("{base}/files/employee-document?token={encoded}")
+    Ok(format!("{base}/files/employee-document?token={encoded}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn host_parser_reads_http_authority_without_path_or_port() {
+        assert_eq!(
+            host_from_http_base("https://api.heliorsoft.com/files"),
+            Some("api.heliorsoft.com")
+        );
+        assert_eq!(host_from_http_base("http://127.0.0.1:4013"), Some("127.0.0.1"));
+    }
+
+    #[test]
+    fn loopback_hosts_are_not_public_download_hosts() {
+        assert!(is_loopback_or_wildcard_host("localhost"));
+        assert!(is_loopback_or_wildcard_host("127.0.0.1"));
+        assert!(is_loopback_or_wildcard_host("0.0.0.0"));
+        assert!(!is_loopback_or_wildcard_host("api.heliorsoft.com"));
+    }
 }

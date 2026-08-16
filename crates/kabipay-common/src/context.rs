@@ -214,6 +214,10 @@ pub const PERM_PERFORMANCE_MANAGE: &str = "performance:manage";
 pub const PERM_LEARNING_MANAGE: &str = "learning:manage";
 /// Workplace: asset categories and assignments registry.
 pub const PERM_ASSETS_MANAGE: &str = "assets:manage";
+/// Workplace: read tenant-wide asset inventory and employee assignments.
+pub const PERM_ASSETS_READ: &str = "assets:read";
+/// Self-service: view assets assigned to the signed-in employee.
+pub const PERM_ASSETS_SELF: &str = "assets:self";
 /// Workplace: view/manage tenant-wide grievance cases (beyond own submissions).
 pub const PERM_GRIEVANCE_MANAGE: &str = "grievance:manage";
 /// Self-service: file grievances and view own cases/categories.
@@ -429,6 +433,14 @@ impl ClientClaims {
             let u = r.to_ascii_uppercase();
             u == "HR_ADMIN" || u == "TENANT_ADMIN" || u == "ORG_ADMIN"
         })
+    }
+
+    pub fn can_read_assets_registry(&self) -> bool {
+        self.can_manage_assets_registry() || self.has_any_permission(&[PERM_ASSETS_READ])
+    }
+
+    pub fn can_read_own_assets(&self) -> bool {
+        self.can_read_assets_registry() || self.has_any_permission(&[PERM_ASSETS_SELF])
     }
 
     pub fn can_manage_succession_planning(&self) -> bool {

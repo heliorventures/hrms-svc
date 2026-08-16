@@ -488,7 +488,9 @@ pub fn download_claims(
 }
 
 /// Build a time-limited HMAC download URL (HTTP GET) for a stored file.
-pub fn public_download_url(claims: &kabipay_common::file_download_token::FileDownloadClaims) -> String {
+pub fn public_download_url(
+    claims: &kabipay_common::file_download_token::FileDownloadClaims,
+) -> KabiPayResult<String> {
     public_employee_file_download_url(claims)
 }
 

@@ -1,8 +1,8 @@
 //! GraphQL DTOs for kabipay-assets.
 
-use async_graphql::{SimpleObject, ID};
+use async_graphql::{InputObject, SimpleObject, ID};
 use chrono::{DateTime, NaiveDate, Utc};
-use kabipay_db_entities::tenant::d0022_assets::{asset, asset_category};
+use kabipay_db_entities::tenant::d0022_assets::{asset, asset_allocation, asset_category};
 
 #[derive(SimpleObject, Clone, Debug)]
 #[graphql(name = "AssetCategory")]
@@ -56,4 +56,67 @@ impl From<asset::Model> for AssetDto {
             status: m.status,
         }
     }
+}
+
+#[derive(SimpleObject, Clone, Debug)]
+#[graphql(name = "AssetAssignment")]
+pub struct AssetAssignmentDto {
+    pub id: ID,
+    pub asset_id: ID,
+    pub employee_id: ID,
+    pub asset_name: String,
+    pub asset_tag: Option<String>,
+    pub serial_number: Option<String>,
+    pub purchase_value: Option<String>,
+    pub allocated_on: NaiveDate,
+    pub expected_return_on: Option<NaiveDate>,
+    pub condition_at_allocation: Option<String>,
+    pub status: String,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+impl AssetAssignmentDto {
+    pub fn from_parts(
+        allocation: asset_allocation::Model,
+        asset: asset::Model,
+        include_purchase_value: bool,
+    ) -> Self {
+        Self {
+            id: ID(allocation.id.to_string()),
+            asset_id: ID(allocation.asset_id.to_string()),
+            employee_id: ID(allocation.employee_id.to_string()),
+            asset_name: asset.name,
+            asset_tag: asset.asset_tag,
+            serial_number: asset.serial_number,
+            purchase_value: if include_purchase_value {
+                asset.purchase_value.map(|d| d.to_string())
+            } else {
+                None
+            },
+            allocated_on: allocation.allocated_on,
+            expected_return_on: allocation.expected_return_on,
+            condition_at_allocation: allocation.condition_at_allocation,
+            status: allocation.status,
+            created_at: allocation.created_at,
+            updated_at: allocation.updated_at,
+        }
+    }
+}
+
+#[derive(InputObject, Clone, Debug)]
+pub struct AssignAssetInput {
+    pub asset_id: ID,
+    pub employee_id: ID,
+    pub allocated_on: NaiveDate,
+    pub expected_return_on: Option<NaiveDate>,
+    pub condition_at_allocation: Option<String>,
+}
+
+#[derive(InputObject, Clone, Debug)]
+pub struct ReturnAssetInput {
+    pub asset_allocation_id: ID,
+    pub returned_on: NaiveDate,
+    pub condition_at_return: Option<String>,
+    pub remarks: Option<String>,
 }

@@ -5,7 +5,9 @@ use kabipay_db_entities::tenant::d0007_employee_core::{
     employee, employee_bank, employee_pan, employment_history,
 };
 use kabipay_db_entities::tenant::d0012_payroll::{
-    payroll_compliance_setting, payroll_cycle, payslip, payslip_component, salary_component,
+    employee_salary_component_override, employee_salary_structure, payroll_compliance_setting,
+    payroll_cycle, payslip, payslip_component, salary_component, salary_structure,
+    salary_structure_component,
 };
 use kabipay_db_entities::tenant::d0013_tax_statutory::tax_computation;
 use chrono::{NaiveDate, Utc};
@@ -15,6 +17,7 @@ use sea_orm::{
     QueryFilter, QueryOrder, QuerySelect, Set, TransactionTrait,
 };
 use std::collections::{HashMap, HashSet};
+use std::str::FromStr;
 use uuid::Uuid;
 
 use crate::services::arrear_service;
@@ -37,6 +40,120 @@ pub async fn list_components(
         .all(db)
         .await
         .map_err(KabiPayError::from)
+}
+
+fn normalize_component_code(code: &str) -> KabiPayResult<String> {
+    let normalized = code.trim().to_ascii_uppercase().replace(' ', "_");
+    if normalized.is_empty() {
+        return Err(KabiPayError::Validation("component code must not be empty".into()));
+    }
+    if normalized.len() > 50 {
+        return Err(KabiPayError::Validation("component code must be 50 characters or less".into()));
+    }
+    if !normalized.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') {
+        return Err(KabiPayError::Validation(
+            "component code may contain only letters, numbers, hyphen, and underscore".into(),
+        ));
+    }
+    Ok(normalized)
+}
+
+fn normalize_component_type(component_type: &str) -> KabiPayResult<String> {
+    let normalized = component_type.trim().to_ascii_uppercase();
+    match normalized.as_str() {
+        "EARNING" | "DEDUCTION" | "EMPLOYER_CONTRIBUTION" => Ok(normalized),
+        _ => Err(KabiPayError::Validation(
+            "component type must be EARNING, DEDUCTION, or EMPLOYER_CONTRIBUTION".into(),
+        )),
+    }
+}
+
+fn normalize_calculation_basis(calculation_basis: &str) -> KabiPayResult<String> {
+    let normalized = calculation_basis.trim().to_ascii_uppercase();
+    match normalized.as_str() {
+        "FIXED_ANNUAL" | "FIXED_MONTHLY" | "PERCENT_OF_CTC" | "PERCENT_OF_BASIC" => Ok(normalized),
+        _ => Err(KabiPayError::Validation(
+            "calculation basis must be FIXED_ANNUAL, FIXED_MONTHLY, PERCENT_OF_CTC, or PERCENT_OF_BASIC".into(),
+        )),
+    }
+}
+
+pub fn parse_money_decimal(raw: &str, field: &'static str) -> KabiPayResult<Decimal> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(KabiPayError::Validation(format!("{field} must not be empty")));
+    }
+    let parsed = Decimal::from_str(trimmed)
+        .map_err(|e| KabiPayError::Validation(format!("{field}: {e}")))?;
+    if parsed < Decimal::ZERO {
+        return Err(KabiPayError::Validation(format!("{field} must not be negative")));
+    }
+    Ok(parsed)
+}
+
+pub async fn upsert_salary_component(
+    db: &DatabaseConnection,
+    tenant_id: Uuid,
+    id: Option<Uuid>,
+    name: String,
+    code: String,
+    component_type: String,
+    is_taxable: bool,
+    is_fixed: bool,
+    is_active: bool,
+    formula_expression: Option<String>,
+) -> KabiPayResult<salary_component::Model> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err(KabiPayError::Validation("component name must not be empty".into()));
+    }
+    let code = normalize_component_code(&code)?;
+    let component_type = normalize_component_type(&component_type)?;
+    let now = Utc::now();
+    if let Some(id) = id {
+        let existing = salary_component::Entity::find()
+            .filter(salary_component::Column::Id.eq(id))
+            .filter(salary_component::Column::TenantId.eq(tenant_id))
+            .one(db)
+            .await
+            .map_err(KabiPayError::from)?
+            .ok_or_else(|| KabiPayError::NotFound {
+                entity: "salary_component",
+                id: id.to_string(),
+            })?;
+        let mut active: salary_component::ActiveModel = existing.into();
+        active.name = Set(name.to_string());
+        active.code = Set(code);
+        active.r#type = Set(component_type);
+        active.is_taxable = Set(is_taxable);
+        active.is_fixed = Set(is_fixed);
+        active.is_active = Set(is_active);
+        active.formula_expression = Set(formula_expression.and_then(|s| {
+            let t = s.trim().to_string();
+            if t.is_empty() { None } else { Some(t) }
+        }));
+        active.updated_at = Set(now);
+        return active.update(db).await.map_err(KabiPayError::from);
+    }
+    salary_component::ActiveModel {
+        id: Set(Uuid::new_v4()),
+        tenant_id: Set(tenant_id),
+        name: Set(name.to_string()),
+        code: Set(code),
+        r#type: Set(component_type),
+        is_taxable: Set(is_taxable),
+        is_fixed: Set(is_fixed),
+        is_active: Set(is_active),
+        formula_expression: Set(formula_expression.and_then(|s| {
+            let t = s.trim().to_string();
+            if t.is_empty() { None } else { Some(t) }
+        })),
+        created_at: Set(now),
+        updated_at: Set(now),
+    }
+    .insert(db)
+    .await
+    .map_err(KabiPayError::from)
 }
 
 /// Insert a **DRAFT** `payroll_cycle` for a calendar month. Rejects if a cycle for the same
@@ -108,6 +225,156 @@ pub async fn list_cycles(
         .all(db)
         .await
         .map_err(KabiPayError::from)
+}
+
+pub async fn list_salary_structures(
+    db: &DatabaseConnection,
+    tenant_id: Uuid,
+    limit: u64,
+) -> KabiPayResult<Vec<(salary_structure::Model, Vec<(salary_structure_component::Model, salary_component::Model)>)>> {
+    let limit = limit.clamp(1, 100);
+    let structures = salary_structure::Entity::find()
+        .filter(salary_structure::Column::TenantId.eq(tenant_id))
+        .order_by_asc(salary_structure::Column::Name)
+        .limit(limit)
+        .all(db)
+        .await
+        .map_err(KabiPayError::from)?;
+    let structure_ids = structures.iter().map(|s| s.id).collect::<Vec<_>>();
+    if structure_ids.is_empty() {
+        return Ok(vec![]);
+    }
+    let components = salary_structure_component::Entity::find()
+        .filter(salary_structure_component::Column::TenantId.eq(tenant_id))
+        .filter(salary_structure_component::Column::SalaryStructureId.is_in(structure_ids))
+        .order_by_asc(salary_structure_component::Column::DisplayOrder)
+        .all(db)
+        .await
+        .map_err(KabiPayError::from)?;
+    let component_ids = components.iter().map(|c| c.salary_component_id).collect::<Vec<_>>();
+    let component_rows = salary_component::Entity::find()
+        .filter(salary_component::Column::TenantId.eq(tenant_id))
+        .filter(salary_component::Column::Id.is_in(component_ids))
+        .all(db)
+        .await
+        .map_err(KabiPayError::from)?;
+    let component_map = component_rows.into_iter().map(|c| (c.id, c)).collect::<HashMap<_, _>>();
+    let mut grouped: HashMap<Uuid, Vec<(salary_structure_component::Model, salary_component::Model)>> = HashMap::new();
+    for row in components {
+        if let Some(component) = component_map.get(&row.salary_component_id) {
+            grouped.entry(row.salary_structure_id).or_default().push((row, component.clone()));
+        }
+    }
+    Ok(structures
+        .into_iter()
+        .map(|structure| {
+            let lines = grouped.remove(&structure.id).unwrap_or_default();
+            (structure, lines)
+        })
+        .collect())
+}
+
+pub async fn upsert_salary_structure(
+    db: &DatabaseConnection,
+    tenant_id: Uuid,
+    id: Option<Uuid>,
+    name: String,
+    description: Option<String>,
+    components: Vec<(Uuid, String, Decimal, i32)>,
+) -> KabiPayResult<(salary_structure::Model, Vec<(salary_structure_component::Model, salary_component::Model)>)> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err(KabiPayError::Validation("salary structure name must not be empty".into()));
+    }
+    if components.is_empty() {
+        return Err(KabiPayError::Validation("salary structure must contain at least one component".into()));
+    }
+    let now = Utc::now();
+    let txn = db.begin().await.map_err(KabiPayError::from)?;
+    let structure = if let Some(id) = id {
+        let existing = salary_structure::Entity::find()
+            .filter(salary_structure::Column::Id.eq(id))
+            .filter(salary_structure::Column::TenantId.eq(tenant_id))
+            .one(&txn)
+            .await
+            .map_err(KabiPayError::from)?
+            .ok_or_else(|| KabiPayError::NotFound {
+                entity: "salary_structure",
+                id: id.to_string(),
+            })?;
+        let mut active: salary_structure::ActiveModel = existing.into();
+        active.name = Set(name.to_string());
+        active.description = Set(description.and_then(|s| {
+            let t = s.trim().to_string();
+            if t.is_empty() { None } else { Some(t) }
+        }));
+        active.updated_at = Set(now);
+        active.update(&txn).await.map_err(KabiPayError::from)?
+    } else {
+        salary_structure::ActiveModel {
+            id: Set(Uuid::new_v4()),
+            tenant_id: Set(tenant_id),
+            name: Set(name.to_string()),
+            description: Set(description.and_then(|s| {
+                let t = s.trim().to_string();
+                if t.is_empty() { None } else { Some(t) }
+            })),
+            created_at: Set(now),
+            updated_at: Set(now),
+        }
+        .insert(&txn)
+        .await
+        .map_err(KabiPayError::from)?
+    };
+
+    salary_structure_component::Entity::delete_many()
+        .filter(salary_structure_component::Column::TenantId.eq(tenant_id))
+        .filter(salary_structure_component::Column::SalaryStructureId.eq(structure.id))
+        .exec(&txn)
+        .await
+        .map_err(KabiPayError::from)?;
+
+    for (component_id, basis, value, display_order) in components {
+        let basis = normalize_calculation_basis(&basis)?;
+        let component_exists = salary_component::Entity::find()
+            .filter(salary_component::Column::Id.eq(component_id))
+            .filter(salary_component::Column::TenantId.eq(tenant_id))
+            .one(&txn)
+            .await
+            .map_err(KabiPayError::from)?
+            .is_some();
+        if !component_exists {
+            return Err(KabiPayError::NotFound {
+                entity: "salary_component",
+                id: component_id.to_string(),
+            });
+        }
+        salary_structure_component::ActiveModel {
+            id: Set(Uuid::new_v4()),
+            tenant_id: Set(tenant_id),
+            salary_structure_id: Set(structure.id),
+            salary_component_id: Set(component_id),
+            amount: Set(if basis == "FIXED_ANNUAL" { Some(value) } else { None }),
+            percentage_of_basic: Set(if basis == "PERCENT_OF_BASIC" { Some(value) } else { None }),
+            calculation_basis: Set(basis),
+            calculation_value: Set(Some(value)),
+            display_order: Set(display_order),
+            created_at: Set(now),
+            updated_at: Set(now),
+        }
+        .insert(&txn)
+        .await
+        .map_err(KabiPayError::from)?;
+    }
+
+    txn.commit().await.map_err(KabiPayError::from)?;
+    let rows = list_salary_structures(db, tenant_id, 100).await?;
+    rows.into_iter()
+        .find(|(row, _)| row.id == structure.id)
+        .ok_or_else(|| KabiPayError::NotFound {
+            entity: "salary_structure",
+            id: structure.id.to_string(),
+        })
 }
 
 /// Payslips for a tenant, optionally restricted to one employee, newest first.
@@ -1296,6 +1563,430 @@ async fn latest_employment_salary<C: ConnectionTrait + Send + Sync>(
     Ok(row.and_then(|r| r.salary))
 }
 
+#[derive(Clone, Debug)]
+pub struct SalaryBreakupLine {
+    pub salary_component_id: Uuid,
+    pub component_name: String,
+    pub component_code: String,
+    pub component_type: String,
+    pub calculation_basis: String,
+    pub calculation_value: Decimal,
+    pub annual_amount: Decimal,
+    pub monthly_amount: Decimal,
+    pub is_override: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct SalaryBreakup {
+    pub employee_id: Uuid,
+    pub employee_salary_structure_id: Option<Uuid>,
+    pub annual_ctc: Decimal,
+    pub monthly_gross: Decimal,
+    pub monthly_deductions: Decimal,
+    pub monthly_net_before_statutory: Decimal,
+    pub lines: Vec<SalaryBreakupLine>,
+}
+
+fn period_start(month: i32, year: i32) -> KabiPayResult<NaiveDate> {
+    NaiveDate::from_ymd_opt(year, month as u32, 1).ok_or_else(|| {
+        KabiPayError::Validation(format!("invalid payroll period {month:02}/{year}"))
+    })
+}
+
+async fn active_employee_salary_structure<C: ConnectionTrait + Send + Sync>(
+    db: &C,
+    tenant_id: Uuid,
+    employee_id: Uuid,
+    as_of: NaiveDate,
+) -> KabiPayResult<Option<employee_salary_structure::Model>> {
+    employee_salary_structure::Entity::find()
+        .filter(employee_salary_structure::Column::TenantId.eq(tenant_id))
+        .filter(employee_salary_structure::Column::EmployeeId.eq(employee_id))
+        .filter(employee_salary_structure::Column::EffectiveFrom.lte(as_of))
+        .filter(
+            Condition::any()
+                .add(employee_salary_structure::Column::EffectiveTo.is_null())
+                .add(employee_salary_structure::Column::EffectiveTo.gte(as_of)),
+        )
+        .order_by_desc(employee_salary_structure::Column::EffectiveFrom)
+        .order_by_desc(employee_salary_structure::Column::UpdatedAt)
+        .order_by_desc(employee_salary_structure::Column::CreatedAt)
+        .one(db)
+        .await
+        .map_err(KabiPayError::from)
+}
+
+fn amount_from_rule(
+    basis: &str,
+    value: Decimal,
+    annual_ctc: Decimal,
+    annual_basic: Decimal,
+) -> KabiPayResult<Decimal> {
+    match basis {
+        "FIXED_ANNUAL" => Ok(value),
+        "FIXED_MONTHLY" => Ok(value * Decimal::from(12)),
+        "PERCENT_OF_CTC" => Ok((annual_ctc * value / Decimal::from(100)).round_dp(2)),
+        "PERCENT_OF_BASIC" => Ok((annual_basic * value / Decimal::from(100)).round_dp(2)),
+        _ => Err(KabiPayError::Validation(format!("unsupported calculation basis `{basis}`"))),
+    }
+}
+
+fn component_rule_value(row: &salary_structure_component::Model) -> Decimal {
+    row.calculation_value
+        .or(row.percentage_of_basic)
+        .or(row.amount)
+        .unwrap_or(Decimal::ZERO)
+}
+
+fn resolve_basic_annual(
+    rows: &[(salary_structure_component::Model, salary_component::Model)],
+    annual_ctc: Decimal,
+    base_code: &str,
+    fallback_annual: Decimal,
+) -> KabiPayResult<Decimal> {
+    let base_code = base_code.trim().to_ascii_uppercase();
+    let candidate = rows.iter().find(|(_, component)| {
+        let code = component.code.trim().to_ascii_uppercase();
+        code == base_code || code == "BASIC"
+    });
+    if let Some((row, _)) = candidate {
+        let basis = normalize_calculation_basis(&row.calculation_basis)?;
+        if basis == "PERCENT_OF_BASIC" {
+            return Err(KabiPayError::Validation(
+                "basic salary component cannot be calculated as percentage of basic".into(),
+            ));
+        }
+        return amount_from_rule(
+            &basis,
+            component_rule_value(row),
+            annual_ctc,
+            Decimal::ZERO,
+        );
+    }
+    if fallback_annual > Decimal::ZERO {
+        return Ok(fallback_annual);
+    }
+    Ok(annual_ctc)
+}
+
+async fn salary_breakup_for_structure<C: ConnectionTrait + Send + Sync>(
+    db: &C,
+    tenant_id: Uuid,
+    employee_id: Uuid,
+    employee_structure: employee_salary_structure::Model,
+    base_code: &str,
+    fallback_monthly_salary: Decimal,
+) -> KabiPayResult<SalaryBreakup> {
+    let structure_components = salary_structure_component::Entity::find()
+        .filter(salary_structure_component::Column::TenantId.eq(tenant_id))
+        .filter(salary_structure_component::Column::SalaryStructureId.eq(employee_structure.salary_structure_id))
+        .order_by_asc(salary_structure_component::Column::DisplayOrder)
+        .all(db)
+        .await
+        .map_err(KabiPayError::from)?;
+    if structure_components.is_empty() {
+        return Err(KabiPayError::Validation(
+            "assigned salary structure has no components".into(),
+        ));
+    }
+    let component_ids = structure_components.iter().map(|c| c.salary_component_id).collect::<Vec<_>>();
+    let components = salary_component::Entity::find()
+        .filter(salary_component::Column::TenantId.eq(tenant_id))
+        .filter(salary_component::Column::Id.is_in(component_ids))
+        .filter(salary_component::Column::IsActive.eq(true))
+        .all(db)
+        .await
+        .map_err(KabiPayError::from)?;
+    let component_map = components.into_iter().map(|c| (c.id, c)).collect::<HashMap<_, _>>();
+    let rows = structure_components
+        .into_iter()
+        .filter_map(|row| component_map.get(&row.salary_component_id).cloned().map(|component| (row, component)))
+        .collect::<Vec<_>>();
+    let fallback_annual = (fallback_monthly_salary * Decimal::from(12)).round_dp(2);
+    let annual_basic = resolve_basic_annual(&rows, employee_structure.ctc, base_code, fallback_annual)?;
+
+    let overrides = employee_salary_component_override::Entity::find()
+        .filter(employee_salary_component_override::Column::TenantId.eq(tenant_id))
+        .filter(employee_salary_component_override::Column::EmployeeSalaryStructureId.eq(employee_structure.id))
+        .filter(employee_salary_component_override::Column::IsActive.eq(true))
+        .all(db)
+        .await
+        .map_err(KabiPayError::from)?;
+    let override_map = overrides.into_iter().map(|o| (o.salary_component_id, o)).collect::<HashMap<_, _>>();
+
+    let mut lines = Vec::new();
+    let mut seen_components = HashSet::new();
+    for (row, component) in rows {
+        let override_row = override_map.get(&component.id);
+        let basis = override_row
+            .map(|o| o.calculation_basis.clone())
+            .unwrap_or_else(|| row.calculation_basis.clone());
+        let basis = normalize_calculation_basis(&basis)?;
+        let value = override_row
+            .map(|o| o.calculation_value)
+            .unwrap_or_else(|| component_rule_value(&row));
+        let annual = amount_from_rule(&basis, value, employee_structure.ctc, annual_basic)?.round_dp(2);
+        let monthly = (annual / Decimal::from(12)).round_dp(2);
+        seen_components.insert(component.id);
+        lines.push(SalaryBreakupLine {
+            salary_component_id: component.id,
+            component_name: component.name,
+            component_code: component.code,
+            component_type: component.r#type,
+            calculation_basis: basis,
+            calculation_value: value,
+            annual_amount: annual,
+            monthly_amount: monthly,
+            is_override: override_row.is_some(),
+        });
+    }
+    for (component_id, override_row) in override_map {
+        if seen_components.contains(&component_id) {
+            continue;
+        }
+        let Some(component) = salary_component::Entity::find()
+            .filter(salary_component::Column::TenantId.eq(tenant_id))
+            .filter(salary_component::Column::Id.eq(component_id))
+            .filter(salary_component::Column::IsActive.eq(true))
+            .one(db)
+            .await
+            .map_err(KabiPayError::from)?
+        else {
+            continue;
+        };
+        let basis = normalize_calculation_basis(&override_row.calculation_basis)?;
+        let annual = amount_from_rule(
+            &basis,
+            override_row.calculation_value,
+            employee_structure.ctc,
+            annual_basic,
+        )?
+        .round_dp(2);
+        lines.push(SalaryBreakupLine {
+            salary_component_id: component.id,
+            component_name: component.name,
+            component_code: component.code,
+            component_type: component.r#type,
+            calculation_basis: basis,
+            calculation_value: override_row.calculation_value,
+            annual_amount: annual,
+            monthly_amount: (annual / Decimal::from(12)).round_dp(2),
+            is_override: true,
+        });
+    }
+    lines.sort_by(|a, b| a.component_code.cmp(&b.component_code));
+    let monthly_gross: Decimal = lines
+        .iter()
+        .filter(|line| line.component_type.eq_ignore_ascii_case("EARNING"))
+        .map(|line| line.monthly_amount)
+        .sum();
+    let monthly_deductions: Decimal = lines
+        .iter()
+        .filter(|line| line.component_type.eq_ignore_ascii_case("DEDUCTION"))
+        .map(|line| line.monthly_amount)
+        .sum();
+    Ok(SalaryBreakup {
+        employee_id,
+        employee_salary_structure_id: Some(employee_structure.id),
+        annual_ctc: employee_structure.ctc,
+        monthly_gross: monthly_gross.round_dp(2),
+        monthly_deductions: monthly_deductions.round_dp(2),
+        monthly_net_before_statutory: (monthly_gross - monthly_deductions).round_dp(2),
+        lines,
+    })
+}
+
+pub async fn preview_employee_salary_breakup(
+    db: &DatabaseConnection,
+    tenant_id: Uuid,
+    employee_id: Uuid,
+    as_of: NaiveDate,
+) -> KabiPayResult<Option<SalaryBreakup>> {
+    let comp_cfg = find_payroll_compliance_setting(db, tenant_id).await?;
+    let base_code = comp_cfg
+        .as_ref()
+        .map(|c| c.base_salary_component_code.as_str())
+        .unwrap_or("BASIC");
+    let fallback = latest_employment_salary(db, tenant_id, employee_id)
+        .await?
+        .unwrap_or(Decimal::ZERO);
+    let Some(structure) = active_employee_salary_structure(db, tenant_id, employee_id, as_of).await? else {
+        return Ok(None);
+    };
+    salary_breakup_for_structure(db, tenant_id, employee_id, structure, base_code, fallback)
+        .await
+        .map(Some)
+}
+
+pub async fn assign_employee_salary_structure(
+    db: &DatabaseConnection,
+    tenant_id: Uuid,
+    employee_id: Uuid,
+    salary_structure_id: Uuid,
+    annual_ctc: Decimal,
+    effective_from: NaiveDate,
+    effective_to: Option<NaiveDate>,
+    overrides: Vec<(Uuid, String, Decimal, Option<String>, bool)>,
+) -> KabiPayResult<employee_salary_structure::Model> {
+    if annual_ctc <= Decimal::ZERO {
+        return Err(KabiPayError::Validation("annual CTC must be greater than zero".into()));
+    }
+    if let Some(to) = effective_to {
+        if to < effective_from {
+            return Err(KabiPayError::Validation("effectiveTo cannot be before effectiveFrom".into()));
+        }
+    }
+    let now = Utc::now();
+    let txn = db.begin().await.map_err(KabiPayError::from)?;
+    let employee_exists = employee::Entity::find()
+        .filter(employee::Column::TenantId.eq(tenant_id))
+        .filter(employee::Column::Id.eq(employee_id))
+        .filter(employee::Column::IsDeleted.eq(false))
+        .one(&txn)
+        .await
+        .map_err(KabiPayError::from)?
+        .is_some();
+    if !employee_exists {
+        return Err(KabiPayError::NotFound {
+            entity: "employee",
+            id: employee_id.to_string(),
+        });
+    }
+    let structure_exists = salary_structure::Entity::find()
+        .filter(salary_structure::Column::TenantId.eq(tenant_id))
+        .filter(salary_structure::Column::Id.eq(salary_structure_id))
+        .one(&txn)
+        .await
+        .map_err(KabiPayError::from)?
+        .is_some();
+    if !structure_exists {
+        return Err(KabiPayError::NotFound {
+            entity: "salary_structure",
+            id: salary_structure_id.to_string(),
+        });
+    }
+    let same_effective_row = employee_salary_structure::Entity::find()
+        .filter(employee_salary_structure::Column::TenantId.eq(tenant_id))
+        .filter(employee_salary_structure::Column::EmployeeId.eq(employee_id))
+        .filter(employee_salary_structure::Column::EffectiveFrom.eq(effective_from))
+        .one(&txn)
+        .await
+        .map_err(KabiPayError::from)?;
+    if let Some(existing) = same_effective_row {
+        let mut active: employee_salary_structure::ActiveModel = existing.into();
+        active.salary_structure_id = Set(salary_structure_id);
+        active.ctc = Set(annual_ctc);
+        active.effective_to = Set(effective_to);
+        active.updated_at = Set(now);
+        let row = active.update(&txn).await.map_err(KabiPayError::from)?;
+        replace_employee_salary_component_overrides(
+            &txn,
+            tenant_id,
+            row.id,
+            overrides,
+            now,
+        )
+        .await?;
+        txn.commit().await.map_err(KabiPayError::from)?;
+        return Ok(row);
+    }
+
+    let previous_effective_to = effective_from.pred_opt().ok_or_else(|| {
+        KabiPayError::Validation("effectiveFrom is too early to close previous salary assignment".into())
+    })?;
+    let overlapping_existing_rows = employee_salary_structure::Entity::find()
+        .filter(employee_salary_structure::Column::TenantId.eq(tenant_id))
+        .filter(employee_salary_structure::Column::EmployeeId.eq(employee_id))
+        .filter(employee_salary_structure::Column::EffectiveFrom.lt(effective_from))
+        .filter(
+            Condition::any()
+                .add(employee_salary_structure::Column::EffectiveTo.is_null())
+                .add(employee_salary_structure::Column::EffectiveTo.gte(effective_from)),
+        )
+        .all(&txn)
+        .await
+        .map_err(KabiPayError::from)?;
+    for existing in overlapping_existing_rows {
+        let mut active: employee_salary_structure::ActiveModel = existing.into();
+        active.effective_to = Set(Some(previous_effective_to));
+        active.updated_at = Set(now);
+        active.update(&txn).await.map_err(KabiPayError::from)?;
+    }
+
+    let has_future_overlap = employee_salary_structure::Entity::find()
+        .filter(employee_salary_structure::Column::TenantId.eq(tenant_id))
+        .filter(employee_salary_structure::Column::EmployeeId.eq(employee_id))
+        .filter(employee_salary_structure::Column::EffectiveFrom.gt(effective_from))
+        .all(&txn)
+        .await
+        .map_err(KabiPayError::from)?
+        .into_iter()
+        .any(|existing| effective_to.map_or(true, |to| existing.effective_from <= to));
+    if has_future_overlap {
+        return Err(KabiPayError::Validation(
+            "effective period overlaps an existing future salary assignment".into(),
+        ));
+    }
+
+    let row = employee_salary_structure::ActiveModel {
+        id: Set(Uuid::new_v4()),
+        tenant_id: Set(tenant_id),
+        employee_id: Set(employee_id),
+        salary_structure_id: Set(salary_structure_id),
+        ctc: Set(annual_ctc),
+        effective_from: Set(effective_from),
+        effective_to: Set(effective_to),
+        created_at: Set(now),
+        updated_at: Set(now),
+    }
+    .insert(&txn)
+    .await
+    .map_err(KabiPayError::from)?;
+    replace_employee_salary_component_overrides(&txn, tenant_id, row.id, overrides, now).await?;
+    txn.commit().await.map_err(KabiPayError::from)?;
+    Ok(row)
+}
+
+async fn replace_employee_salary_component_overrides<C: ConnectionTrait + Send + Sync>(
+    db: &C,
+    tenant_id: Uuid,
+    employee_salary_structure_id: Uuid,
+    overrides: Vec<(Uuid, String, Decimal, Option<String>, bool)>,
+    now: chrono::DateTime<Utc>,
+) -> KabiPayResult<()> {
+    employee_salary_component_override::Entity::delete_many()
+        .filter(employee_salary_component_override::Column::TenantId.eq(tenant_id))
+        .filter(
+            employee_salary_component_override::Column::EmployeeSalaryStructureId
+                .eq(employee_salary_structure_id),
+        )
+        .exec(db)
+        .await
+        .map_err(KabiPayError::from)?;
+    for (component_id, basis, value, notes, is_active) in overrides {
+        let basis = normalize_calculation_basis(&basis)?;
+        employee_salary_component_override::ActiveModel {
+            id: Set(Uuid::new_v4()),
+            tenant_id: Set(tenant_id),
+            employee_salary_structure_id: Set(employee_salary_structure_id),
+            salary_component_id: Set(component_id),
+            calculation_basis: Set(basis),
+            calculation_value: Set(value),
+            notes: Set(notes.and_then(|s| {
+                let t = s.trim().to_string();
+                if t.is_empty() { None } else { Some(t) }
+            })),
+            is_active: Set(is_active),
+            created_at: Set(now),
+            updated_at: Set(now),
+        }
+        .insert(db)
+        .await
+        .map_err(KabiPayError::from)?;
+    }
+    Ok(())
+}
+
 async fn find_active_salary_component_by_code<C: ConnectionTrait + Send + Sync>(
     db: &C,
     tenant_id: Uuid,
@@ -1474,6 +2165,7 @@ pub async fn run_payroll_for_cycle(
     let tds_map = tds_by_employee_fy(&txn, tenant_id, &emp_id_list, fy).await?;
 
     let now = Utc::now();
+    let payroll_period_start = period_start(cycle_row.month, cycle_row.year)?;
     for emp in employees {
         if have.contains(&emp.id) {
             continue;
@@ -1481,15 +2173,51 @@ pub async fn run_payroll_for_cycle(
         let base = latest_employment_salary(&txn, tenant_id, emp.id)
             .await?
             .unwrap_or(Decimal::ZERO);
+        let structure_breakup = match active_employee_salary_structure(
+            &txn,
+            tenant_id,
+            emp.id,
+            payroll_period_start,
+        )
+        .await?
+        {
+            Some(structure) => Some(
+                salary_breakup_for_structure(
+                    &txn,
+                    tenant_id,
+                    emp.id,
+                    structure,
+                    base_code,
+                    base,
+                )
+                .await?,
+            ),
+            None => None,
+        };
         let pending = arrear_service::list_pending_by_employee(&txn, tenant_id, emp.id).await?;
         let arrear_sum: Decimal = pending.iter().map(|a| a.amount).sum();
-        if base <= Decimal::ZERO && arrear_sum <= Decimal::ZERO {
+        let structure_gross = structure_breakup
+            .as_ref()
+            .map(|b| b.monthly_gross)
+            .unwrap_or(Decimal::ZERO);
+        let structure_deductions = structure_breakup
+            .as_ref()
+            .map(|b| b.monthly_deductions)
+            .unwrap_or(Decimal::ZERO);
+        if base <= Decimal::ZERO && structure_gross <= Decimal::ZERO && arrear_sum <= Decimal::ZERO {
             continue;
         }
-        let gross = (base + arrear_sum).round_dp(2);
+        let recurring_gross = if structure_gross > Decimal::ZERO {
+            structure_gross
+        } else {
+            base
+        };
+        let gross = (recurring_gross + arrear_sum).round_dp(2);
         let tds_m = tds_map.get(&emp.id).map(|d| d.round_dp(2));
         let (stat, tds) = statutory_india::compute(gross, tds_m);
-        let total_ded = statutory_india::employee_deduction_total(&stat, tds);
+        let total_ded = (structure_deductions
+            + statutory_india::employee_deduction_total(&stat, tds))
+            .round_dp(2);
         let net = (gross - total_ded).round_dp(2);
 
         let pid = Uuid::new_v4();
@@ -1519,7 +2247,26 @@ pub async fn run_payroll_for_cycle(
         .await
         .map_err(KabiPayError::from)?;
 
-        if base > Decimal::ZERO {
+        if let Some(breakup) = &structure_breakup {
+            for line in &breakup.lines {
+                if line.monthly_amount <= Decimal::ZERO {
+                    continue;
+                }
+                payslip_component::ActiveModel {
+                    id: Set(Uuid::new_v4()),
+                    tenant_id: Set(tenant_id),
+                    payslip_id: Set(pid),
+                    salary_component_id: Set(line.salary_component_id),
+                    amount: Set(line.monthly_amount),
+                    component_type: Set(Some(line.component_type.clone())),
+                    created_at: Set(now),
+                    updated_at: Set(now),
+                }
+                .insert(&txn)
+                .await
+                .map_err(KabiPayError::from)?;
+            }
+        } else if base > Decimal::ZERO {
             let line_id = Uuid::new_v4();
             payslip_component::ActiveModel {
                 id: Set(line_id),

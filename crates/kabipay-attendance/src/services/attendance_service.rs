@@ -21,7 +21,7 @@ use sea_orm::{
 use std::collections::HashMap;
 use uuid::Uuid;
 
-use crate::services::{hrms_master_service, timesheet_policy};
+use crate::services::{hrms_master_service, timesheet_dates, timesheet_policy};
 
 const ATTENDANCE_STATUS_COMPLETE: &str = "COMPLETE";
 const MANUAL_ATTENDANCE_SOURCE: &str = "WEB+MANUAL";
@@ -492,12 +492,25 @@ pub async fn create_timesheet_entry(
             "hoursWorked must be greater than zero".into(),
         ));
     }
+    timesheet_policy::assert_required_project_and_task(
+        project_code.as_deref(),
+        description.as_deref(),
+    )?;
     timesheet_policy::assert_work_date_allowed_for_entry(db, tenant_id, work_date).await?;
     timesheet_policy::assert_week_has_no_active_submission(
         db,
         tenant_id,
         employee_id,
         work_date,
+    )
+    .await?;
+    timesheet_policy::assert_day_hours_with_entry_change(
+        db,
+        tenant_id,
+        employee_id,
+        work_date,
+        None,
+        hours_worked,
     )
     .await?;
     timesheet_policy::assert_week_hours_with_entry_change(
@@ -594,6 +607,10 @@ pub async fn update_timesheet_entry(
             "hoursWorked must be greater than zero".into(),
         ));
     }
+    timesheet_policy::assert_required_project_and_task(
+        project_code.as_deref(),
+        description.as_deref(),
+    )?;
     let row = timesheet_entry::Entity::find()
         .filter(timesheet_entry::Column::Id.eq(entry_id))
         .filter(timesheet_entry::Column::TenantId.eq(tenant_id))
@@ -608,13 +625,33 @@ pub async fn update_timesheet_entry(
             "timesheet entry belongs to another employee".into(),
         ));
     }
+    let row_status = row.status.trim().to_uppercase();
+    let existing_week_start = timesheet_dates::week_monday_sunday(row.work_date).0;
+    let next_week_start = timesheet_dates::week_monday_sunday(work_date).0;
     timesheet_policy::assert_entry_mut_allowed(db, tenant_id, &row).await?;
     timesheet_policy::assert_work_date_allowed_for_entry(db, tenant_id, work_date).await?;
-    timesheet_policy::assert_week_has_no_active_submission(
+    if row_status == "APPROVED" {
+        if existing_week_start != next_week_start {
+            return Err(KabiPayError::Validation(
+                "approved timesheet rows cannot be moved to another week".into(),
+            ));
+        }
+    } else {
+        timesheet_policy::assert_week_has_no_active_submission(
+            db,
+            tenant_id,
+            employee_id,
+            work_date,
+        )
+        .await?;
+    }
+    timesheet_policy::assert_day_hours_with_entry_change(
         db,
         tenant_id,
         employee_id,
         work_date,
+        Some(entry_id),
+        hours_worked,
     )
     .await?;
     timesheet_policy::assert_week_hours_with_entry_change(

@@ -15,7 +15,9 @@ use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
 use uuid::Uuid;
 
 use crate::resolvers::types::{
-    PayrollArrearDto, PayrollComplianceSettingDto, PayrollCycleDto, PayslipDetailDto, SalaryComponentDto,
+    PayrollArrearDto, PayrollComplianceSettingDto, PayrollCycleDto, PayslipDetailDto,
+    SalaryBreakupLineDto, SalaryBreakupPreviewDto, SalaryComponentDto, SalaryStructureComponentDto,
+    SalaryStructureDto,
 };
 use crate::services::arrear_service;
 use crate::services::payroll_service;
@@ -46,6 +48,93 @@ impl QueryRoot {
             .await
             .map_err(KabiPayError::into_graphql)?;
         Ok(rows.into_iter().map(SalaryComponentDto::from).collect())
+    }
+
+    async fn salary_structures(
+        &self,
+        ctx: &Context<'_>,
+        #[graphql(default = 100)] limit: u64,
+    ) -> Result<Vec<SalaryStructureDto>> {
+        let tenant_id = require_tenant_id(ctx)?;
+        let claims = require_client_claims(ctx)?;
+        if !claims.can_export_payroll_statutory() && !claims.can_manage_compensation_admin() {
+            return Err(
+                KabiPayError::Forbidden(
+                    "salary structures require payroll:statutory_export or compensation:manage".into(),
+                )
+                .into_graphql(),
+            );
+        }
+        let db = tenant_db(ctx, tenant_id).await?;
+        let rows = payroll_service::list_salary_structures(&db, tenant_id, limit)
+            .await
+            .map_err(KabiPayError::into_graphql)?;
+        Ok(rows
+            .into_iter()
+            .map(|(structure, components)| {
+                let component_dtos = components
+                    .into_iter()
+                    .map(|(line, component)| SalaryStructureComponentDto::from_parts(line, component))
+                    .collect();
+                SalaryStructureDto::from_head(structure, component_dtos)
+            })
+            .collect())
+    }
+
+    async fn employee_salary_breakup_preview(
+        &self,
+        ctx: &Context<'_>,
+        employee_id: ID,
+        as_of: Option<chrono::NaiveDate>,
+    ) -> Result<Option<SalaryBreakupPreviewDto>> {
+        let tenant_id = require_tenant_id(ctx)?;
+        let claims = require_client_claims(ctx)?;
+        let db = tenant_db(ctx, tenant_id).await?;
+        let eid = parse_uuid(&employee_id, "employeeId")?;
+        let viewer_eid = resolve_client_employee_id(ctx, &db, tenant_id).await.ok();
+        if viewer_eid != Some(eid)
+            && !claims.can_export_payroll_statutory()
+            && !claims.can_manage_compensation_admin()
+        {
+            return Err(
+                KabiPayError::Forbidden(
+                    "salary breakup is private to the employee and payroll/HR".into(),
+                )
+                .into_graphql(),
+            );
+        }
+        let as_of = as_of.unwrap_or_else(|| chrono::Utc::now().date_naive());
+        let Some(preview) = payroll_service::preview_employee_salary_breakup(&db, tenant_id, eid, as_of)
+            .await
+            .map_err(KabiPayError::into_graphql)?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(SalaryBreakupPreviewDto {
+            employee_id: ID(preview.employee_id.to_string()),
+            employee_salary_structure_id: preview
+                .employee_salary_structure_id
+                .map(|id| ID(id.to_string())),
+            annual_ctc: preview.annual_ctc.to_string(),
+            monthly_gross: preview.monthly_gross.to_string(),
+            monthly_deductions: preview.monthly_deductions.to_string(),
+            monthly_net_before_statutory: preview.monthly_net_before_statutory.to_string(),
+            lines: preview
+                .lines
+                .into_iter()
+                .map(|line| SalaryBreakupLineDto {
+                    salary_component_id: ID(line.salary_component_id.to_string()),
+                    component_name: line.component_name,
+                    component_code: line.component_code,
+                    component_type: line.component_type,
+                    calculation_basis: line.calculation_basis,
+                    calculation_value: line.calculation_value.to_string(),
+                    annual_amount: line.annual_amount.to_string(),
+                    monthly_amount: line.monthly_amount.to_string(),
+                    is_override: line.is_override,
+                })
+                .collect(),
+        }))
     }
 
     /// List payroll cycles for the caller's tenant, most recent first.
@@ -120,7 +209,7 @@ impl QueryRoot {
             })?;
         let ttl = ttl_seconds.clamp(60, 86_400) as i64;
         let claims = file_download_claims(tenant_id, logo_id, fs_row.mime_type.clone(), ttl);
-        Ok(public_employee_file_download_url(&claims))
+        public_employee_file_download_url(&claims).map_err(KabiPayError::into_graphql)
     }
 
     /// One payslip with `lines` = `payslip_component` rows.

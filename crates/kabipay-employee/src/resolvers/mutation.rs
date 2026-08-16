@@ -354,6 +354,7 @@ impl MutationRoot {
             employment_type: input.employment_type,
             status: input.status,
             user_id: opt_uuid(&input.user_id, "userId")?,
+            linked_user_email: input.linked_user_email,
         };
         let m = employee_service::update(&db, tenant_id, eid, patch)
             .await
