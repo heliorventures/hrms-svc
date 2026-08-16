@@ -438,9 +438,10 @@ pub async fn client_change_password(
         )));
     }
     if new_pw == current_password {
-        return Err(KabiPayError::Validation(
-            "newPassword must differ from current password".into(),
-        ));
+        return Err(KabiPayError::BusinessRule {
+            code: "PASSWORD_REUSE_NOT_ALLOWED",
+            message: "New password must be different from the current password.".into(),
+        });
     }
 
     let started = Instant::now();
@@ -469,7 +470,10 @@ pub async fn client_change_password(
         password_tasks::verify(current_password, user_row.password_hash.clone()).await;
     request_metrics::record_phase("password_verify", Some(tenant_id), started);
     if !password_matches? {
-        return Err(KabiPayError::Unauthorised);
+        return Err(KabiPayError::BusinessRule {
+            code: "CURRENT_PASSWORD_INCORRECT",
+            message: "The current password is incorrect.".into(),
+        });
     }
 
     let started = Instant::now();

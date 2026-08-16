@@ -10,6 +10,9 @@ use kabipay_common::{
     subgraph::{require_tenant_id, resolve_client_employee_id, tenant_db},
     KabiPayError,
 };
+use kabipay_db_entities::tenant::d0007_employee_core::employee;
+use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+use std::collections::HashMap;
 use uuid::Uuid;
 
 use crate::resolvers::types::{
@@ -75,9 +78,42 @@ impl QueryRoot {
             from_date,
             to_date,
         )
-            .await
-            .map_err(KabiPayError::into_graphql)?;
-        Ok(rows.into_iter().map(LeaveRequestDto::from).collect())
+        .await
+        .map_err(KabiPayError::into_graphql)?;
+        let mut employee_ids: Vec<Uuid> = rows.iter().map(|row| row.employee_id).collect();
+        employee_ids.sort_unstable();
+        employee_ids.dedup();
+        let employee_labels: HashMap<Uuid, (String, String)> = if employee_ids.is_empty() {
+            HashMap::new()
+        } else {
+            employee::Entity::find()
+                .filter(employee::Column::TenantId.eq(tenant_id))
+                .filter(employee::Column::IsDeleted.eq(false))
+                .filter(employee::Column::Id.is_in(employee_ids))
+                .all(&db)
+                .await
+                .map_err(|error| KabiPayError::from(error).into_graphql())?
+                .into_iter()
+                .map(|employee| {
+                    let name = format!("{} {}", employee.first_name, employee.last_name)
+                        .trim()
+                        .to_string();
+                    (employee.id, (name, employee.employee_code))
+                })
+                .collect()
+        };
+
+        Ok(rows
+            .into_iter()
+            .map(|row| {
+                let label = employee_labels.get(&row.employee_id).cloned();
+                let dto = LeaveRequestDto::from(row);
+                match label {
+                    Some((name, code)) => dto.with_employee_label(name, code),
+                    None => dto,
+                }
+            })
+            .collect())
     }
 
     /// Leave-balance rows for an employee. Pass `employeeId` to target a

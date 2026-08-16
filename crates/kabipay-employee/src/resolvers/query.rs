@@ -13,19 +13,21 @@ use crate::resolvers::types::{
     ClearanceChecklistItemDto, DepartmentDto, DesignationDto, DocumentTypeDto,
     EmployeeAadhaarRecordDto, EmployeeBankAccountDto, EmployeeDirectoryEntryDto,
     EmployeeDirectoryPageDto, EmployeeDocumentDto, EmployeeDto, EmployeeIdentityProfileDto,
-    EmployeeEducationDto, EmployeePanRecordDto, EmployeeProfileAccessDto,
-    EmployeeProfileChangeRequestDto, EmployeeWorkExperienceDto, EmploymentHistoryRecordDto,
+    EmployeeEducationDto, EmployeeEvidenceReviewQueueItemDto, EmployeePanRecordDto,
+    EmployeeProfileAccessDto, EmployeeProfileChangeRequestDto,
     EmployeeProfileChangeReviewDetailDto, EmployeeProfileReviewQueueItemDto,
-    EmployeeEvidenceReviewQueueItemDto,
-    FnfSettlementDto, OnboardingChecklistItemDto, OrgChartRowDto, SeparationDto,
-    TenantCatalogPermissionDto, TenantDirectoryRoleDto, TenantDirectoryUserDto,
-    TenantPermissionScopeDto,
+    EmployeeWorkExperienceDto, EmploymentHistoryRecordDto, FnfSettlementDto,
+    OnboardingChecklistItemDto, OrgChartRowDto, SeparationDto, TenantCatalogPermissionDto,
+    TenantDirectoryRoleDto, TenantDirectoryUserDto, TenantPermissionScopeDto,
 };
 use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter};
 
+use crate::entities::d0007_employee_core::employee;
 use crate::entities::d0008_document_system::employee_document;
+use crate::entities::d0029_file_storage::file_storage;
 use crate::resolvers::scope::{
-    assert_employee_in_data_scope, data_scope_employee, require_tenant_rbac_admin, resolve_viewer_employee,
+    assert_employee_in_data_scope, data_scope_employee, require_tenant_rbac_admin,
+    resolve_viewer_employee,
 };
 use crate::services::document_file_service::{self, download_claims};
 use crate::services::{
@@ -33,7 +35,6 @@ use crate::services::{
     offboarding_fnf_service, onboarding_service, org_service, profile_change_service,
     profile_extras_service, profile_record_service, rbac_admin_service, separation_service,
 };
-use crate::entities::d0029_file_storage::file_storage;
 
 pub struct QueryRoot;
 
@@ -352,6 +353,31 @@ impl QueryRoot {
     /// belongs to another tenant (never leaks cross-tenant rows).
     async fn employee(&self, ctx: &Context<'_>, id: ID) -> Result<Option<EmployeeDto>> {
         resolve_employee_dto(ctx, id).await
+    }
+
+    /// Authoritative employee profile linked to the authenticated user.
+    ///
+    /// This resolves `employee.user_id` on every call instead of trusting the
+    /// optional denormalized `employee_id` access-token claim, so older tokens
+    /// and repaired account links still reach the correct profile.
+    async fn my_employee(&self, ctx: &Context<'_>) -> Result<Option<EmployeeDto>> {
+        let claims = require_client_claims(ctx)?;
+        let tenant_id = require_tenant_id(ctx)?;
+        let db = tenant_db(ctx, tenant_id).await?;
+        let model = employee::Entity::find()
+            .filter(employee::Column::TenantId.eq(tenant_id))
+            .filter(employee::Column::UserId.eq(claims.sub))
+            .filter(employee::Column::IsDeleted.eq(false))
+            .one(&db)
+            .await
+            .map_err(|error| KabiPayError::from(error).into_graphql())?;
+
+        let Some(model) = model else {
+            return Ok(None);
+        };
+        let mut enriched =
+            enrich_employee_dtos(&db, tenant_id, vec![EmployeeDto::from(model)]).await?;
+        Ok(enriched.pop())
     }
 
     /// Apollo Federation **entity** lookup (`_entities`) — not exposed as a public `Query` field.

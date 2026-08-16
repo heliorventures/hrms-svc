@@ -103,6 +103,8 @@ pub struct LeaveRequestDto {
     pub id: ID,
     pub tenant_id: ID,
     pub employee_id: ID,
+    pub employee_name: Option<String>,
+    pub employee_code: Option<String>,
     pub leave_type_id: ID,
     pub from_date: NaiveDate,
     pub to_date: NaiveDate,
@@ -153,6 +155,14 @@ impl From<leave_balance::Model> for LeaveBalanceDto {
             created_at: m.created_at,
             updated_at: m.updated_at,
         }
+    }
+}
+
+impl LeaveRequestDto {
+    pub fn with_employee_label(mut self, name: String, code: String) -> Self {
+        self.employee_name = Some(name);
+        self.employee_code = Some(code);
+        self
     }
 }
 
@@ -220,6 +230,8 @@ impl From<leave_request::Model> for LeaveRequestDto {
             id: ID(m.id.to_string()),
             tenant_id: ID(m.tenant_id.to_string()),
             employee_id: ID(m.employee_id.to_string()),
+            employee_name: None,
+            employee_code: None,
             leave_type_id: ID(m.leave_type_id.to_string()),
             from_date: m.from_date,
             to_date: m.to_date,

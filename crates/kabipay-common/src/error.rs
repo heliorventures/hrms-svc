@@ -41,6 +41,16 @@ pub enum KabiPayError {
     #[error("validation error: {0}")]
     Validation(String),
 
+    /// A caller-correctable domain rule with a stable machine-readable code.
+    ///
+    /// Keep `message` free of secrets and database details because REST and
+    /// GraphQL clients receive it verbatim.
+    #[error("{message}")]
+    BusinessRule {
+        code: &'static str,
+        message: String,
+    },
+
     #[error("conflict: {0}")]
     Conflict(String),
 
@@ -84,6 +94,7 @@ impl KabiPayError {
             Self::Unauthorised => "UNAUTHENTICATED",
             Self::Forbidden(_) => "FORBIDDEN",
             Self::Validation(_) => "VALIDATION_ERROR",
+            Self::BusinessRule { code, .. } => *code,
             Self::Conflict(_) => "CONFLICT",
             Self::Database(_) => "DATABASE_ERROR",
             Self::TenantDatabaseUnavailable(_) => "TENANT_DATABASE_UNAVAILABLE",
@@ -103,7 +114,7 @@ impl KabiPayError {
             | Self::TenantSuspended(_) => S::FORBIDDEN,
             Self::Unauthorised | Self::Jwt(_) => S::UNAUTHORIZED,
             Self::Forbidden(_) => S::FORBIDDEN,
-            Self::Validation(_) | Self::Json(_) => S::BAD_REQUEST,
+            Self::Validation(_) | Self::BusinessRule { .. } | Self::Json(_) => S::BAD_REQUEST,
             Self::Conflict(_) => S::CONFLICT,
             Self::TenantDatabaseUnavailable(_) => S::SERVICE_UNAVAILABLE,
             Self::Database(_) | Self::Internal(_) => S::INTERNAL_SERVER_ERROR,
@@ -165,5 +176,17 @@ mod tests {
             timeout.http_status(),
             axum::http::StatusCode::SERVICE_UNAVAILABLE
         );
+    }
+
+    #[test]
+    fn business_rule_preserves_its_public_code() {
+        let err = KabiPayError::BusinessRule {
+            code: "CURRENT_PASSWORD_INCORRECT",
+            message: "The current password is incorrect.".into(),
+        };
+
+        assert_eq!(err.code(), "CURRENT_PASSWORD_INCORRECT");
+        assert_eq!(err.http_status(), axum::http::StatusCode::BAD_REQUEST);
+        assert_eq!(err.to_string(), "The current password is incorrect.");
     }
 }

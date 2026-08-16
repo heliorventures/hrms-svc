@@ -29,7 +29,7 @@ use axum::{
     routing::get,
     Router,
 };
-use kabipay_db_entities::tenant::d0007_employee_core::employee;
+use kabipay_db_entities::tenant::{d0005_auth_rbac::user, d0007_employee_core::employee};
 use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter};
 use std::{net::SocketAddr, sync::Arc};
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
@@ -322,6 +322,9 @@ where
         RequestIdentity::Client { tenant_id, claims } => {
             req = req.data(TenantId(tenant_id));
             if let Some(c) = claims {
+                ensure_active_client_user(schema.as_ref(), tenant_id, c.sub)
+                    .await
+                    .map_err(|error| (error.http_status(), error.to_string()))?;
                 req = req.data(c);
             }
         }
@@ -336,6 +339,67 @@ where
         RequestIdentity::None => {}
     }
     Ok(schema.execute(req).await.into())
+}
+
+/// Re-check mutable account state before accepting an otherwise valid client JWT.
+///
+/// Access tokens remain cryptographically stateless, but account activation is
+/// mutable security state. Performing this check at the shared subgraph boundary
+/// makes employee deactivation effective immediately for both gateway and direct
+/// subgraph traffic instead of waiting for access-token expiry.
+async fn ensure_active_client_user<Q, M, S>(
+    schema: &Schema<Q, M, S>,
+    tenant_id: Uuid,
+    user_id: Uuid,
+) -> KabiPayResult<()>
+where
+    Q: ObjectType + 'static,
+    M: ObjectType + 'static,
+    S: SubscriptionType + 'static,
+{
+    let ops_db = schema
+        .data::<DatabaseConnection>()
+        .ok_or_else(|| {
+            KabiPayError::Internal("ops DatabaseConnection missing from schema data".into())
+        })?;
+    let cache = schema
+        .data::<TenantDbCache>()
+        .ok_or_else(|| KabiPayError::Internal("TenantDbCache missing from schema data".into()))?;
+    let fallback = schema
+        .data::<TenantDbConfig>()
+        .ok_or_else(|| {
+            KabiPayError::Internal("TenantDbConfig missing from schema data".into())
+        })?;
+    let db = resolve_tenant_db(tenant_id, ops_db, cache, fallback).await?;
+    let row = user::Entity::find_by_id(user_id)
+        .filter(user::Column::TenantId.eq(tenant_id))
+        .one(&db)
+        .await
+        .map_err(|error| KabiPayError::from_tenant_db(tenant_id, error))?;
+
+    if account_allows_client_access(row.map(|found| (found.is_active, found.is_deleted))) {
+        Ok(())
+    } else {
+        Err(KabiPayError::Unauthorised)
+    }
+}
+
+fn account_allows_client_access(account_state: Option<(bool, bool)>) -> bool {
+    matches!(account_state, Some((true, false)))
+}
+
+#[cfg(test)]
+mod active_client_tests {
+    use super::account_allows_client_access;
+
+    #[test]
+    fn only_active_non_deleted_users_keep_client_access() {
+        assert!(account_allows_client_access(Some((true, false))));
+        assert!(!account_allows_client_access(Some((false, false))));
+        assert!(!account_allows_client_access(Some((true, true))));
+        assert!(!account_allows_client_access(Some((false, true))));
+        assert!(!account_allows_client_access(None));
+    }
 }
 
 /// Playground HTML for `GET /graphql` on a tenant subgraph.

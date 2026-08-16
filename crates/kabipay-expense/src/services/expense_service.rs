@@ -116,6 +116,7 @@ pub async fn submit_expense(
             "amount must be greater than zero".into(),
         ));
     }
+    let currency = normalize_currency_code(currency)?;
 
     let txn = db.begin().await?;
 
@@ -141,9 +142,10 @@ pub async fn submit_expense(
 
     if let Some(cap) = constraints.max_amount_per_claim {
         if amount > cap {
-            return Err(KabiPayError::Validation(format!(
-                "amount exceeds permitted cap for this category ({cap})",
-            )));
+            return Err(KabiPayError::BusinessRule {
+                code: "EXPENSE_CLAIM_LIMIT_EXCEEDED",
+                message: format!("Amount exceeds the permitted category limit ({cap})."),
+            });
         }
     }
 
@@ -159,9 +161,12 @@ pub async fn submit_expense(
         )
         .await?;
         if already + amount > ml {
-            return Err(KabiPayError::Validation(format!(
-                "would exceed monthly limit for this category ({ml}; already claimed {already})",
-            )));
+            return Err(KabiPayError::BusinessRule {
+                code: "EXPENSE_MONTHLY_LIMIT_EXCEEDED",
+                message: format!(
+                    "This claim would exceed the monthly category limit ({ml}; already claimed {already})."
+                ),
+            });
         }
     }
 
@@ -201,7 +206,7 @@ pub async fn submit_expense(
         employee_id: Set(employee_id),
         expense_category_id: Set(expense_category_id),
         amount: Set(amount),
-        currency: Set(currency.to_string()),
+        currency: Set(currency),
         expense_date: Set(expense_date),
         title: Set(title.to_string()),
         status: Set("PENDING".into()),
@@ -300,6 +305,37 @@ async fn try_attach_expense_workflow(
 pub fn parse_amount(s: &str) -> KabiPayResult<Decimal> {
     Decimal::from_str(s.trim())
         .map_err(|_| KabiPayError::Validation("invalid amount; must be a decimal string".into()))
+}
+
+/// Normalize the ISO-style currency code accepted at the API boundary.
+pub fn normalize_currency_code(raw: &str) -> KabiPayResult<String> {
+    let normalized = raw.trim().to_ascii_uppercase();
+    if normalized.len() != 3 || !normalized.bytes().all(|byte| byte.is_ascii_alphabetic()) {
+        return Err(KabiPayError::Validation(
+            "currency must be a 3-letter ISO code".into(),
+        ));
+    }
+    Ok(normalized)
+}
+
+#[cfg(test)]
+mod currency_tests {
+    use super::normalize_currency_code;
+
+    #[test]
+    fn normalizes_lowercase_currency_codes() {
+        assert_eq!(
+            normalize_currency_code(" inr ").expect("valid currency code"),
+            "INR"
+        );
+    }
+
+    #[test]
+    fn rejects_partial_or_non_alpha_currency_codes() {
+        assert!(normalize_currency_code("").is_err());
+        assert!(normalize_currency_code("IN").is_err());
+        assert!(normalize_currency_code("IN1").is_err());
+    }
 }
 
 const STATUS_PENDING: &str = "PENDING";

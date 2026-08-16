@@ -17,8 +17,8 @@ use kabipay_db_entities::tenant::d0027_communication_audit::notification;
 use kabipay_db_entities::tenant::d0030_outbox_events::outbox_event;
 use rust_decimal::Decimal;
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseConnection, EntityTrait, QueryFilter,
-    QueryOrder, QuerySelect, Set, TransactionTrait,
+    ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseConnection, DbBackend, EntityTrait,
+    QueryFilter, QueryOrder, QuerySelect, Set, Statement, TransactionTrait,
 };
 use std::collections::HashSet;
 use uuid::Uuid;
@@ -186,7 +186,54 @@ pub async fn submit_leave_request(
         ));
     }
 
+    let normalized_half_day_session = normalize_half_day_request(
+        from_date,
+        to_date,
+        is_half_day,
+        half_day_session,
+    )?;
+
     let txn = db.begin().await?;
+
+    // Prevent two simultaneous submissions from both passing the overlap
+    // check before either row is visible. The key is tenant + employee scoped.
+    txn.execute(Statement::from_sql_and_values(
+        DbBackend::Postgres,
+        "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+        vec![format!("{tenant_id}:{employee_id}").into()],
+    ))
+    .await?;
+
+    let overlapping = leave_request::Entity::find()
+        .filter(leave_request::Column::TenantId.eq(tenant_id))
+        .filter(leave_request::Column::EmployeeId.eq(employee_id))
+        .filter(leave_request::Column::IsDeleted.eq(false))
+        .filter(
+            leave_request::Column::Status
+                .is_in([STATUS_PENDING.to_string(), STATUS_APPROVED.to_string()]),
+        )
+        .filter(leave_request::Column::FromDate.lte(to_date))
+        .filter(leave_request::Column::ToDate.gte(from_date))
+        .all(&txn)
+        .await?;
+    if overlapping.iter().any(|existing| {
+        leave_ranges_conflict(
+            from_date,
+            to_date,
+            is_half_day,
+            normalized_half_day_session.as_deref(),
+            existing.from_date,
+            existing.to_date,
+            existing.is_half_day,
+            existing.half_day_session.as_deref(),
+        )
+    }) {
+        return Err(KabiPayError::BusinessRule {
+            code: "LEAVE_DATE_OVERLAP",
+            message: "An active leave request already covers all or part of this date range."
+                .into(),
+        });
+    }
 
     let lt = leave_type::Entity::find_by_id(leave_type_id)
         .filter(leave_type::Column::TenantId.eq(tenant_id))
@@ -227,18 +274,18 @@ pub async fn submit_leave_request(
     let year = from_date.year();
     let bal = if lt.is_paid {
         let bal = leave_balance::Entity::find()
-        .filter(leave_balance::Column::TenantId.eq(tenant_id))
-        .filter(leave_balance::Column::EmployeeId.eq(employee_id))
-        .filter(leave_balance::Column::LeaveTypeId.eq(leave_type_id))
-        .filter(leave_balance::Column::Year.eq(year))
-        .one(&txn)
-        .await?
-        .ok_or_else(|| {
-            KabiPayError::Validation(
-                "no leave balance for this leave type and year — configure a leave policy with entitlement or ask HR to provision balances"
-                    .into(),
-            )
-        })?;
+            .filter(leave_balance::Column::TenantId.eq(tenant_id))
+            .filter(leave_balance::Column::EmployeeId.eq(employee_id))
+            .filter(leave_balance::Column::LeaveTypeId.eq(leave_type_id))
+            .filter(leave_balance::Column::Year.eq(year))
+            .one(&txn)
+            .await?
+            .ok_or_else(|| {
+                KabiPayError::Validation(
+                    "no leave balance for this leave type and year — configure a leave policy with entitlement or ask HR to provision balances"
+                        .into(),
+                )
+            })?;
 
         if bal.balance_days < days {
             return Err(KabiPayError::Validation(
@@ -261,7 +308,7 @@ pub async fn submit_leave_request(
         to_date: Set(to_date),
         days_requested: Set(days),
         is_half_day: Set(is_half_day),
-        half_day_session: Set(half_day_session),
+        half_day_session: Set(normalized_half_day_session),
         status: Set("PENDING".into()),
         reason: Set(reason),
         rejection_reason: Set(None),
@@ -301,6 +348,104 @@ const STATUS_PENDING: &str = "PENDING";
 const STATUS_APPROVED: &str = "APPROVED";
 const STATUS_REJECTED: &str = "REJECTED";
 const STATUS_CANCELLED: &str = "CANCELLED";
+
+fn normalize_half_day_request(
+    from_date: NaiveDate,
+    to_date: NaiveDate,
+    is_half_day: bool,
+    half_day_session: Option<String>,
+) -> KabiPayResult<Option<String>> {
+    if !is_half_day {
+        return Ok(None);
+    }
+    if from_date != to_date {
+        return Err(KabiPayError::Validation(
+            "half-day leave must start and end on the same date".into(),
+        ));
+    }
+    let normalized = half_day_session
+        .map(|value| value.trim().to_ascii_uppercase())
+        .unwrap_or_default();
+    if !matches!(normalized.as_str(), "FIRST_HALF" | "SECOND_HALF") {
+        return Err(KabiPayError::Validation(
+            "halfDaySession must be FIRST_HALF or SECOND_HALF".into(),
+        ));
+    }
+    Ok(Some(normalized))
+}
+
+fn leave_ranges_conflict(
+    from_date: NaiveDate,
+    to_date: NaiveDate,
+    is_half_day: bool,
+    half_day_session: Option<&str>,
+    existing_from_date: NaiveDate,
+    existing_to_date: NaiveDate,
+    existing_is_half_day: bool,
+    existing_half_day_session: Option<&str>,
+) -> bool {
+    let complementary_half_days = is_half_day
+        && existing_is_half_day
+        && from_date == to_date
+        && existing_from_date == existing_to_date
+        && existing_from_date == from_date
+        && half_day_session.is_some()
+        && existing_half_day_session.is_some()
+        && half_day_session != existing_half_day_session;
+    !complementary_half_days
+}
+
+#[cfg(test)]
+mod overlap_tests {
+    use super::leave_ranges_conflict;
+    use chrono::NaiveDate;
+
+    fn date(day: u32) -> NaiveDate {
+        NaiveDate::from_ymd_opt(2026, 8, day).expect("valid test date")
+    }
+
+    #[test]
+    fn full_day_requests_conflict_on_the_same_date() {
+        assert!(leave_ranges_conflict(
+            date(17),
+            date(17),
+            false,
+            None,
+            date(17),
+            date(17),
+            false,
+            None,
+        ));
+    }
+
+    #[test]
+    fn complementary_half_day_sessions_do_not_conflict() {
+        assert!(!leave_ranges_conflict(
+            date(17),
+            date(17),
+            true,
+            Some("SECOND_HALF"),
+            date(17),
+            date(17),
+            true,
+            Some("FIRST_HALF"),
+        ));
+    }
+
+    #[test]
+    fn duplicate_half_day_sessions_conflict() {
+        assert!(leave_ranges_conflict(
+            date(17),
+            date(17),
+            true,
+            Some("FIRST_HALF"),
+            date(17),
+            date(17),
+            true,
+            Some("FIRST_HALF"),
+        ));
+    }
+}
 
 /// New outbox rows start here until a consumer marks them processed (Gap G — M6).
 const OUTBOX_STATUS_PENDING: &str = "PENDING";
