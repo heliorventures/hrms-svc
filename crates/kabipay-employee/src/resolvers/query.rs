@@ -11,7 +11,7 @@ use kabipay_common::{
 use uuid::Uuid;
 
 use crate::resolvers::types::{
-    ClearanceChecklistItemDto, DepartmentDto, DesignationDto, DocumentTypeDto,
+    ClearanceChecklistItemDto, CompanyDocumentDto, DepartmentDto, DesignationDto, DocumentTypeDto,
     EmployeeAadhaarRecordDto, EmployeeBankAccountDto, EmployeeDirectoryEntryDto,
     EmployeeDirectoryPageDto, EmployeeDocumentAttachmentDto, EmployeeDocumentDto, EmployeeDto,
     EmployeeEducationDto, EmployeeEvidenceReviewQueueItemDto, EmployeeIdentityProfileDto,
@@ -31,7 +31,7 @@ use crate::resolvers::scope::{
     assert_employee_in_data_scope, data_scope_employee, require_tenant_rbac_admin,
     resolve_viewer_employee,
 };
-use crate::services::document_file_service;
+use crate::services::{company_document_service, document_file_service};
 use crate::services::{
     directory_service, document_service, employee_service, employment_history_service,
     offboarding_fnf_service, onboarding_service, org_service, profile_change_service,
@@ -453,7 +453,43 @@ impl QueryRoot {
         Ok(rows.into_iter().map(DocumentTypeDto::from).collect())
     }
 
-    /// Uploaded employee documents. Omit `employeeId` to list the caller’s own files (JWT).
+    /// Company policy, onboarding, and exit-formality documents.
+    async fn company_documents(
+        &self,
+        ctx: &Context<'_>,
+        category: Option<String>,
+        #[graphql(default = true)] active_only: bool,
+        #[graphql(default = 100)] limit: u64,
+    ) -> Result<Vec<CompanyDocumentDto>> {
+        let tenant_id = require_tenant_id(ctx)?;
+        let claims = require_client_claims(ctx)?;
+        let db = tenant_db(ctx, tenant_id).await?;
+        let include_hidden = claims.can_manage_employee_directory()
+            || claims.can_manage_onboarding_tenant()
+            || claims.can_manage_tenant_rbac();
+        let rows = company_document_service::list_company_documents(
+            &db,
+            tenant_id,
+            category,
+            active_only,
+            include_hidden,
+            limit,
+        )
+        .await
+        .map_err(KabiPayError::into_graphql)?;
+        let file_map = company_document_service::map_file_storage_rows(&db, tenant_id, &rows)
+            .await
+            .map_err(KabiPayError::into_graphql)?;
+        Ok(rows
+            .into_iter()
+            .map(|row| {
+                let file = file_map.get(&row.file_storage_id);
+                CompanyDocumentDto::from(row).with_file(file)
+            })
+            .collect())
+    }
+
+    /// Uploaded employee documents. Omit `employeeId` to list the caller's own files (JWT).
     async fn employee_documents(
         &self,
         ctx: &Context<'_>,
@@ -747,6 +783,62 @@ impl QueryRoot {
                 .original_filename
                 .clone()
                 .unwrap_or_else(|| "document".to_string()),
+            mime_type: fs_row
+                .mime_type
+                .clone()
+                .unwrap_or_else(|| "application/octet-stream".to_string()),
+            file_size_bytes: fs_row
+                .file_size_bytes
+                .and_then(|size| i32::try_from(size).ok()),
+            content_base64: STANDARD.encode(bytes),
+        })
+    }
+
+    /// Private company document bytes authorized through the company document record.
+    async fn company_document_attachment(
+        &self,
+        ctx: &Context<'_>,
+        company_document_id: ID,
+    ) -> Result<TenantFileAttachmentDto> {
+        let tenant_id = require_tenant_id(ctx)?;
+        let claims = require_client_claims(ctx)?;
+        let db = tenant_db(ctx, tenant_id).await?;
+        let document_id = parse_uuid(&company_document_id, "companyDocumentId")?;
+        let doc = company_document_service::find_company_document(&db, tenant_id, document_id)
+            .await
+            .map_err(KabiPayError::into_graphql)?;
+        let can_manage = claims.can_manage_employee_directory()
+            || claims.can_manage_onboarding_tenant()
+            || claims.can_manage_tenant_rbac();
+        if !can_manage && (doc.status != "ACTIVE" || !doc.visible_to_employees) {
+            return Err(KabiPayError::Forbidden(
+                "company document is not visible to employees".to_string(),
+            )
+            .into_graphql());
+        }
+        let fs_row = file_storage::Entity::find_by_id(doc.file_storage_id)
+            .filter(file_storage::Column::TenantId.eq(tenant_id))
+            .one(&db)
+            .await
+            .map_err(|e: sea_orm::DbErr| KabiPayError::from(e).into_graphql())?
+            .ok_or_else(|| {
+                KabiPayError::NotFound {
+                    entity: "fileStorage",
+                    id: doc.file_storage_id.to_string(),
+                }
+                .into_graphql()
+            })?;
+        let bytes = document_file_service::read_stored_file_bytes(
+            &document_file_service::local_file_root(),
+            &fs_row,
+        )
+        .await
+        .map_err(KabiPayError::into_graphql)?;
+        Ok(TenantFileAttachmentDto {
+            file_name: fs_row
+                .original_filename
+                .clone()
+                .unwrap_or_else(|| doc.title.clone()),
             mime_type: fs_row
                 .mime_type
                 .clone()

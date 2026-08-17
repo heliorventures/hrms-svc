@@ -16,6 +16,7 @@ use crate::entities::d0017_onboarding_offboarding::{
     clearance_checklist, fnf_settlement, onboarding_checklist, separation,
 };
 use crate::entities::d0029_file_storage::file_storage;
+use crate::entities::d0056_company_documents::company_document;
 use kabipay_db_entities::tenant::d0005_auth_rbac::{permission, permission_scope, role, user};
 
 /// Federated `Employee` type. `id` is the canonical cross-service identifier (Gap A).
@@ -164,6 +165,59 @@ impl From<document_type::Model> for DocumentTypeDto {
             created_at: m.created_at,
             updated_at: m.updated_at,
         }
+    }
+}
+
+#[derive(SimpleObject, Clone, Debug)]
+#[graphql(name = "CompanyDocument")]
+pub struct CompanyDocumentDto {
+    pub id: ID,
+    pub tenant_id: ID,
+    pub category: String,
+    pub title: String,
+    pub description: Option<String>,
+    pub file_storage_id: ID,
+    pub original_file_name: Option<String>,
+    pub mime_type: Option<String>,
+    pub file_size_bytes: Option<i32>,
+    pub status: String,
+    pub visible_to_employees: bool,
+    pub uploaded_by_user_id: Option<ID>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+impl From<company_document::Model> for CompanyDocumentDto {
+    fn from(m: company_document::Model) -> Self {
+        Self {
+            id: ID(m.id.to_string()),
+            tenant_id: ID(m.tenant_id.to_string()),
+            category: m.category,
+            title: m.title,
+            description: m.description,
+            file_storage_id: ID(m.file_storage_id.to_string()),
+            original_file_name: None,
+            mime_type: None,
+            file_size_bytes: None,
+            status: m.status,
+            visible_to_employees: m.visible_to_employees,
+            uploaded_by_user_id: m.uploaded_by.map(|id| ID(id.to_string())),
+            created_at: m.created_at,
+            updated_at: m.updated_at,
+        }
+    }
+}
+
+impl CompanyDocumentDto {
+    pub fn with_file(mut self, file: Option<&file_storage::Model>) -> Self {
+        if let Some(file) = file {
+            self.original_file_name = file.original_filename.clone();
+            self.mime_type = file.mime_type.clone();
+            self.file_size_bytes = file
+                .file_size_bytes
+                .and_then(|size| i32::try_from(size).ok());
+        }
+        self
     }
 }
 
@@ -961,6 +1015,16 @@ pub struct UploadTenantFileInput {
     pub mime_type: Option<String>,
     /// Standard base64 (not data-URL). Max ~6MB decoded.
     pub content_base64: String,
+}
+
+#[derive(InputObject, Clone, Debug)]
+pub struct CreateCompanyDocumentInput {
+    pub category: String,
+    pub title: String,
+    pub description: Option<String>,
+    pub file_storage_id: ID,
+    #[graphql(default = true)]
+    pub visible_to_employees: bool,
 }
 
 #[derive(SimpleObject, Clone, Debug)]

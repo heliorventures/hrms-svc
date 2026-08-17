@@ -2,6 +2,7 @@
 //!
 //! Resolvers call these functions. Services are the only layer that touches SeaORM.
 
+pub mod company_document_service;
 pub mod document_file_service;
 pub mod document_service;
 pub mod directory_service;

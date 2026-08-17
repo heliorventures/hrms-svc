@@ -12,7 +12,8 @@ use uuid::Uuid;
 use crate::resolvers::query::enrich_employee_dtos;
 use crate::resolvers::scope::{assert_employee_in_data_scope, require_tenant_rbac_admin};
 use crate::resolvers::types::{
-    ClearanceChecklistItemDto, CreateEmployeeInput, EmployeeAadhaarRecordDto,
+    ClearanceChecklistItemDto, CompanyDocumentDto, CreateCompanyDocumentInput, CreateEmployeeInput,
+    EmployeeAadhaarRecordDto,
     EmployeeBankAccountDto, EmployeeDocumentDto, EmployeeDto, EmployeePanRecordDto,
     EmployeeEducationDto, EmployeeProfileChangeRequestDto, EmployeeWorkExperienceDto,
     EmploymentHistoryRecordDto, FnfSettlementDto,
@@ -25,6 +26,7 @@ use crate::resolvers::types::{
     UpsertEmployeeEducationInput, UpsertEmployeePrimaryPanInput,
     UpsertEmployeeWorkExperienceInput, UpsertFnfSettlementInput,
 };
+use crate::services::company_document_service;
 use crate::services::document_file_service;
 use crate::services::document_service;
 use crate::services::employee_service::{
@@ -432,6 +434,91 @@ impl MutationRoot {
         .await
         .map_err(KabiPayError::into_graphql)?;
         Ok(UploadedTenantFileDto::from(m))
+    }
+
+    /// HR/admin: publish a company policy, onboarding, or exit-formality document.
+    async fn create_company_document(
+        &self,
+        ctx: &Context<'_>,
+        input: CreateCompanyDocumentInput,
+    ) -> Result<CompanyDocumentDto> {
+        let claims = require_client_claims(ctx)?;
+        if !claims.can_manage_employee_directory()
+            && !claims.can_manage_onboarding_tenant()
+            && !claims.can_manage_tenant_rbac()
+        {
+            return Err(KabiPayError::Forbidden(
+                "employee:write, onboarding:manage, or role:manage is required to manage company documents".into(),
+            )
+            .into_graphql());
+        }
+        let tenant_id = require_tenant_id(ctx)?;
+        let db = tenant_db(ctx, tenant_id).await?;
+        let file_storage_id = parse_uuid(&input.file_storage_id, "fileStorageId")?;
+        let row = company_document_service::create_company_document(
+            &db,
+            tenant_id,
+            company_document_service::NewCompanyDocument {
+                category: input.category,
+                title: input.title,
+                description: input.description,
+                file_storage_id,
+                visible_to_employees: input.visible_to_employees,
+                uploaded_by: claims.sub,
+            },
+        )
+        .await
+        .map_err(KabiPayError::into_graphql)?;
+        Ok(CompanyDocumentDto::from(row))
+    }
+
+    /// HR/admin: archive a company document without deleting its private file.
+    async fn archive_company_document(
+        &self,
+        ctx: &Context<'_>,
+        company_document_id: ID,
+    ) -> Result<CompanyDocumentDto> {
+        let claims = require_client_claims(ctx)?;
+        if !claims.can_manage_employee_directory()
+            && !claims.can_manage_onboarding_tenant()
+            && !claims.can_manage_tenant_rbac()
+        {
+            return Err(KabiPayError::Forbidden(
+                "employee:write, onboarding:manage, or role:manage is required to manage company documents".into(),
+            )
+            .into_graphql());
+        }
+        let tenant_id = require_tenant_id(ctx)?;
+        let db = tenant_db(ctx, tenant_id).await?;
+        let document_id = parse_uuid(&company_document_id, "companyDocumentId")?;
+        let row = company_document_service::archive_company_document(&db, tenant_id, document_id)
+            .await
+            .map_err(KabiPayError::into_graphql)?;
+        Ok(CompanyDocumentDto::from(row))
+    }
+
+    /// HR/admin: soft-delete a company document without deleting its private file.
+    async fn delete_company_document(
+        &self,
+        ctx: &Context<'_>,
+        company_document_id: ID,
+    ) -> Result<bool> {
+        let claims = require_client_claims(ctx)?;
+        if !claims.can_manage_employee_directory()
+            && !claims.can_manage_onboarding_tenant()
+            && !claims.can_manage_tenant_rbac()
+        {
+            return Err(KabiPayError::Forbidden(
+                "employee:write, onboarding:manage, or role:manage is required to manage company documents".into(),
+            )
+            .into_graphql());
+        }
+        let tenant_id = require_tenant_id(ctx)?;
+        let db = tenant_db(ctx, tenant_id).await?;
+        let document_id = parse_uuid(&company_document_id, "companyDocumentId")?;
+        company_document_service::delete_company_document(&db, tenant_id, document_id, claims.sub)
+            .await
+            .map_err(KabiPayError::into_graphql)
     }
 
     /// Demographics + emergency contact. Employee may edit **self**; HR may edit anyone in scope.

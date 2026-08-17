@@ -36,3 +36,4 @@ pub mod d0033_travel_request;
 pub mod d0035_payroll_arrear;
 pub mod d0046_user_notification_preference;
 pub mod d0050_employee_self_service;
+pub mod d0056_company_documents;
