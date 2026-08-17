@@ -1,6 +1,6 @@
 //! `file_storage` rows for announcement attachments (no `employee_document`).
 
-use std::path::PathBuf;
+use std::path::{Component, PathBuf};
 
 use chrono::Utc;
 use kabipay_common::{KabiPayError, KabiPayResult};
@@ -9,8 +9,8 @@ use sea_orm::{ActiveModelTrait, ActiveValue::Set, DatabaseConnection};
 use uuid::Uuid;
 
 use super::object_store::{
-    FileStorageMode, S3CompatSettings, ensure_tenant_bucket, s3_delete, s3_operator_for_bucket, s3_put,
-    tenant_bucket_name, PROVIDER_S3_COMPAT,
+    FileStorageMode, S3CompatSettings, PROVIDER_S3_COMPAT, ensure_tenant_bucket, s3_delete,
+    s3_operator_for_bucket, s3_put, s3_read, tenant_bucket_name,
 };
 
 const PROVIDER_LOCAL: &str = "LOCAL";
@@ -32,11 +32,115 @@ pub fn local_file_root() -> PathBuf {
     PathBuf::from(root)
 }
 
-fn absolute_storage_path(tenant_id: Uuid, file_id: Uuid) -> PathBuf {
-    let mut p = local_file_root();
-    p.push(tenant_id.to_string());
-    p.push(format!("{file_id}"));
-    p
+fn local_fallback_enabled() -> bool {
+    let fallback_mode = std::env::var("KABIPAY_FILE_STORAGE_FALLBACK")
+        .ok()
+        .map(|value| value.trim().to_ascii_lowercase());
+    if matches!(fallback_mode.as_deref(), Some("local" | "disk")) {
+        return true;
+    }
+    std::env::var("KABIPAY_FILE_STORAGE_LOCAL_FALLBACK")
+        .ok()
+        .map(|value| matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+        .unwrap_or(false)
+}
+
+/// Read announcement attachment bytes through the private storage backend.
+pub async fn read_blob(row: &file_storage::Model) -> KabiPayResult<Vec<u8>> {
+    match row.provider.trim().to_ascii_uppercase().as_str() {
+        PROVIDER_LOCAL => read_local_blob(row).await,
+        PROVIDER_S3_COMPAT => read_s3_blob(row).await,
+        provider => Err(KabiPayError::Validation(format!(
+            "unsupported file storage provider: {provider}"
+        ))),
+    }
+}
+
+async fn read_local_blob(row: &file_storage::Model) -> KabiPayResult<Vec<u8>> {
+    if row
+        .storage_path
+        .as_str()
+        .contains('\\')
+        || std::path::Path::new(&row.storage_path)
+            .components()
+            .any(|part| {
+                matches!(
+                    part,
+                    Component::ParentDir | Component::RootDir | Component::Prefix(_)
+                )
+            })
+    {
+        return Err(KabiPayError::Validation("invalid file path".into()));
+    }
+    let file_root = local_file_root();
+    let full = file_root.join(&row.storage_path);
+    tokio::fs::read(&full)
+        .await
+        .map_err(|e| KabiPayError::Internal(format!("read local file: {e}")))
+}
+
+async fn read_s3_blob(row: &file_storage::Model) -> KabiPayResult<Vec<u8>> {
+    let cfg = S3CompatSettings::from_env()?;
+    let bucket = row
+        .bucket
+        .clone()
+        .or_else(|| cfg.default_bucket.clone())
+        .ok_or_else(|| KabiPayError::Validation("file storage bucket is missing".into()))?;
+    let op = s3_operator_for_bucket(&cfg, &bucket)?;
+    s3_read(&op, &row.storage_path).await
+}
+
+fn safe_filename(original_filename: &str) -> String {
+    let sanitized = original_filename
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_') {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>()
+        .trim_matches(|ch| ch == '.' || ch == '-')
+        .chars()
+        .take(120)
+        .collect::<String>();
+    if sanitized.is_empty() {
+        "attachment".to_string()
+    } else {
+        sanitized
+    }
+}
+
+fn storage_path_for(
+    tenant_id: Uuid,
+    uploaded_by: Option<Uuid>,
+    file_id: Uuid,
+    original_filename: &str,
+) -> String {
+    let owner = uploaded_by
+        .map(|id| id.to_string())
+        .unwrap_or_else(|| "unassigned".to_string());
+    format!(
+        "tenants/{tenant_id}/users/{owner}/announcements/{file_id}/{}",
+        safe_filename(original_filename)
+    )
+}
+
+fn absolute_storage_path(storage_path: &str) -> KabiPayResult<PathBuf> {
+    if storage_path.contains('\\')
+        || std::path::Path::new(storage_path)
+            .components()
+            .any(|part| {
+                matches!(
+                    part,
+                    Component::ParentDir | Component::RootDir | Component::Prefix(_)
+                )
+            })
+    {
+        return Err(KabiPayError::Validation("invalid file path".into()));
+    }
+    Ok(local_file_root().join(storage_path))
 }
 
 /// Persist bytes to disk or object storage; returns new `file_storage.id`.
@@ -75,48 +179,28 @@ pub async fn store_blob(
             .await
         }
         FileStorageMode::S3Compat => {
-            let cfg = S3CompatSettings::from_env()?;
-            let file_id = Uuid::new_v4();
-            let now = Utc::now();
-            let (bucket, storage_path): (String, String) = if cfg.per_tenant_bucket {
-                let b = tenant_bucket_name(tenant_id, &cfg.bucket_prefix);
-                ensure_tenant_bucket(&cfg, &b).await?;
-                (b, file_id.to_string())
-            } else {
-                let b = cfg
-                    .default_bucket
-                    .as_ref()
-                    .expect("validated in S3CompatSettings::from_env")
-                    .clone();
-                ensure_tenant_bucket(&cfg, &b).await?;
-                (b, format!("{}/{}", tenant_id, file_id))
-            };
-            let sz = bytes.len() as i64;
-            let op = s3_operator_for_bucket(&cfg, &bucket)?;
-            s3_put(
-                &op,
-                &storage_path,
-                bytes,
-                mime_type.as_deref().filter(|s| !s.is_empty()),
-            )
-            .await?;
-            let inserted = insert_fs_row(
+            let s3_result = upload_s3(
                 db,
                 tenant_id,
                 uploaded_by,
-                original_filename,
-                mime_type,
-                file_id,
-                now,
-                Some(bucket),
-                storage_path.clone(),
-                sz,
+                original_filename.clone(),
+                mime_type.clone(),
+                bytes.clone(),
             )
             .await;
-            if inserted.is_err() {
-                s3_delete(&op, &storage_path).await;
+            match s3_result {
+                Ok(id) => Ok(id),
+                Err(error) if local_fallback_enabled() => {
+                    tracing::warn!(
+                        error = %error,
+                        tenant_id = %tenant_id,
+                        "S3 announcement attachment upload failed; using configured local fallback"
+                    );
+                    upload_local(db, tenant_id, uploaded_by, original_filename, mime_type, bytes)
+                        .await
+                }
+                Err(error) => Err(error),
             }
-            inserted
         }
         FileStorageMode::AzureBlob => Err(KabiPayError::Validation(
             "KABIPAY_FILE_STORAGE_MODE=azure is not implemented yet.".into(),
@@ -134,8 +218,8 @@ async fn upload_local(
 ) -> KabiPayResult<Uuid> {
     let file_id = Uuid::new_v4();
     let now = Utc::now();
-    let rel = format!("{}/{}", tenant_id, file_id);
-    let path = absolute_storage_path(tenant_id, file_id);
+    let rel = storage_path_for(tenant_id, uploaded_by, file_id, &original_filename);
+    let path = absolute_storage_path(&rel)?;
     if let Some(parent) = path.parent() {
         tokio::fs::create_dir_all(parent)
             .await
@@ -160,6 +244,55 @@ async fn upload_local(
     .await;
     if inserted.is_err() {
         let _ = tokio::fs::remove_file(&path).await;
+    }
+    inserted
+}
+
+async fn upload_s3(
+    db: &DatabaseConnection,
+    tenant_id: Uuid,
+    uploaded_by: Option<Uuid>,
+    original_filename: String,
+    mime_type: Option<String>,
+    bytes: Vec<u8>,
+) -> KabiPayResult<Uuid> {
+    let cfg = S3CompatSettings::from_env()?;
+    let file_id = Uuid::new_v4();
+    let now = Utc::now();
+    let bucket = if cfg.per_tenant_bucket {
+        tenant_bucket_name(tenant_id, &cfg.bucket_prefix)
+    } else {
+        cfg.default_bucket
+            .as_ref()
+            .expect("validated in S3CompatSettings::from_env")
+            .clone()
+    };
+    ensure_tenant_bucket(&cfg, &bucket).await?;
+    let storage_path = storage_path_for(tenant_id, uploaded_by, file_id, &original_filename);
+    let sz = bytes.len() as i64;
+    let op = s3_operator_for_bucket(&cfg, &bucket)?;
+    s3_put(
+        &op,
+        &storage_path,
+        bytes,
+        mime_type.as_deref().filter(|s| !s.is_empty()),
+    )
+    .await?;
+    let inserted = insert_fs_row(
+        db,
+        tenant_id,
+        uploaded_by,
+        original_filename,
+        mime_type,
+        file_id,
+        now,
+        Some(bucket),
+        storage_path.clone(),
+        sz,
+    )
+    .await;
+    if inserted.is_err() {
+        s3_delete(&op, &storage_path).await;
     }
     inserted
 }

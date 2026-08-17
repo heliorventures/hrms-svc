@@ -1,6 +1,7 @@
 //! Root query resolvers for kabipay-employee.
 
 use async_graphql::{Context, Object, Result, ID};
+use base64::{engine::general_purpose::STANDARD, Engine as _};
 use kabipay_common::{
     subgraph::{
         require_client_claims, require_tenant_id, resolve_client_employee_id, tenant_db,
@@ -12,13 +13,14 @@ use uuid::Uuid;
 use crate::resolvers::types::{
     ClearanceChecklistItemDto, DepartmentDto, DesignationDto, DocumentTypeDto,
     EmployeeAadhaarRecordDto, EmployeeBankAccountDto, EmployeeDirectoryEntryDto,
-    EmployeeDirectoryPageDto, EmployeeDocumentDto, EmployeeDto, EmployeeIdentityProfileDto,
-    EmployeeEducationDto, EmployeeEvidenceReviewQueueItemDto, EmployeePanRecordDto,
-    EmployeeProfileAccessDto, EmployeeProfileChangeRequestDto,
+    EmployeeDirectoryPageDto, EmployeeDocumentAttachmentDto, EmployeeDocumentDto, EmployeeDto,
+    EmployeeEducationDto, EmployeeEvidenceReviewQueueItemDto, EmployeeIdentityProfileDto,
+    EmployeePanRecordDto, EmployeeProfileAccessDto, EmployeeProfileChangeRequestDto,
     EmployeeProfileChangeReviewDetailDto, EmployeeProfileReviewQueueItemDto,
     EmployeeWorkExperienceDto, EmploymentHistoryRecordDto, FnfSettlementDto,
     OnboardingChecklistItemDto, OrgChartRowDto, SeparationDto, TenantCatalogPermissionDto,
-    TenantDirectoryRoleDto, TenantDirectoryUserDto, TenantPermissionScopeDto,
+    TenantDirectoryRoleDto, TenantDirectoryUserDto, TenantFileAttachmentDto,
+    TenantPermissionScopeDto,
 };
 use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter};
 
@@ -29,7 +31,7 @@ use crate::resolvers::scope::{
     assert_employee_in_data_scope, data_scope_employee, require_tenant_rbac_admin,
     resolve_viewer_employee,
 };
-use crate::services::document_file_service::{self, download_claims};
+use crate::services::document_file_service;
 use crate::services::{
     directory_service, document_service, employee_service, employment_history_service,
     offboarding_fnf_service, onboarding_service, org_service, profile_change_service,
@@ -636,14 +638,12 @@ impl QueryRoot {
         Ok(rows)
     }
 
-    /// HMAC time-limited URL for `GET /files/employee-document?token=...` (no `Authorization` on GET).
-    /// Caller must be able to read the employee who owns the document.
-    async fn employee_document_signed_read_url(
+    /// Private employee document bytes. Caller must be able to read the employee who owns the document.
+    async fn employee_document_attachment(
         &self,
         ctx: &Context<'_>,
         employee_document_id: ID,
-        #[graphql(default = 600)] ttl_seconds: i32,
-    ) -> Result<String> {
+    ) -> Result<EmployeeDocumentAttachmentDto> {
         let tenant_id = require_tenant_id(ctx)?;
         let db = tenant_db(ctx, tenant_id).await?;
         let doc_id = parse_uuid(&employee_document_id, "employeeDocumentId")?;
@@ -676,12 +676,89 @@ impl QueryRoot {
                 }
                 .into_graphql()
             })?;
-        let ttl = ttl_seconds.clamp(60, 86_400) as i64;
-        let claims = download_claims(tenant_id, file_id, fs_row.mime_type.clone(), ttl);
-        document_file_service::public_download_url(&claims).map_err(KabiPayError::into_graphql)
+        let bytes = document_file_service::read_stored_file_bytes(
+            &document_file_service::local_file_root(),
+            &fs_row,
+        )
+        .await
+        .map_err(KabiPayError::into_graphql)?;
+        Ok(EmployeeDocumentAttachmentDto {
+            file_name: fs_row
+                .original_filename
+                .clone()
+                .unwrap_or_else(|| "document".to_string()),
+            mime_type: fs_row
+                .mime_type
+                .clone()
+                .unwrap_or_else(|| "application/octet-stream".to_string()),
+            file_size_bytes: fs_row
+                .file_size_bytes
+                .and_then(|size| i32::try_from(size).ok()),
+            content_base64: STANDARD.encode(bytes),
+        })
     }
 
-    /// Onboarding tasks for an employee. Omit `employeeId` for the JWT subject’s checklist.
+    /// Private tenant file bytes for generic `file_storage` uploads.
+    ///
+    /// This is intentionally not a public/signed URL. Generic file storage is shared by multiple
+    /// HRMS modules, so reads are limited to the uploader or elevated tenant HR/onboarding/RBAC
+    /// admins until each module has its own business-object-specific visibility rules.
+    async fn tenant_file_attachment(
+        &self,
+        ctx: &Context<'_>,
+        file_storage_id: ID,
+    ) -> Result<TenantFileAttachmentDto> {
+        let tenant_id = require_tenant_id(ctx)?;
+        let claims = require_client_claims(ctx)?;
+        let db = tenant_db(ctx, tenant_id).await?;
+        let file_id = parse_uuid(&file_storage_id, "fileStorageId")?;
+        let fs_row = file_storage::Entity::find_by_id(file_id)
+            .filter(file_storage::Column::TenantId.eq(tenant_id))
+            .one(&db)
+            .await
+            .map_err(|e: sea_orm::DbErr| KabiPayError::from(e).into_graphql())?
+            .ok_or_else(|| {
+                KabiPayError::NotFound {
+                    entity: "fileStorage",
+                    id: file_id.to_string(),
+                }
+                .into_graphql()
+            })?;
+
+        let uploaded_by_viewer = fs_row.uploaded_by == Some(claims.sub);
+        let can_read_tenant_admin_file = claims.can_manage_employee_directory()
+            || claims.can_manage_onboarding_tenant()
+            || claims.can_manage_tenant_rbac();
+        if !uploaded_by_viewer && !can_read_tenant_admin_file {
+            return Err(KabiPayError::Forbidden(
+                "file is private to the uploader or tenant HR/onboarding admins".to_string(),
+            )
+            .into_graphql());
+        }
+
+        let bytes = document_file_service::read_stored_file_bytes(
+            &document_file_service::local_file_root(),
+            &fs_row,
+        )
+        .await
+        .map_err(KabiPayError::into_graphql)?;
+        Ok(TenantFileAttachmentDto {
+            file_name: fs_row
+                .original_filename
+                .clone()
+                .unwrap_or_else(|| "document".to_string()),
+            mime_type: fs_row
+                .mime_type
+                .clone()
+                .unwrap_or_else(|| "application/octet-stream".to_string()),
+            file_size_bytes: fs_row
+                .file_size_bytes
+                .and_then(|size| i32::try_from(size).ok()),
+            content_base64: STANDARD.encode(bytes),
+        })
+    }
+
+    /// Onboarding tasks for an employee. Omit `employeeId` for the JWT subject's checklist.
     /// HR / directory managers may pass another employee id (same data-scope rules as documents).
     async fn onboarding_checklist(
         &self,

@@ -1,9 +1,10 @@
 //! GraphQL DTOs for kabipay-notification.
 
 use async_graphql::{ComplexObject, Context, InputObject, Result, SimpleObject, ID};
+use base64::engine::general_purpose::STANDARD;
+use base64::Engine;
 use chrono::{DateTime, Utc};
 use kabipay_common::{
-    file_download_token::{file_download_claims, public_employee_file_download_url},
     subgraph::{require_client_claims, tenant_db},
     KabiPayError,
 };
@@ -11,6 +12,17 @@ use kabipay_db_entities::tenant::d0027_communication_audit::{announcement, notif
 use kabipay_db_entities::tenant::d0029_file_storage::file_storage;
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
 use uuid::Uuid;
+
+const MAX_INLINE_ANNOUNCEMENT_ATTACHMENT_BYTES: usize = 6 * 1024 * 1024;
+
+#[derive(SimpleObject, Clone, Debug)]
+#[graphql(name = "AnnouncementAttachment")]
+pub struct AnnouncementAttachmentDto {
+    pub file_name: String,
+    pub mime_type: String,
+    pub file_size_bytes: Option<i32>,
+    pub content_base64: String,
+}
 
 #[derive(SimpleObject, Clone, Debug)]
 #[graphql(complex)]
@@ -34,25 +46,31 @@ pub struct AnnouncementDto {
 
 #[ComplexObject]
 impl AnnouncementDto {
-    /// Time-limited URL for inline image / preview (`GET` on kabipay-employee).
-    async fn image_read_url(&self, ctx: &Context<'_>) -> Result<Option<String>> {
-        self.attachment_read_url(ctx, self.image_file_storage_id.clone())
+    /// Authenticated image bytes for inline preview. No storage or signed URL is exposed.
+    async fn image_attachment(
+        &self,
+        ctx: &Context<'_>,
+    ) -> Result<Option<AnnouncementAttachmentDto>> {
+        self.attachment_content(ctx, self.image_file_storage_id.clone())
             .await
     }
 
-    /// Time-limited URL to open or download the attached document.
-    async fn document_read_url(&self, ctx: &Context<'_>) -> Result<Option<String>> {
-        self.attachment_read_url(ctx, self.document_file_storage_id.clone())
+    /// Authenticated document bytes for client-side Blob download. No storage or signed URL is exposed.
+    async fn document_attachment(
+        &self,
+        ctx: &Context<'_>,
+    ) -> Result<Option<AnnouncementAttachmentDto>> {
+        self.attachment_content(ctx, self.document_file_storage_id.clone())
             .await
     }
 }
 
 impl AnnouncementDto {
-    async fn attachment_read_url(
+    async fn attachment_content(
         &self,
         ctx: &Context<'_>,
         file_id: Option<ID>,
-    ) -> Result<Option<String>> {
+    ) -> Result<Option<AnnouncementAttachmentDto>> {
         let Some(fid) = file_id else {
             return Ok(None);
         };
@@ -84,10 +102,38 @@ impl AnnouncementDto {
                 }
                 .into_graphql()
             })?;
-        let claims = file_download_claims(tenant_id, storage_id, fs_row.mime_type.clone(), 600);
-        public_employee_file_download_url(&claims)
-            .map(Some)
-            .map_err(KabiPayError::into_graphql)
+        if fs_row
+            .file_size_bytes
+            .is_some_and(|size| size > MAX_INLINE_ANNOUNCEMENT_ATTACHMENT_BYTES as i64)
+        {
+            return Err(KabiPayError::Validation(
+                "announcement attachment is too large to return inline".into(),
+            )
+            .into_graphql());
+        }
+        let bytes = crate::services::announcement_storage::read_blob(&fs_row)
+            .await
+            .map_err(KabiPayError::into_graphql)?;
+        if bytes.len() > MAX_INLINE_ANNOUNCEMENT_ATTACHMENT_BYTES {
+            return Err(KabiPayError::Validation(
+                "announcement attachment is too large to return inline".into(),
+            )
+            .into_graphql());
+        }
+        Ok(Some(AnnouncementAttachmentDto {
+            file_name: fs_row
+                .original_filename
+                .filter(|name| !name.trim().is_empty())
+                .unwrap_or_else(|| "attachment".into()),
+            mime_type: fs_row
+                .mime_type
+                .filter(|mime| !mime.trim().is_empty())
+                .unwrap_or_else(|| "application/octet-stream".into()),
+            file_size_bytes: fs_row
+                .file_size_bytes
+                .and_then(|size| i32::try_from(size).ok()),
+            content_base64: STANDARD.encode(bytes),
+        }))
     }
 }
 

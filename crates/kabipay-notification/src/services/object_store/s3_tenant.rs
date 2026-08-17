@@ -123,6 +123,13 @@ pub async fn s3_put(
     Ok(())
 }
 
+pub async fn s3_read(op: &Operator, key: &str) -> KabiPayResult<Vec<u8>> {
+    op.read(key)
+        .await
+        .map(|buffer| buffer.to_vec())
+        .map_err(|e| KabiPayError::Internal(format!("S3 get_object: {e}")))
+}
+
 pub async fn s3_delete(op: &Operator, key: &str) {
     if let Err(e) = op.delete(key).await {
         tracing::warn!(error = %e, key, "S3 delete_object cleanup failed");

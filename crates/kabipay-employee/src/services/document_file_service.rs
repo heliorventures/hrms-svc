@@ -1,13 +1,10 @@
 //! `file_storage` + `employee_document` writes: **LOCAL** disk or **S3-compatible** object storage
 //! (Cloudflare R2, AWS S3, MinIO, …). See `object_store::config` for environment variables.
 
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use chrono::Utc;
-use kabipay_common::{
-    file_download_token::{file_download_claims, public_employee_file_download_url},
-    KabiPayError, KabiPayResult,
-};
+use kabipay_common::{KabiPayError, KabiPayResult};
 use sea_orm::{
     ActiveModelTrait, ActiveValue::Set, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter,
     TransactionTrait,
@@ -31,11 +28,69 @@ pub fn local_file_root() -> PathBuf {
     PathBuf::from(root)
 }
 
-fn absolute_storage_path(tenant_id: Uuid, file_id: Uuid) -> PathBuf {
-    let mut p = local_file_root();
-    p.push(tenant_id.to_string());
-    p.push(format!("{file_id}"));
-    p
+fn local_fallback_enabled() -> bool {
+    let fallback_mode = std::env::var("KABIPAY_FILE_STORAGE_FALLBACK")
+        .ok()
+        .map(|value| value.trim().to_ascii_lowercase());
+    if matches!(fallback_mode.as_deref(), Some("local" | "disk")) {
+        return true;
+    }
+    std::env::var("KABIPAY_FILE_STORAGE_LOCAL_FALLBACK")
+        .ok()
+        .map(|value| matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+        .unwrap_or(false)
+}
+
+fn safe_filename(original_filename: &str) -> String {
+    let sanitized = original_filename
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_') {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>()
+        .trim_matches(|ch| ch == '.' || ch == '-')
+        .chars()
+        .take(120)
+        .collect::<String>();
+    if sanitized.is_empty() {
+        "document".to_string()
+    } else {
+        sanitized
+    }
+}
+
+fn storage_path_for(
+    tenant_id: Uuid,
+    owner_user_id: Option<Uuid>,
+    category: &str,
+    file_id: Uuid,
+    original_filename: &str,
+) -> String {
+    let owner = owner_user_id
+        .map(|id| id.to_string())
+        .unwrap_or_else(|| "unassigned".to_string());
+    format!(
+        "tenants/{tenant_id}/users/{owner}/{category}/{file_id}/{}",
+        safe_filename(original_filename)
+    )
+}
+
+fn absolute_storage_path(storage_path: &str) -> KabiPayResult<PathBuf> {
+    if storage_path.contains('\\')
+        || Path::new(storage_path).components().any(|part| {
+            matches!(
+                part,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        })
+    {
+        return Err(KabiPayError::Validation("invalid file path".into()));
+    }
+    Ok(local_file_root().join(storage_path))
 }
 
 /// Read bytes for `GET /files/employee-document`. Uses row metadata (not only current env) so
@@ -45,10 +100,17 @@ pub async fn read_stored_file_bytes(
     row: &file_storage::Model,
 ) -> KabiPayResult<Vec<u8>> {
     if row.provider == PROVIDER_LOCAL {
-        let full = file_root.join(&row.storage_path);
-        if !full.starts_with(file_root) {
-            return Err(KabiPayError::Validation("path invalid".into()));
+        if row.storage_path.contains('\\')
+            || Path::new(&row.storage_path).components().any(|part| {
+                matches!(
+                    part,
+                    Component::ParentDir | Component::RootDir | Component::Prefix(_)
+                )
+            })
+        {
+            return Err(KabiPayError::Validation("invalid file path".into()));
         }
+        let full = file_root.join(&row.storage_path);
         return match tokio::fs::read(&full).await {
             Ok(b) => Ok(b),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(KabiPayError::NotFound {
@@ -106,53 +168,42 @@ pub async fn upload_employee_document(
             .await
         }
         FileStorageMode::S3Compat => {
-            let cfg = S3CompatSettings::from_env()?;
-            let file_id = Uuid::new_v4();
-            let doc_id = Uuid::new_v4();
-            let now = Utc::now();
-            let (bucket, storage_path): (String, String) = if cfg.per_tenant_bucket {
-                let b = tenant_bucket_name(tenant_id, &cfg.bucket_prefix);
-                ensure_tenant_bucket(&cfg, &b).await?;
-                (b, file_id.to_string())
-            } else {
-                let b = cfg
-                    .default_bucket
-                    .as_ref()
-                    .expect("validated in S3CompatSettings::from_env")
-                    .clone();
-                ensure_tenant_bucket(&cfg, &b).await?;
-                (b, format!("{}/{}", tenant_id, file_id))
-            };
-            let sz = bytes.len() as i64;
-            let op = s3_operator_for_bucket(&cfg, &bucket)?;
-            s3_put(
-                &op,
-                &storage_path,
-                bytes,
-                mime_type.as_deref().filter(|s| !s.is_empty()),
-            )
-            .await?;
-            let inserted = insert_fs_doc(
+            let s3_result = upload_s3_employee_document(
                 db,
                 tenant_id,
                 employee_id,
                 document_type_id,
                 uploader_user_id,
-                original_filename,
-                mime_type,
-                file_id,
-                doc_id,
-                now,
-                Some(bucket),
-                storage_path.clone(),
-                sz,
+                original_filename.clone(),
+                mime_type.clone(),
+                bytes.clone(),
                 hr_auto_approve,
             )
             .await;
-            if inserted.is_err() {
-                s3_delete(&op, &storage_path).await;
+            match s3_result {
+                Ok(row) => Ok(row),
+                Err(error) if local_fallback_enabled() => {
+                    tracing::warn!(
+                        error = %error,
+                        tenant_id = %tenant_id,
+                        employee_id = %employee_id,
+                        "S3 employee document upload failed; using configured local fallback"
+                    );
+                    upload_local(
+                        db,
+                        tenant_id,
+                        employee_id,
+                        document_type_id,
+                        uploader_user_id,
+                        original_filename,
+                        mime_type,
+                        bytes,
+                        hr_auto_approve,
+                    )
+                    .await
+                }
+                Err(error) => Err(error),
             }
-            inserted
         }
         FileStorageMode::AzureBlob => Err(KabiPayError::Validation(
             "KABIPAY_FILE_STORAGE_MODE=azure is not implemented yet. Use local, or s3_compat for R2/S3/MinIO."
@@ -193,9 +244,7 @@ pub async fn cleanup_unlinked_employee_document(
 
     if let Some(stored_file) = stored_file {
         if stored_file.provider == PROVIDER_LOCAL {
-            let root = local_file_root();
-            let full_path = root.join(&stored_file.storage_path);
-            if full_path.starts_with(&root) {
+            if let Ok(full_path) = absolute_storage_path(&stored_file.storage_path) {
                 let _ = tokio::fs::remove_file(full_path).await;
             }
         } else if stored_file.provider == PROVIDER_S3_COMPAT {
@@ -227,8 +276,14 @@ pub async fn upload_tenant_file(
         FileStorageMode::Local => {
             let file_id = Uuid::new_v4();
             let now = Utc::now();
-            let rel = format!("{}/{}", tenant_id, file_id);
-            let path = absolute_storage_path(tenant_id, file_id);
+            let rel = storage_path_for(
+                tenant_id,
+                uploader_user_id,
+                "documents",
+                file_id,
+                &original_filename,
+            );
+            let path = absolute_storage_path(&rel)?;
             if let Some(parent) = path.parent() {
                 tokio::fs::create_dir_all(parent).await.map_err(|e: std::io::Error| {
                     KabiPayError::Internal(format!("create_dir_all: {e}"))
@@ -256,48 +311,35 @@ pub async fn upload_tenant_file(
             inserted
         }
         FileStorageMode::S3Compat => {
-            let cfg = S3CompatSettings::from_env()?;
-            let file_id = Uuid::new_v4();
-            let now = Utc::now();
-            let (bucket, storage_path): (String, String) = if cfg.per_tenant_bucket {
-                let b = tenant_bucket_name(tenant_id, &cfg.bucket_prefix);
-                ensure_tenant_bucket(&cfg, &b).await?;
-                (b, file_id.to_string())
-            } else {
-                let b = cfg
-                    .default_bucket
-                    .as_ref()
-                    .expect("validated in S3CompatSettings::from_env")
-                    .clone();
-                ensure_tenant_bucket(&cfg, &b).await?;
-                (b, format!("{}/{}", tenant_id, file_id))
-            };
-            let size = bytes.len() as i64;
-            let op = s3_operator_for_bucket(&cfg, &bucket)?;
-            s3_put(
-                &op,
-                &storage_path,
-                bytes,
-                mime_type.as_deref().filter(|s| !s.is_empty()),
-            )
-            .await?;
-            let inserted = insert_file_storage(
+            let s3_result = upload_s3_tenant_file(
                 db,
                 tenant_id,
                 uploader_user_id,
-                original_filename,
-                mime_type,
-                file_id,
-                now,
-                Some(bucket),
-                storage_path.clone(),
-                size,
+                original_filename.clone(),
+                mime_type.clone(),
+                bytes.clone(),
             )
             .await;
-            if inserted.is_err() {
-                s3_delete(&op, &storage_path).await;
+            match s3_result {
+                Ok(row) => Ok(row),
+                Err(error) if local_fallback_enabled() => {
+                    tracing::warn!(
+                        error = %error,
+                        tenant_id = %tenant_id,
+                        "S3 tenant file upload failed; using configured local fallback"
+                    );
+                    upload_local_tenant_file(
+                        db,
+                        tenant_id,
+                        uploader_user_id,
+                        original_filename,
+                        mime_type,
+                        bytes,
+                    )
+                    .await
+                }
+                Err(error) => Err(error),
             }
-            inserted
         }
         FileStorageMode::AzureBlob => Err(KabiPayError::Validation(
             "KABIPAY_FILE_STORAGE_MODE=azure is not implemented yet. Use local, or s3_compat for R2/S3/MinIO."
@@ -364,8 +406,14 @@ async fn upload_local(
     let file_id = Uuid::new_v4();
     let doc_id = Uuid::new_v4();
     let now = Utc::now();
-    let rel = format!("{}/{}", tenant_id, file_id);
-    let path = absolute_storage_path(tenant_id, file_id);
+    let rel = storage_path_for(
+        tenant_id,
+        Some(employee_id),
+        "documents",
+        file_id,
+        &original_filename,
+    );
+    let path = absolute_storage_path(&rel)?;
     if let Some(parent) = path.parent() {
         tokio::fs::create_dir_all(parent)
             .await
@@ -395,6 +443,169 @@ async fn upload_local(
     .await;
     if inserted.is_err() {
         let _ = tokio::fs::remove_file(&path).await;
+    }
+    inserted
+}
+
+async fn upload_s3_employee_document(
+    db: &DatabaseConnection,
+    tenant_id: Uuid,
+    employee_id: Uuid,
+    document_type_id: Uuid,
+    uploader_user_id: Option<Uuid>,
+    original_filename: String,
+    mime_type: Option<String>,
+    bytes: Vec<u8>,
+    hr_auto_approve: bool,
+) -> KabiPayResult<employee_document::Model> {
+    let cfg = S3CompatSettings::from_env()?;
+    let file_id = Uuid::new_v4();
+    let doc_id = Uuid::new_v4();
+    let now = Utc::now();
+    let bucket = if cfg.per_tenant_bucket {
+        tenant_bucket_name(tenant_id, &cfg.bucket_prefix)
+    } else {
+        cfg.default_bucket
+            .as_ref()
+            .expect("validated in S3CompatSettings::from_env")
+            .clone()
+    };
+    ensure_tenant_bucket(&cfg, &bucket).await?;
+    let storage_path = storage_path_for(
+        tenant_id,
+        Some(employee_id),
+        "documents",
+        file_id,
+        &original_filename,
+    );
+    let sz = bytes.len() as i64;
+    let op = s3_operator_for_bucket(&cfg, &bucket)?;
+    s3_put(
+        &op,
+        &storage_path,
+        bytes,
+        mime_type.as_deref().filter(|s| !s.is_empty()),
+    )
+    .await?;
+    let inserted = insert_fs_doc(
+        db,
+        tenant_id,
+        employee_id,
+        document_type_id,
+        uploader_user_id,
+        original_filename,
+        mime_type,
+        file_id,
+        doc_id,
+        now,
+        Some(bucket),
+        storage_path.clone(),
+        sz,
+        hr_auto_approve,
+    )
+    .await;
+    if inserted.is_err() {
+        s3_delete(&op, &storage_path).await;
+    }
+    inserted
+}
+
+async fn upload_local_tenant_file(
+    db: &DatabaseConnection,
+    tenant_id: Uuid,
+    uploader_user_id: Option<Uuid>,
+    original_filename: String,
+    mime_type: Option<String>,
+    bytes: Vec<u8>,
+) -> KabiPayResult<file_storage::Model> {
+    let file_id = Uuid::new_v4();
+    let now = Utc::now();
+    let rel = storage_path_for(
+        tenant_id,
+        uploader_user_id,
+        "documents",
+        file_id,
+        &original_filename,
+    );
+    let path = absolute_storage_path(&rel)?;
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(|e: std::io::Error| KabiPayError::Internal(format!("create_dir_all: {e}")))?;
+    }
+    tokio::fs::write(&path, &bytes)
+        .await
+        .map_err(|e| KabiPayError::Internal(format!("write local file: {e}")))?;
+    let inserted = insert_file_storage(
+        db,
+        tenant_id,
+        uploader_user_id,
+        original_filename,
+        mime_type,
+        file_id,
+        now,
+        None,
+        rel,
+        bytes.len() as i64,
+    )
+    .await;
+    if inserted.is_err() {
+        let _ = tokio::fs::remove_file(&path).await;
+    }
+    inserted
+}
+
+async fn upload_s3_tenant_file(
+    db: &DatabaseConnection,
+    tenant_id: Uuid,
+    uploader_user_id: Option<Uuid>,
+    original_filename: String,
+    mime_type: Option<String>,
+    bytes: Vec<u8>,
+) -> KabiPayResult<file_storage::Model> {
+    let cfg = S3CompatSettings::from_env()?;
+    let file_id = Uuid::new_v4();
+    let now = Utc::now();
+    let bucket = if cfg.per_tenant_bucket {
+        tenant_bucket_name(tenant_id, &cfg.bucket_prefix)
+    } else {
+        cfg.default_bucket
+            .as_ref()
+            .expect("validated in S3CompatSettings::from_env")
+            .clone()
+    };
+    ensure_tenant_bucket(&cfg, &bucket).await?;
+    let storage_path = storage_path_for(
+        tenant_id,
+        uploader_user_id,
+        "documents",
+        file_id,
+        &original_filename,
+    );
+    let size = bytes.len() as i64;
+    let op = s3_operator_for_bucket(&cfg, &bucket)?;
+    s3_put(
+        &op,
+        &storage_path,
+        bytes,
+        mime_type.as_deref().filter(|s| !s.is_empty()),
+    )
+    .await?;
+    let inserted = insert_file_storage(
+        db,
+        tenant_id,
+        uploader_user_id,
+        original_filename,
+        mime_type,
+        file_id,
+        now,
+        Some(bucket),
+        storage_path.clone(),
+        size,
+    )
+    .await;
+    if inserted.is_err() {
+        s3_delete(&op, &storage_path).await;
     }
     inserted
 }
@@ -475,23 +686,6 @@ async fn insert_fs_doc(
         .await
         .map_err(KabiPayError::from)?
         .ok_or_else(|| KabiPayError::Internal("inserted employee_document missing".into()))
-}
-
-/// Build signed claims for a short-TTL GET URL (no DB required on download).
-pub fn download_claims(
-    tenant_id: Uuid,
-    file_storage_id: Uuid,
-    mime_type: Option<String>,
-    ttl_seconds: i64,
-) -> kabipay_common::file_download_token::FileDownloadClaims {
-    file_download_claims(tenant_id, file_storage_id, mime_type, ttl_seconds)
-}
-
-/// Build a time-limited HMAC download URL (HTTP GET) for a stored file.
-pub fn public_download_url(
-    claims: &kabipay_common::file_download_token::FileDownloadClaims,
-) -> KabiPayResult<String> {
-    public_employee_file_download_url(claims)
 }
 
 async fn insert_file_storage(

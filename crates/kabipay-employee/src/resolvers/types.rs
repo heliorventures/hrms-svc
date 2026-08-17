@@ -987,6 +987,26 @@ impl From<file_storage::Model> for UploadedTenantFileDto {
     }
 }
 
+#[derive(SimpleObject, Clone, Debug)]
+#[graphql(name = "EmployeeDocumentAttachment")]
+pub struct EmployeeDocumentAttachmentDto {
+    pub file_name: String,
+    pub mime_type: String,
+    pub file_size_bytes: Option<i32>,
+    /// Standard base64 payload returned only after employee/data-scope authorization.
+    pub content_base64: String,
+}
+
+#[derive(SimpleObject, Clone, Debug)]
+#[graphql(name = "TenantFileAttachment")]
+pub struct TenantFileAttachmentDto {
+    pub file_name: String,
+    pub mime_type: String,
+    pub file_size_bytes: Option<i32>,
+    /// Standard base64 payload returned only after tenant file authorization.
+    pub content_base64: String,
+}
+
 impl From<employee::Model> for EmployeeDto {
     fn from(m: employee::Model) -> Self {
         let full_name = format!("{} {}", m.first_name.trim(), m.last_name.trim())
