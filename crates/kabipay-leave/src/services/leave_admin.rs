@@ -199,9 +199,10 @@ pub async fn upsert_leave_policy(
         .into_iter()
         .any(|policy| id.map(|pid| pid != policy.id).unwrap_or(true));
     if duplicate {
-        return Err(KabiPayError::Validation(
-            "only one leave policy is allowed per leave type".into(),
-        ));
+        return Err(KabiPayError::BusinessRule {
+            code: "LEAVE_POLICY_DUPLICATE",
+            message: "only one leave policy is allowed per leave type".into(),
+        });
     }
 
     if let Some(pid) = id {
@@ -260,13 +261,6 @@ pub async fn delete_leave_policy(
         .await
         .map_err(KabiPayError::from)?;
     Ok(r.rows_affected > 0)
-}
-
-/// Effective entitlement from a policy row as of today. Fixed annual policies use
-/// `annual_entitlement`; monthly policies use earned months in the current year.
-pub fn entitled_days_from_policy(pol: &leave_policy::Model) -> Option<Decimal> {
-    let as_of = Utc::now().date_naive();
-    entitled_days_from_policy_as_of(pol, None, as_of.year(), as_of)
 }
 
 fn first_day_of_month(year: i32, month: u32) -> NaiveDate {
@@ -355,75 +349,115 @@ pub async fn provision_leave_balances_from_policies(
         .map_err(KabiPayError::from)?;
 
     let mut touched: u32 = 0;
-    let now = Utc::now();
-
     for emp in &employees {
-        for pol in &unique_policies {
-            if let Some(ref app) = pol.applicable_to {
-                let t = app.trim().to_ascii_uppercase();
-                if !t.is_empty() && t != "ALL" && t != "*" {
-                    continue;
-                }
-            }
-            let as_of = Utc::now().date_naive();
-            let Some(target_entitled) =
-                entitled_days_from_policy_as_of(pol, Some(emp.date_of_joining), year, as_of)
-            else {
-                continue;
-            };
-            if target_entitled <= Decimal::ZERO {
-                continue;
-            }
-
-            let existing = leave_balance::Entity::find()
-                .filter(leave_balance::Column::TenantId.eq(tenant_id))
-                .filter(leave_balance::Column::EmployeeId.eq(emp.id))
-                .filter(leave_balance::Column::LeaveTypeId.eq(pol.leave_type_id))
-                .filter(leave_balance::Column::Year.eq(year))
-                .one(db)
-                .await
-                .map_err(KabiPayError::from)?;
-
-            if let Some(row) = existing {
-                let balance_days = balance_days_from_components(
-                    target_entitled,
-                    row.carried_forward_days,
-                    row.used_days,
-                    row.pending_days,
-                );
-                let mut am: leave_balance::ActiveModel = row.into();
-                am.entitled_days = Set(target_entitled);
-                am.balance_days = Set(balance_days);
-                am.updated_at = Set(now);
-                am.update(db).await.map_err(KabiPayError::from)?;
-            } else {
-                let balance_days = compute_balance_days(
-                    target_entitled,
-                    Decimal::ZERO,
-                    Decimal::ZERO,
-                    Decimal::ZERO,
-                )?;
-                let new_id = Uuid::new_v4();
-                let am = leave_balance::ActiveModel {
-                    id: Set(new_id),
-                    tenant_id: Set(tenant_id),
-                    employee_id: Set(emp.id),
-                    leave_type_id: Set(pol.leave_type_id),
-                    year: Set(year),
-                    entitled_days: Set(target_entitled),
-                    used_days: Set(Decimal::ZERO),
-                    pending_days: Set(Decimal::ZERO),
-                    carried_forward_days: Set(Decimal::ZERO),
-                    balance_days: Set(balance_days),
-                    created_at: Set(now),
-                    updated_at: Set(now),
-                };
-                am.insert(db).await.map_err(KabiPayError::from)?;
-            }
-            touched += 1;
-        }
+        touched += provision_for_employee(db, tenant_id, emp, &unique_policies, year).await?;
     }
+    Ok(touched)
+}
 
+/// Ensures the requested employee has current-year balance rows without requiring an
+/// administrator to run the tenant-wide provisioning action first. This is intentionally
+/// idempotent and preserves used, pending, and carried-forward days.
+pub async fn ensure_employee_leave_balances(
+    db: &DatabaseConnection,
+    tenant_id: Uuid,
+    employee_id: Uuid,
+    year: i32,
+) -> KabiPayResult<u32> {
+    let emp = employee::Entity::find_by_id(employee_id)
+        .filter(employee::Column::TenantId.eq(tenant_id))
+        .filter(employee::Column::IsDeleted.eq(false))
+        .one(db)
+        .await
+        .map_err(KabiPayError::from)?
+        .ok_or_else(|| KabiPayError::NotFound {
+            entity: "employee",
+            id: employee_id.to_string(),
+        })?;
+    let policies = list_leave_policies(db, tenant_id, 500).await?;
+    let mut seen_types = HashSet::new();
+    let unique_policies = policies
+        .into_iter()
+        .filter(|policy| seen_types.insert(policy.leave_type_id))
+        .collect::<Vec<_>>();
+    provision_for_employee(db, tenant_id, &emp, &unique_policies, year).await
+}
+
+async fn provision_for_employee(
+    db: &DatabaseConnection,
+    tenant_id: Uuid,
+    emp: &employee::Model,
+    policies: &[leave_policy::Model],
+    year: i32,
+) -> KabiPayResult<u32> {
+    let now = Utc::now();
+    let as_of = now.date_naive();
+    let mut touched = 0;
+    for pol in policies {
+        if let Some(ref app) = pol.applicable_to {
+            let t = app.trim().to_ascii_uppercase();
+            if !t.is_empty() && t != "ALL" && t != "*" {
+                continue;
+            }
+        }
+        let Some(target_entitled) =
+            entitled_days_from_policy_as_of(pol, Some(emp.date_of_joining), year, as_of)
+        else {
+            continue;
+        };
+        if target_entitled <= Decimal::ZERO {
+            continue;
+        }
+        let existing = leave_balance::Entity::find()
+            .filter(leave_balance::Column::TenantId.eq(tenant_id))
+            .filter(leave_balance::Column::EmployeeId.eq(emp.id))
+            .filter(leave_balance::Column::LeaveTypeId.eq(pol.leave_type_id))
+            .filter(leave_balance::Column::Year.eq(year))
+            .one(db)
+            .await
+            .map_err(KabiPayError::from)?;
+        if let Some(row) = existing {
+            let balance_days = balance_days_from_components(
+                target_entitled,
+                row.carried_forward_days,
+                row.used_days,
+                row.pending_days,
+            );
+            if row.entitled_days == target_entitled && row.balance_days == balance_days {
+                continue;
+            }
+            let mut am: leave_balance::ActiveModel = row.into();
+            am.entitled_days = Set(target_entitled);
+            am.balance_days = Set(balance_days);
+            am.updated_at = Set(now);
+            am.update(db).await.map_err(KabiPayError::from)?;
+        } else {
+            let balance_days = compute_balance_days(
+                target_entitled,
+                Decimal::ZERO,
+                Decimal::ZERO,
+                Decimal::ZERO,
+            )?;
+            leave_balance::ActiveModel {
+                id: Set(Uuid::new_v4()),
+                tenant_id: Set(tenant_id),
+                employee_id: Set(emp.id),
+                leave_type_id: Set(pol.leave_type_id),
+                year: Set(year),
+                entitled_days: Set(target_entitled),
+                used_days: Set(Decimal::ZERO),
+                pending_days: Set(Decimal::ZERO),
+                carried_forward_days: Set(Decimal::ZERO),
+                balance_days: Set(balance_days),
+                created_at: Set(now),
+                updated_at: Set(now),
+            }
+            .insert(db)
+            .await
+            .map_err(KabiPayError::from)?;
+        }
+        touched += 1;
+    }
     Ok(touched)
 }
 

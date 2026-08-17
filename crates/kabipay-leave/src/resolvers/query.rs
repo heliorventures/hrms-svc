@@ -1,7 +1,7 @@
 //! Root query resolvers for kabipay-leave.
 
 use async_graphql::{Context, Object, Result, ID};
-use chrono::NaiveDate;
+use chrono::{Datelike, NaiveDate};
 use kabipay_common::client_data_scope::{
     data_scope_from_context, resolve_employee_scope_filter, resolve_viewer_employee,
 };
@@ -142,6 +142,10 @@ impl QueryRoot {
         if !filt.allows_employee(emp) {
             return Ok(vec![]);
         }
+        let balance_year = year.unwrap_or_else(|| chrono::Utc::now().year());
+        leave_admin::ensure_employee_leave_balances(&db, tenant_id, emp, balance_year)
+            .await
+            .map_err(KabiPayError::into_graphql)?;
         let rows = leave_service::list_balances_for_employee(&db, tenant_id, emp, year, limit)
             .await
             .map_err(KabiPayError::into_graphql)?;

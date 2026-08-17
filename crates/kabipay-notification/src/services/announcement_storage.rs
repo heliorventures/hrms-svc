@@ -33,16 +33,21 @@ pub fn local_file_root() -> PathBuf {
 }
 
 fn local_fallback_enabled() -> bool {
-    let fallback_mode = std::env::var("KABIPAY_FILE_STORAGE_FALLBACK")
-        .ok()
-        .map(|value| value.trim().to_ascii_lowercase());
-    if matches!(fallback_mode.as_deref(), Some("local" | "disk")) {
-        return true;
+    // Keep announcement attachments on the same storage policy as employee/company documents:
+    // object storage is preferred, while local tenant-scoped storage is the default recovery path.
+    if let Ok(value) = std::env::var("KABIPAY_FILE_STORAGE_FALLBACK") {
+        return !matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "no" | "none" | "disabled" | "off"
+        );
     }
-    std::env::var("KABIPAY_FILE_STORAGE_LOCAL_FALLBACK")
-        .ok()
-        .map(|value| matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
-        .unwrap_or(false)
+    if let Ok(value) = std::env::var("KABIPAY_FILE_STORAGE_LOCAL_FALLBACK") {
+        return matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "local" | "disk"
+        );
+    }
+    true
 }
 
 /// Read announcement attachment bytes through the private storage backend.
