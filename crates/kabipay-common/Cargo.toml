@@ -36,3 +36,4 @@ base64.workspace = true
 hmac.workspace = true
 sha2.workspace = true
 urlencoding.workspace = true
+opendal = { version = "0.55.0", features = ["services-s3"] }

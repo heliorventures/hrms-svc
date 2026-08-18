@@ -16,6 +16,7 @@ use crate::entities::d0017_onboarding_offboarding::{
     clearance_checklist, fnf_settlement, onboarding_checklist, separation,
 };
 use crate::entities::d0029_file_storage::file_storage;
+use crate::entities::d0059_file_upload_stage::file_upload_stage;
 use crate::entities::d0056_company_documents::company_document;
 use kabipay_db_entities::tenant::d0005_auth_rbac::{permission, permission_scope, role, user};
 
@@ -176,7 +177,6 @@ pub struct CompanyDocumentDto {
     pub category: String,
     pub title: String,
     pub description: Option<String>,
-    pub file_storage_id: ID,
     pub original_file_name: Option<String>,
     pub mime_type: Option<String>,
     pub file_size_bytes: Option<i32>,
@@ -195,7 +195,6 @@ impl From<company_document::Model> for CompanyDocumentDto {
             category: m.category,
             title: m.title,
             description: m.description,
-            file_storage_id: ID(m.file_storage_id.to_string()),
             original_file_name: None,
             mime_type: None,
             file_size_bytes: None,
@@ -1018,13 +1017,49 @@ pub struct UploadTenantFileInput {
 }
 
 #[derive(InputObject, Clone, Debug)]
+pub struct UploadCompanyDocumentFileInput {
+    pub file_name: String,
+    pub mime_type: Option<String>,
+    /// Standard base64 (not data-URL). Max ~6MB decoded.
+    pub content_base64: String,
+}
+
+#[derive(InputObject, Clone, Debug)]
 pub struct CreateCompanyDocumentInput {
     pub category: String,
     pub title: String,
     pub description: Option<String>,
-    pub file_storage_id: ID,
+    pub staged_upload_id: ID,
     #[graphql(default = true)]
     pub visible_to_employees: bool,
+}
+
+#[derive(SimpleObject, Clone, Debug)]
+#[graphql(name = "StagedCompanyDocumentUpload")]
+pub struct StagedCompanyDocumentUploadDto {
+    /// Opaque operation stage ID. This is not a `file_storage.id`.
+    pub id: ID,
+    pub original_file_name: Option<String>,
+    pub mime_type: Option<String>,
+    pub file_size_bytes: Option<i32>,
+    pub expires_at: DateTime<Utc>,
+}
+
+impl StagedCompanyDocumentUploadDto {
+    pub fn from_parts(
+        stage: file_upload_stage::Model,
+        file: file_storage::Model,
+    ) -> Self {
+        Self {
+            id: ID(stage.id.to_string()),
+            original_file_name: file.original_filename,
+            mime_type: file.mime_type,
+            file_size_bytes: file
+                .file_size_bytes
+                .and_then(|size| i32::try_from(size).ok()),
+            expires_at: stage.expires_at,
+        }
+    }
 }
 
 #[derive(SimpleObject, Clone, Debug)]

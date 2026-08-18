@@ -112,6 +112,24 @@ async fn maybe_store_doc(
     Ok(None)
 }
 
+async fn cleanup_attachment_ids(
+    db: &sea_orm::DatabaseConnection,
+    tenant_id: Uuid,
+    file_ids: impl IntoIterator<Item = Uuid>,
+) {
+    for file_id in file_ids {
+        if let Err(error) =
+            announcement_storage::delete_blob_if_unreferenced(db, tenant_id, file_id).await
+        {
+            tracing::warn!(
+                tenant_id = %tenant_id,
+                code = error.code(),
+                "announcement attachment cleanup failed"
+            );
+        }
+    }
+}
+
 pub struct MutationRoot;
 
 #[Object]
@@ -197,10 +215,18 @@ impl MutationRoot {
         let target_audience =
             merged_target_audience(input.target_audience.clone(), input.target_role_code.clone())?;
 
-        let image_file_storage_id = maybe_store_image(&db, tenant_id, Some(claims.sub), &input).await?;
-        let document_file_storage_id = maybe_store_doc(&db, tenant_id, Some(claims.sub), &input).await?;
+        let image_file_storage_id =
+            maybe_store_image(&db, tenant_id, Some(claims.sub), &input).await?;
+        let document_file_storage_id =
+            match maybe_store_doc(&db, tenant_id, Some(claims.sub), &input).await {
+                Ok(file_id) => file_id,
+                Err(error) => {
+                    cleanup_attachment_ids(&db, tenant_id, image_file_storage_id).await;
+                    return Err(error);
+                }
+            };
 
-        let row = notification_service::create_announcement(
+        let created = notification_service::create_announcement(
             &db,
             tenant_id,
             claims.sub,
@@ -217,8 +243,19 @@ impl MutationRoot {
                 expires_at: input.expires_at,
             },
         )
-        .await
-        .map_err(KabiPayError::into_graphql)?;
+        .await;
+        let row = match created {
+            Ok(row) => row,
+            Err(error) => {
+                cleanup_attachment_ids(
+                    &db,
+                    tenant_id,
+                    image_file_storage_id.into_iter().chain(document_file_storage_id),
+                )
+                .await;
+                return Err(error.into_graphql());
+            }
+        };
         Ok(AnnouncementDto::from(row))
     }
 
@@ -262,6 +299,42 @@ impl MutationRoot {
             );
         }
 
+        // Resolve every fallible non-storage input before persisting replacement
+        // bytes so validation failures cannot orphan newly stored objects.
+        let td_patch = if input.clear_target_department {
+            Some(None)
+        } else if let Some(ref id) = input.target_department_id {
+            Some(Some(parse_uuid(id, "targetDepartmentId")?))
+        } else {
+            None
+        };
+        let tl_patch = if input.clear_target_location {
+            Some(None)
+        } else if let Some(ref id) = input.target_location_id {
+            Some(Some(parse_uuid(id, "targetLocationId")?))
+        } else {
+            None
+        };
+        let (clear_role_aud, aud_patch) = if input.clear_role_audience {
+            (true, None)
+        } else if input.target_audience.is_some()
+            || input
+                .target_role_code
+                .as_ref()
+                .map(|s| !s.trim().is_empty())
+                .unwrap_or(false)
+        {
+            (
+                false,
+                merged_target_audience(
+                    input.target_audience.clone(),
+                    input.target_role_code.clone(),
+                )?,
+            )
+        } else {
+            (false, None)
+        };
+
         let img_input = CreateAnnouncementInput {
             title: String::new(),
             body: None,
@@ -280,6 +353,7 @@ impl MutationRoot {
             document_content_base64: input.document_content_base64.clone(),
         };
 
+        let mut newly_stored_ids = Vec::with_capacity(2);
         let image_patch = if input.clear_image {
             Some(None)
         } else if input
@@ -288,13 +362,13 @@ impl MutationRoot {
             .map(|s| !s.trim().is_empty())
             .unwrap_or(false)
         {
-            Some(Some(
-                maybe_store_image(&db, tenant_id, Some(claims.sub), &img_input)
+            let file_id = maybe_store_image(&db, tenant_id, Some(claims.sub), &img_input)
                     .await?
                     .ok_or_else(|| {
                         KabiPayError::Validation("image upload expected".into()).into_graphql()
-                    })?,
-            ))
+                    })?;
+            newly_stored_ids.push(file_id);
+            Some(Some(file_id))
         } else {
             None
         };
@@ -307,47 +381,23 @@ impl MutationRoot {
             .map(|s| !s.trim().is_empty())
             .unwrap_or(false)
         {
-            Some(Some(
-                maybe_store_doc(&db, tenant_id, Some(claims.sub), &img_input)
-                    .await?
-                    .ok_or_else(|| {
-                        KabiPayError::Validation("document upload expected".into()).into_graphql()
-                    })?,
-            ))
+            let stored = maybe_store_doc(&db, tenant_id, Some(claims.sub), &img_input).await;
+            let file_id = match stored {
+                Ok(Some(file_id)) => file_id,
+                Ok(None) => {
+                    cleanup_attachment_ids(&db, tenant_id, newly_stored_ids).await;
+                    return Err(KabiPayError::Validation("document upload expected".into())
+                        .into_graphql());
+                }
+                Err(error) => {
+                    cleanup_attachment_ids(&db, tenant_id, newly_stored_ids).await;
+                    return Err(error);
+                }
+            };
+            newly_stored_ids.push(file_id);
+            Some(Some(file_id))
         } else {
             None
-        };
-
-        let td_patch = if input.clear_target_department {
-            Some(None)
-        } else if let Some(ref id) = input.target_department_id {
-            Some(Some(parse_uuid(id, "targetDepartmentId")?))
-        } else {
-            None
-        };
-        let tl_patch = if input.clear_target_location {
-            Some(None)
-        } else if let Some(ref id) = input.target_location_id {
-            Some(Some(parse_uuid(id, "targetLocationId")?))
-        } else {
-            None
-        };
-
-        let (clear_role_aud, aud_patch) = if input.clear_role_audience {
-            (true, None)
-        } else if input.target_audience.is_some()
-            || input
-                .target_role_code
-                .as_ref()
-                .map(|s| !s.trim().is_empty())
-                .unwrap_or(false)
-        {
-            (
-                false,
-                merged_target_audience(input.target_audience.clone(), input.target_role_code.clone())?,
-            )
-        } else {
-            (false, None)
         };
 
         let patch = notification_service::AnnouncementUpdate {
@@ -371,9 +421,14 @@ impl MutationRoot {
             document_file_storage_id: doc_patch,
         };
 
-        let row = notification_service::update_announcement(&db, tenant_id, aid, patch)
-            .await
-            .map_err(KabiPayError::into_graphql)?;
+        let updated = notification_service::update_announcement(&db, tenant_id, aid, patch).await;
+        let row = match updated {
+            Ok(row) => row,
+            Err(error) => {
+                cleanup_attachment_ids(&db, tenant_id, newly_stored_ids).await;
+                return Err(error.into_graphql());
+            }
+        };
         Ok(AnnouncementDto::from(row))
     }
 

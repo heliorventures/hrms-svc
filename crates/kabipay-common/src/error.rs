@@ -51,13 +51,21 @@ pub enum KabiPayError {
         message: String,
     },
 
+    /// A caller-correctable state or uniqueness conflict with a stable
+    /// machine-readable code.
+    #[error("{message}")]
+    ConflictRule {
+        code: &'static str,
+        message: String,
+    },
+
     #[error("conflict: {0}")]
     Conflict(String),
 
-    #[error("database error: {0}")]
+    #[error("database operation failed")]
     Database(#[from] sea_orm::DbErr),
 
-    #[error("organization workspace is temporarily unavailable: {0}")]
+    #[error("organization workspace is temporarily unavailable")]
     TenantDatabaseUnavailable(Uuid),
 
     #[error("JWT error: {0}")]
@@ -66,7 +74,7 @@ pub enum KabiPayError {
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
 
-    #[error("internal error: {0}")]
+    #[error("internal server error")]
     Internal(String),
 }
 
@@ -95,6 +103,7 @@ impl KabiPayError {
             Self::Forbidden(_) => "FORBIDDEN",
             Self::Validation(_) => "VALIDATION_ERROR",
             Self::BusinessRule { code, .. } => *code,
+            Self::ConflictRule { code, .. } => *code,
             Self::Conflict(_) => "CONFLICT",
             Self::Database(_) => "DATABASE_ERROR",
             Self::TenantDatabaseUnavailable(_) => "TENANT_DATABASE_UNAVAILABLE",
@@ -115,7 +124,7 @@ impl KabiPayError {
             Self::Unauthorised | Self::Jwt(_) => S::UNAUTHORIZED,
             Self::Forbidden(_) => S::FORBIDDEN,
             Self::Validation(_) | Self::BusinessRule { .. } | Self::Json(_) => S::BAD_REQUEST,
-            Self::Conflict(_) => S::CONFLICT,
+            Self::ConflictRule { .. } | Self::Conflict(_) => S::CONFLICT,
             Self::TenantDatabaseUnavailable(_) => S::SERVICE_UNAVAILABLE,
             Self::Database(_) | Self::Internal(_) => S::INTERNAL_SERVER_ERROR,
         }
@@ -125,13 +134,46 @@ impl KabiPayError {
     /// conflicting blanket `From<T: Display>`, so this is explicit instead of `From`).
     pub fn into_graphql(self) -> async_graphql::Error {
         let code = self.code();
-        let mut e = async_graphql::Error::new(self.to_string());
+        let error_id = self.record_internal_failure(code);
+        let mut e = async_graphql::Error::new(self.public_message());
         e.extensions = Some({
             let mut map = async_graphql::ErrorExtensionValues::default();
             map.set("code", code);
+            if let Some(error_id) = error_id {
+                map.set("errorId", error_id.to_string());
+            }
             map
         });
         e
+    }
+
+    /// Emit only allowlisted diagnostic fields. The wrapped database/internal message can
+    /// contain SQL, paths, object keys, or PII and must never enter application logs.
+    fn record_internal_failure(&self, code: &'static str) -> Option<Uuid> {
+        let error_class = match self {
+            Self::Database(_) => "DATABASE",
+            Self::Internal(_) => "INTERNAL",
+            _ => return None,
+        };
+        let error_id = Uuid::new_v4();
+        tracing::error!(
+            error_id = %error_id,
+            code,
+            error_class,
+            "request failed with an internal service error"
+        );
+        Some(error_id)
+    }
+
+    fn public_message(&self) -> String {
+        match self {
+            Self::Database(_) => "database operation failed".into(),
+            Self::Internal(_) => "internal server error".into(),
+            Self::TenantDatabaseUnavailable(_) => {
+                "organization workspace is temporarily unavailable".into()
+            }
+            _ => self.to_string(),
+        }
     }
 }
 
@@ -139,12 +181,18 @@ impl KabiPayError {
 impl axum::response::IntoResponse for KabiPayError {
     fn into_response(self) -> axum::response::Response {
         let status = self.http_status();
-        let body = axum::Json(serde_json::json!({
+        let code = self.code();
+        let error_id = self.record_internal_failure(code);
+        let mut payload = serde_json::json!({
             "error": {
-                "code": self.code(),
-                "message": self.to_string(),
+                "code": code,
+                "message": self.public_message(),
             }
-        }));
+        });
+        if let Some(error_id) = error_id {
+            payload["error"]["errorId"] = serde_json::Value::String(error_id.to_string());
+        }
+        let body = axum::Json(payload);
         (status, body).into_response()
     }
 }
@@ -164,7 +212,7 @@ mod tests {
         );
         assert_eq!(
             err.to_string(),
-            "organization workspace is temporarily unavailable: e6d4fc13-feb8-52a0-93bd-f66c795969b1"
+            "organization workspace is temporarily unavailable"
         );
 
         let timeout = KabiPayError::from_tenant_db(
@@ -188,5 +236,38 @@ mod tests {
         assert_eq!(err.code(), "CURRENT_PASSWORD_INCORRECT");
         assert_eq!(err.http_status(), axum::http::StatusCode::BAD_REQUEST);
         assert_eq!(err.to_string(), "The current password is incorrect.");
+    }
+
+    #[test]
+    fn conflict_rule_preserves_its_public_code_and_conflict_status() {
+        let err = KabiPayError::ConflictRule {
+            code: "ASSET_TAG_CONFLICT",
+            message: "asset tag is already in use".into(),
+        };
+
+        assert_eq!(err.code(), "ASSET_TAG_CONFLICT");
+        assert_eq!(err.http_status(), axum::http::StatusCode::CONFLICT);
+        assert_eq!(err.to_string(), "asset tag is already in use");
+    }
+
+    #[test]
+    fn database_and_internal_errors_are_sanitized_for_graphql_clients() {
+        let database_error = KabiPayError::Database(sea_orm::DbErr::Custom(
+            "duplicate key value violates secret_constraint".into(),
+        ));
+        assert_eq!(database_error.to_string(), "database operation failed");
+        let database = database_error.into_graphql();
+        assert_eq!(database.message, "database operation failed");
+        assert!(!database.message.contains("secret_constraint"));
+        let database_extensions = database.extensions.as_ref().unwrap();
+        assert!(database_extensions.get("errorId").is_some());
+
+        let internal_error = KabiPayError::Internal("private implementation detail".into());
+        assert_eq!(internal_error.to_string(), "internal server error");
+        let internal = internal_error.into_graphql();
+        assert_eq!(internal.message, "internal server error");
+        assert!(!internal.message.contains("private implementation detail"));
+        let internal_extensions = internal.extensions.as_ref().unwrap();
+        assert!(internal_extensions.get("errorId").is_some());
     }
 }

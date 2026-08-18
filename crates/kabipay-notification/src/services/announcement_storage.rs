@@ -3,13 +3,20 @@
 use std::path::{Component, PathBuf};
 
 use chrono::Utc;
+use kabipay_common::private_file_cleanup::{
+    enqueue_and_delete_private_file, enqueue_private_file_cleanup_coordinates,
+};
 use kabipay_common::{KabiPayError, KabiPayResult};
+use kabipay_db_entities::tenant::d0027_communication_audit::announcement;
 use kabipay_db_entities::tenant::d0029_file_storage::file_storage;
-use sea_orm::{ActiveModelTrait, ActiveValue::Set, DatabaseConnection};
+use sea_orm::{
+    ActiveModelTrait, ActiveValue::Set, ColumnTrait, Condition, DatabaseConnection, EntityTrait,
+    QueryFilter, TransactionTrait,
+};
 use uuid::Uuid;
 
 use super::object_store::{
-    FileStorageMode, S3CompatSettings, PROVIDER_S3_COMPAT, ensure_tenant_bucket, s3_delete,
+    FileStorageMode, S3CompatSettings, PROVIDER_S3_COMPAT, ensure_tenant_bucket,
     s3_operator_for_bucket, s3_put, s3_read, tenant_bucket_name,
 };
 
@@ -25,6 +32,40 @@ const ALLOWED_ANNOUNCEMENT_MIME_TYPES: &[&str] = &[
     "image/webp",
     "text/plain",
 ];
+
+/// After an object write, metadata insertion can fail independently. Persist a coordinate-only
+/// tombstone so the worker owns eventual deletion even though no file-storage row exists.
+async fn enqueue_failed_object_write_cleanup(
+    db: &DatabaseConnection,
+    tenant_id: Uuid,
+    provider: &str,
+    bucket: Option<&str>,
+    storage_path: &str,
+) -> KabiPayResult<()> {
+    let correlation_id = Uuid::new_v4();
+    if let Err(error) = enqueue_private_file_cleanup_coordinates(
+        db,
+        tenant_id,
+        provider,
+        bucket,
+        storage_path,
+    )
+    .await
+    {
+        // A tenant database outage can prevent both metadata insertion and durable cleanup.
+        // Coordinates are deliberately omitted; operators correlate the opaque request ID.
+        tracing::error!(
+            tenant_id = %tenant_id,
+            cleanup_correlation_id = %correlation_id,
+            error_class = error.code(),
+            "private file cleanup tombstone could not be recorded"
+        );
+        return Err(KabiPayError::Internal(
+            "private file cleanup could not be scheduled".into(),
+        ));
+    }
+    Ok(())
+}
 
 pub fn local_file_root() -> PathBuf {
     let root =
@@ -61,6 +102,45 @@ pub async fn read_blob(row: &file_storage::Model) -> KabiPayResult<Vec<u8>> {
     }
 }
 
+/// Durably enqueue an unreferenced attachment for physical deletion. The file row is removed in
+/// the same transaction as the tombstone; the shared worker retries physical deletion.
+pub async fn delete_blob_if_unreferenced(
+    db: &DatabaseConnection,
+    tenant_id: Uuid,
+    file_id: Uuid,
+) -> KabiPayResult<bool> {
+    let txn = db.begin().await.map_err(KabiPayError::from)?;
+    let still_referenced = announcement::Entity::find()
+        .filter(announcement::Column::TenantId.eq(tenant_id))
+        .filter(
+            Condition::any()
+                .add(announcement::Column::ImageFileStorageId.eq(file_id))
+                .add(announcement::Column::DocumentFileStorageId.eq(file_id)),
+        )
+        .one(&txn)
+        .await
+        .map_err(KabiPayError::from)?
+        .is_some();
+    if still_referenced {
+        txn.commit().await.map_err(KabiPayError::from)?;
+        return Ok(false);
+    }
+
+    let Some(row) = file_storage::Entity::find_by_id(file_id)
+        .filter(file_storage::Column::TenantId.eq(tenant_id))
+        .lock_exclusive()
+        .one(&txn)
+        .await
+        .map_err(KabiPayError::from)?
+    else {
+        txn.commit().await.map_err(KabiPayError::from)?;
+        return Ok(false);
+    };
+    enqueue_and_delete_private_file(&txn, tenant_id, &row).await?;
+    txn.commit().await.map_err(KabiPayError::from)?;
+    Ok(true)
+}
+
 async fn read_local_blob(row: &file_storage::Model) -> KabiPayResult<Vec<u8>> {
     if row
         .storage_path
@@ -79,9 +159,16 @@ async fn read_local_blob(row: &file_storage::Model) -> KabiPayResult<Vec<u8>> {
     }
     let file_root = local_file_root();
     let full = file_root.join(&row.storage_path);
-    tokio::fs::read(&full)
-        .await
-        .map_err(|e| KabiPayError::Internal(format!("read local file: {e}")))
+    match tokio::fs::read(&full).await {
+        Ok(bytes) => Ok(bytes),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Err(KabiPayError::NotFound {
+                entity: "announcementAttachment",
+                id: "requested".into(),
+            })
+        }
+        Err(error) => Err(KabiPayError::Internal(format!("read local file: {error}"))),
+    }
 }
 
 async fn read_s3_blob(row: &file_storage::Model) -> KabiPayResult<Vec<u8>> {
@@ -197,8 +284,8 @@ pub async fn store_blob(
                 Ok(id) => Ok(id),
                 Err(error) if local_fallback_enabled() => {
                     tracing::warn!(
-                        error = %error,
                         tenant_id = %tenant_id,
+                        code = error.code(),
                         "S3 announcement attachment upload failed; using configured local fallback"
                     );
                     upload_local(db, tenant_id, uploaded_by, original_filename, mime_type, bytes)
@@ -243,14 +330,17 @@ async fn upload_local(
         file_id,
         now,
         None,
-        rel,
+        rel.clone(),
         sz,
     )
     .await;
-    if inserted.is_err() {
-        let _ = tokio::fs::remove_file(&path).await;
+    match inserted {
+        Ok(file_id) => Ok(file_id),
+        Err(error) => {
+            enqueue_failed_object_write_cleanup(db, tenant_id, PROVIDER_LOCAL, None, &rel).await?;
+            Err(error)
+        }
     }
-    inserted
 }
 
 async fn upload_s3(
@@ -291,15 +381,25 @@ async fn upload_s3(
         mime_type,
         file_id,
         now,
-        Some(bucket),
+        Some(bucket.clone()),
         storage_path.clone(),
         sz,
     )
     .await;
-    if inserted.is_err() {
-        s3_delete(&op, &storage_path).await;
+    match inserted {
+        Ok(file_id) => Ok(file_id),
+        Err(error) => {
+            enqueue_failed_object_write_cleanup(
+                db,
+                tenant_id,
+                PROVIDER_S3_COMPAT,
+                Some(&bucket),
+                &storage_path,
+            )
+            .await?;
+            Err(error)
+        }
     }
-    inserted
 }
 
 fn validate_supported_upload_type(mime_type: &Option<String>, bytes: &[u8]) -> KabiPayResult<()> {

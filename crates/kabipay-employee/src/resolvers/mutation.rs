@@ -21,7 +21,8 @@ use crate::resolvers::types::{
     PermissionScopeAssignmentInput, ProvisionEmployeeLoginInput, ResetEmployeePasswordInput,
     SeparationDto, SetEmployeeCompensationInput, SubmitEmployeeProfileChangeInput,
     SubmitSeparationInput, UpdateEmployeeInput, UpdateEmployeePersonalProfileInput,
-    UpdateEmployeeSelfServiceProfileInput, UploadEmployeeDocumentInput, UploadTenantFileInput,
+    StagedCompanyDocumentUploadDto, UpdateEmployeeSelfServiceProfileInput,
+    UploadCompanyDocumentFileInput, UploadEmployeeDocumentInput, UploadTenantFileInput,
     UploadedTenantFileDto, UpsertEmployeePrimaryAadhaarInput, UpsertEmployeePrimaryBankInput,
     UpsertEmployeeEducationInput, UpsertEmployeePrimaryPanInput,
     UpsertEmployeeWorkExperienceInput, UpsertFnfSettlementInput,
@@ -226,6 +227,20 @@ fn require_offboarding_hr_mutation(ctx: &Context<'_>) -> Result<()> {
         KabiPayError::Forbidden("employee:write or onboarding:manage required".into())
             .into_graphql(),
     )
+}
+
+fn require_company_document_manager(claims: &ClientClaims) -> Result<()> {
+    if claims.can_manage_employee_directory()
+        || claims.can_manage_onboarding_tenant()
+        || claims.can_manage_tenant_rbac()
+    {
+        return Ok(());
+    }
+    Err(KabiPayError::Forbidden(
+        "employee:write, onboarding:manage, or role:manage is required to manage company documents"
+            .into(),
+    )
+    .into_graphql())
 }
 
 pub struct MutationRoot;
@@ -436,6 +451,37 @@ impl MutationRoot {
         Ok(UploadedTenantFileDto::from(m))
     }
 
+    /// Stage a private company-document upload without exposing `file_storage` metadata.
+    async fn upload_company_document_file(
+        &self,
+        ctx: &Context<'_>,
+        input: UploadCompanyDocumentFileInput,
+    ) -> Result<StagedCompanyDocumentUploadDto> {
+        let claims = require_client_claims(ctx)?;
+        require_company_document_manager(claims)?;
+        let tenant_id = require_tenant_id(ctx)?;
+        let db = tenant_db(ctx, tenant_id).await?;
+        let bytes = STANDARD
+            .decode(input.content_base64.as_bytes())
+            .map_err(|error| {
+                KabiPayError::Validation(format!("contentBase64: {error}")).into_graphql()
+            })?;
+        let staged = document_file_service::upload_company_document_file(
+            &db,
+            tenant_id,
+            claims.sub,
+            input.file_name,
+            input.mime_type,
+            bytes,
+        )
+        .await
+        .map_err(KabiPayError::into_graphql)?;
+        Ok(StagedCompanyDocumentUploadDto::from_parts(
+            staged.stage,
+            staged.file,
+        ))
+    }
+
     /// HR/admin: publish a company policy, onboarding, or exit-formality document.
     async fn create_company_document(
         &self,
@@ -443,33 +489,44 @@ impl MutationRoot {
         input: CreateCompanyDocumentInput,
     ) -> Result<CompanyDocumentDto> {
         let claims = require_client_claims(ctx)?;
-        if !claims.can_manage_employee_directory()
-            && !claims.can_manage_onboarding_tenant()
-            && !claims.can_manage_tenant_rbac()
-        {
-            return Err(KabiPayError::Forbidden(
-                "employee:write, onboarding:manage, or role:manage is required to manage company documents".into(),
-            )
-            .into_graphql());
-        }
+        require_company_document_manager(claims)?;
         let tenant_id = require_tenant_id(ctx)?;
         let db = tenant_db(ctx, tenant_id).await?;
-        let file_storage_id = parse_uuid(&input.file_storage_id, "fileStorageId")?;
-        let row = company_document_service::create_company_document(
+        let staged_upload_id = parse_uuid(&input.staged_upload_id, "stagedUploadId")?;
+        let created = company_document_service::create_company_document(
             &db,
             tenant_id,
             company_document_service::NewCompanyDocument {
                 category: input.category,
                 title: input.title,
                 description: input.description,
-                file_storage_id,
+                staged_upload_id,
                 visible_to_employees: input.visible_to_employees,
                 uploaded_by: claims.sub,
             },
         )
-        .await
-        .map_err(KabiPayError::into_graphql)?;
-        Ok(CompanyDocumentDto::from(row))
+        .await;
+        let (row, file) = match created {
+            Ok(result) => result,
+            Err(error) => {
+                if let Err(cleanup_error) = document_file_service::cleanup_unlinked_company_upload(
+                    &db,
+                    tenant_id,
+                    staged_upload_id,
+                    claims.sub,
+                )
+                .await
+                {
+                    tracing::warn!(
+                        tenant_id = %tenant_id,
+                        code = cleanup_error.code(),
+                        "company-document upload compensation failed"
+                    );
+                }
+                return Err(error.into_graphql());
+            }
+        };
+        Ok(CompanyDocumentDto::from(row).with_file(Some(&file)))
     }
 
     /// HR/admin: archive a company document without deleting its private file.
@@ -479,15 +536,7 @@ impl MutationRoot {
         company_document_id: ID,
     ) -> Result<CompanyDocumentDto> {
         let claims = require_client_claims(ctx)?;
-        if !claims.can_manage_employee_directory()
-            && !claims.can_manage_onboarding_tenant()
-            && !claims.can_manage_tenant_rbac()
-        {
-            return Err(KabiPayError::Forbidden(
-                "employee:write, onboarding:manage, or role:manage is required to manage company documents".into(),
-            )
-            .into_graphql());
-        }
+        require_company_document_manager(claims)?;
         let tenant_id = require_tenant_id(ctx)?;
         let db = tenant_db(ctx, tenant_id).await?;
         let document_id = parse_uuid(&company_document_id, "companyDocumentId")?;
@@ -497,22 +546,15 @@ impl MutationRoot {
         Ok(CompanyDocumentDto::from(row))
     }
 
-    /// HR/admin: soft-delete a company document without deleting its private file.
+    /// HR/admin: permanently delete a company document and durably schedule its private file
+    /// for physical deletion. Use `archiveCompanyDocument` when audit retention is required.
     async fn delete_company_document(
         &self,
         ctx: &Context<'_>,
         company_document_id: ID,
     ) -> Result<bool> {
         let claims = require_client_claims(ctx)?;
-        if !claims.can_manage_employee_directory()
-            && !claims.can_manage_onboarding_tenant()
-            && !claims.can_manage_tenant_rbac()
-        {
-            return Err(KabiPayError::Forbidden(
-                "employee:write, onboarding:manage, or role:manage is required to manage company documents".into(),
-            )
-            .into_graphql());
-        }
+        require_company_document_manager(claims)?;
         let tenant_id = require_tenant_id(ctx)?;
         let db = tenant_db(ctx, tenant_id).await?;
         let document_id = parse_uuid(&company_document_id, "companyDocumentId")?;
@@ -849,7 +891,11 @@ impl MutationRoot {
             Ok(row) => education_dto(&db, tenant_id, row).await,
             Err(error) => {
                 if let Err(cleanup_error) = document_file_service::cleanup_unlinked_employee_document(&db, tenant_id, document.id).await {
-                    tracing::error!(%cleanup_error, employee_document_id = %document.id, "failed to compensate unlinked education evidence upload");
+                    tracing::error!(
+                        tenant_id = %tenant_id,
+                        code = cleanup_error.code(),
+                        "failed to compensate unlinked education evidence upload"
+                    );
                 }
                 Err(error.into_graphql())
             }
@@ -1020,7 +1066,11 @@ impl MutationRoot {
             Ok(row) => work_experience_dto(&db, tenant_id, row).await,
             Err(error) => {
                 if let Err(cleanup_error) = document_file_service::cleanup_unlinked_employee_document(&db, tenant_id, document.id).await {
-                    tracing::error!(%cleanup_error, employee_document_id = %document.id, "failed to compensate unlinked work evidence upload");
+                    tracing::error!(
+                        tenant_id = %tenant_id,
+                        code = cleanup_error.code(),
+                        "failed to compensate unlinked work evidence upload"
+                    );
                 }
                 Err(error.into_graphql())
             }

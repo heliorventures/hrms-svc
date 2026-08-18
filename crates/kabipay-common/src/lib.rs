@@ -21,6 +21,7 @@ pub mod jwt;
 pub mod middleware;
 pub mod pagination;
 pub mod password;
+pub mod private_file_cleanup;
 pub mod subgraph;
 pub mod telemetry;
 pub mod tenant_seed;

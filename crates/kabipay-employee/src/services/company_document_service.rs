@@ -1,15 +1,18 @@
 //! Company policy, onboarding, and exit-formality documents.
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
+use kabipay_common::private_file_cleanup::enqueue_and_delete_private_file;
 use kabipay_common::{KabiPayError, KabiPayResult};
 use sea_orm::{
     ActiveModelTrait, ActiveValue::Set, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter,
-    QueryOrder, QuerySelect,
+    QueryOrder, QuerySelect, TransactionTrait,
 };
 use uuid::Uuid;
 
 use crate::entities::d0029_file_storage::file_storage;
 use crate::entities::d0056_company_documents::company_document;
+use crate::entities::d0059_file_upload_stage::file_upload_stage;
+use crate::services::document_file_service::COMPANY_DOCUMENT_UPLOAD_PURPOSE;
 
 const ACTIVE_STATUS: &str = "ACTIVE";
 const ARCHIVED_STATUS: &str = "ARCHIVED";
@@ -21,7 +24,7 @@ pub struct NewCompanyDocument {
     pub category: String,
     pub title: String,
     pub description: Option<String>,
-    pub file_storage_id: Uuid,
+    pub staged_upload_id: Uuid,
     pub visible_to_employees: bool,
     pub uploaded_by: Uuid,
 }
@@ -101,41 +104,102 @@ pub async fn create_company_document(
     db: &DatabaseConnection,
     tenant_id: Uuid,
     input: NewCompanyDocument,
-) -> KabiPayResult<company_document::Model> {
-    let file = file_storage::Entity::find_by_id(input.file_storage_id)
+) -> KabiPayResult<(company_document::Model, file_storage::Model)> {
+    let category = normalize_category(&input.category)?;
+    let title = normalize_title(&input.title)?;
+    let description = normalize_description(input.description);
+    let now = Utc::now();
+    let txn = db.begin().await.map_err(KabiPayError::from)?;
+    let stage = file_upload_stage::Entity::find_by_id(input.staged_upload_id)
+        .filter(file_upload_stage::Column::TenantId.eq(tenant_id))
+        .lock_exclusive()
+        .one(&txn)
+        .await
+        .map_err(KabiPayError::from)?
+        .ok_or_else(invalid_company_document_stage)?;
+    validate_company_document_stage(
+        &stage.purpose,
+        stage.created_by,
+        stage.expires_at.clone(),
+        stage.claimed_at.clone(),
+        input.uploaded_by,
+        now.clone(),
+    )?;
+    let file = file_storage::Entity::find_by_id(stage.file_storage_id)
         .filter(file_storage::Column::TenantId.eq(tenant_id))
-        .one(db)
+        .lock_shared()
+        .one(&txn)
         .await
         .map_err(KabiPayError::from)?
         .ok_or_else(|| KabiPayError::NotFound {
             entity: "fileStorage",
-            id: input.file_storage_id.to_string(),
+            id: stage.file_storage_id.to_string(),
         })?;
     if file.uploaded_by != Some(input.uploaded_by) {
-        return Err(KabiPayError::Forbidden(
-            "company document must use a file uploaded by the current admin".into(),
-        ));
+        return Err(invalid_company_document_stage());
     }
 
-    let now = Utc::now();
     let id = Uuid::new_v4();
     let model = company_document::ActiveModel {
         id: Set(id),
         tenant_id: Set(tenant_id),
-        category: Set(normalize_category(&input.category)?),
-        title: Set(normalize_title(&input.title)?),
-        description: Set(normalize_description(input.description)),
-        file_storage_id: Set(input.file_storage_id),
+        category: Set(category),
+        title: Set(title),
+        description: Set(description),
+        file_storage_id: Set(file.id),
         status: Set(ACTIVE_STATUS.to_string()),
         visible_to_employees: Set(input.visible_to_employees),
         uploaded_by: Set(Some(input.uploaded_by)),
         is_deleted: Set(false),
         deleted_at: Set(None),
         deleted_by: Set(None),
-        created_at: Set(now),
-        updated_at: Set(now),
+        created_at: Set(now.clone()),
+        updated_at: Set(now.clone()),
     };
-    model.insert(db).await.map_err(KabiPayError::from)
+    let row = model.insert(&txn).await.map_err(KabiPayError::from)?;
+    let mut active_stage: file_upload_stage::ActiveModel = stage.into();
+    active_stage.claimed_at = Set(Some(now.clone()));
+    active_stage.claimed_resource_id = Set(Some(row.id));
+    active_stage.updated_at = Set(now);
+    active_stage
+        .update(&txn)
+        .await
+        .map_err(KabiPayError::from)?;
+    txn.commit().await.map_err(KabiPayError::from)?;
+    Ok((row, file))
+}
+
+fn invalid_company_document_stage() -> KabiPayError {
+    KabiPayError::ConflictRule {
+        code: "COMPANY_DOCUMENT_UPLOAD_INVALID",
+        message: "staged upload is not valid for a company document".into(),
+    }
+}
+
+fn validate_company_document_stage(
+    purpose: &str,
+    created_by: Uuid,
+    expires_at: DateTime<Utc>,
+    claimed_at: Option<DateTime<Utc>>,
+    expected_creator: Uuid,
+    now: DateTime<Utc>,
+) -> KabiPayResult<()> {
+    if purpose != COMPANY_DOCUMENT_UPLOAD_PURPOSE || created_by != expected_creator {
+        return Err(invalid_company_document_stage());
+    }
+    if claimed_at.is_some() {
+        return Err(KabiPayError::ConflictRule {
+            code: "COMPANY_DOCUMENT_UPLOAD_CLAIMED",
+            message: "staged upload has already been used".into(),
+        });
+    }
+    if expires_at <= now {
+        return Err(KabiPayError::ConflictRule {
+            code: "COMPANY_DOCUMENT_UPLOAD_EXPIRED",
+            message: "staged upload has expired".into(),
+        });
+    }
+    Ok(())
 }
 
 pub async fn archive_company_document(
@@ -164,26 +228,47 @@ pub async fn delete_company_document(
     db: &DatabaseConnection,
     tenant_id: Uuid,
     document_id: Uuid,
-    deleted_by: Uuid,
+    _deleted_by: Uuid,
 ) -> KabiPayResult<bool> {
+    let txn = db.begin().await.map_err(KabiPayError::from)?;
     let row = company_document::Entity::find_by_id(document_id)
         .filter(company_document::Column::TenantId.eq(tenant_id))
         .filter(company_document::Column::IsDeleted.eq(false))
-        .one(db)
+        .lock_exclusive()
+        .one(&txn)
         .await
         .map_err(KabiPayError::from)?
         .ok_or_else(|| KabiPayError::NotFound {
             entity: "companyDocument",
             id: document_id.to_string(),
         })?;
-    let now = Utc::now();
-    let mut active: company_document::ActiveModel = row.into();
-    active.is_deleted = Set(true);
-    active.status = Set(ARCHIVED_STATUS.to_string());
-    active.deleted_at = Set(Some(now));
-    active.deleted_by = Set(Some(deleted_by));
-    active.updated_at = Set(now);
-    active.update(db).await.map_err(KabiPayError::from)?;
+    let file = file_storage::Entity::find_by_id(row.file_storage_id)
+        .filter(file_storage::Column::TenantId.eq(tenant_id))
+        .lock_exclusive()
+        .one(&txn)
+        .await
+        .map_err(KabiPayError::from)?
+        .ok_or_else(|| KabiPayError::Internal("company document file metadata is missing".into()))?;
+
+    // Claimed stages are audit evidence only while the business record exists. A permanent
+    // delete removes that evidence before the RESTRICT FK, then durably tombstones the file.
+    file_upload_stage::Entity::delete_many()
+        .filter(file_upload_stage::Column::TenantId.eq(tenant_id))
+        .filter(file_upload_stage::Column::ClaimedResourceId.eq(document_id))
+        .exec(&txn)
+        .await
+        .map_err(KabiPayError::from)?;
+    let deleted = company_document::Entity::delete_by_id(document_id)
+        .exec(&txn)
+        .await
+        .map_err(KabiPayError::from)?;
+    if deleted.rows_affected != 1 {
+        return Err(KabiPayError::Internal(
+            "company document delete affected an unexpected number of rows".into(),
+        ));
+    }
+    enqueue_and_delete_private_file(&txn, tenant_id, &file).await?;
+    txn.commit().await.map_err(KabiPayError::from)?;
     Ok(true)
 }
 
@@ -202,6 +287,67 @@ pub async fn find_company_document(
             entity: "companyDocument",
             id: document_id.to_string(),
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Duration;
+
+    #[test]
+    fn company_document_stage_requires_expected_creator_purpose_and_live_lease() {
+        let creator = Uuid::new_v4();
+        let now = Utc::now();
+
+        assert_eq!(
+            validate_company_document_stage(
+                "OTHER_PURPOSE",
+                creator,
+                now + Duration::minutes(1),
+                None,
+                creator,
+                now,
+            )
+            .unwrap_err()
+            .code(),
+            "COMPANY_DOCUMENT_UPLOAD_INVALID"
+        );
+        assert_eq!(
+            validate_company_document_stage(
+                COMPANY_DOCUMENT_UPLOAD_PURPOSE,
+                creator,
+                now - Duration::seconds(1),
+                None,
+                creator,
+                now,
+            )
+            .unwrap_err()
+            .code(),
+            "COMPANY_DOCUMENT_UPLOAD_EXPIRED"
+        );
+        assert_eq!(
+            validate_company_document_stage(
+                COMPANY_DOCUMENT_UPLOAD_PURPOSE,
+                creator,
+                now + Duration::minutes(1),
+                Some(now),
+                creator,
+                now,
+            )
+            .unwrap_err()
+            .code(),
+            "COMPANY_DOCUMENT_UPLOAD_CLAIMED"
+        );
+        assert!(validate_company_document_stage(
+            COMPANY_DOCUMENT_UPLOAD_PURPOSE,
+            creator,
+            now + Duration::minutes(1),
+            None,
+            creator,
+            now,
+        )
+        .is_ok());
+    }
 }
 
 pub async fn map_file_storage_rows(

@@ -707,8 +707,8 @@ impl QueryRoot {
             .map_err(|e: sea_orm::DbErr| KabiPayError::from(e).into_graphql())?
             .ok_or_else(|| {
                 KabiPayError::NotFound {
-                    entity: "fileStorage",
-                    id: file_id.to_string(),
+                    entity: "employeeDocument",
+                    id: doc_id.to_string(),
                 }
                 .into_graphql()
             })?;
@@ -717,68 +717,15 @@ impl QueryRoot {
             &fs_row,
         )
         .await
-        .map_err(KabiPayError::into_graphql)?;
+        .map_err(|error| match error {
+            KabiPayError::NotFound { .. } => KabiPayError::NotFound {
+                entity: "employeeDocument",
+                id: doc_id.to_string(),
+            }
+            .into_graphql(),
+            other => other.into_graphql(),
+        })?;
         Ok(EmployeeDocumentAttachmentDto {
-            file_name: fs_row
-                .original_filename
-                .clone()
-                .unwrap_or_else(|| "document".to_string()),
-            mime_type: fs_row
-                .mime_type
-                .clone()
-                .unwrap_or_else(|| "application/octet-stream".to_string()),
-            file_size_bytes: fs_row
-                .file_size_bytes
-                .and_then(|size| i32::try_from(size).ok()),
-            content_base64: STANDARD.encode(bytes),
-        })
-    }
-
-    /// Private tenant file bytes for generic `file_storage` uploads.
-    ///
-    /// This is intentionally not a public/signed URL. Generic file storage is shared by multiple
-    /// HRMS modules, so reads are limited to the uploader or elevated tenant HR/onboarding/RBAC
-    /// admins until each module has its own business-object-specific visibility rules.
-    async fn tenant_file_attachment(
-        &self,
-        ctx: &Context<'_>,
-        file_storage_id: ID,
-    ) -> Result<TenantFileAttachmentDto> {
-        let tenant_id = require_tenant_id(ctx)?;
-        let claims = require_client_claims(ctx)?;
-        let db = tenant_db(ctx, tenant_id).await?;
-        let file_id = parse_uuid(&file_storage_id, "fileStorageId")?;
-        let fs_row = file_storage::Entity::find_by_id(file_id)
-            .filter(file_storage::Column::TenantId.eq(tenant_id))
-            .one(&db)
-            .await
-            .map_err(|e: sea_orm::DbErr| KabiPayError::from(e).into_graphql())?
-            .ok_or_else(|| {
-                KabiPayError::NotFound {
-                    entity: "fileStorage",
-                    id: file_id.to_string(),
-                }
-                .into_graphql()
-            })?;
-
-        let uploaded_by_viewer = fs_row.uploaded_by == Some(claims.sub);
-        let can_read_tenant_admin_file = claims.can_manage_employee_directory()
-            || claims.can_manage_onboarding_tenant()
-            || claims.can_manage_tenant_rbac();
-        if !uploaded_by_viewer && !can_read_tenant_admin_file {
-            return Err(KabiPayError::Forbidden(
-                "file is private to the uploader or tenant HR/onboarding admins".to_string(),
-            )
-            .into_graphql());
-        }
-
-        let bytes = document_file_service::read_stored_file_bytes(
-            &document_file_service::local_file_root(),
-            &fs_row,
-        )
-        .await
-        .map_err(KabiPayError::into_graphql)?;
-        Ok(TenantFileAttachmentDto {
             file_name: fs_row
                 .original_filename
                 .clone()
@@ -822,18 +769,22 @@ impl QueryRoot {
             .await
             .map_err(|e: sea_orm::DbErr| KabiPayError::from(e).into_graphql())?
             .ok_or_else(|| {
-                KabiPayError::NotFound {
-                    entity: "fileStorage",
-                    id: doc.file_storage_id.to_string(),
-                }
-                .into_graphql()
+                KabiPayError::Internal("company document file metadata is missing".into())
+                    .into_graphql()
             })?;
         let bytes = document_file_service::read_stored_file_bytes(
             &document_file_service::local_file_root(),
             &fs_row,
         )
         .await
-        .map_err(KabiPayError::into_graphql)?;
+        .map_err(|error| match error {
+            KabiPayError::NotFound { .. } => KabiPayError::NotFound {
+                entity: "companyDocument",
+                id: document_id.to_string(),
+            }
+            .into_graphql(),
+            other => other.into_graphql(),
+        })?;
         Ok(TenantFileAttachmentDto {
             file_name: fs_row
                 .original_filename

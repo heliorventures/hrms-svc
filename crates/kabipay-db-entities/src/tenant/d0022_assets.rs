@@ -11,6 +11,9 @@ pub mod asset_category {
         pub tenant_id: Uuid,
         pub name: String,
         pub code: Option<String>,
+        pub is_active: bool,
+        pub retired_at: Option<DateTimeUtc>,
+        pub retired_by: Option<Uuid>,
         pub created_at: DateTimeUtc,
         pub updated_at: DateTimeUtc,
     }
@@ -38,6 +41,8 @@ pub mod asset {
         pub purchase_date: Option<NaiveDate>,
         pub status: String,
         pub location_id: Option<Uuid>,
+        pub retired_at: Option<DateTimeUtc>,
+        pub retired_by: Option<Uuid>,
         pub created_at: DateTimeUtc,
         pub updated_at: DateTimeUtc,
     }

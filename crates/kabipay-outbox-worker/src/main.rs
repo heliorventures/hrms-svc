@@ -7,6 +7,9 @@ use chrono::{Duration as ChronoDuration, Utc};
 use hmac::{Hmac, Mac};
 use kabipay_common::db::{connect_ops_db, resolve_tenant_db, TenantDbCache, TenantDbConfig};
 use kabipay_common::load_dotenv;
+use kabipay_common::private_file_cleanup::{
+    process_private_file_cleanup_tasks, sweep_expired_company_upload_stages,
+};
 use kabipay_common::subgraph::{ops_dsn_from_env, tenant_db_config_from_env};
 use kabipay_common::telemetry::init_tracing;
 use kabipay_db_entities::ops::tenant_database;
@@ -511,6 +514,12 @@ async fn main() -> anyhow::Result<()> {
                 for tid in tenants {
                     match resolve_tenant_db(tid, &ops_db, &cache, &fallback).await {
                         Ok(tdb) => {
+                            if let Err(error) = sweep_expired_company_upload_stages(&tdb, tid, 25).await {
+                                tracing::error!(%tid, code = error.code(), "expired file-upload stage sweep failed");
+                            }
+                            if let Err(error) = process_private_file_cleanup_tasks(&tdb, tid, 25).await {
+                                tracing::error!(%tid, code = error.code(), "private file cleanup sweep failed");
+                            }
                             if let Err(e) = process_tenant_outbox(&tdb, tid, cap).await {
                                 tracing::error!(%tid, error = %e, "tenant outbox sweep failed");
                             }

@@ -104,34 +104,25 @@ async fn employee_graphql(
 async fn employee_file_download(
     State(st): State<Arc<EmployeeState>>,
     Query(q): Query<FileQuery>,
-) -> Result<axum::response::Response, (StatusCode, String)> {
-    let claims = verify_download_token(&q.token).ok_or((
-        StatusCode::UNAUTHORIZED,
-        "invalid or expired token".to_string(),
-    ))?;
+) -> Result<axum::response::Response, KabiPayError> {
+    let claims = verify_download_token(&q.token).ok_or(KabiPayError::Unauthorised)?;
 
     let db = resolve_tenant_db(claims.tenant_id, &st.ops, &st.cache, &st.fallback)
         .await
-        .map_err(|e: KabiPayError| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:?}")))?;
+        .map_err(|error: KabiPayError| error)?;
 
     let row = file_storage::Entity::find_by_id(claims.file_storage_id)
         .filter(file_storage::Column::TenantId.eq(claims.tenant_id))
         .one(&db)
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-        .ok_or((StatusCode::NOT_FOUND, "file metadata not found".to_string()))?;
+        .map_err(KabiPayError::from)?
+        .ok_or_else(|| KabiPayError::NotFound {
+            entity: "document",
+            id: "requested".into(),
+        })?;
 
     let body = document_file_service::read_stored_file_bytes(&st.file_root, &row)
-        .await
-        .map_err(|e: KabiPayError| {
-            use kabipay_common::error::KabiPayError as E;
-            let st = match &e {
-                E::NotFound { .. } => StatusCode::NOT_FOUND,
-                E::Validation(_) => StatusCode::BAD_REQUEST,
-                _ => StatusCode::INTERNAL_SERVER_ERROR,
-            };
-            (st, e.to_string())
-        })?;
+        .await?;
 
     let ct = claims
         .mime_type
@@ -149,6 +140,6 @@ async fn employee_file_download(
         .header(header::CONTENT_TYPE, ct)
         .header(header::CONTENT_DISPOSITION, disp)
         .body(Body::from(body))
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|_| KabiPayError::Internal("failed to build file response".into()))?;
     Ok(res)
 }

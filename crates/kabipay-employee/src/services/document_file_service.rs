@@ -3,24 +3,67 @@
 
 use std::path::{Component, Path, PathBuf};
 
-use chrono::Utc;
+use chrono::{DateTime, Duration, Utc};
+use kabipay_common::private_file_cleanup::{
+    enqueue_and_delete_private_file, enqueue_private_file_cleanup_coordinates,
+};
 use kabipay_common::{KabiPayError, KabiPayResult};
 use sea_orm::{
     ActiveModelTrait, ActiveValue::Set, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter,
-    TransactionTrait,
+    QuerySelect, Select, TransactionTrait,
 };
 use uuid::Uuid;
 
 use super::object_store::{
-    FileStorageMode, S3CompatSettings, ensure_tenant_bucket, s3_delete, s3_operator_for_bucket,
-    s3_put, s3_read, tenant_bucket_name, PROVIDER_S3_COMPAT,
+    FileStorageMode, S3CompatSettings, ensure_tenant_bucket, s3_operator_for_bucket, s3_put,
+    s3_read, tenant_bucket_name, PROVIDER_S3_COMPAT,
 };
 use crate::entities::d0008_document_system::employee_document;
 use crate::entities::d0029_file_storage::file_storage;
+use crate::entities::d0059_file_upload_stage::file_upload_stage;
 
 const PROVIDER_LOCAL: &str = "LOCAL";
 const MAX_BYTES: usize = 6 * 1024 * 1024;
 const ALLOWED_DOCUMENT_MIME_TYPES: &[&str] = &["application/pdf", "image/jpeg", "image/png"];
+pub const COMPANY_DOCUMENT_UPLOAD_PURPOSE: &str = "COMPANY_DOCUMENT";
+const COMPANY_DOCUMENT_UPLOAD_TTL_MINUTES: i64 = 15;
+
+/// Persist an object-only tombstone if the write completed but the metadata transaction failed.
+/// If the tenant DB is unavailable too, only an opaque correlation/error class is logged.
+async fn enqueue_failed_object_write_cleanup(
+    db: &DatabaseConnection,
+    tenant_id: Uuid,
+    provider: &str,
+    bucket: Option<&str>,
+    storage_path: &str,
+) -> KabiPayResult<()> {
+    let correlation_id = Uuid::new_v4();
+    if let Err(error) = enqueue_private_file_cleanup_coordinates(
+        db,
+        tenant_id,
+        provider,
+        bucket,
+        storage_path,
+    )
+    .await
+    {
+        tracing::error!(
+            tenant_id = %tenant_id,
+            cleanup_correlation_id = %correlation_id,
+            error_class = error.code(),
+            "private file cleanup tombstone could not be recorded"
+        );
+        return Err(KabiPayError::Internal(
+            "private file cleanup could not be scheduled".into(),
+        ));
+    }
+    Ok(())
+}
+
+pub struct StagedCompanyDocumentUpload {
+    pub stage: file_upload_stage::Model,
+    pub file: file_storage::Model,
+}
 
 pub fn local_file_root() -> PathBuf {
     let root =
@@ -118,8 +161,8 @@ pub async fn read_stored_file_bytes(
         return match tokio::fs::read(&full).await {
             Ok(b) => Ok(b),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(KabiPayError::NotFound {
-                entity: "file_storage",
-                id: row.id.to_string(),
+                entity: "document",
+                id: "requested".to_string(),
             }),
             Err(e) => Err(KabiPayError::Internal(format!("read local file: {e}"))),
         };
@@ -188,9 +231,8 @@ pub async fn upload_employee_document(
                 Ok(row) => Ok(row),
                 Err(error) if local_fallback_enabled() => {
                     tracing::warn!(
-                        error = %error,
                         tenant_id = %tenant_id,
-                        employee_id = %employee_id,
+                        code = error.code(),
                         "S3 employee document upload failed; using configured local fallback"
                     );
                     upload_local(
@@ -223,10 +265,13 @@ pub async fn cleanup_unlinked_employee_document(
     tenant_id: Uuid,
     document_id: Uuid,
 ) -> KabiPayResult<()> {
+    let txn = db.begin().await.map_err(KabiPayError::from)?;
     let document = employee_document::Entity::find_by_id(document_id)
         .filter(employee_document::Column::TenantId.eq(tenant_id))
-        .one(db)
-        .await?
+        .lock_exclusive()
+        .one(&txn)
+        .await
+        .map_err(KabiPayError::from)?
         .ok_or_else(|| KabiPayError::NotFound {
             entity: "employeeDocument",
             id: document_id.to_string(),
@@ -234,32 +279,167 @@ pub async fn cleanup_unlinked_employee_document(
     let stored_file = match document.file_storage_id {
         Some(file_id) => file_storage::Entity::find_by_id(file_id)
             .filter(file_storage::Column::TenantId.eq(tenant_id))
-            .one(db)
-            .await?,
+            .lock_exclusive()
+            .one(&txn)
+            .await
+            .map_err(KabiPayError::from)?,
         None => None,
     };
 
-    let txn = db.begin().await?;
-    employee_document::Entity::delete_by_id(document.id).exec(&txn).await?;
-    if let Some(file_id) = document.file_storage_id {
-        file_storage::Entity::delete_by_id(file_id).exec(&txn).await?;
-    }
-    txn.commit().await?;
-
+    employee_document::Entity::delete_by_id(document.id)
+        .exec(&txn)
+        .await
+        .map_err(KabiPayError::from)?;
     if let Some(stored_file) = stored_file {
-        if stored_file.provider == PROVIDER_LOCAL {
-            if let Ok(full_path) = absolute_storage_path(&stored_file.storage_path) {
-                let _ = tokio::fs::remove_file(full_path).await;
-            }
-        } else if stored_file.provider == PROVIDER_S3_COMPAT {
-            if let (Ok(settings), Some(bucket)) = (S3CompatSettings::from_env(), stored_file.bucket) {
-                if let Ok(operator) = s3_operator_for_bucket(&settings, &bucket) {
-                    s3_delete(&operator, &stored_file.storage_path).await;
-                }
-            }
+        enqueue_and_delete_private_file(&txn, tenant_id, &stored_file).await?;
+    }
+    txn.commit().await.map_err(KabiPayError::from)?;
+    Ok(())
+}
+
+fn unclaimed_company_stage_query(
+    stage_id: Uuid,
+    tenant_id: Uuid,
+    creator_user_id: Uuid,
+    expires_at: DateTime<Utc>,
+) -> Select<file_upload_stage::Entity> {
+    file_upload_stage::Entity::find()
+        .filter(file_upload_stage::Column::Id.eq(stage_id))
+        .filter(file_upload_stage::Column::TenantId.eq(tenant_id))
+        .filter(file_upload_stage::Column::Purpose.eq(COMPANY_DOCUMENT_UPLOAD_PURPOSE))
+        .filter(file_upload_stage::Column::CreatedBy.eq(creator_user_id))
+        .filter(file_upload_stage::Column::ExpiresAt.eq(expires_at))
+        .filter(file_upload_stage::Column::ClaimedAt.is_null())
+}
+
+/// Store a company-document upload behind an opaque, creator-bound stage ID.
+/// The underlying `file_storage.id` is never returned to the caller.
+pub async fn upload_company_document_file(
+    db: &DatabaseConnection,
+    tenant_id: Uuid,
+    creator_user_id: Uuid,
+    original_filename: String,
+    mime_type: Option<String>,
+    bytes: Vec<u8>,
+) -> KabiPayResult<StagedCompanyDocumentUpload> {
+    let file = upload_tenant_file(
+        db,
+        tenant_id,
+        Some(creator_user_id),
+        original_filename,
+        mime_type,
+        bytes,
+    )
+    .await?;
+    let now = Utc::now();
+    let stage = file_upload_stage::ActiveModel {
+        id: Set(Uuid::new_v4()),
+        tenant_id: Set(tenant_id),
+        file_storage_id: Set(file.id),
+        purpose: Set(COMPANY_DOCUMENT_UPLOAD_PURPOSE.to_string()),
+        created_by: Set(creator_user_id),
+        expires_at: Set(now + Duration::minutes(COMPANY_DOCUMENT_UPLOAD_TTL_MINUTES)),
+        claimed_at: Set(None),
+        claimed_resource_id: Set(None),
+        created_at: Set(now),
+        updated_at: Set(now),
+    }
+    .insert(db)
+    .await;
+
+    match stage {
+        Ok(stage) => Ok(StagedCompanyDocumentUpload { stage, file }),
+        Err(error) => {
+            cleanup_known_new_file(db, tenant_id, &file).await;
+            Err(KabiPayError::from(error))
         }
     }
-    Ok(())
+}
+
+/// Compensate only an operation-owned company upload that is still unclaimed.
+/// The exact expiry from the locked stage is repeated in the delete predicate so
+/// a replaced/recreated lease cannot be removed by a stale cleanup attempt.
+pub async fn cleanup_unlinked_company_upload(
+    db: &DatabaseConnection,
+    tenant_id: Uuid,
+    stage_id: Uuid,
+    uploader_user_id: Uuid,
+) -> KabiPayResult<bool> {
+    let txn = db.begin().await.map_err(KabiPayError::from)?;
+    let Some(stage_lease) = file_upload_stage::Entity::find()
+        .filter(file_upload_stage::Column::Id.eq(stage_id))
+        .filter(file_upload_stage::Column::TenantId.eq(tenant_id))
+        .filter(file_upload_stage::Column::Purpose.eq(COMPANY_DOCUMENT_UPLOAD_PURPOSE))
+        .filter(file_upload_stage::Column::CreatedBy.eq(uploader_user_id))
+        .filter(file_upload_stage::Column::ClaimedAt.is_null())
+        .one(&txn)
+        .await
+        .map_err(KabiPayError::from)?
+    else {
+        return Ok(false);
+    };
+    let Some(stage) = unclaimed_company_stage_query(
+        stage_id,
+        tenant_id,
+        uploader_user_id,
+        stage_lease.expires_at.clone(),
+    )
+    .lock_exclusive()
+    .one(&txn)
+    .await
+    .map_err(KabiPayError::from)?
+    else {
+        return Ok(false);
+    };
+
+    let Some(stored_file) = file_storage::Entity::find_by_id(stage.file_storage_id)
+        .filter(file_storage::Column::TenantId.eq(tenant_id))
+        .lock_exclusive()
+        .one(&txn)
+        .await
+        .map_err(KabiPayError::from)?
+    else {
+        return Err(KabiPayError::Internal(
+            "staged upload file metadata is missing".into(),
+        ));
+    };
+
+    let deleted_stage = file_upload_stage::Entity::delete_many()
+        .filter(file_upload_stage::Column::Id.eq(stage.id))
+        .filter(file_upload_stage::Column::TenantId.eq(tenant_id))
+        .filter(file_upload_stage::Column::Purpose.eq(COMPANY_DOCUMENT_UPLOAD_PURPOSE))
+        .filter(file_upload_stage::Column::CreatedBy.eq(uploader_user_id))
+        .filter(file_upload_stage::Column::ExpiresAt.eq(stage.expires_at.clone()))
+        .filter(file_upload_stage::Column::ClaimedAt.is_null())
+        .exec(&txn)
+        .await
+        .map_err(KabiPayError::from)?;
+    if deleted_stage.rows_affected == 0 {
+        return Ok(false);
+    }
+    enqueue_and_delete_private_file(&txn, tenant_id, &stored_file).await?;
+    txn.commit().await.map_err(KabiPayError::from)?;
+    Ok(true)
+}
+
+async fn cleanup_known_new_file(
+    db: &DatabaseConnection,
+    tenant_id: Uuid,
+    stored_file: &file_storage::Model,
+) {
+    let result = async {
+        let txn = db.begin().await.map_err(KabiPayError::from)?;
+        enqueue_and_delete_private_file(&txn, tenant_id, stored_file).await?;
+        txn.commit().await.map_err(KabiPayError::from)
+    }
+    .await;
+    if let Err(error) = result {
+        tracing::warn!(
+            tenant_id = %tenant_id,
+            code = error.code(),
+            "new company upload cleanup could not be queued"
+        );
+    }
 }
 
 /// Persist a tenant-scoped file without attaching it to an employee document. This is used by
@@ -305,14 +485,20 @@ pub async fn upload_tenant_file(
                 file_id,
                 now,
                 None,
-                rel,
+                rel.clone(),
                 bytes.len() as i64,
             )
             .await;
-            if inserted.is_err() {
-                let _ = tokio::fs::remove_file(&path).await;
+            match inserted {
+                Ok(file) => Ok(file),
+                Err(error) => {
+                    enqueue_failed_object_write_cleanup(
+                        db, tenant_id, PROVIDER_LOCAL, None, &rel,
+                    )
+                    .await?;
+                    Err(error)
+                }
             }
-            inserted
         }
         FileStorageMode::S3Compat => {
             let s3_result = upload_s3_tenant_file(
@@ -328,8 +514,8 @@ pub async fn upload_tenant_file(
                 Ok(row) => Ok(row),
                 Err(error) if local_fallback_enabled() => {
                     tracing::warn!(
-                        error = %error,
                         tenant_id = %tenant_id,
+                        code = error.code(),
                         "S3 tenant file upload failed; using configured local fallback"
                     );
                     upload_local_tenant_file(
@@ -440,15 +626,18 @@ async fn upload_local(
         doc_id,
         now,
         None,
-        rel,
+        rel.clone(),
         sz,
         hr_auto_approve,
     )
     .await;
-    if inserted.is_err() {
-        let _ = tokio::fs::remove_file(&path).await;
+    match inserted {
+        Ok(document) => Ok(document),
+        Err(error) => {
+            enqueue_failed_object_write_cleanup(db, tenant_id, PROVIDER_LOCAL, None, &rel).await?;
+            Err(error)
+        }
     }
-    inserted
 }
 
 async fn upload_s3_employee_document(
@@ -502,16 +691,26 @@ async fn upload_s3_employee_document(
         file_id,
         doc_id,
         now,
-        Some(bucket),
+        Some(bucket.clone()),
         storage_path.clone(),
         sz,
         hr_auto_approve,
     )
     .await;
-    if inserted.is_err() {
-        s3_delete(&op, &storage_path).await;
+    match inserted {
+        Ok(document) => Ok(document),
+        Err(error) => {
+            enqueue_failed_object_write_cleanup(
+                db,
+                tenant_id,
+                PROVIDER_S3_COMPAT,
+                Some(&bucket),
+                &storage_path,
+            )
+            .await?;
+            Err(error)
+        }
     }
-    inserted
 }
 
 async fn upload_local_tenant_file(
@@ -549,14 +748,17 @@ async fn upload_local_tenant_file(
         file_id,
         now,
         None,
-        rel,
+        rel.clone(),
         bytes.len() as i64,
     )
     .await;
-    if inserted.is_err() {
-        let _ = tokio::fs::remove_file(&path).await;
+    match inserted {
+        Ok(file) => Ok(file),
+        Err(error) => {
+            enqueue_failed_object_write_cleanup(db, tenant_id, PROVIDER_LOCAL, None, &rel).await?;
+            Err(error)
+        }
     }
-    inserted
 }
 
 async fn upload_s3_tenant_file(
@@ -603,15 +805,25 @@ async fn upload_s3_tenant_file(
         mime_type,
         file_id,
         now,
-        Some(bucket),
+        Some(bucket.clone()),
         storage_path.clone(),
         size,
     )
     .await;
-    if inserted.is_err() {
-        s3_delete(&op, &storage_path).await;
+    match inserted {
+        Ok(file) => Ok(file),
+        Err(error) => {
+            enqueue_failed_object_write_cleanup(
+                db,
+                tenant_id,
+                PROVIDER_S3_COMPAT,
+                Some(&bucket),
+                &storage_path,
+            )
+            .await?;
+            Err(error)
+        }
     }
-    inserted
 }
 
 async fn insert_fs_doc(
@@ -724,4 +936,29 @@ async fn insert_file_storage(
         updated_at: Set(now),
     };
     fs_am.insert(db).await.map_err(KabiPayError::from)
+}
+
+#[cfg(test)]
+mod stage_tests {
+    use super::*;
+    use chrono::Duration;
+    use sea_orm::{DbBackend, QueryTrait};
+
+    #[test]
+    fn company_stage_cleanup_query_is_operation_scoped() {
+        let stage_id = Uuid::new_v4();
+        let tenant_id = Uuid::new_v4();
+        let creator = Uuid::new_v4();
+        let expires_at = Utc::now() + Duration::minutes(15);
+        let statement = unclaimed_company_stage_query(stage_id, tenant_id, creator, expires_at)
+            .build(DbBackend::Postgres)
+            .to_string();
+
+        assert!(statement.contains(&stage_id.to_string()));
+        assert!(statement.contains(&tenant_id.to_string()));
+        assert!(statement.contains(&creator.to_string()));
+        assert!(statement.contains(COMPANY_DOCUMENT_UPLOAD_PURPOSE));
+        assert!(statement.contains("\"claimed_at\" IS NULL"));
+        assert!(statement.contains("\"expires_at\""));
+    }
 }

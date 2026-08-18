@@ -2,13 +2,15 @@
 //! **Outbound email/SMS** is not implemented here; see the crate **`README.md`** for the roadmap.
 
 use chrono::{DateTime, Utc};
+use kabipay_common::private_file_cleanup::enqueue_and_delete_private_file;
 use kabipay_common::{KabiPayError, KabiPayResult};
 use kabipay_db_entities::tenant::d0005_auth_rbac::{role, user, user_role};
 use kabipay_db_entities::tenant::d0007_employee_core::employee;
 use kabipay_db_entities::tenant::d0027_communication_audit::{announcement, notification};
+use kabipay_db_entities::tenant::d0029_file_storage::file_storage;
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, Condition, DatabaseConnection, EntityTrait, QueryFilter, QueryOrder,
-    QuerySelect, Set,
+    ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait, DatabaseConnection, EntityTrait,
+    QueryFilter, QueryOrder, QuerySelect, Set, TransactionTrait,
 };
 use std::collections::HashSet;
 use uuid::Uuid;
@@ -99,7 +101,10 @@ fn announcement_role_target(m: &announcement::Model) -> Option<String> {
         .filter(|role| !role.is_empty())
 }
 
-async fn active_user_ids(db: &DatabaseConnection, tenant_id: Uuid) -> KabiPayResult<HashSet<Uuid>> {
+async fn active_user_ids<C: ConnectionTrait>(
+    db: &C,
+    tenant_id: Uuid,
+) -> KabiPayResult<HashSet<Uuid>> {
     let rows = user::Entity::find()
         .filter(user::Column::TenantId.eq(tenant_id))
         .filter(user::Column::IsActive.eq(true))
@@ -111,7 +116,7 @@ async fn active_user_ids(db: &DatabaseConnection, tenant_id: Uuid) -> KabiPayRes
 }
 
 async fn role_target_user_ids(
-    db: &DatabaseConnection,
+    db: &impl ConnectionTrait,
     tenant_id: Uuid,
     role_code: &str,
 ) -> KabiPayResult<HashSet<Uuid>> {
@@ -134,7 +139,7 @@ async fn role_target_user_ids(
 }
 
 async fn employee_target_user_ids(
-    db: &DatabaseConnection,
+    db: &impl ConnectionTrait,
     tenant_id: Uuid,
     department_id: Option<Uuid>,
     location_id: Option<Uuid>,
@@ -154,7 +159,7 @@ async fn employee_target_user_ids(
 }
 
 async fn announcement_recipient_user_ids(
-    db: &DatabaseConnection,
+    db: &impl ConnectionTrait,
     tenant_id: Uuid,
     m: &announcement::Model,
 ) -> KabiPayResult<Vec<Uuid>> {
@@ -290,6 +295,7 @@ pub async fn create_announcement(
     created_by: Uuid,
     new: NewAnnouncement,
 ) -> KabiPayResult<announcement::Model> {
+    let transaction = db.begin().await.map_err(KabiPayError::from)?;
     let id = Uuid::new_v4();
     let now = Utc::now();
     let publish_at = new.publish_at.unwrap_or(now);
@@ -310,17 +316,17 @@ pub async fn create_announcement(
         created_at: Set(now),
         updated_at: Set(now),
     };
-    am.insert(db).await.map_err(KabiPayError::from)?;
+    am.insert(&transaction).await.map_err(KabiPayError::from)?;
     let row = announcement::Entity::find_by_id(id)
-        .one(db)
+        .one(&transaction)
         .await?
         .ok_or_else(|| KabiPayError::Internal("announcement missing after insert".into()))?;
     let visible_now = row.publish_at.map(|t| t <= now).unwrap_or(true)
         && row.expires_at.map(|t| t > now).unwrap_or(true);
     if visible_now {
-        let recipients = announcement_recipient_user_ids(db, tenant_id, &row).await?;
+        let recipients = announcement_recipient_user_ids(&transaction, tenant_id, &row).await?;
         insert_notifications_for_users(
-            db,
+            &transaction,
             tenant_id,
             recipients,
             Some("ANNOUNCEMENT".into()),
@@ -330,6 +336,7 @@ pub async fn create_announcement(
         )
         .await?;
     }
+    transaction.commit().await.map_err(KabiPayError::from)?;
     Ok(row)
 }
 
@@ -353,12 +360,19 @@ pub async fn update_announcement(
     announcement_id: Uuid,
     patch: AnnouncementUpdate,
 ) -> KabiPayResult<announcement::Model> {
-    let row = get_announcement(db, tenant_id, announcement_id)
-        .await?
+    let transaction = db.begin().await.map_err(KabiPayError::from)?;
+    let row = announcement::Entity::find_by_id(announcement_id)
+        .filter(announcement::Column::TenantId.eq(tenant_id))
+        .lock_exclusive()
+        .one(&transaction)
+        .await
+        .map_err(KabiPayError::from)?
         .ok_or_else(|| KabiPayError::NotFound {
             entity: "announcement",
             id: announcement_id.to_string(),
         })?;
+    let previous_image_id = row.image_file_storage_id;
+    let previous_document_id = row.document_file_storage_id;
     let mut am: announcement::ActiveModel = row.into();
     let now = Utc::now();
     if let Some(t) = patch.title {
@@ -397,11 +411,29 @@ pub async fn update_announcement(
         am.document_file_storage_id = Set(d);
     }
     am.updated_at = Set(now);
-    am.update(db).await.map_err(KabiPayError::from)?;
-    announcement::Entity::find_by_id(announcement_id)
-        .one(db)
-        .await?
-        .ok_or_else(|| KabiPayError::Internal("announcement missing after update".into()))
+    am.update(&transaction).await.map_err(KabiPayError::from)?;
+    let updated = announcement::Entity::find_by_id(announcement_id)
+        .filter(announcement::Column::TenantId.eq(tenant_id))
+        .one(&transaction)
+        .await
+        .map_err(KabiPayError::from)?
+        .ok_or_else(|| KabiPayError::Internal("announcement missing after update".into()))?;
+
+    let mut removed_ids = [previous_image_id, previous_document_id]
+        .into_iter()
+        .flatten()
+        .filter(|file_id| {
+            Some(*file_id) != updated.image_file_storage_id
+                && Some(*file_id) != updated.document_file_storage_id
+        })
+        .collect::<Vec<_>>();
+    removed_ids.sort_unstable();
+    removed_ids.dedup();
+    for file_id in removed_ids {
+        enqueue_attachment_if_unreferenced(&transaction, tenant_id, file_id).await?;
+    }
+    transaction.commit().await.map_err(KabiPayError::from)?;
+    Ok(updated)
 }
 
 pub async fn delete_announcement(
@@ -409,19 +441,68 @@ pub async fn delete_announcement(
     tenant_id: Uuid,
     announcement_id: Uuid,
 ) -> KabiPayResult<u64> {
-    let r = announcement::Entity::delete_many()
-        .filter(announcement::Column::Id.eq(announcement_id))
+    let transaction = db.begin().await.map_err(KabiPayError::from)?;
+    let row = announcement::Entity::find_by_id(announcement_id)
         .filter(announcement::Column::TenantId.eq(tenant_id))
-        .exec(db)
+        .lock_exclusive()
+        .one(&transaction)
         .await
-        .map_err(KabiPayError::from)?;
-    if r.rows_affected == 0 {
-        return Err(KabiPayError::NotFound {
+        .map_err(KabiPayError::from)?
+        .ok_or_else(|| KabiPayError::NotFound {
             entity: "announcement",
             id: announcement_id.to_string(),
-        });
+        })?;
+    let mut removed_ids = [row.image_file_storage_id, row.document_file_storage_id]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    removed_ids.sort_unstable();
+    removed_ids.dedup();
+    let result = announcement::Entity::delete_by_id(announcement_id)
+        .exec(&transaction)
+        .await
+        .map_err(KabiPayError::from)?;
+    if result.rows_affected != 1 {
+        return Err(KabiPayError::Internal(
+            "announcement delete affected an unexpected number of rows".into(),
+        ));
     }
-    Ok(r.rows_affected)
+    for file_id in removed_ids {
+        enqueue_attachment_if_unreferenced(&transaction, tenant_id, file_id).await?;
+    }
+    transaction.commit().await.map_err(KabiPayError::from)?;
+    Ok(1)
+}
+
+async fn enqueue_attachment_if_unreferenced(
+    db: &impl ConnectionTrait,
+    tenant_id: Uuid,
+    file_id: Uuid,
+) -> KabiPayResult<()> {
+    let still_referenced = announcement::Entity::find()
+        .filter(announcement::Column::TenantId.eq(tenant_id))
+        .filter(
+            Condition::any()
+                .add(announcement::Column::ImageFileStorageId.eq(file_id))
+                .add(announcement::Column::DocumentFileStorageId.eq(file_id)),
+        )
+        .one(db)
+        .await
+        .map_err(KabiPayError::from)?
+        .is_some();
+    if still_referenced {
+        return Ok(());
+    }
+    let file = file_storage::Entity::find_by_id(file_id)
+        .filter(file_storage::Column::TenantId.eq(tenant_id))
+        .lock_exclusive()
+        .one(db)
+        .await
+        .map_err(KabiPayError::from)?;
+    if let Some(file) = file {
+        enqueue_and_delete_private_file(db, tenant_id, &file).await?;
+    }
+    Ok(())
 }
 
 pub async fn create_notifications_for_users(
@@ -447,7 +528,7 @@ pub async fn create_notifications_for_users(
 }
 
 async fn insert_notifications_for_users(
-    db: &DatabaseConnection,
+    db: &impl ConnectionTrait,
     tenant_id: Uuid,
     user_ids: Vec<Uuid>,
     kind: Option<String>,

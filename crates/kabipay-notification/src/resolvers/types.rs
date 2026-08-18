@@ -1,19 +1,8 @@
 //! GraphQL DTOs for kabipay-notification.
 
-use async_graphql::{ComplexObject, Context, InputObject, Result, SimpleObject, ID};
-use base64::engine::general_purpose::STANDARD;
-use base64::Engine;
+use async_graphql::{InputObject, SimpleObject, ID};
 use chrono::{DateTime, Utc};
-use kabipay_common::{
-    subgraph::{require_client_claims, tenant_db},
-    KabiPayError,
-};
 use kabipay_db_entities::tenant::d0027_communication_audit::{announcement, notification};
-use kabipay_db_entities::tenant::d0029_file_storage::file_storage;
-use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
-use uuid::Uuid;
-
-const MAX_INLINE_ANNOUNCEMENT_ATTACHMENT_BYTES: usize = 6 * 1024 * 1024;
 
 #[derive(SimpleObject, Clone, Debug)]
 #[graphql(name = "AnnouncementAttachment")]
@@ -25,7 +14,6 @@ pub struct AnnouncementAttachmentDto {
 }
 
 #[derive(SimpleObject, Clone, Debug)]
-#[graphql(complex)]
 #[graphql(name = "Announcement")]
 pub struct AnnouncementDto {
     pub id: ID,
@@ -37,104 +25,11 @@ pub struct AnnouncementDto {
     pub target_department_id: Option<ID>,
     pub target_location_id: Option<ID>,
     pub post_source: String,
-    pub image_file_storage_id: Option<ID>,
-    pub document_file_storage_id: Option<ID>,
+    pub has_image_attachment: bool,
+    pub has_document_attachment: bool,
     pub publish_at: Option<DateTime<Utc>>,
     pub expires_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
-}
-
-#[ComplexObject]
-impl AnnouncementDto {
-    /// Authenticated image bytes for inline preview. No storage or signed URL is exposed.
-    async fn image_attachment(
-        &self,
-        ctx: &Context<'_>,
-    ) -> Result<Option<AnnouncementAttachmentDto>> {
-        self.attachment_content(ctx, self.image_file_storage_id.clone())
-            .await
-    }
-
-    /// Authenticated document bytes for client-side Blob download. No storage or signed URL is exposed.
-    async fn document_attachment(
-        &self,
-        ctx: &Context<'_>,
-    ) -> Result<Option<AnnouncementAttachmentDto>> {
-        self.attachment_content(ctx, self.document_file_storage_id.clone())
-            .await
-    }
-}
-
-impl AnnouncementDto {
-    async fn attachment_content(
-        &self,
-        ctx: &Context<'_>,
-        file_id: Option<ID>,
-    ) -> Result<Option<AnnouncementAttachmentDto>> {
-        let Some(fid) = file_id else {
-            return Ok(None);
-        };
-        require_client_claims(ctx)?;
-        let tenant_id = Uuid::parse_str(self.tenant_id.as_str())
-            .map_err(|e| KabiPayError::Validation(format!("tenant: {e}")).into_graphql())?;
-        let storage_id = Uuid::parse_str(fid.as_str())
-            .map_err(|e| KabiPayError::Validation(format!("file: {e}")).into_graphql())?;
-        let db = tenant_db(ctx, tenant_id).await?;
-        let allowed = crate::services::notification_service::announcement_links_file_storage(
-            &db, tenant_id, storage_id,
-        )
-        .await
-        .map_err(KabiPayError::into_graphql)?;
-        if !allowed {
-            return Err(
-                KabiPayError::Forbidden("file is not attached to an announcement".into()).into_graphql(),
-            );
-        }
-        let fs_row = file_storage::Entity::find_by_id(storage_id)
-            .filter(file_storage::Column::TenantId.eq(tenant_id))
-            .one(&db)
-            .await
-            .map_err(|e: sea_orm::DbErr| KabiPayError::from(e).into_graphql())?
-            .ok_or_else(|| {
-                KabiPayError::NotFound {
-                    entity: "fileStorage",
-                    id: storage_id.to_string(),
-                }
-                .into_graphql()
-            })?;
-        if fs_row
-            .file_size_bytes
-            .is_some_and(|size| size > MAX_INLINE_ANNOUNCEMENT_ATTACHMENT_BYTES as i64)
-        {
-            return Err(KabiPayError::Validation(
-                "announcement attachment is too large to return inline".into(),
-            )
-            .into_graphql());
-        }
-        let bytes = crate::services::announcement_storage::read_blob(&fs_row)
-            .await
-            .map_err(KabiPayError::into_graphql)?;
-        if bytes.len() > MAX_INLINE_ANNOUNCEMENT_ATTACHMENT_BYTES {
-            return Err(KabiPayError::Validation(
-                "announcement attachment is too large to return inline".into(),
-            )
-            .into_graphql());
-        }
-        Ok(Some(AnnouncementAttachmentDto {
-            file_name: fs_row
-                .original_filename
-                .filter(|name| !name.trim().is_empty())
-                .unwrap_or_else(|| "attachment".into()),
-            mime_type: fs_row
-                .mime_type
-                .filter(|mime| !mime.trim().is_empty())
-                .unwrap_or_else(|| "application/octet-stream".into()),
-            file_size_bytes: fs_row
-                .file_size_bytes
-                .and_then(|size| i32::try_from(size).ok()),
-            content_base64: STANDARD.encode(bytes),
-        }))
-    }
 }
 
 impl From<announcement::Model> for AnnouncementDto {
@@ -149,12 +44,45 @@ impl From<announcement::Model> for AnnouncementDto {
             target_department_id: m.target_department_id.map(|u| ID(u.to_string())),
             target_location_id: m.target_location_id.map(|u| ID(u.to_string())),
             post_source: m.post_source,
-            image_file_storage_id: m.image_file_storage_id.map(|u| ID(u.to_string())),
-            document_file_storage_id: m.document_file_storage_id.map(|u| ID(u.to_string())),
+            has_image_attachment: m.image_file_storage_id.is_some(),
+            has_document_attachment: m.document_file_storage_id.is_some(),
             publish_at: m.publish_at,
             expires_at: m.expires_at,
             created_at: m.created_at,
         }
+    }
+}
+
+#[cfg(test)]
+mod announcement_tests {
+    use super::*;
+    use uuid::Uuid;
+
+    #[test]
+    fn announcement_summary_reports_attachment_presence_without_loading_bytes() {
+        let image_id = Uuid::new_v4();
+        let model = announcement::Model {
+            id: Uuid::new_v4(),
+            tenant_id: Uuid::new_v4(),
+            created_by: Some(Uuid::new_v4()),
+            title: "Maintenance".into(),
+            body: None,
+            target_audience: None,
+            target_department_id: None,
+            target_location_id: None,
+            publish_at: Some(Utc::now()),
+            expires_at: None,
+            image_file_storage_id: Some(image_id),
+            document_file_storage_id: None,
+            post_source: "company".into(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+
+        let dto = AnnouncementDto::from(model);
+
+        assert!(dto.has_image_attachment);
+        assert!(!dto.has_document_attachment);
     }
 }
 

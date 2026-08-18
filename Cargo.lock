@@ -1841,6 +1841,7 @@ dependencies = [
  "hmac",
  "jsonwebtoken",
  "kabipay-db-entities",
+ "opendal",
  "sea-orm",
  "serde",
  "serde_json",
