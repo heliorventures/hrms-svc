@@ -1,4 +1,5 @@
-//! SeaORM model for migration 0060 durable private-file cleanup tombstones.
+//! SeaORM model for migration 0060 durable private-file cleanup tombstones,
+//! hardened with explicit claim ownership by migration 0062.
 
 pub mod private_file_cleanup_task {
     use crate::tenant::prelude::*;
@@ -19,6 +20,7 @@ pub mod private_file_cleanup_task {
         pub attempt_count: i32,
         pub next_attempt_at: DateTimeUtc,
         pub claimed_at: Option<DateTimeUtc>,
+        pub claim_token: Option<Uuid>,
         pub last_error_class: Option<String>,
         pub completed_at: Option<DateTimeUtc>,
         pub created_at: DateTimeUtc,

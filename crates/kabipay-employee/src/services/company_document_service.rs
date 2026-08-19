@@ -112,6 +112,7 @@ pub async fn create_company_document(
     let txn = db.begin().await.map_err(KabiPayError::from)?;
     let stage = file_upload_stage::Entity::find_by_id(input.staged_upload_id)
         .filter(file_upload_stage::Column::TenantId.eq(tenant_id))
+        .filter(file_upload_stage::Column::CleanupBlockedAt.is_null())
         .lock_exclusive()
         .one(&txn)
         .await

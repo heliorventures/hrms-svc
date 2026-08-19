@@ -16,7 +16,7 @@ use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseConnection, EntityTrait,
     QueryFilter, QueryOrder, QuerySelect, Set, TransactionTrait,
 };
-use sea_orm::sea_query::{LockBehavior, LockType};
+use sea_orm::sea_query::{LockBehavior, LockType, OnConflict};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
@@ -29,6 +29,7 @@ const STATUS_COMPLETED: &str = "COMPLETED";
 const PROVIDER_LOCAL: &str = "LOCAL";
 const PROVIDER_S3: &str = "S3";
 const COMPANY_DOCUMENT_PURPOSE: &str = "COMPANY_DOCUMENT";
+const STAGE_ERROR_MISSING_FILE_STORAGE: &str = "MISSING_FILE_STORAGE";
 
 struct CleanupCoordinates {
     provider: String,
@@ -185,21 +186,8 @@ async fn enqueue_private_file_cleanup_coordinates_inner<C>(
 where
     C: ConnectionTrait,
 {
-    let existing = private_file_cleanup_task::Entity::find()
-        .filter(private_file_cleanup_task::Column::TenantId.eq(tenant_id))
-        .filter(
-            private_file_cleanup_task::Column::DeduplicationKey
-                .eq(coordinates.deduplication_key.clone()),
-        )
-        .one(db)
-        .await
-        .map_err(KabiPayError::from)?;
-    if existing.is_some() {
-        return Ok(());
-    }
-
     let now = Utc::now();
-    private_file_cleanup_task::ActiveModel {
+    let task = private_file_cleanup_task::ActiveModel {
         id: Set(Uuid::new_v4()),
         tenant_id: Set(tenant_id),
         file_storage_id: Set(file_storage_id),
@@ -212,15 +200,32 @@ where
         attempt_count: Set(0),
         next_attempt_at: Set(now),
         claimed_at: Set(None),
+        claim_token: Set(None),
         last_error_class: Set(None),
         completed_at: Set(None),
         created_at: Set(now),
         updated_at: Set(now),
-    }
-    .insert(db)
-    .await
-    .map_err(KabiPayError::from)?;
+    };
+    cleanup_task_insert(task)
+        .exec_without_returning(db)
+        .await
+        .map_err(KabiPayError::from)?;
     Ok(())
+}
+
+fn cleanup_task_insert(
+    task: private_file_cleanup_task::ActiveModel,
+) -> sea_orm::TryInsert<private_file_cleanup_task::ActiveModel> {
+    private_file_cleanup_task::Entity::insert(task)
+        .on_conflict(
+            OnConflict::columns([
+                private_file_cleanup_task::Column::TenantId,
+                private_file_cleanup_task::Column::DeduplicationKey,
+            ])
+            .do_nothing()
+            .to_owned(),
+        )
+        .do_nothing()
 }
 
 /// Persist a coordinate-only tombstone after an object write succeeds but metadata insertion
@@ -314,6 +319,7 @@ async fn claim_due_task(
         let mut active: private_file_cleanup_task::ActiveModel = stale.into();
         active.status = Set(STATUS_FAILED.to_string());
         active.claimed_at = Set(None);
+        active.claim_token = Set(None);
         active.last_error_class = Set(Some(CleanupErrorClass::ObjectStore.as_str().to_string()));
         active.next_attempt_at = Set(now);
         active.updated_at = Set(now);
@@ -338,13 +344,14 @@ async fn claim_due_task(
         txn.commit().await.map_err(KabiPayError::from)?;
         return Ok(None);
     };
-    let mut active: private_file_cleanup_task::ActiveModel = row.clone().into();
+    let mut active: private_file_cleanup_task::ActiveModel = row.into();
     active.status = Set(STATUS_PROCESSING.to_string());
     active.claimed_at = Set(Some(now));
+    active.claim_token = Set(Some(Uuid::new_v4()));
     active.updated_at = Set(now);
-    active.update(&txn).await.map_err(KabiPayError::from)?;
+    let claimed_task = active.update(&txn).await.map_err(KabiPayError::from)?;
     txn.commit().await.map_err(KabiPayError::from)?;
-    Ok(Some(row))
+    Ok(Some(claimed_task))
 }
 
 async fn delete_physical_object(
@@ -421,38 +428,89 @@ async fn delete_physical_object(
 async fn complete_task(
     db: &DatabaseConnection,
     task: &private_file_cleanup_task::Model,
-) -> KabiPayResult<()> {
+) -> KabiPayResult<bool> {
     let now = Utc::now();
-    let mut active: private_file_cleanup_task::ActiveModel = task.clone().into();
-    active.status = Set(STATUS_COMPLETED.to_string());
-    active.attempt_count = Set(task.attempt_count.saturating_add(1));
-    active.bucket = Set(None);
-    active.storage_path = Set(None);
-    active.local_root = Set(None);
-    active.claimed_at = Set(None);
-    active.last_error_class = Set(None);
-    active.completed_at = Set(Some(now));
-    active.updated_at = Set(now);
-    active.update(db).await.map_err(KabiPayError::from)?;
-    Ok(())
+    let result = complete_task_update(task, now)?
+        .exec(db)
+        .await
+        .map_err(KabiPayError::from)?;
+    cleanup_claim_update_applied(result.rows_affected)
+}
+
+fn complete_task_update(
+    task: &private_file_cleanup_task::Model,
+    now: chrono::DateTime<Utc>,
+) -> KabiPayResult<sea_orm::UpdateMany<private_file_cleanup_task::Entity>> {
+    let claim_token = task.claim_token.ok_or_else(|| {
+        KabiPayError::Internal("private file cleanup claim ownership invariant failed".into())
+    })?;
+    Ok(private_file_cleanup_task::Entity::update_many()
+        .set(private_file_cleanup_task::ActiveModel {
+            status: Set(STATUS_COMPLETED.to_string()),
+            attempt_count: Set(task.attempt_count.saturating_add(1)),
+            bucket: Set(None),
+            storage_path: Set(None),
+            local_root: Set(None),
+            claimed_at: Set(None),
+            claim_token: Set(None),
+            last_error_class: Set(None),
+            completed_at: Set(Some(now)),
+            updated_at: Set(now),
+            ..Default::default()
+        })
+        .filter(private_file_cleanup_task::Column::Id.eq(task.id))
+        .filter(private_file_cleanup_task::Column::TenantId.eq(task.tenant_id))
+        .filter(private_file_cleanup_task::Column::Status.eq(STATUS_PROCESSING))
+        .filter(private_file_cleanup_task::Column::ClaimToken.eq(claim_token)))
 }
 
 async fn fail_task(
     db: &DatabaseConnection,
     task: &private_file_cleanup_task::Model,
     error_class: CleanupErrorClass,
-) -> KabiPayResult<()> {
+) -> KabiPayResult<bool> {
     let now = Utc::now();
+    let result = fail_task_update(task, error_class, now)?
+        .exec(db)
+        .await
+        .map_err(KabiPayError::from)?;
+    cleanup_claim_update_applied(result.rows_affected)
+}
+
+fn fail_task_update(
+    task: &private_file_cleanup_task::Model,
+    error_class: CleanupErrorClass,
+    now: chrono::DateTime<Utc>,
+) -> KabiPayResult<sea_orm::UpdateMany<private_file_cleanup_task::Entity>> {
+    let claim_token = task.claim_token.ok_or_else(|| {
+        KabiPayError::Internal("private file cleanup claim ownership invariant failed".into())
+    })?;
     let attempts = task.attempt_count.saturating_add(1);
-    let mut active: private_file_cleanup_task::ActiveModel = task.clone().into();
-    active.status = Set(STATUS_FAILED.to_string());
-    active.attempt_count = Set(attempts);
-    active.next_attempt_at = Set(now + retry_delay(attempts));
-    active.claimed_at = Set(None);
-    active.last_error_class = Set(Some(error_class.as_str().to_string()));
-    active.updated_at = Set(now);
-    active.update(db).await.map_err(KabiPayError::from)?;
-    Ok(())
+    Ok(private_file_cleanup_task::Entity::update_many()
+        .set(private_file_cleanup_task::ActiveModel {
+            status: Set(STATUS_FAILED.to_string()),
+            attempt_count: Set(attempts),
+            next_attempt_at: Set(now + retry_delay(attempts)),
+            claimed_at: Set(None),
+            claim_token: Set(None),
+            last_error_class: Set(Some(error_class.as_str().to_string())),
+            updated_at: Set(now),
+            ..Default::default()
+        })
+        .filter(private_file_cleanup_task::Column::Id.eq(task.id))
+        .filter(private_file_cleanup_task::Column::TenantId.eq(task.tenant_id))
+        .filter(private_file_cleanup_task::Column::Status.eq(STATUS_PROCESSING))
+        .filter(private_file_cleanup_task::Column::ClaimToken.eq(claim_token)))
+}
+
+fn cleanup_claim_update_applied(rows_affected: u64) -> KabiPayResult<bool> {
+    match rows_affected {
+        0 => Ok(false),
+        1 => Ok(true),
+        _ => Err(KabiPayError::Internal(
+            "private file cleanup claim ownership invariant failed".into(),
+        )),
+    }
 }
 
 /// Process up to `limit` cleanup tombstones for one tenant. Logs contain only task IDs and
@@ -467,7 +525,7 @@ pub async fn process_private_file_cleanup_tasks(
         let Some(task) = claim_due_task(db, tenant_id).await? else {
             break;
         };
-        match delete_physical_object(tenant_id, &task).await {
+        let claim_applied = match delete_physical_object(tenant_id, &task).await {
             Ok(()) => complete_task(db, &task).await?,
             Err(error_class) => {
                 tracing::warn!(
@@ -476,8 +534,15 @@ pub async fn process_private_file_cleanup_tasks(
                     error_class = error_class.as_str(),
                     "private file cleanup deferred"
                 );
-                fail_task(db, &task, error_class).await?;
+                fail_task(db, &task, error_class).await?
             }
+        };
+        if !claim_applied {
+            tracing::warn!(
+                tenant_id = %tenant_id,
+                cleanup_task_id = %task.id,
+                "private file cleanup claim ownership was lost before the result was recorded"
+            );
         }
         processed += 1;
     }
@@ -494,12 +559,7 @@ pub async fn sweep_expired_company_upload_stages(
     let mut swept = 0;
     for _ in 0..limit.clamp(1, 100) {
         let txn = db.begin().await.map_err(KabiPayError::from)?;
-        let stage = file_upload_stage::Entity::find()
-            .filter(file_upload_stage::Column::TenantId.eq(tenant_id))
-            .filter(file_upload_stage::Column::Purpose.eq(COMPANY_DOCUMENT_PURPOSE))
-            .filter(file_upload_stage::Column::ClaimedAt.is_null())
-            .filter(file_upload_stage::Column::ExpiresAt.lte(Utc::now()))
-            .order_by_asc(file_upload_stage::Column::ExpiresAt)
+        let stage = expired_company_upload_stage_query(tenant_id, Utc::now())
             .lock_with_behavior(LockType::Update, LockBehavior::SkipLocked)
             .one(&txn)
             .await
@@ -517,10 +577,24 @@ pub async fn sweep_expired_company_upload_stages(
         if let Some(file) = file {
             enqueue_and_delete_private_file(&txn, tenant_id, &file).await?;
         } else {
-            file_upload_stage::Entity::delete_by_id(stage.id)
-                .exec(&txn)
+            let mut blocked_stage: file_upload_stage::ActiveModel = stage.into();
+            blocked_stage.cleanup_blocked_at = Set(Some(Utc::now()));
+            blocked_stage.cleanup_error_class = Set(Some(
+                STAGE_ERROR_MISSING_FILE_STORAGE.to_string(),
+            ));
+            let blocked_stage = blocked_stage
+                .update(&txn)
                 .await
                 .map_err(KabiPayError::from)?;
+            txn.commit().await.map_err(KabiPayError::from)?;
+            tracing::error!(
+                tenant_id = %tenant_id,
+                upload_stage_id = %blocked_stage.id,
+                file_storage_id = %blocked_stage.file_storage_id,
+                error_class = STAGE_ERROR_MISSING_FILE_STORAGE,
+                "expired upload stage quarantined because its file metadata is missing"
+            );
+            continue;
         }
         txn.commit().await.map_err(KabiPayError::from)?;
         swept += 1;
@@ -528,9 +602,131 @@ pub async fn sweep_expired_company_upload_stages(
     Ok(swept)
 }
 
+fn expired_company_upload_stage_query(
+    tenant_id: Uuid,
+    now: chrono::DateTime<Utc>,
+) -> sea_orm::Select<file_upload_stage::Entity> {
+    file_upload_stage::Entity::find()
+        .filter(file_upload_stage::Column::TenantId.eq(tenant_id))
+        .filter(file_upload_stage::Column::Purpose.eq(COMPANY_DOCUMENT_PURPOSE))
+        .filter(file_upload_stage::Column::ClaimedAt.is_null())
+        .filter(file_upload_stage::Column::CleanupBlockedAt.is_null())
+        .filter(file_upload_stage::Column::ExpiresAt.lte(now))
+        .order_by_asc(file_upload_stage::Column::ExpiresAt)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sea_orm::{DbBackend, QueryTrait};
+
+    fn pending_cleanup_task() -> private_file_cleanup_task::ActiveModel {
+        let tenant_id = Uuid::parse_str("e6d4fc13-feb8-52a0-93bd-f66c795969b1").unwrap();
+        let now = Utc::now();
+        private_file_cleanup_task::ActiveModel {
+            id: Set(Uuid::new_v4()),
+            tenant_id: Set(tenant_id),
+            file_storage_id: Set(None),
+            deduplication_key: Set("a".repeat(64)),
+            provider: Set(PROVIDER_S3.to_string()),
+            bucket: Set(Some("private-files".to_string())),
+            storage_path: Set(Some(format!("tenants/{tenant_id}/documents/file.pdf"))),
+            local_root: Set(None),
+            status: Set(STATUS_PENDING.to_string()),
+            attempt_count: Set(0),
+            next_attempt_at: Set(now),
+            claimed_at: Set(None),
+            claim_token: Set(None),
+            last_error_class: Set(None),
+            completed_at: Set(None),
+            created_at: Set(now),
+            updated_at: Set(now),
+        }
+    }
+
+    fn processing_cleanup_task() -> private_file_cleanup_task::Model {
+        let tenant_id = Uuid::parse_str("e6d4fc13-feb8-52a0-93bd-f66c795969b1").unwrap();
+        let now = Utc::now();
+        private_file_cleanup_task::Model {
+            id: Uuid::parse_str("45f5cff2-ac39-4ec4-b6e8-a430d8c93ba3").unwrap(),
+            tenant_id,
+            file_storage_id: None,
+            deduplication_key: "a".repeat(64),
+            provider: PROVIDER_S3.to_string(),
+            bucket: Some("private-files".to_string()),
+            storage_path: Some(format!("tenants/{tenant_id}/documents/file.pdf")),
+            local_root: None,
+            status: STATUS_PROCESSING.to_string(),
+            attempt_count: 2,
+            next_attempt_at: now,
+            claimed_at: Some(now),
+            claim_token: Some(
+                Uuid::parse_str("39d6d782-e61c-4714-b3b4-a71c82df128d").unwrap(),
+            ),
+            last_error_class: None,
+            completed_at: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    #[test]
+    fn cleanup_enqueue_is_atomic_and_idempotent() {
+        let statement = cleanup_task_insert(pending_cleanup_task())
+            .build(DbBackend::Postgres)
+            .to_string();
+
+        assert!(statement.contains(
+            "ON CONFLICT (\"tenant_id\", \"deduplication_key\") DO NOTHING"
+        ));
+    }
+
+    #[test]
+    fn terminal_cleanup_updates_require_the_current_claim_token() {
+        let task = processing_cleanup_task();
+        let now = Utc::now();
+        let statements = [
+            (complete_task_update(&task, now).unwrap(), STATUS_COMPLETED),
+            (
+                fail_task_update(&task, CleanupErrorClass::ObjectStore, now).unwrap(),
+                STATUS_FAILED,
+            ),
+        ];
+
+        for (update, terminal_status) in statements {
+            let statement = update.build(DbBackend::Postgres).to_string();
+            assert!(statement.contains(&task.id.to_string()));
+            assert!(statement.contains(&task.tenant_id.to_string()));
+            assert!(statement.contains("\"status\" = 'PROCESSING'"));
+            assert!(statement.contains(
+                "\"claim_token\" = '39d6d782-e61c-4714-b3b4-a71c82df128d'"
+            ));
+            assert!(
+                statement.contains(&format!("\"status\" = '{terminal_status}'")),
+                "{statement}"
+            );
+            assert!(statement.contains("\"claim_token\" = NULL"), "{statement}");
+        }
+    }
+
+    #[test]
+    fn lost_cleanup_claim_is_not_reported_as_applied() {
+        assert!(!cleanup_claim_update_applied(0).unwrap());
+        assert!(cleanup_claim_update_applied(1).unwrap());
+        assert!(cleanup_claim_update_applied(2).is_err());
+    }
+
+    #[test]
+    fn expired_stage_sweep_excludes_quarantined_evidence() {
+        let tenant_id = Uuid::parse_str("e6d4fc13-feb8-52a0-93bd-f66c795969b1").unwrap();
+        let statement = expired_company_upload_stage_query(tenant_id, Utc::now())
+            .build(DbBackend::Postgres)
+            .to_string();
+
+        assert!(statement.contains("\"cleanup_blocked_at\" IS NULL"));
+        assert!(statement.contains("\"claimed_at\" IS NULL"));
+        assert!(statement.contains(COMPANY_DOCUMENT_PURPOSE));
+    }
 
     #[test]
     fn cleanup_paths_are_tenant_bound_and_relative() {

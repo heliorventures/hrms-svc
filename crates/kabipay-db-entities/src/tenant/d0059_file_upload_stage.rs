@@ -1,4 +1,4 @@
-//! Auto-generated from `kabipay-database/changelog/migrations/0059_file_upload_stage/file_upload_stage.xml`.
+//! Generated from migration 0059 and extended with cleanup quarantine state by migration 0062.
 
 pub mod file_upload_stage {
     use crate::tenant::prelude::*;
@@ -15,6 +15,8 @@ pub mod file_upload_stage {
         pub expires_at: DateTimeUtc,
         pub claimed_at: Option<DateTimeUtc>,
         pub claimed_resource_id: Option<Uuid>,
+        pub cleanup_blocked_at: Option<DateTimeUtc>,
+        pub cleanup_error_class: Option<String>,
         pub created_at: DateTimeUtc,
         pub updated_at: DateTimeUtc,
     }

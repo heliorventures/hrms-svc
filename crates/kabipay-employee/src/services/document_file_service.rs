@@ -310,6 +310,7 @@ fn unclaimed_company_stage_query(
         .filter(file_upload_stage::Column::CreatedBy.eq(creator_user_id))
         .filter(file_upload_stage::Column::ExpiresAt.eq(expires_at))
         .filter(file_upload_stage::Column::ClaimedAt.is_null())
+        .filter(file_upload_stage::Column::CleanupBlockedAt.is_null())
 }
 
 /// Store a company-document upload behind an opaque, creator-bound stage ID.
@@ -341,6 +342,8 @@ pub async fn upload_company_document_file(
         expires_at: Set(now + Duration::minutes(COMPANY_DOCUMENT_UPLOAD_TTL_MINUTES)),
         claimed_at: Set(None),
         claimed_resource_id: Set(None),
+        cleanup_blocked_at: Set(None),
+        cleanup_error_class: Set(None),
         created_at: Set(now),
         updated_at: Set(now),
     }
@@ -372,6 +375,7 @@ pub async fn cleanup_unlinked_company_upload(
         .filter(file_upload_stage::Column::Purpose.eq(COMPANY_DOCUMENT_UPLOAD_PURPOSE))
         .filter(file_upload_stage::Column::CreatedBy.eq(uploader_user_id))
         .filter(file_upload_stage::Column::ClaimedAt.is_null())
+        .filter(file_upload_stage::Column::CleanupBlockedAt.is_null())
         .one(&txn)
         .await
         .map_err(KabiPayError::from)?
@@ -411,6 +415,7 @@ pub async fn cleanup_unlinked_company_upload(
         .filter(file_upload_stage::Column::CreatedBy.eq(uploader_user_id))
         .filter(file_upload_stage::Column::ExpiresAt.eq(stage.expires_at.clone()))
         .filter(file_upload_stage::Column::ClaimedAt.is_null())
+        .filter(file_upload_stage::Column::CleanupBlockedAt.is_null())
         .exec(&txn)
         .await
         .map_err(KabiPayError::from)?;
@@ -959,6 +964,7 @@ mod stage_tests {
         assert!(statement.contains(&creator.to_string()));
         assert!(statement.contains(COMPANY_DOCUMENT_UPLOAD_PURPOSE));
         assert!(statement.contains("\"claimed_at\" IS NULL"));
+        assert!(statement.contains("\"cleanup_blocked_at\" IS NULL"));
         assert!(statement.contains("\"expires_at\""));
     }
 }
