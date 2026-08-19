@@ -129,9 +129,3 @@ pub async fn s3_read(op: &Operator, key: &str) -> KabiPayResult<Vec<u8>> {
         .map(|buffer| buffer.to_vec())
         .map_err(|e| KabiPayError::Internal(format!("S3 get_object: {e}")))
 }
-
-pub async fn s3_delete(op: &Operator, key: &str) -> KabiPayResult<()> {
-    op.delete(key)
-        .await
-        .map_err(|error| KabiPayError::Internal(format!("S3 delete_object: {error}")))
-}

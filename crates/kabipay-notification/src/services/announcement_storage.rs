@@ -11,7 +11,7 @@ use kabipay_db_entities::tenant::d0027_communication_audit::announcement;
 use kabipay_db_entities::tenant::d0029_file_storage::file_storage;
 use sea_orm::{
     ActiveModelTrait, ActiveValue::Set, ColumnTrait, Condition, DatabaseConnection, EntityTrait,
-    QueryFilter, TransactionTrait,
+    QueryFilter, QuerySelect, TransactionTrait,
 };
 use uuid::Uuid;
 
