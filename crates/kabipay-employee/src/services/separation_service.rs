@@ -1,6 +1,6 @@
 //! Employee separation / offboarding (domain 0017).
 
-use chrono::NaiveDate;
+use chrono::{NaiveDate, Utc};
 use kabipay_common::{KabiPayError, KabiPayResult};
 use kabipay_db_entities::tenant::d0017_onboarding_offboarding::separation;
 use sea_orm::{
@@ -9,7 +9,7 @@ use sea_orm::{
 };
 use uuid::Uuid;
 
-use crate::services::offboarding_fnf_service;
+use crate::services::{employee_service, offboarding_fnf_service};
 
 pub async fn list_for_tenant(
     db: &DatabaseConnection,
@@ -98,6 +98,8 @@ pub async fn resolve_separation(
     let new_status = if approved { "APPROVED" } else { "REJECTED" };
     let now = chrono::Utc::now();
     let txn = db.begin().await.map_err(KabiPayError::from)?;
+    let employee_id = row.employee_id;
+    let last_working_date = row.last_working_date;
     let mut am: separation::ActiveModel = row.into();
     am.status = Set(new_status.to_string());
     am.approved_by = Set(Some(approver_user_id));
@@ -105,6 +107,9 @@ pub async fn resolve_separation(
     am.update(&txn).await?;
     if approved {
         offboarding_fnf_service::ensure_artifacts_on_approval(&txn, tenant_id, separation_id).await?;
+        if last_working_date <= Utc::now().date_naive() {
+            employee_service::deactivate_employee_access(&txn, tenant_id, employee_id).await?;
+        }
     }
     txn.commit().await?;
     separation::Entity::find_by_id(separation_id)

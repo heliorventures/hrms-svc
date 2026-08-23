@@ -59,6 +59,30 @@ async fn sync_linked_user_status<C: ConnectionTrait>(
     Ok(())
 }
 
+pub(crate) async fn deactivate_employee_access<C: ConnectionTrait>(
+    db: &C,
+    tenant_id: Uuid,
+    employee_id: Uuid,
+) -> KabiPayResult<()> {
+    let found = employee::Entity::find_by_id(employee_id)
+        .filter(employee::Column::TenantId.eq(tenant_id))
+        .filter(employee::Column::IsDeleted.eq(false))
+        .one(db)
+        .await?
+        .ok_or_else(|| KabiPayError::NotFound {
+            entity: "employee",
+            id: employee_id.to_string(),
+        })?;
+    let user_id = found.user_id;
+    if !found.status.trim().eq_ignore_ascii_case("INACTIVE") {
+        let mut am: employee::ActiveModel = found.into();
+        am.status = Set("INACTIVE".into());
+        am.updated_at = Set(Utc::now());
+        am.update(db).await?;
+    }
+    sync_linked_user_status(db, tenant_id, user_id, "INACTIVE").await
+}
+
 async fn update_linked_user_email<C: ConnectionTrait>(
     db: &C,
     tenant_id: Uuid,

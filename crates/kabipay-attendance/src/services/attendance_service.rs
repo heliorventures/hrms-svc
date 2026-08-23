@@ -1,6 +1,6 @@
 //! Tenant-scoped SeaORM queries and commands for shifts, holidays, and attendance.
 
-use chrono::{NaiveDate, NaiveTime, Utc};
+use chrono::{DateTime, FixedOffset, NaiveDate, NaiveTime, Utc};
 use kabipay_common::client_data_scope::EmployeeScopeFilter;
 use kabipay_common::{KabiPayError, KabiPayResult};
 use rust_decimal::Decimal;
@@ -28,6 +28,40 @@ const MANUAL_ATTENDANCE_SOURCE: &str = "WEB+MANUAL";
 const MANUAL_SELF_REPORTED: &str = "SELF_REPORTED";
 const MANUAL_REGULARIZED: &str = "REGULARIZED";
 const MAX_DAY_MINUTES: i32 = 24 * 60;
+const DEFAULT_ATTENDANCE_TIMEZONE_OFFSET_MINUTES: i32 = 330;
+const ATTENDANCE_TIMEZONE_OFFSET_ENV: &str = "KABIPAY_ATTENDANCE_TIMEZONE_OFFSET_MINUTES";
+
+fn attendance_timezone_offset_minutes_from_env() -> i32 {
+    std::env::var(ATTENDANCE_TIMEZONE_OFFSET_ENV)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<i32>().ok())
+        .filter(|minutes| (-14 * 60..=14 * 60).contains(minutes))
+        .unwrap_or(DEFAULT_ATTENDANCE_TIMEZONE_OFFSET_MINUTES)
+}
+
+fn attendance_timezone_offset(offset_minutes: i32) -> FixedOffset {
+    FixedOffset::east_opt(offset_minutes * 60).unwrap_or_else(|| {
+        FixedOffset::east_opt(DEFAULT_ATTENDANCE_TIMEZONE_OFFSET_MINUTES * 60)
+            .expect("default attendance timezone offset is valid")
+    })
+}
+
+fn attendance_business_date_time(
+    now_utc: DateTime<Utc>,
+    offset_minutes: i32,
+) -> (NaiveDate, NaiveTime) {
+    let local = now_utc.with_timezone(&attendance_timezone_offset(offset_minutes));
+    (local.date_naive(), local.time())
+}
+
+fn assert_total_attendance_minutes_under_daily_cap(total_minutes: i32) -> KabiPayResult<()> {
+    if total_minutes >= MAX_DAY_MINUTES {
+        return Err(KabiPayError::Validation(
+            "total attendance for a day must be less than 24 hours".into(),
+        ));
+    }
+    Ok(())
+}
 
 pub async fn list_shifts(
     db: &DatabaseConnection,
@@ -184,11 +218,7 @@ async fn assert_manual_attendance_segment_allowed(
         }
     }
 
-    if total_minutes > MAX_DAY_MINUTES {
-        return Err(KabiPayError::Validation(
-            "total attendance for a day cannot exceed 24 hours".into(),
-        ));
-    }
+    assert_total_attendance_minutes_under_daily_cap(total_minutes)?;
 
     Ok(())
 }
@@ -268,8 +298,8 @@ pub async fn punch_today(
     )?;
 
     let now_ts = Utc::now();
-    let today = now_ts.date_naive();
-    let now_t = now_ts.naive_utc().time();
+    let (today, now_t) =
+        attendance_business_date_time(now_ts, attendance_timezone_offset_minutes_from_env());
     let source = if geo.is_some() { "WEB+GPS" } else { "WEB" };
     let open = attendance::Entity::find()
         .filter(attendance::Column::TenantId.eq(tenant_id))
@@ -908,4 +938,38 @@ pub async fn list_holidays_in_calendar(
         .limit(limit)
         .all(db)
         .await?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::{NaiveDate, NaiveTime};
+
+    #[test]
+    fn live_punch_clock_uses_configured_business_timezone_not_utc_wall_time() {
+        let now_utc = "2026-08-22T20:00:00Z"
+            .parse::<DateTime<Utc>>()
+            .expect("valid UTC timestamp");
+
+        let (work_date, punch_time) =
+            attendance_business_date_time(now_utc, DEFAULT_ATTENDANCE_TIMEZONE_OFFSET_MINUTES);
+
+        assert_eq!(
+            work_date,
+            NaiveDate::from_ymd_opt(2026, 8, 23).expect("valid date")
+        );
+        assert_eq!(
+            punch_time,
+            NaiveTime::from_hms_opt(1, 30, 0).expect("valid time")
+        );
+    }
+
+    #[test]
+    fn attendance_daily_total_must_remain_below_twenty_four_hours() {
+        assert!(assert_total_attendance_minutes_under_daily_cap(23 * 60 + 59)
+            .is_ok());
+        assert!(assert_total_attendance_minutes_under_daily_cap(24 * 60).is_err());
+        assert!(assert_total_attendance_minutes_under_daily_cap(24 * 60 + 1)
+            .is_err());
+    }
 }

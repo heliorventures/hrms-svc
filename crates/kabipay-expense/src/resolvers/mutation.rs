@@ -93,9 +93,16 @@ impl MutationRoot {
                 expense_service::parse_amount(&s).map_err(KabiPayError::into_graphql)?,
             ),
         };
-        let m = expense_service::approve_expense(&db, tenant_id, id, claims.sub, approved_dec)
-            .await
-            .map_err(KabiPayError::into_graphql)?;
+        let m = expense_service::approve_expense(
+            &db,
+            tenant_id,
+            id,
+            claims.sub,
+            claims.can_approve_expense(),
+            approved_dec,
+        )
+        .await
+        .map_err(KabiPayError::into_graphql)?;
         Ok(ExpenseDto::from(m))
     }
 
@@ -109,9 +116,16 @@ impl MutationRoot {
         let tenant_id = require_tenant_id(ctx)?;
         let db = tenant_db(ctx, tenant_id).await?;
         let id = parse_uuid(&expense_id, "expenseId")?;
-        let m = expense_service::reject_expense(&db, tenant_id, id, claims.sub, reason)
-            .await
-            .map_err(KabiPayError::into_graphql)?;
+        let m = expense_service::reject_expense(
+            &db,
+            tenant_id,
+            id,
+            claims.sub,
+            claims.can_approve_expense(),
+            reason,
+        )
+        .await
+        .map_err(KabiPayError::into_graphql)?;
         Ok(ExpenseDto::from(m))
     }
 
@@ -162,9 +176,15 @@ impl MutationRoot {
         let tenant_id = require_tenant_id(ctx)?;
         let db = tenant_db(ctx, tenant_id).await?;
         let id = parse_uuid(&travel_request_id, "travelRequestId")?;
-        let m = travel_request_service::approve_travel_request(&db, tenant_id, id, claims.sub)
-            .await
-            .map_err(KabiPayError::into_graphql)?;
+        let m = travel_request_service::approve_travel_request(
+            &db,
+            tenant_id,
+            id,
+            claims.sub,
+            claims.can_approve_expense(),
+        )
+        .await
+        .map_err(KabiPayError::into_graphql)?;
         Ok(TravelRequestDto::from(m))
     }
 
@@ -183,6 +203,7 @@ impl MutationRoot {
             tenant_id,
             id,
             claims.sub,
+            claims.can_approve_expense(),
             reason,
         )
         .await

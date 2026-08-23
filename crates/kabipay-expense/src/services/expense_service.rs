@@ -359,10 +359,22 @@ pub async fn expense_viewer_may_approve(
     db: &DatabaseConnection,
     tenant_id: Uuid,
     viewer_user_id: Uuid,
+    viewer_has_expense_approval_override: bool,
     status: &str,
     subject_employee_id: Uuid,
     workflow_instance_id: Option<Uuid>,
 ) -> KabiPayResult<bool> {
+    if viewer_has_expense_approval_override
+        && workflow_inbox::entity_row_is_pending(status, STATUS_PENDING)
+    {
+        return match workflow_instance_id {
+            Some(inst_id) => {
+                workflow_inbox::workflow_instance_accepts_actions(db, tenant_id, inst_id).await
+            }
+            None => Ok(true),
+        };
+    }
+
     workflow_inbox::viewer_may_approve_pending_row(
         db,
         tenant_id,
@@ -721,6 +733,7 @@ pub async fn approve_expense(
     tenant_id: Uuid,
     expense_id: Uuid,
     approver_user_id: Uuid,
+    approver_has_expense_approval_override: bool,
     approved_amount: Option<Decimal>,
 ) -> KabiPayResult<expense::Model> {
     let txn = db.begin().await?;
@@ -751,14 +764,16 @@ pub async fn approve_expense(
             .await?
             .ok_or_else(|| KabiPayError::Validation("workflow step not found".into()))?;
 
-        workflow_approval::assert_workflow_step_actor(
-            &txn,
-            tenant_id,
-            approver_user_id,
-            model.employee_id,
-            &cur_step,
-        )
-        .await?;
+        if !approver_has_expense_approval_override {
+            workflow_approval::assert_workflow_step_actor(
+                &txn,
+                tenant_id,
+                approver_user_id,
+                model.employee_id,
+                &cur_step,
+            )
+            .await?;
+        }
 
         let act = workflow_action::ActiveModel {
             id: Set(Uuid::new_v4()),
@@ -809,14 +824,15 @@ pub async fn approve_expense(
         let fin = resolve_final_approved_amount(model.amount, approved_amount)?;
         finalize_expense_approval(&txn, tenant_id, expense_id, approver_user_id, fin, now).await?;
     } else {
-        if !workflow_approval::user_has_permission_via_roles(
-            &txn,
-            tenant_id,
-            approver_user_id,
-            "expense",
-            "approve",
-        )
-        .await?
+        if !approver_has_expense_approval_override
+            && !workflow_approval::user_has_permission_via_roles(
+                &txn,
+                tenant_id,
+                approver_user_id,
+                "expense",
+                "approve",
+            )
+            .await?
         {
             return Err(KabiPayError::Forbidden(
                 "only users with expense approval permission may approve claims without a workflow"
@@ -860,20 +876,22 @@ pub async fn reject_expense(
     tenant_id: Uuid,
     expense_id: Uuid,
     rejector_user_id: Uuid,
+    rejector_has_expense_approval_override: bool,
     rejection_reason: Option<String>,
 ) -> KabiPayResult<expense::Model> {
     let txn = db.begin().await?;
     let model = load_pending_expense_conn(&txn, tenant_id, expense_id).await?;
 
     if model.workflow_instance_id.is_none() {
-        if !workflow_approval::user_has_permission_via_roles(
-            &txn,
-            tenant_id,
-            rejector_user_id,
-            "expense",
-            "approve",
-        )
-        .await?
+        if !rejector_has_expense_approval_override
+            && !workflow_approval::user_has_permission_via_roles(
+                &txn,
+                tenant_id,
+                rejector_user_id,
+                "expense",
+                "approve",
+            )
+            .await?
         {
             return Err(KabiPayError::Forbidden(
                 "only users with expense approval permission may reject claims without a workflow"
@@ -900,14 +918,16 @@ pub async fn reject_expense(
                         .one(&txn)
                         .await?
                         .ok_or_else(|| KabiPayError::Validation("workflow step not found".into()))?;
-                    workflow_approval::assert_workflow_step_actor(
-                        &txn,
-                        tenant_id,
-                        rejector_user_id,
-                        model.employee_id,
-                        &st,
-                    )
-                    .await?;
+                    if !rejector_has_expense_approval_override {
+                        workflow_approval::assert_workflow_step_actor(
+                            &txn,
+                            tenant_id,
+                            rejector_user_id,
+                            model.employee_id,
+                            &st,
+                        )
+                        .await?;
+                    }
                     let act = workflow_action::ActiveModel {
                         id: Set(Uuid::new_v4()),
                         tenant_id: Set(tenant_id),

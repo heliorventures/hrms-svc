@@ -3,7 +3,7 @@
 
 use uuid::Uuid;
 
-use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter};
+use sea_orm::{ColumnTrait, ConnectionTrait, DatabaseConnection, EntityTrait, QueryFilter};
 
 use kabipay_db_entities::tenant::d0025_workflow::workflow_instance;
 
@@ -55,6 +55,30 @@ pub async fn pending_workflow_step_title(
         return Ok(None);
     };
     Ok(Some(step.step_name))
+}
+
+pub async fn workflow_instance_accepts_actions(
+    db: &impl ConnectionTrait,
+    tenant_id: Uuid,
+    workflow_instance_id: Uuid,
+) -> KabiPayResult<bool> {
+    let Some(inst) = workflow_instance::Entity::find_by_id(workflow_instance_id)
+        .filter(workflow_instance::Column::TenantId.eq(tenant_id))
+        .one(db)
+        .await?
+    else {
+        return Ok(false);
+    };
+    if !inst
+        .status
+        .trim()
+        .eq_ignore_ascii_case(WF_INSTANCE_IN_PROGRESS)
+    {
+        return Ok(false);
+    }
+    workflow_current_step::resolve_logical_current_workflow_step(db, tenant_id, &inst)
+        .await
+        .map(|step| step.is_some())
 }
 
 /// Mirrors [`crate::workflow_approval`] behaviour for **`assert_workflow_step_actor`** mutations.
