@@ -384,6 +384,10 @@ fn leave_ranges_conflict(
     existing_is_half_day: bool,
     existing_half_day_session: Option<&str>,
 ) -> bool {
+    if existing_to_date < from_date || existing_from_date > to_date {
+        return false;
+    }
+
     let complementary_half_days = is_half_day
         && existing_is_half_day
         && from_date == to_date
@@ -443,6 +447,20 @@ mod overlap_tests {
             date(17),
             true,
             Some("FIRST_HALF"),
+        ));
+    }
+
+    #[test]
+    fn non_overlapping_ranges_do_not_conflict_even_when_called_directly() {
+        assert!(!leave_ranges_conflict(
+            date(17),
+            date(17),
+            false,
+            None,
+            date(18),
+            date(18),
+            false,
+            None,
         ));
     }
 }

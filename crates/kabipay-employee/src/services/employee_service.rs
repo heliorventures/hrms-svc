@@ -101,9 +101,10 @@ async fn update_linked_user_email<C: ConnectionTrait>(
             .one(db)
             .await?;
         if existing.is_some() {
-            return Err(KabiPayError::Conflict(
-                "email is already in use in this tenant".into(),
-            ));
+            return Err(KabiPayError::ConflictRule {
+                code: "USER_EMAIL_CONFLICT",
+                message: "email is already in use in this tenant".into(),
+            });
         }
     }
     let user_row = user::Entity::find_by_id(user_id)
@@ -516,9 +517,10 @@ async fn insert_login_user<C: ConnectionTrait>(
         .await?
         .is_some()
     {
-        return Err(KabiPayError::Conflict(
-            "username is already in use in this tenant".into(),
-        ));
+        return Err(KabiPayError::ConflictRule {
+            code: "USER_USERNAME_CONFLICT",
+            message: "username is already in use in this tenant".into(),
+        });
     }
     if let Some(ref email_value) = email {
         if user::Entity::find()
@@ -528,9 +530,10 @@ async fn insert_login_user<C: ConnectionTrait>(
             .await?
             .is_some()
         {
-            return Err(KabiPayError::Conflict(
-                "email is already in use in this tenant".into(),
-            ));
+            return Err(KabiPayError::ConflictRule {
+                code: "USER_EMAIL_CONFLICT",
+                message: "email is already in use in this tenant".into(),
+            });
         }
     }
 
@@ -571,9 +574,10 @@ pub async fn create<C: ConnectionTrait>(
         .await?
         .is_some()
     {
-        return Err(KabiPayError::Conflict(
-            "employee code is already in use in this tenant".into(),
-        ));
+        return Err(KabiPayError::ConflictRule {
+            code: "EMPLOYEE_CODE_CONFLICT",
+            message: "employee code is already in use in this tenant".into(),
+        });
     }
 
     let id = Uuid::new_v4();
