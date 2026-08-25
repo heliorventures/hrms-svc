@@ -8,19 +8,31 @@ use kabipay_common::{
     },
     KabiPayError,
 };
+use kabipay_db_entities::tenant::{
+    d0007_employee_core::employee, d0010_time_shift_roster::attendance,
+};
+use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, TransactionTrait};
 use uuid::Uuid;
 
 use crate::resolvers::types::{
-    AddManualAttendanceSegmentInput, AttendanceAdjustmentPolicyDto, AttendanceDto,
-    AttendancePunchPolicyDto, CreateTimesheetEntryInput, HolidayCalendarDto, HolidayDayDto,
+    AddManagedAttendanceSegmentInput, AddManualAttendanceSegmentInput,
+    AttendanceAdjustmentPolicyDto, AttendanceDto, AttendancePunchPolicyDto,
+    CreateTimesheetEntryInput, HolidayCalendarDto, HolidayDayDto, ManagedAttendanceDto,
     PunchTodayInput, TimesheetEntryDto, TimesheetLockPolicyDto, TimesheetWeekBatchDto,
-    UpdateManualAttendanceSegmentInput, UpdateTimesheetEntryInput,
-    UpsertAttendanceAdjustmentPolicyInput,
+    UpdateManagedAttendanceSegmentInput, UpdateManualAttendanceSegmentInput,
+    UpdateTimesheetEntryInput, UpsertAttendanceAdjustmentPolicyInput,
     UpsertAttendancePunchPolicyInput, UpsertHolidayCalendarInput, UpsertHolidayDayInput,
     UpsertTimesheetLockPolicyInput,
 };
+use crate::resolvers::attendance_management_auth;
 use crate::resolvers::timesheet_assignment_auth;
 use crate::services::{
+    attendance_management_service::ManagedAttendanceRow,
+    attendance_regularization_service::{
+        create_managed_attendance_segment_in_transaction,
+        update_managed_attendance_segment_in_transaction, ManagedCreateCommand,
+        ManagedUpdateCommand, SegmentTimes,
+    },
     attendance_service, hrms_master_service, punch_policy, timesheet_batch_service,
     timesheet_project_assignment_service,
 };
@@ -28,6 +40,33 @@ use crate::services::{
 fn parse_uuid(id: &ID, field: &'static str) -> Result<Uuid> {
     Uuid::parse_str(id.as_str())
         .map_err(|e| KabiPayError::Validation(format!("invalid {field}: {e}")).into_graphql())
+}
+
+async fn managed_attendance_dto<C>(
+    db: &C,
+    row: attendance::Model,
+) -> Result<ManagedAttendanceDto>
+where
+    C: ConnectionTrait,
+{
+    let target = employee::Entity::find_by_id(row.employee_id)
+        .filter(employee::Column::TenantId.eq(row.tenant_id))
+        .filter(employee::Column::IsDeleted.eq(false))
+        .one(db)
+        .await
+        .map_err(KabiPayError::from)
+        .map_err(KabiPayError::into_graphql)?
+        .ok_or_else(|| {
+            KabiPayError::Internal("managed attendance employee missing after write".into())
+                .into_graphql()
+        })?;
+    Ok(ManagedAttendanceDto::from(ManagedAttendanceRow {
+        employee_name: format!("{} {}", target.first_name, target.last_name)
+            .trim()
+            .to_owned(),
+        employee_code: target.employee_code,
+        attendance: row,
+    }))
 }
 
 fn require_leave_configuration_admin(ctx: &Context<'_>) -> Result<()> {
@@ -148,7 +187,6 @@ impl MutationRoot {
         let employee_id = resolve_client_employee_id(ctx, &db, tenant_id)
             .await
             .map_err(KabiPayError::into_graphql)?;
-        let privileged = claims.can_regularize_attendance_records();
         let m = attendance_service::add_manual_attendance_segment(
             &db,
             tenant_id,
@@ -156,7 +194,6 @@ impl MutationRoot {
             input.work_date,
             input.check_in_time,
             input.check_out_time,
-            privileged,
         )
         .await
         .map_err(KabiPayError::into_graphql)?;
@@ -184,7 +221,6 @@ impl MutationRoot {
             .await
             .map_err(KabiPayError::into_graphql)?;
         let attendance_id = parse_uuid(&input.id, "id")?;
-        let privileged = claims.can_regularize_attendance_records();
         let m = attendance_service::update_manual_attendance_segment(
             &db,
             tenant_id,
@@ -193,11 +229,109 @@ impl MutationRoot {
             input.work_date,
             input.check_in_time,
             input.check_out_time,
-            privileged,
         )
         .await
         .map_err(KabiPayError::into_graphql)?;
         Ok(AttendanceDto::from(m))
+    }
+
+    async fn add_managed_attendance_segment(
+        &self,
+        ctx: &Context<'_>,
+        input: AddManagedAttendanceSegmentInput,
+    ) -> Result<ManagedAttendanceDto> {
+        let tenant_id = require_tenant_id(ctx)?;
+        attendance_management_auth::require_regularizer(ctx)?;
+        let actor_user_id = require_client_claims(ctx)?.sub;
+        let target_employee_id = parse_uuid(&input.employee_id, "employeeId")?;
+        let request_id = client_request_hints(ctx).request_id;
+        let db = tenant_db(ctx, tenant_id).await?;
+        let mut txn = db
+            .begin()
+            .await
+            .map_err(KabiPayError::from)
+            .map_err(KabiPayError::into_graphql)?;
+        attendance_management_auth::assert_target_in_scope_with_connection(
+            ctx,
+            &txn,
+            tenant_id,
+            target_employee_id,
+        )
+        .await?;
+        let created = create_managed_attendance_segment_in_transaction(
+            &mut txn,
+            &ManagedCreateCommand {
+                tenant_id,
+                target_employee_id,
+                actor_user_id,
+                segment: SegmentTimes {
+                    work_date: input.work_date,
+                    check_in_time: input.check_in_time,
+                    check_out_time: input.check_out_time,
+                },
+                reason: input.reason,
+                request_id,
+            },
+        )
+        .await
+        .map_err(KabiPayError::into_graphql)?;
+        let result = managed_attendance_dto(&txn, created).await?;
+        txn.commit()
+            .await
+            .map_err(KabiPayError::from)
+            .map_err(KabiPayError::into_graphql)?;
+        Ok(result)
+    }
+
+    async fn update_managed_attendance_segment(
+        &self,
+        ctx: &Context<'_>,
+        input: UpdateManagedAttendanceSegmentInput,
+    ) -> Result<ManagedAttendanceDto> {
+        let tenant_id = require_tenant_id(ctx)?;
+        attendance_management_auth::require_regularizer(ctx)?;
+        let actor_user_id = require_client_claims(ctx)?.sub;
+        let attendance_id = parse_uuid(&input.id, "id")?;
+        let request_id = client_request_hints(ctx).request_id;
+        let db = tenant_db(ctx, tenant_id).await?;
+        let mut txn = db
+            .begin()
+            .await
+            .map_err(KabiPayError::from)
+            .map_err(KabiPayError::into_graphql)?;
+        let initial = attendance_management_auth::attendance_target_in_scope_with_connection(
+            ctx,
+            &txn,
+            tenant_id,
+            attendance_id,
+        )
+        .await?;
+        let updated = update_managed_attendance_segment_in_transaction(
+            &mut txn,
+            &ManagedUpdateCommand {
+                tenant_id,
+                attendance_id,
+                target_employee_id: initial.employee_id,
+                actor_user_id,
+                initial_work_date: initial.work_date,
+                segment: SegmentTimes {
+                    work_date: input.work_date,
+                    check_in_time: input.check_in_time,
+                    check_out_time: input.check_out_time,
+                },
+                reason: input.reason,
+                request_id,
+                expected_updated_at: input.expected_updated_at,
+            },
+        )
+        .await
+        .map_err(KabiPayError::into_graphql)?;
+        let result = managed_attendance_dto(&txn, updated).await?;
+        txn.commit()
+            .await
+            .map_err(KabiPayError::from)
+            .map_err(KabiPayError::into_graphql)?;
+        Ok(result)
     }
 
     async fn create_timesheet_entry(

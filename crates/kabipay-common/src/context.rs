@@ -245,6 +245,8 @@ pub const PERM_NOTIFICATION_MANAGE: &str = "notification:manage";
 pub struct ClientRequestHints {
     /// First hop from `X-Forwarded-For`, else `X-Real-IP`, when present.
     pub client_ip: Option<String>,
+    /// Gateway correlation identifier, normalized at the HTTP boundary.
+    pub request_id: Option<String>,
 }
 
 impl ClientClaims {
@@ -524,13 +526,7 @@ impl ClientClaims {
 
     /// Manual attendance corrections beyond the configured employee window (`attendance:regularize`).
     pub fn can_regularize_attendance_records(&self) -> bool {
-        if self.has_any_permission(&[PERM_ATTENDANCE_REGULARIZE, PERM_EMPLOYEE_MANAGE]) {
-            return true;
-        }
-        self.roles.iter().any(|r| {
-            let u = r.to_ascii_uppercase();
-            u == "HR_ADMIN" || u == "TENANT_ADMIN" || u == "ORG_ADMIN"
-        })
+        self.has_any_permission(&[PERM_ATTENDANCE_REGULARIZE])
     }
 
     /// Approve weekly timesheet batches (`timesheet:approve`), analogous to leave approval.
@@ -575,10 +571,16 @@ impl ClientClaims {
     /// Effective data scope for list/detail filters (`permission_scope` merged at login). Defaults
     /// to `Self_` when unset (legacy tokens and least-privilege default).
     pub fn data_scope(&self, resource: &str) -> ScopeType {
+        self.explicit_data_scope(resource).unwrap_or(ScopeType::Self_)
+    }
+
+    /// Parsed JWT scope only when this resource has an explicit valid value.
+    /// Managed operations use this to fail closed without changing the legacy
+    /// `data_scope` SELF default used by self-service flows.
+    pub fn explicit_data_scope(&self, resource: &str) -> Option<ScopeType> {
         self.resource_scopes
             .get(resource)
-            .and_then(|s| ScopeType::parse_loose(s))
-            .unwrap_or(ScopeType::Self_)
+            .and_then(|scope| ScopeType::parse_loose(scope))
     }
 }
 
@@ -624,5 +626,31 @@ mod tests {
         let claims = client_claims(&[], &[PERM_EMPLOYEE_WRITE]);
 
         assert!(!claims.can_record_own_attendance_punches());
+    }
+
+    #[test]
+    fn attendance_regularize_requires_explicit_permission() {
+        assert!(client_claims(&[], &[PERM_ATTENDANCE_REGULARIZE])
+            .can_regularize_attendance_records());
+        assert!(!client_claims(&["HR_ADMIN"], &[])
+            .can_regularize_attendance_records());
+        assert!(!client_claims(&[], &[PERM_EMPLOYEE_MANAGE])
+            .can_regularize_attendance_records());
+    }
+
+    #[test]
+    fn explicit_data_scope_requires_a_present_valid_scope() {
+        let mut claims = client_claims(&[], &[]);
+        assert_eq!(claims.explicit_data_scope(SCOPE_RES_ATTENDANCE), None);
+
+        claims
+            .resource_scopes
+            .insert(SCOPE_RES_ATTENDANCE.to_string(), "ALL".to_string());
+        assert_eq!(claims.explicit_data_scope(SCOPE_RES_ATTENDANCE), Some(ScopeType::All));
+
+        claims
+            .resource_scopes
+            .insert(SCOPE_RES_ATTENDANCE.to_string(), "INVALID".to_string());
+        assert_eq!(claims.explicit_data_scope(SCOPE_RES_ATTENDANCE), None);
     }
 }

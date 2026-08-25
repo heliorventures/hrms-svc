@@ -5,12 +5,8 @@
 
 use async_graphql::EmptySubscription;
 use async_graphql::Schema;
+use kabipay_attendance::{MutationRoot, QueryRoot};
 use kabipay_common::subgraph::{serve_subgraph, SubgraphConfig};
-
-mod resolvers;
-mod services;
-
-use resolvers::{MutationRoot, QueryRoot};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {

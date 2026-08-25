@@ -1,17 +1,19 @@
 #!/usr/bin/env python3
 """
-Generate kabipay-db-entities Rust sources from Liquibase tenant migrations (0005-0030).
-Run from repo root:  python kabipay-svc/scripts/generate_db_entities.py
+Generate kabipay-db-entities Rust sources from Liquibase tenant migrations.
+Run from repo root:  python hrms-svc/scripts/generate_db_entities.py
 """
 from __future__ import annotations
 
+import argparse
 import re
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
 NS = {"db": "http://www.liquibase.org/xml/ns/dbchangelog"}
-MIGRATIONS = Path("kabipay-database/changelog/migrations")
-OUT = Path("kabipay-svc/crates/kabipay-db-entities/src/tenant")
+REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
+MIGRATIONS = REPOSITORY_ROOT / "hrms-database/changelog/migrations"
+OUT = REPOSITORY_ROOT / "hrms-svc/crates/kabipay-db-entities/src/tenant"
 
 COMPOSITE_PK: dict[str, list[str]] = {
     "role_permission": ["role_id", "permission_id"],
@@ -142,34 +144,93 @@ def domain_rust_mod(folder_name: str) -> str:
     return f"d{folder_name}"
 
 
+def generate_domain(directory: Path) -> str:
+    """Generate one migration directory and return its Rust module name."""
+    if "integration_connector" in directory.name and "0005_integration" in directory.name:
+        return ""
+
+    chunks: list[str] = []
+    sources: list[str] = []
+    for xml in sorted(directory.glob("*.xml")):
+        part = process_file(xml)
+        if part:
+            chunks.extend(part)
+            sources.append(xml.relative_to(REPOSITORY_ROOT).as_posix())
+    if not chunks:
+        return ""
+
+    module_name = domain_rust_mod(directory.name)
+    src_comment = ", ".join(sources)
+    body = "\n".join(chunks)
+    (OUT / f"{module_name}.rs").write_text(
+        f"//! Auto-generated from `{src_comment}`.\n\n{body}",
+        encoding="utf-8",
+    )
+    return module_name
+
+
+def merge_module_export(module_name: str) -> None:
+    """Add one generated migration module without rewriting other module exports."""
+    if not module_name:
+        return
+
+    mod_path = OUT / "mod.rs"
+    contents_bytes = mod_path.read_bytes()
+    newline = "\r\n" if b"\r\n" in contents_bytes else "\n"
+    contents = contents_bytes.decode("utf-8")
+    lines = contents.splitlines()
+    export = f"pub mod {module_name};"
+    if export in lines:
+        return
+
+    domain_export = re.compile(r"pub mod d\d{4}_[A-Za-z0-9_]+;")
+    first_domain_export = next(
+        (index for index, line in enumerate(lines) if domain_export.fullmatch(line)),
+        None,
+    )
+    if first_domain_export is None:
+        lines.extend(["", export])
+    else:
+        last_domain_export = first_domain_export
+        while (
+            last_domain_export + 1 < len(lines)
+            and domain_export.fullmatch(lines[last_domain_export + 1])
+        ):
+            last_domain_export += 1
+        domain_exports = lines[first_domain_export : last_domain_export + 1]
+        lines[first_domain_export : last_domain_export + 1] = sorted(
+            [*domain_exports, export]
+        )
+
+    mod_path.write_bytes((newline.join(lines) + newline).encode("utf-8"))
+
+
 def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--only",
+        help="Generate one migration directory without rewriting other modules",
+    )
+    args = parser.parse_args()
+
     OUT.mkdir(parents=True, exist_ok=True)
+    if args.only:
+        selected = MIGRATIONS / args.only
+        if not selected.is_dir() or not re.match(r"^\d{4}_", selected.name):
+            raise SystemExit(f"Unknown tenant migration directory: {args.only}")
+        merge_module_export(generate_domain(selected))
+        return
+
     dirs = sorted(
         [p for p in MIGRATIONS.iterdir() if p.is_dir() and re.match(r"^\d{4}_", p.name)],
         key=lambda p: p.name,
     )
     mod_lines: list[str] = []
 
-    for d in dirs:
-        if "integration_connector" in d.name and "0005_integration" in d.name:
-            continue
-        chunks: list[str] = []
-        sources: list[str] = []
-        for xml in sorted(d.glob("*.xml")):
-            part = process_file(xml)
-            if part:
-                chunks.extend(part)
-                sources.append(xml.as_posix())
-        if not chunks:
-            continue
-        fname = f"{domain_rust_mod(d.name)}.rs"
-        src_comment = ", ".join(sources)
-        body = "\n".join(chunks)
-        (OUT / fname).write_text(
-            f"//! Auto-generated from `{src_comment}`.\n\n{body}",
-            encoding="utf-8",
-        )
-        mod_lines.append(f"pub mod {domain_rust_mod(d.name)};")
+    for directory in dirs:
+        module_name = generate_domain(directory)
+        if module_name:
+            mod_lines.append(f"pub mod {module_name};")
 
     prelude = """//! Shared imports for generated tenant entities.
 pub use sea_orm::entity::prelude::*;

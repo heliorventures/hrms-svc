@@ -4,9 +4,9 @@ use async_graphql::Context;
 
 use crate::context::{ClientClaims, ClientViewerEmployee, ScopeType};
 use crate::error::{KabiPayError, KabiPayResult};
-use crate::subgraph::resolve_client_employee_id;
+use crate::subgraph::resolve_client_employee_id_with_connection;
 use kabipay_db_entities::tenant::d0007_employee_core::employee;
-use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter};
+use sea_orm::{ColumnTrait, ConnectionTrait, DatabaseConnection, EntityTrait, QueryFilter};
 use uuid::Uuid;
 
 /// Dev / probe: no JWT → treat as **ALL** (unchanged from subgraph conventions).
@@ -23,10 +23,23 @@ pub async fn resolve_viewer_employee(
     db: &DatabaseConnection,
     tenant_id: Uuid,
 ) -> async_graphql::Result<Option<ClientViewerEmployee>> {
+    resolve_viewer_employee_with_connection(ctx, db, tenant_id).await
+}
+
+/// Connection-generic form of [`resolve_viewer_employee`] for callers that
+/// must resolve a viewer inside their existing transaction.
+pub async fn resolve_viewer_employee_with_connection<C>(
+    ctx: &Context<'_>,
+    db: &C,
+    tenant_id: Uuid,
+) -> async_graphql::Result<Option<ClientViewerEmployee>>
+where
+    C: ConnectionTrait + Sync,
+{
     if ctx.data_opt::<ClientClaims>().is_none() {
         return Ok(None);
     }
-    let Ok(emp_id) = resolve_client_employee_id(ctx, db, tenant_id).await else {
+    let Ok(emp_id) = resolve_client_employee_id_with_connection(ctx, db, tenant_id).await else {
         return Ok(None);
     };
     let Some(emp) = employee::Entity::find_by_id(emp_id)
@@ -80,7 +93,7 @@ pub fn employee_model_in_scope(
 }
 
 /// Restrict queries with an **`employee_id`** FK (expense, attendance, payslip, …).
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum EmployeeScopeFilter {
     Unrestricted,
     /// No rows should be returned (`WHERE 1=0` equivalent).
@@ -104,6 +117,20 @@ pub async fn resolve_employee_scope_filter(
     scope: ScopeType,
     viewer: Option<ClientViewerEmployee>,
 ) -> KabiPayResult<EmployeeScopeFilter> {
+    resolve_employee_scope_filter_with_connection(db, tenant_id, scope, viewer).await
+}
+
+/// Connection-generic form of [`resolve_employee_scope_filter`] for callers
+/// that must resolve an employee scope inside their existing transaction.
+pub async fn resolve_employee_scope_filter_with_connection<C>(
+    db: &C,
+    tenant_id: Uuid,
+    scope: ScopeType,
+    viewer: Option<ClientViewerEmployee>,
+) -> KabiPayResult<EmployeeScopeFilter>
+where
+    C: ConnectionTrait + Sync,
+{
     match scope {
         ScopeType::All => Ok(EmployeeScopeFilter::Unrestricted),
         ScopeType::Self_ => {

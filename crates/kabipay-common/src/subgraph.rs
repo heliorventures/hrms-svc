@@ -30,7 +30,7 @@ use axum::{
     Router,
 };
 use kabipay_db_entities::tenant::{d0005_auth_rbac::user, d0007_employee_core::employee};
-use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter};
+use sea_orm::{ColumnTrait, ConnectionTrait, DatabaseConnection, EntityTrait, QueryFilter};
 use std::{net::SocketAddr, sync::Arc};
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
 use uuid::Uuid;
@@ -116,6 +116,23 @@ fn client_ip_from_headers(headers: &HeaderMap) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+fn request_id_from_headers(headers: &HeaderMap) -> Result<Option<String>, (StatusCode, String)> {
+    let Some(value) = headers.get("x-request-id") else {
+        return Ok(None);
+    };
+    let value = value.to_str().map_err(|_| {
+        (
+            StatusCode::BAD_REQUEST,
+            "x-request-id header is not valid ASCII".to_string(),
+        )
+    })?;
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(value.chars().take(128).collect()))
+}
+
 /// Read the caller's full JWT claims. Available only when the caller
 /// authenticated with `Authorization: Bearer <jwt>` (not the dev header).
 /// Resolvers that need `user_id`, `roles`, or `permissions` should call
@@ -135,6 +152,19 @@ pub async fn resolve_client_employee_id(
     db: &DatabaseConnection,
     tenant_id: Uuid,
 ) -> KabiPayResult<Uuid> {
+    resolve_client_employee_id_with_connection(ctx, db, tenant_id).await
+}
+
+/// Connection-generic form of [`resolve_client_employee_id`] for callers that
+/// must resolve an employee inside their existing transaction.
+pub async fn resolve_client_employee_id_with_connection<C>(
+    ctx: &Context<'_>,
+    db: &C,
+    tenant_id: Uuid,
+) -> KabiPayResult<Uuid>
+where
+    C: ConnectionTrait + Sync,
+{
     let claims = ctx
         .data_opt::<ClientClaims>()
         .ok_or(KabiPayError::Unauthorised)?;
@@ -316,6 +346,7 @@ where
     let mut req = req.into_inner();
     let hints = ClientRequestHints {
         client_ip: client_ip_from_headers(&headers),
+        request_id: request_id_from_headers(&headers)?,
     };
     req = req.data(hints);
     match extract_request_identity(&headers)? {

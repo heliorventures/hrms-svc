@@ -17,6 +17,7 @@ use crate::resolvers::query::parse_uuid;
 use crate::services::timesheet_batch_service;
 
 use crate::services::attendance_service::PunchDaySummary;
+use crate::services::attendance_management_service::ManagedAttendanceRow;
 
 #[derive(SimpleObject, Clone, Debug)]
 #[graphql(name = "Shift")]
@@ -69,6 +70,65 @@ pub struct AttendanceDto {
     pub late_minutes: Option<i32>,
 }
 
+#[derive(SimpleObject, Clone, Debug)]
+#[graphql(name = "AttendanceEdge")]
+pub struct AttendanceEdgeDto {
+    pub cursor: String,
+    pub node: AttendanceDto,
+}
+
+#[derive(SimpleObject, Clone, Debug)]
+#[graphql(name = "ManagedAttendance")]
+pub struct ManagedAttendanceDto {
+    pub id: ID,
+    pub tenant_id: ID,
+    pub employee_id: ID,
+    pub shift_id: Option<ID>,
+    pub work_date: NaiveDate,
+    pub check_in_time: Option<NaiveTime>,
+    pub check_out_time: Option<NaiveTime>,
+    pub check_in_lat: Option<String>,
+    pub check_in_lng: Option<String>,
+    pub check_out_lat: Option<String>,
+    pub check_out_lng: Option<String>,
+    pub status: Option<String>,
+    pub source: Option<String>,
+    pub late_minutes: Option<i32>,
+    pub employee_name: String,
+    pub employee_code: String,
+    pub regularization_status: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(SimpleObject, Clone, Debug)]
+#[graphql(name = "ManagedAttendanceEdge")]
+pub struct ManagedAttendanceEdgeDto {
+    pub cursor: String,
+    pub node: ManagedAttendanceDto,
+}
+
+#[derive(SimpleObject, Clone, Debug)]
+#[graphql(name = "AttendancePageInfo")]
+pub struct AttendancePageInfoDto {
+    pub end_cursor: Option<String>,
+    pub has_next_page: bool,
+}
+
+#[derive(SimpleObject, Clone, Debug)]
+#[graphql(name = "AttendanceConnection")]
+pub struct AttendanceConnectionDto {
+    pub edges: Vec<AttendanceEdgeDto>,
+    pub page_info: AttendancePageInfoDto,
+}
+
+#[derive(SimpleObject, Clone, Debug)]
+#[graphql(name = "ManagedAttendanceConnection")]
+pub struct ManagedAttendanceConnectionDto {
+    pub edges: Vec<ManagedAttendanceEdgeDto>,
+    pub page_info: AttendancePageInfoDto,
+}
+
 /// Optional client GPS (browser / mobile) for the **current** punch (in or out).
 #[derive(InputObject, Clone, Debug)]
 pub struct PunchTodayInput {
@@ -92,6 +152,25 @@ pub struct UpdateManualAttendanceSegmentInput {
     pub work_date: NaiveDate,
     pub check_in_time: NaiveTime,
     pub check_out_time: NaiveTime,
+}
+
+#[derive(InputObject, Clone, Debug)]
+pub struct AddManagedAttendanceSegmentInput {
+    pub employee_id: ID,
+    pub work_date: NaiveDate,
+    pub check_in_time: NaiveTime,
+    pub check_out_time: NaiveTime,
+    pub reason: String,
+}
+
+#[derive(InputObject, Clone, Debug)]
+pub struct UpdateManagedAttendanceSegmentInput {
+    pub id: ID,
+    pub work_date: NaiveDate,
+    pub check_in_time: NaiveTime,
+    pub check_out_time: NaiveTime,
+    pub reason: String,
+    pub expected_updated_at: DateTime<Utc>,
 }
 
 /// One work day: all punch segments + sum of completed segment lengths (minutes).
@@ -385,6 +464,33 @@ impl From<attendance::Model> for AttendanceDto {
             status: m.status,
             source: m.source,
             late_minutes: m.late_minutes,
+        }
+    }
+}
+
+impl From<ManagedAttendanceRow> for ManagedAttendanceDto {
+    fn from(row: ManagedAttendanceRow) -> Self {
+        let attendance = row.attendance;
+        Self {
+            id: ID(attendance.id.to_string()),
+            tenant_id: ID(attendance.tenant_id.to_string()),
+            employee_id: ID(attendance.employee_id.to_string()),
+            shift_id: attendance.shift_id.map(|id| ID(id.to_string())),
+            work_date: attendance.work_date,
+            check_in_time: attendance.check_in_time,
+            check_out_time: attendance.check_out_time,
+            check_in_lat: attendance.check_in_lat.map(|value| value.to_string()),
+            check_in_lng: attendance.check_in_lng.map(|value| value.to_string()),
+            check_out_lat: attendance.check_out_lat.map(|value| value.to_string()),
+            check_out_lng: attendance.check_out_lng.map(|value| value.to_string()),
+            status: attendance.status,
+            source: attendance.source,
+            late_minutes: attendance.late_minutes,
+            employee_name: row.employee_name,
+            employee_code: row.employee_code,
+            regularization_status: attendance.regularization_status,
+            created_at: attendance.created_at,
+            updated_at: attendance.updated_at,
         }
     }
 }

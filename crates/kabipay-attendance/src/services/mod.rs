@@ -1,4 +1,6 @@
 ﻿pub mod attendance_service;
+pub mod attendance_regularization_service;
+pub mod attendance_management_service;
 pub mod hrms_master_service;
 pub mod punch_policy;
 pub mod timesheet_batch_service;

@@ -1,7 +1,7 @@
 //! Root query resolvers for kabipay-attendance.
 
 use async_graphql::{Context, Object, Result, ID};
-use chrono::{NaiveDate, Utc};
+use chrono::{Duration, NaiveDate, Utc};
 use kabipay_common::{
     client_data_scope::{
         data_scope_from_context, resolve_employee_scope_filter, resolve_viewer_employee,
@@ -13,15 +13,34 @@ use kabipay_common::{
 use uuid::Uuid;
 
 use crate::resolvers::types::{
-    AttendanceAdjustmentPolicyDto, AttendanceDto, AttendancePunchPolicyDto, HolidayCalendarDto,
-    HolidayDayDto, HolidayEntryDto, PunchDaySummaryDto, ShiftDto, TimesheetEntryDto,
+    AttendanceAdjustmentPolicyDto, AttendanceConnectionDto, AttendanceDto, AttendanceEdgeDto,
+    AttendancePageInfoDto, AttendancePunchPolicyDto, HolidayCalendarDto, HolidayDayDto,
+    HolidayEntryDto, ManagedAttendanceConnectionDto, ManagedAttendanceDto,
+    ManagedAttendanceEdgeDto, PunchDaySummaryDto, ShiftDto, TimesheetEntryDto,
     TimesheetLockPolicyDto, TimesheetProjectOptionDto, TimesheetWeekBatchDto,
 };
+use crate::resolvers::attendance_management_auth;
 use crate::resolvers::timesheet_assignment_auth;
 use crate::services::{
-    attendance_service, hrms_master_service, punch_policy, timesheet_batch_service,
+    attendance_management_service, attendance_service, hrms_master_service, punch_policy, timesheet_batch_service,
     timesheet_project_assignment_service,
 };
+
+fn self_attendance_date_range(
+    from_date: Option<NaiveDate>,
+    to_date: Option<NaiveDate>,
+) -> Result<(NaiveDate, NaiveDate)> {
+    let to_date = to_date.unwrap_or_else(|| Utc::now().date_naive());
+    let from_date = match from_date {
+        Some(value) => value,
+        None => to_date.checked_sub_signed(Duration::days(91)).ok_or_else(|| {
+            KabiPayError::Validation("invalid attendance date range".into()).into_graphql()
+        })?,
+    };
+    attendance_management_service::validate_date_range(from_date, to_date)
+        .map_err(KabiPayError::into_graphql)?;
+    Ok((from_date, to_date))
+}
 
 pub struct QueryRoot;
 
@@ -84,6 +103,118 @@ impl QueryRoot {
             .await
             .map_err(KabiPayError::into_graphql)?;
         Ok(rows.into_iter().map(AttendanceDto::from).collect())
+    }
+
+    /// Cursor-paginated attendance for the JWT-linked employee only.
+    async fn my_attendance(
+        &self,
+        ctx: &Context<'_>,
+        from_date: Option<NaiveDate>,
+        to_date: Option<NaiveDate>,
+        first: Option<i32>,
+        after: Option<String>,
+    ) -> Result<AttendanceConnectionDto> {
+        let tenant_id = require_tenant_id(ctx)?;
+        let db = tenant_db(ctx, tenant_id).await?;
+        let employee_id = resolve_client_employee_id(ctx, &db, tenant_id)
+            .await
+            .map_err(KabiPayError::into_graphql)?;
+        let (from_date, to_date) = self_attendance_date_range(from_date, to_date)?;
+        let page = attendance_management_service::list_my_attendance(
+            &db,
+            tenant_id,
+            employee_id,
+            from_date,
+            to_date,
+            first,
+            after.as_deref(),
+        )
+        .await
+        .map_err(KabiPayError::into_graphql)?;
+        Ok(AttendanceConnectionDto {
+            edges: page
+                .rows
+                .into_iter()
+                .map(|row| AttendanceEdgeDto {
+                    cursor: attendance_management_service::AttendanceCursor::new(
+                        row.work_date,
+                        row.created_at,
+                        row.id,
+                    )
+                    .encode(),
+                    node: row.into(),
+                })
+                .collect(),
+            page_info: AttendancePageInfoDto {
+                end_cursor: page.end_cursor,
+                has_next_page: page.has_next_page,
+            },
+        })
+    }
+
+    /// Cursor-paginated attendance for active employees within the caller's explicit attendance scope.
+    async fn managed_attendance(
+        &self,
+        ctx: &Context<'_>,
+        from_date: NaiveDate,
+        to_date: NaiveDate,
+        employee_search: Option<String>,
+        employee_id: Option<ID>,
+        first: Option<i32>,
+        after: Option<String>,
+    ) -> Result<ManagedAttendanceConnectionDto> {
+        let tenant_id = require_tenant_id(ctx)?;
+        attendance_management_auth::require_regularizer(ctx)?;
+        let db = tenant_db(ctx, tenant_id).await?;
+        let scope = attendance_management_auth::scope_filter(ctx, &db, tenant_id).await?;
+        let employee_id = employee_id
+            .as_ref()
+            .map(|value| parse_uuid(value, "employeeId"))
+            .transpose()?;
+        if let Some(employee_id) = employee_id {
+            attendance_management_auth::assert_target_in_resolved_scope(
+                &db,
+                tenant_id,
+                &scope,
+                employee_id,
+            )
+            .await?;
+        }
+        let page = attendance_management_service::list_managed_attendance(
+            &db,
+            tenant_id,
+            &scope,
+            from_date,
+            to_date,
+            employee_search.as_deref(),
+            employee_id,
+            first,
+            after.as_deref(),
+        )
+        .await
+        .map_err(KabiPayError::into_graphql)?;
+        Ok(ManagedAttendanceConnectionDto {
+            edges: page
+                .rows
+                .into_iter()
+                .map(|row| {
+                    let cursor = attendance_management_service::AttendanceCursor::new(
+                        row.attendance.work_date,
+                        row.attendance.created_at,
+                        row.attendance.id,
+                    )
+                    .encode();
+                    ManagedAttendanceEdgeDto {
+                        cursor,
+                        node: ManagedAttendanceDto::from(row),
+                    }
+                })
+                .collect(),
+            page_info: AttendancePageInfoDto {
+                end_cursor: page.end_cursor,
+                has_next_page: page.has_next_page,
+            },
+        })
     }
 
     /// Multi-segment punch for one work day: total worked minutes and all segments

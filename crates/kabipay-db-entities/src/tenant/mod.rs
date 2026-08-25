@@ -39,3 +39,4 @@ pub mod d0050_employee_self_service;
 pub mod d0056_company_documents;
 pub mod d0059_file_upload_stage;
 pub mod d0060_private_file_cleanup;
+pub mod d0063_attendance_management;
