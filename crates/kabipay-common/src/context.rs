@@ -165,6 +165,9 @@ pub struct ClientClaims {
     pub roles: Vec<String>,
     #[serde(default)]
     pub permissions: Vec<String>,
+    /// Widest scope for each exact permission code, such as `attendance:read`.
+    #[serde(default)]
+    pub permission_scopes: HashMap<String, String>,
     /// Widest `ScopeType` per `permission.resource` (keys: e.g. `employee`, `leave` — wire values
     /// are `SELF` | `TEAM` | `DEPARTMENT` | `ALL`). Omitted in legacy tokens; treated as SELF.
     #[serde(default)]
@@ -176,12 +179,15 @@ pub const CLIENT_JWT_ISSUER: &str = "kabipay-client";
 
 /// JWT `permissions` claim uses `resource:action` to match `permission` rows.
 pub const PERM_EMPLOYEE_WRITE: &str = "employee:write";
+pub const PERM_EMPLOYEE_READ: &str = "employee:read";
 /// Broader org directory edits (e.g. bulk / sensitive fields) — same gate as write for now.
 pub const PERM_EMPLOYEE_MANAGE: &str = "employee:manage";
 /// Approve or reject other users' leave requests.
 pub const PERM_LEAVE_APPROVE: &str = "leave:approve";
+pub const PERM_LEAVE_READ: &str = "leave:read";
 /// Approve or reject expense claims submitted by others.
 pub const PERM_EXPENSE_APPROVE: &str = "expense:approve";
+pub const PERM_EXPENSE_READ: &str = "expense:read";
 /// Configure expense categories (travel/meal/other claim types employees select).
 pub const PERM_EXPENSE_MANAGE: &str = "expense:manage";
 /// Mark expense reimbursements as paid / failed / on hold (payroll or accounting path).
@@ -192,6 +198,7 @@ pub const PERM_TAX_PROOF_APPROVE: &str = "tax:approve";
 pub const PERM_PAYROLL_STATUTORY_EXPORT: &str = "payroll:statutory_export";
 /// Configure live punch enforcement (geofence / IP allowlist) for the tenant.
 pub const PERM_ATTENDANCE_PUNCH_POLICY: &str = "attendance:punch_policy";
+pub const PERM_ATTENDANCE_READ: &str = "attendance:read";
 /// Create or edit **workflow** definitions and **steps** (tenant configuration).
 pub const PERM_WORKFLOW_MANAGE: &str = "workflow:manage";
 /// Configure **leave** master data (types, policies, balances) and holiday calendars (attendance subgraph).
@@ -234,6 +241,7 @@ pub const PERM_ATTENDANCE_PUNCH_SELF: &str = "attendance:punch_self";
 pub const PERM_ATTENDANCE_REGULARIZE: &str = "attendance:regularize";
 /// Approve or reject submitted weekly timesheets.
 pub const PERM_TIMESHEET_APPROVE: &str = "timesheet:approve";
+pub const PERM_TIMESHEET_READ: &str = "timesheet:read";
 /// Configure timesheet catalogs (projects / tasks) and lock policy (`master_data` backed).
 pub const PERM_TIMESHEET_MANAGE: &str = "timesheet:manage";
 /// Create or edit **tenant announcements**, send **direct in-app notifications**, and remove broadcasts.
@@ -259,182 +267,82 @@ impl ClientClaims {
 
     /// Create/update other users' **employee** rows (not self-service profile edits).
     pub fn can_manage_employee_directory(&self) -> bool {
-        if self.has_any_permission(&[PERM_EMPLOYEE_WRITE, PERM_EMPLOYEE_MANAGE]) {
-            return true;
-        }
-        self.roles.iter().any(|r| {
-            let u = r.to_ascii_uppercase();
-            u == "HR_ADMIN" || u == "TENANT_ADMIN" || u == "ORG_ADMIN"
-        })
+        self.has_any_permission(&[PERM_EMPLOYEE_WRITE, PERM_EMPLOYEE_MANAGE])
     }
 
     /// Approve or reject **leave** requests (not the employee's own self-service only path).
     pub fn can_approve_leave(&self) -> bool {
-        if self.has_any_permission(&[PERM_LEAVE_APPROVE]) {
-            return true;
-        }
-        self.roles.iter().any(|r| {
-            let u = r.to_ascii_uppercase();
-            u == "HR_ADMIN" || u == "TENANT_ADMIN" || u == "ORG_ADMIN"
-        })
+        self.has_any_permission(&[PERM_LEAVE_APPROVE])
     }
 
     /// Approve or reject **expense** claims (approver/manager path).
     pub fn can_approve_expense(&self) -> bool {
-        if self.has_any_permission(&[PERM_EXPENSE_APPROVE]) {
-            return true;
-        }
-        self.roles.iter().any(|r| {
-            let u = r.to_ascii_uppercase();
-            u == "HR_ADMIN" || u == "TENANT_ADMIN" || u == "ORG_ADMIN"
-        })
+        self.has_any_permission(&[PERM_EXPENSE_APPROVE])
     }
 
     /// Update expense **payment** / reimbursement status after approval.
     pub fn can_mark_expense_payment(&self) -> bool {
-        if self.has_any_permission(&[PERM_EXPENSE_PAY]) {
-            return true;
-        }
-        // Same baseline as approvers + accounting — finance often overlaps with expense approval.
-        false
+        self.has_any_permission(&[PERM_EXPENSE_PAY])
     }
 
     /// Approve or reject **tax deduction proof** lines (documented actuals).
     pub fn can_approve_tax_proof(&self) -> bool {
-        if self.has_any_permission(&[PERM_TAX_PROOF_APPROVE]) {
-            return true;
-        }
-        self.roles.iter().any(|r| {
-            let u = r.to_ascii_uppercase();
-            u == "HR_ADMIN" || u == "TENANT_ADMIN" || u == "ORG_ADMIN"
-        })
+        self.has_any_permission(&[PERM_TAX_PROOF_APPROVE])
     }
 
     /// Download tenant-wide **statutory payroll** reports (TDS summary CSV, etc.).
     pub fn can_export_payroll_statutory(&self) -> bool {
-        if self.has_any_permission(&[PERM_PAYROLL_STATUTORY_EXPORT]) {
-            return true;
-        }
-        self.roles.iter().any(|r| {
-            let u = r.to_ascii_uppercase();
-            u == "HR_ADMIN" || u == "TENANT_ADMIN" || u == "ORG_ADMIN"
-        })
+        self.has_any_permission(&[PERM_PAYROLL_STATUTORY_EXPORT])
     }
 
     /// Configure **live punch** policy (geofence + IP allowlist) for the tenant.
     pub fn can_configure_attendance_punch_policy(&self) -> bool {
-        if self.has_any_permission(&[PERM_ATTENDANCE_PUNCH_POLICY]) {
-            return true;
-        }
-        self.roles.iter().any(|r| {
-            let u = r.to_ascii_uppercase();
-            u == "HR_ADMIN" || u == "TENANT_ADMIN" || u == "ORG_ADMIN"
-        })
+        self.has_any_permission(&[PERM_ATTENDANCE_PUNCH_POLICY])
     }
 
     /// Create or update **workflow** definitions and **steps** (tenant approval graphs).
     pub fn can_manage_workflow_definitions(&self) -> bool {
-        if self.has_any_permission(&[PERM_WORKFLOW_MANAGE]) {
-            return true;
-        }
-        self.roles.iter().any(|r| {
-            let u = r.to_ascii_uppercase();
-            u == "HR_ADMIN" || u == "TENANT_ADMIN" || u == "ORG_ADMIN"
-        })
+        self.has_any_permission(&[PERM_WORKFLOW_MANAGE])
     }
 
     /// Configure leave types, policies, employee balances, and (via attendance) holiday calendars.
     pub fn can_manage_leave_configuration(&self) -> bool {
-        if self.has_any_permission(&[PERM_LEAVE_MANAGE]) {
-            return true;
-        }
-        self.roles.iter().any(|r| {
-            let u = r.to_ascii_uppercase();
-            u == "HR_ADMIN" || u == "TENANT_ADMIN" || u == "ORG_ADMIN"
-        })
+        self.has_any_permission(&[PERM_LEAVE_MANAGE])
     }
 
     /// Configure expense claim categories master data (`expense_category`).
     pub fn can_manage_expense_configuration(&self) -> bool {
-        if self.has_any_permission(&[PERM_EXPENSE_MANAGE]) {
-            return true;
-        }
-        self.roles.iter().any(|r| {
-            let u = r.to_ascii_uppercase();
-            u == "HR_ADMIN" || u == "TENANT_ADMIN" || u == "ORG_ADMIN"
-        })
+        self.has_any_permission(&[PERM_EXPENSE_MANAGE])
     }
 
-    /// Manage tenant RBAC: roles, permission grants, and list scopes (`role:manage` or elevated HR / tenant admin).
+    /// Manage tenant RBAC: roles, permission grants, and list scopes (`role:manage`).
     pub fn can_manage_tenant_rbac(&self) -> bool {
-        if self.has_any_permission(&[PERM_ROLE_MANAGE]) {
-            return true;
-        }
-        self.roles.iter().any(|r| {
-            let u = r.to_ascii_uppercase();
-            u == "HR_ADMIN" || u == "TENANT_ADMIN" || u == "ORG_ADMIN"
-        })
+        self.has_any_permission(&[PERM_ROLE_MANAGE])
     }
 
     pub fn can_manage_benefits_catalog(&self) -> bool {
-        if self.has_any_permission(&[PERM_BENEFITS_MANAGE]) {
-            return true;
-        }
-        self.roles.iter().any(|r| {
-            let u = r.to_ascii_uppercase();
-            u == "HR_ADMIN" || u == "TENANT_ADMIN" || u == "ORG_ADMIN"
-        })
+        self.has_any_permission(&[PERM_BENEFITS_MANAGE])
     }
 
     /// Benefit types/plans list queries for the workplace Benefits UI (HR + enrollment pickers).
     pub fn can_read_benefit_catalog_queries(&self) -> bool {
-        if self.has_any_permission(&[PERM_BENEFITS_MANAGE, PERM_BENEFITS_SELF]) {
-            return true;
-        }
-        self.roles.iter().any(|r| {
-            let u = r.to_ascii_uppercase();
-            u == "HR_ADMIN" || u == "TENANT_ADMIN" || u == "ORG_ADMIN"
-        })
+        self.has_any_permission(&[PERM_BENEFITS_MANAGE, PERM_BENEFITS_SELF])
     }
 
     pub fn can_manage_recruitment(&self) -> bool {
-        if self.has_any_permission(&[PERM_RECRUITMENT_MANAGE]) {
-            return true;
-        }
-        self.roles.iter().any(|r| {
-            let u = r.to_ascii_uppercase();
-            u == "HR_ADMIN" || u == "TENANT_ADMIN" || u == "ORG_ADMIN"
-        })
+        self.has_any_permission(&[PERM_RECRUITMENT_MANAGE])
     }
 
     pub fn can_manage_performance_programs(&self) -> bool {
-        if self.has_any_permission(&[PERM_PERFORMANCE_MANAGE]) {
-            return true;
-        }
-        self.roles.iter().any(|r| {
-            let u = r.to_ascii_uppercase();
-            u == "HR_ADMIN" || u == "TENANT_ADMIN" || u == "ORG_ADMIN"
-        })
+        self.has_any_permission(&[PERM_PERFORMANCE_MANAGE])
     }
 
     pub fn can_manage_learning_catalog(&self) -> bool {
-        if self.has_any_permission(&[PERM_LEARNING_MANAGE]) {
-            return true;
-        }
-        self.roles.iter().any(|r| {
-            let u = r.to_ascii_uppercase();
-            u == "HR_ADMIN" || u == "TENANT_ADMIN" || u == "ORG_ADMIN"
-        })
+        self.has_any_permission(&[PERM_LEARNING_MANAGE])
     }
 
     pub fn can_manage_assets_registry(&self) -> bool {
-        if self.has_any_permission(&[PERM_ASSETS_MANAGE]) {
-            return true;
-        }
-        self.roles.iter().any(|r| {
-            let u = r.to_ascii_uppercase();
-            u == "HR_ADMIN" || u == "TENANT_ADMIN" || u == "ORG_ADMIN"
-        })
+        self.has_any_permission(&[PERM_ASSETS_MANAGE])
     }
 
     pub fn can_read_assets_registry(&self) -> bool {
@@ -446,77 +354,35 @@ impl ClientClaims {
     }
 
     pub fn can_manage_succession_planning(&self) -> bool {
-        if self.has_any_permission(&[PERM_SUCCESSION_MANAGE]) {
-            return true;
-        }
-        self.roles.iter().any(|r| {
-            let u = r.to_ascii_uppercase();
-            u == "HR_ADMIN" || u == "TENANT_ADMIN" || u == "ORG_ADMIN"
-        })
+        self.has_any_permission(&[PERM_SUCCESSION_MANAGE])
     }
 
     pub fn can_manage_compensation_admin(&self) -> bool {
-        if self.has_any_permission(&[PERM_COMPENSATION_MANAGE]) {
-            return true;
-        }
-        self.roles.iter().any(|r| {
-            let u = r.to_ascii_uppercase();
-            u == "HR_ADMIN" || u == "TENANT_ADMIN" || u == "ORG_ADMIN"
-        })
+        self.has_any_permission(&[PERM_COMPENSATION_MANAGE])
     }
 
     pub fn can_manage_grievance_tenant_cases(&self) -> bool {
-        if self.has_any_permission(&[PERM_GRIEVANCE_MANAGE]) {
-            return true;
-        }
-        self.roles.iter().any(|r| {
-            let u = r.to_ascii_uppercase();
-            u == "HR_ADMIN" || u == "TENANT_ADMIN" || u == "ORG_ADMIN"
-        })
+        self.has_any_permission(&[PERM_GRIEVANCE_MANAGE])
     }
 
-    /// Submit grievances and view **own** cases (`grievance:self`, or manage, or legacy HR roles).
+    /// Submit grievances and view **own** cases (`grievance:self` or `grievance:manage`).
     pub fn can_use_grievance_self_service(&self) -> bool {
-        if self.has_any_permission(&[PERM_GRIEVANCE_SELF, PERM_GRIEVANCE_MANAGE]) {
-            return true;
-        }
-        self.roles.iter().any(|r| {
-            let u = r.to_ascii_uppercase();
-            u == "HR_ADMIN" || u == "TENANT_ADMIN" || u == "ORG_ADMIN"
-        })
+        self.has_any_permission(&[PERM_GRIEVANCE_SELF, PERM_GRIEVANCE_MANAGE])
     }
 
     /// Tenant-wide onboarding/offboarding lists and HR depth (`onboarding:manage`).
     pub fn can_manage_onboarding_tenant(&self) -> bool {
-        if self.has_any_permission(&[PERM_ONBOARDING_MANAGE]) {
-            return true;
-        }
-        self.roles.iter().any(|r| {
-            let u = r.to_ascii_uppercase();
-            u == "HR_ADMIN" || u == "TENANT_ADMIN" || u == "ORG_ADMIN"
-        })
+        self.has_any_permission(&[PERM_ONBOARDING_MANAGE])
     }
 
-    /// Join checklist + own separation flows (`onboarding:self`, or `onboarding:manage`, or legacy HR roles).
+    /// Join checklist + own separation flows (`onboarding:self` or `onboarding:manage`).
     pub fn can_use_onboarding_self_service(&self) -> bool {
-        if self.has_any_permission(&[PERM_ONBOARDING_SELF, PERM_ONBOARDING_MANAGE]) {
-            return true;
-        }
-        self.roles.iter().any(|r| {
-            let u = r.to_ascii_uppercase();
-            u == "HR_ADMIN" || u == "TENANT_ADMIN" || u == "ORG_ADMIN"
-        })
+        self.has_any_permission(&[PERM_ONBOARDING_SELF, PERM_ONBOARDING_MANAGE])
     }
 
     /// Workforce insights UI (`analytics:read`) — dashboards, report catalog, snapshots.
     pub fn can_access_analytics_insights(&self) -> bool {
-        if self.has_any_permission(&[PERM_ANALYTICS_READ]) {
-            return true;
-        }
-        self.roles.iter().any(|r| {
-            let u = r.to_ascii_uppercase();
-            u == "HR_ADMIN" || u == "TENANT_ADMIN" || u == "ORG_ADMIN"
-        })
+        self.has_any_permission(&[PERM_ANALYTICS_READ])
     }
 
     /// Own-device punches require the explicit `attendance:punch_self` permission.
@@ -531,41 +397,23 @@ impl ClientClaims {
 
     /// Approve weekly timesheet batches (`timesheet:approve`), analogous to leave approval.
     pub fn can_approve_timesheet_requests(&self) -> bool {
-        if self.has_any_permission(&[PERM_TIMESHEET_APPROVE]) {
-            return true;
-        }
-        self.roles.iter().any(|r| {
-            let u = r.to_ascii_uppercase();
-            u == "HR_ADMIN" || u == "TENANT_ADMIN" || u == "ORG_ADMIN"
-        })
+        self.has_any_permission(&[PERM_TIMESHEET_APPROVE])
     }
 
     /// HR configuration for timesheet projects/tasks and lock JSON (`timesheet:manage`).
     pub fn can_manage_timesheet_configuration(&self) -> bool {
-        if self.has_any_permission(&[PERM_TIMESHEET_MANAGE]) {
-            return true;
-        }
-        self.roles.iter().any(|r| {
-            let u = r.to_ascii_uppercase();
-            u == "HR_ADMIN" || u == "TENANT_ADMIN" || u == "ORG_ADMIN"
-        })
+        self.has_any_permission(&[PERM_TIMESHEET_MANAGE])
     }
 
     /// HR / comms admin: announcements, direct notifications, and related deletes. Also accepts
     /// split permissions from the RBAC catalog (`notification:*`).
     pub fn can_manage_notifications(&self) -> bool {
-        if self.has_any_permission(&[
+        self.has_any_permission(&[
             PERM_NOTIFICATION_MANAGE,
             "notification:create",
             "notification:update",
             "notification:delete",
-        ]) {
-            return true;
-        }
-        self.roles.iter().any(|r| {
-            let u = r.to_ascii_uppercase();
-            u == "HR_ADMIN" || u == "TENANT_ADMIN" || u == "ORG_ADMIN"
-        })
+        ])
     }
 
     /// Effective data scope for list/detail filters (`permission_scope` merged at login). Defaults
@@ -580,6 +428,20 @@ impl ClientClaims {
     pub fn explicit_data_scope(&self, resource: &str) -> Option<ScopeType> {
         self.resource_scopes
             .get(resource)
+            .and_then(|scope| ScopeType::parse_loose(scope))
+    }
+
+    /// Effective scope for one exact permission. Missing or malformed values
+    /// remain SELF so legacy tokens cannot gain broader access.
+    pub fn scope_for_permission(&self, permission: &str) -> ScopeType {
+        self.explicit_scope_for_permission(permission)
+            .unwrap_or(ScopeType::Self_)
+    }
+
+    pub fn explicit_scope_for_permission(&self, permission: &str) -> Option<ScopeType> {
+        let key = permission.trim().to_ascii_lowercase();
+        self.permission_scopes
+            .get(&key)
             .and_then(|scope| ScopeType::parse_loose(scope))
     }
 }
@@ -603,6 +465,7 @@ mod tests {
                 .iter()
                 .map(|permission| (*permission).to_string())
                 .collect(),
+            permission_scopes: HashMap::new(),
             resource_scopes: HashMap::new(),
         }
     }
@@ -619,6 +482,36 @@ mod tests {
         let claims = client_claims(&["HR_ADMIN"], &[]);
 
         assert!(!claims.can_record_own_attendance_punches());
+    }
+
+    #[test]
+    fn administrator_role_does_not_grant_runtime_capabilities_without_permissions() {
+        let claims = client_claims(&["TENANT_ADMIN", "HR_ADMIN", "ORG_ADMIN"], &[]);
+
+        assert!(!claims.can_manage_employee_directory());
+        assert!(!claims.can_approve_leave());
+        assert!(!claims.can_approve_expense());
+        assert!(!claims.can_mark_expense_payment());
+        assert!(!claims.can_approve_tax_proof());
+        assert!(!claims.can_export_payroll_statutory());
+        assert!(!claims.can_configure_attendance_punch_policy());
+        assert!(!claims.can_manage_workflow_definitions());
+        assert!(!claims.can_manage_leave_configuration());
+        assert!(!claims.can_manage_expense_configuration());
+        assert!(!claims.can_manage_tenant_rbac());
+        assert!(!claims.can_manage_benefits_catalog());
+        assert!(!claims.can_manage_recruitment());
+        assert!(!claims.can_manage_performance_programs());
+        assert!(!claims.can_manage_learning_catalog());
+        assert!(!claims.can_manage_assets_registry());
+        assert!(!claims.can_manage_succession_planning());
+        assert!(!claims.can_manage_compensation_admin());
+        assert!(!claims.can_manage_grievance_tenant_cases());
+        assert!(!claims.can_manage_onboarding_tenant());
+        assert!(!claims.can_access_analytics_insights());
+        assert!(!claims.can_approve_timesheet_requests());
+        assert!(!claims.can_manage_timesheet_configuration());
+        assert!(!claims.can_manage_notifications());
     }
 
     #[test]

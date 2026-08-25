@@ -69,7 +69,7 @@ impl MutationRoot {
         if !claims.can_approve_tax_proof() {
             return Err(
                 KabiPayError::Forbidden(
-                    "manage tax configuration requires tax:approve or HR / tenant admin role".into(),
+                    "manage tax configuration requires tax:approve".into(),
                 )
                 .into_graphql(),
             );
@@ -101,7 +101,7 @@ impl MutationRoot {
         if !claims.can_approve_tax_proof() {
             return Err(
                 KabiPayError::Forbidden(
-                    "manage tax slabs requires tax:approve or HR / tenant admin role".into(),
+                    "manage tax slabs requires tax:approve".into(),
                 )
                 .into_graphql(),
             );
@@ -143,7 +143,7 @@ impl MutationRoot {
         if !claims.can_approve_tax_proof() {
             return Err(
                 KabiPayError::Forbidden(
-                    "manage tax sections requires tax:approve or HR / tenant admin role".into(),
+                    "manage tax sections requires tax:approve".into(),
                 )
                 .into_graphql(),
             );
@@ -215,7 +215,7 @@ impl MutationRoot {
         if !claims.can_approve_tax_proof() {
             return Err(
                 KabiPayError::Forbidden(
-                    "tax proof approve permission required (tax:approve or HR / tenant admin role)"
+                    "tax proof approval requires tax:approve"
                         .into(),
                 )
                 .into_graphql(),
@@ -240,7 +240,7 @@ impl MutationRoot {
         if !claims.can_approve_tax_proof() {
             return Err(
                 KabiPayError::Forbidden(
-                    "tax proof approve permission required (tax:approve or HR / tenant admin role)"
+                    "tax proof approval requires tax:approve"
                         .into(),
                 )
                 .into_graphql(),

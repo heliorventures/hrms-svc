@@ -43,6 +43,8 @@ pub mod separation {
         pub status: String,
         pub approved_by: Option<Uuid>,
         pub workflow_instance_id: Option<Uuid>,
+        pub offboarded_at: Option<DateTimeUtc>,
+        pub offboarding_event_id: Option<Uuid>,
         pub created_at: DateTimeUtc,
         pub updated_at: DateTimeUtc,
     }

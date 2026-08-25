@@ -71,6 +71,7 @@ pub struct WorkflowStepDto {
     pub step_name: String,
     pub approver_type: Option<String>,
     pub approver_role_id: Option<ID>,
+    pub approver_permission: Option<String>,
     pub can_skip: bool,
     pub sla_hours: Option<i32>,
     pub created_at: DateTime<Utc>,
@@ -87,6 +88,7 @@ impl From<workflow_step::Model> for WorkflowStepDto {
             step_name: m.step_name,
             approver_type: m.approver_type,
             approver_role_id: m.approver_role_id.map(|u| ID(u.to_string())),
+            approver_permission: m.approver_permission,
             can_skip: m.can_skip,
             sla_hours: m.sla_hours,
             created_at: m.created_at,
@@ -121,6 +123,7 @@ pub struct CreateWorkflowStepInput {
     pub step_name: String,
     pub approver_type: Option<String>,
     pub approver_role_id: Option<ID>,
+    pub approver_permission: Option<String>,
     #[graphql(default = false)]
     pub can_skip: bool,
     pub sla_hours: Option<i32>,

@@ -7,6 +7,7 @@ use chrono::{NaiveDate, Utc};
 use kabipay_common::client_data_scope::employee_model_in_scope;
 use kabipay_common::context::ClientViewerEmployee;
 use kabipay_common::context::ScopeType;
+use kabipay_common::db_constraint::constraint_name;
 use kabipay_common::{KabiPayError, KabiPayResult};
 use kabipay_db_entities::tenant::d0005_auth_rbac::{role, user, user_role, user_session};
 use sea_orm::{
@@ -17,6 +18,63 @@ use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
 
 use crate::entities::d0007_employee_core::employee;
+
+fn employee_conflict_for_constraint(constraint: &str) -> Option<KabiPayError> {
+    let (code, message) = match constraint {
+        "uq_user_tenant_email" => (
+            "USER_EMAIL_CONFLICT",
+            "email is already in use in this tenant",
+        ),
+        "uq_user_tenant_username" => (
+            "USER_USERNAME_CONFLICT",
+            "username is already in use in this tenant",
+        ),
+        "uq_employee_tenant_code" => (
+            "EMPLOYEE_CODE_CONFLICT",
+            "employee code is already in use in this tenant",
+        ),
+        _ => return None,
+    };
+
+    Some(KabiPayError::ConflictRule {
+        code,
+        message: message.into(),
+    })
+}
+
+fn map_employee_db_error(error: sea_orm::DbErr) -> KabiPayError {
+    constraint_name(&error)
+        .and_then(employee_conflict_for_constraint)
+        .unwrap_or(KabiPayError::Database(error))
+}
+
+#[cfg(test)]
+mod constraint_mapping_tests {
+    use super::*;
+
+    #[test]
+    fn known_employee_identity_constraints_have_stable_public_codes() {
+        assert_eq!(
+            employee_conflict_for_constraint("uq_user_tenant_email")
+                .unwrap()
+                .code(),
+            "USER_EMAIL_CONFLICT"
+        );
+        assert_eq!(
+            employee_conflict_for_constraint("uq_user_tenant_username")
+                .unwrap()
+                .code(),
+            "USER_USERNAME_CONFLICT"
+        );
+        assert_eq!(
+            employee_conflict_for_constraint("uq_employee_tenant_code")
+                .unwrap()
+                .code(),
+            "EMPLOYEE_CODE_CONFLICT"
+        );
+        assert!(employee_conflict_for_constraint("unknown_constraint").is_none());
+    }
+}
 
 /// Keep an already linked auth user enabled only for active employee statuses.
 fn employee_login_is_active(status: &str) -> bool {
@@ -59,30 +117,6 @@ async fn sync_linked_user_status<C: ConnectionTrait>(
     Ok(())
 }
 
-pub(crate) async fn deactivate_employee_access<C: ConnectionTrait>(
-    db: &C,
-    tenant_id: Uuid,
-    employee_id: Uuid,
-) -> KabiPayResult<()> {
-    let found = employee::Entity::find_by_id(employee_id)
-        .filter(employee::Column::TenantId.eq(tenant_id))
-        .filter(employee::Column::IsDeleted.eq(false))
-        .one(db)
-        .await?
-        .ok_or_else(|| KabiPayError::NotFound {
-            entity: "employee",
-            id: employee_id.to_string(),
-        })?;
-    let user_id = found.user_id;
-    if !found.status.trim().eq_ignore_ascii_case("INACTIVE") {
-        let mut am: employee::ActiveModel = found.into();
-        am.status = Set("INACTIVE".into());
-        am.updated_at = Set(Utc::now());
-        am.update(db).await?;
-    }
-    sync_linked_user_status(db, tenant_id, user_id, "INACTIVE").await
-}
-
 async fn update_linked_user_email<C: ConnectionTrait>(
     db: &C,
     tenant_id: Uuid,
@@ -119,7 +153,7 @@ async fn update_linked_user_email<C: ConnectionTrait>(
     let mut am: user::ActiveModel = user_row.into();
     am.email = Set(normalized);
     am.updated_at = Set(Utc::now());
-    am.update(db).await?;
+    am.update(db).await.map_err(map_employee_db_error)?;
     Ok(())
 }
 
@@ -557,7 +591,8 @@ async fn insert_login_user<C: ConnectionTrait>(
         updated_at: Set(now),
     }
     .insert(db)
-    .await?;
+    .await
+    .map_err(map_employee_db_error)?;
     assign_roles(db, tenant_id, id, &role_ids).await?;
     Ok(id)
 }
@@ -620,7 +655,7 @@ pub async fn create<C: ConnectionTrait>(
         created_at: Set(now),
         updated_at: Set(now),
     };
-    am.insert(db).await?;
+    am.insert(db).await.map_err(map_employee_db_error)?;
     employee::Entity::find_by_id(id)
         .one(db)
         .await?

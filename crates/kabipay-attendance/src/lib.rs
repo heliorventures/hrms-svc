@@ -12,6 +12,7 @@ pub use resolvers::{MutationRoot, QueryRoot};
 pub mod attendance_management {
     pub use crate::services::attendance_management_service::AttendancePage;
     pub use crate::services::attendance_regularization_service::{
-        create_managed_attendance_segment_in_transaction, ManagedCreateCommand, SegmentTimes,
+        create_managed_attendance_segment_in_transaction, ManagedCreateCommand, SegmentInstants,
+        SegmentTimes,
     };
 }

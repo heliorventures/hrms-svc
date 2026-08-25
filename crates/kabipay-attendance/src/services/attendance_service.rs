@@ -1,7 +1,8 @@
 //! Tenant-scoped SeaORM queries and commands for shifts, holidays, and attendance.
 
-use chrono::{DateTime, FixedOffset, NaiveDate, NaiveTime, Utc};
+use chrono::{DateTime, NaiveDate, NaiveTime, Utc};
 use kabipay_common::client_data_scope::EmployeeScopeFilter;
+use kabipay_common::tenant_business_clock::TenantBusinessClock;
 use kabipay_common::{KabiPayError, KabiPayResult};
 use rust_decimal::Decimal;
 use std::str::FromStr;
@@ -24,40 +25,17 @@ use uuid::Uuid;
 use crate::services::{
     attendance_regularization_service::{
         assert_locked_attendance_identity, insert_manual_segment, lock_employee_dates,
-        update_manual_segment, validate_segment_with_connection, SegmentTimes,
+        update_manual_segment,
+        validate_segment_with_connection, SegmentTimes,
         MANUAL_SELF_REPORTED,
     },
     timesheet_dates, timesheet_policy,
 };
-#[cfg(test)]
-use crate::services::attendance_regularization_service::{
-    assert_total_attendance_minutes_under_daily_cap,
-};
-
-const DEFAULT_ATTENDANCE_TIMEZONE_OFFSET_MINUTES: i32 = 330;
-const ATTENDANCE_TIMEZONE_OFFSET_ENV: &str = "KABIPAY_ATTENDANCE_TIMEZONE_OFFSET_MINUTES";
-
-fn attendance_timezone_offset_minutes_from_env() -> i32 {
-    std::env::var(ATTENDANCE_TIMEZONE_OFFSET_ENV)
-        .ok()
-        .and_then(|raw| raw.trim().parse::<i32>().ok())
-        .filter(|minutes| (-14 * 60..=14 * 60).contains(minutes))
-        .unwrap_or(DEFAULT_ATTENDANCE_TIMEZONE_OFFSET_MINUTES)
-}
-
-fn attendance_timezone_offset(offset_minutes: i32) -> FixedOffset {
-    FixedOffset::east_opt(offset_minutes * 60).unwrap_or_else(|| {
-        FixedOffset::east_opt(DEFAULT_ATTENDANCE_TIMEZONE_OFFSET_MINUTES * 60)
-            .expect("default attendance timezone offset is valid")
-    })
-}
-
 fn attendance_business_date_time(
     now_utc: DateTime<Utc>,
-    offset_minutes: i32,
+    clock: TenantBusinessClock,
 ) -> (NaiveDate, NaiveTime) {
-    let local = now_utc.with_timezone(&attendance_timezone_offset(offset_minutes));
-    (local.date_naive(), local.time())
+    (clock.business_date(now_utc), clock.local_time(now_utc))
 }
 
 pub async fn list_shifts(
@@ -150,6 +128,36 @@ fn segment_minutes(t_in: chrono::NaiveTime, t_out: chrono::NaiveTime) -> i32 {
     (d / 60) as i32
 }
 
+fn attendance_segment_minutes(row: &attendance::Model) -> i32 {
+    if let (Some(check_in_at), Some(check_out_at)) = (row.check_in_at, row.check_out_at) {
+        let seconds = check_out_at.signed_duration_since(check_in_at).num_seconds();
+        return if seconds > 0 { (seconds / 60) as i32 } else { 0 };
+    }
+    match (row.check_in_time, row.check_out_time) {
+        (Some(check_in), Some(check_out)) => segment_minutes(check_in, check_out),
+        _ => 0,
+    }
+}
+
+fn attendance_segment_seconds(row: &attendance::Model) -> i64 {
+    if let (Some(check_in_at), Some(check_out_at)) = (row.check_in_at, row.check_out_at) {
+        return check_out_at
+            .signed_duration_since(check_in_at)
+            .num_seconds()
+            .max(0);
+    }
+    i64::from(attendance_segment_minutes(row)) * 60
+}
+
+fn assert_total_attendance_seconds_under_daily_cap(total_seconds: i64) -> KabiPayResult<()> {
+    if total_seconds >= 24 * 60 * 60 {
+        return Err(KabiPayError::Validation(
+            "total attendance for a day must be less than 24 hours".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// All attendance rows (segments) for one employee on one work day, ordered oldest first.
 pub async fn list_employee_attendance_on_date(
     db: &DatabaseConnection,
@@ -183,15 +191,15 @@ pub async fn punch_day_summary(
     work_date: NaiveDate,
 ) -> KabiPayResult<PunchDaySummary> {
     let segments = list_employee_attendance_on_date(db, tenant_id, employee_id, work_date).await?;
-    let mut total = 0i32;
-    for row in &segments {
-        if let (Some(tin), Some(tout)) = (row.check_in_time, row.check_out_time) {
-            total += segment_minutes(tin, tout);
-        }
-    }
+    let total = segments.iter().map(attendance_segment_minutes).sum();
     let open_segment = segments
         .iter()
-        .filter(|r| r.check_in_time.is_some() && r.check_out_time.is_none())
+        .filter(|r| {
+            r.status.as_deref() == Some("OPEN")
+                && (r.check_in_at.is_some() || r.check_in_time.is_some())
+                && r.check_out_at.is_none()
+                && r.check_out_time.is_none()
+        })
         .max_by_key(|r| r.created_at)
         .cloned();
     Ok(PunchDaySummary {
@@ -213,6 +221,7 @@ pub async fn punch_today(
     db: &DatabaseConnection,
     tenant_id: Uuid,
     employee_id: Uuid,
+    clock: TenantBusinessClock,
     geo: Option<PunchGeo>,
     client_ip: Option<&str>,
 ) -> KabiPayResult<attendance::Model> {
@@ -225,23 +234,46 @@ pub async fn punch_today(
     )?;
 
     let now_ts = Utc::now();
-    let (today, now_t) =
-        attendance_business_date_time(now_ts, attendance_timezone_offset_minutes_from_env());
+    let (today, now_t) = attendance_business_date_time(now_ts, clock);
     let source = if geo.is_some() { "WEB+GPS" } else { "WEB" };
+    let txn = db.begin().await?;
+    lock_employee_dates(&txn, tenant_id, employee_id, &[today]).await?;
     let open = attendance::Entity::find()
         .filter(attendance::Column::TenantId.eq(tenant_id))
         .filter(attendance::Column::EmployeeId.eq(employee_id))
-        .filter(attendance::Column::WorkDate.eq(today))
+        .filter(attendance::Column::Status.eq("OPEN"))
         .filter(attendance::Column::CheckInTime.is_not_null())
         .filter(attendance::Column::CheckOutTime.is_null())
         .order_by_desc(attendance::Column::CreatedAt)
-        .one(db)
+        .one(&txn)
         .await?;
 
     if let Some(row) = open {
+        lock_employee_dates(&txn, tenant_id, employee_id, &[row.work_date]).await?;
+        let existing = attendance::Entity::find()
+            .filter(attendance::Column::TenantId.eq(tenant_id))
+            .filter(attendance::Column::EmployeeId.eq(employee_id))
+            .filter(attendance::Column::WorkDate.eq(row.work_date))
+            .all(&txn)
+            .await?;
+        let open_seconds = row
+            .check_in_at
+            .map(|check_in_at| now_ts.signed_duration_since(check_in_at).num_seconds())
+            .or_else(|| {
+                row.check_in_time
+                    .map(|check_in| i64::from(segment_minutes(check_in, now_t)) * 60)
+            })
+            .unwrap_or_default();
+        let completed_seconds: i64 = existing
+            .iter()
+            .filter(|segment| segment.id != row.id)
+            .map(attendance_segment_seconds)
+            .sum();
+        assert_total_attendance_seconds_under_daily_cap(completed_seconds + open_seconds)?;
         let id = row.id;
         let mut am: attendance::ActiveModel = row.into();
         am.check_out_time = Set(Some(now_t));
+        am.check_out_at = Set(Some(now_ts));
         am.status = Set(Some("COMPLETE".into()));
         if let Some(g) = geo {
             am.check_out_lat = Set(Some(g.lat));
@@ -249,7 +281,8 @@ pub async fn punch_today(
         }
         am.source = Set(Some(source.into()));
         am.updated_at = Set(now_ts);
-        am.update(db).await?;
+        am.update(&txn).await?;
+        txn.commit().await?;
         return attendance::Entity::find_by_id(id)
             .one(db)
             .await?
@@ -269,6 +302,8 @@ pub async fn punch_today(
         work_date: Set(today),
         check_in_time: Set(Some(now_t)),
         check_out_time: Set(None),
+        check_in_at: Set(Some(now_ts)),
+        check_out_at: Set(None),
         check_in_lat: Set(in_lat),
         check_in_lng: Set(in_lng),
         check_out_lat: Set(None),
@@ -283,7 +318,8 @@ pub async fn punch_today(
         created_at: Set(now_ts),
         updated_at: Set(now_ts),
     };
-    am.insert(db).await?;
+    am.insert(&txn).await?;
+    txn.commit().await?;
     attendance::Entity::find_by_id(id)
         .one(db)
         .await?
@@ -298,15 +334,14 @@ pub async fn add_manual_attendance_segment(
     db: &DatabaseConnection,
     tenant_id: Uuid,
     employee_id: Uuid,
+    clock: TenantBusinessClock,
     work_date: NaiveDate,
     check_in_time: NaiveTime,
     check_out_time: NaiveTime,
 ) -> KabiPayResult<attendance::Model> {
-    let segment = SegmentTimes {
-        work_date,
-        check_in_time,
-        check_out_time,
-    };
+    let segment = SegmentTimes::for_manual_input(work_date, check_in_time, check_out_time);
+    let instants = segment.to_instants(clock)?;
+    let today = clock.now_date();
     let txn = db.begin().await?;
     lock_employee_dates(&txn, tenant_id, employee_id, &[work_date]).await?;
     validate_segment_with_connection(
@@ -316,6 +351,7 @@ pub async fn add_manual_attendance_segment(
         segment,
         None,
         false,
+        today,
     )
     .await?;
     let created = insert_manual_segment(
@@ -323,6 +359,7 @@ pub async fn add_manual_attendance_segment(
         tenant_id,
         employee_id,
         segment,
+        instants,
         MANUAL_SELF_REPORTED,
         Utc::now(),
     )
@@ -336,6 +373,7 @@ pub async fn update_manual_attendance_segment(
     tenant_id: Uuid,
     attendance_id: Uuid,
     requesting_employee_id: Uuid,
+    clock: TenantBusinessClock,
     work_date: NaiveDate,
     check_in_time: NaiveTime,
     check_out_time: NaiveTime,
@@ -356,11 +394,9 @@ pub async fn update_manual_attendance_segment(
         ));
     }
 
-    let segment = SegmentTimes {
-        work_date,
-        check_in_time,
-        check_out_time,
-    };
+    let segment = SegmentTimes::for_manual_input(work_date, check_in_time, check_out_time);
+    let instants = segment.to_instants(clock)?;
+    let today = clock.now_date();
     let locked_employee_id = row.employee_id;
     let locked_work_date = row.work_date;
     lock_employee_dates(
@@ -391,12 +427,14 @@ pub async fn update_manual_attendance_segment(
         segment,
         Some(attendance_id),
         false,
+        today,
     )
     .await?;
     let updated = update_manual_segment(
         &txn,
         row,
         segment,
+        instants,
         MANUAL_SELF_REPORTED,
         Utc::now(),
     )
@@ -440,6 +478,7 @@ pub async fn create_timesheet_entry(
     project_code: Option<String>,
     description: Option<String>,
 ) -> KabiPayResult<timesheet_entry::Model> {
+    assert_timesheet_hours_precision(hours_worked)?;
     if hours_worked <= Decimal::ZERO {
         return Err(KabiPayError::Validation(
             "hoursWorked must be greater than zero".into(),
@@ -555,6 +594,7 @@ pub async fn update_timesheet_entry(
     project_code: Option<String>,
     description: Option<String>,
 ) -> KabiPayResult<timesheet_entry::Model> {
+    assert_timesheet_hours_precision(hours_worked)?;
     if hours_worked <= Decimal::ZERO {
         return Err(KabiPayError::Validation(
             "hoursWorked must be greater than zero".into(),
@@ -638,8 +678,29 @@ pub async fn update_timesheet_entry(
 }
 
 pub fn parse_hours(s: &str) -> KabiPayResult<Decimal> {
-    Decimal::from_str(s.trim())
-        .map_err(|_| KabiPayError::Validation("invalid hoursWorked; use a decimal string".into()))
+    let value = s.trim();
+    let decimal_places = value
+        .split_once('.')
+        .map(|(_, fraction)| fraction.len())
+        .unwrap_or(0);
+    if decimal_places > 2 {
+        return Err(KabiPayError::Validation(
+            "hours worked supports at most two decimal places".into(),
+        ));
+    }
+    let parsed = Decimal::from_str(value)
+        .map_err(|_| KabiPayError::Validation("invalid hoursWorked; use a decimal string".into()))?;
+    assert_timesheet_hours_precision(parsed)?;
+    Ok(parsed)
+}
+
+fn assert_timesheet_hours_precision(hours: Decimal) -> KabiPayResult<()> {
+    if hours.normalize().scale() > 2 {
+        return Err(KabiPayError::Validation(
+            "hours worked supports at most two decimal places".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Validates optional WGS84 pair; `latitude` and `longitude` must both be set or both omitted.
@@ -866,6 +927,14 @@ pub async fn list_holidays_in_calendar(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn timesheet_hours_reject_more_than_two_decimal_places() {
+        assert!(parse_hours("1").is_ok());
+        assert!(parse_hours("1.2").is_ok());
+        assert!(parse_hours("1.23").is_ok());
+        assert!(parse_hours("1.234").is_err());
+    }
     use chrono::{NaiveDate, NaiveTime};
 
     #[test]
@@ -874,8 +943,8 @@ mod tests {
             .parse::<DateTime<Utc>>()
             .expect("valid UTC timestamp");
 
-        let (work_date, punch_time) =
-            attendance_business_date_time(now_utc, DEFAULT_ATTENDANCE_TIMEZONE_OFFSET_MINUTES);
+        let clock = TenantBusinessClock::from_name("Asia/Kolkata").expect("valid timezone");
+        let (work_date, punch_time) = attendance_business_date_time(now_utc, clock);
 
         assert_eq!(
             work_date,
@@ -889,10 +958,25 @@ mod tests {
 
     #[test]
     fn attendance_daily_total_must_remain_below_twenty_four_hours() {
-        assert!(assert_total_attendance_minutes_under_daily_cap(23 * 60 + 59)
-            .is_ok());
-        assert!(assert_total_attendance_minutes_under_daily_cap(24 * 60).is_err());
-        assert!(assert_total_attendance_minutes_under_daily_cap(24 * 60 + 1)
-            .is_err());
+        assert!(
+            crate::services::attendance_regularization_service::assert_total_attendance_minutes_under_daily_cap(
+                23 * 60 + 59,
+            )
+            .is_ok()
+        );
+        assert!(
+            crate::services::attendance_regularization_service::assert_total_attendance_minutes_under_daily_cap(
+                24 * 60,
+            )
+            .is_err()
+        );
+        assert!(
+            crate::services::attendance_regularization_service::assert_total_attendance_minutes_under_daily_cap(
+                24 * 60 + 1,
+            )
+            .is_err()
+        );
+        assert!(assert_total_attendance_seconds_under_daily_cap(24 * 60 * 60 - 1).is_ok());
+        assert!(assert_total_attendance_seconds_under_daily_cap(24 * 60 * 60).is_err());
     }
 }

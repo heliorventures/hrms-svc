@@ -1,4 +1,4 @@
-//! Mutations for workflow definitions (HR / tenant admin).
+//! Permission-protected mutations for workflow definitions.
 
 use async_graphql::{Context, Object, Result, ID};
 use kabipay_common::{
@@ -20,7 +20,7 @@ fn parse_uuid(id: &ID, field: &'static str) -> Result<Uuid> {
 
 #[Object]
 impl MutationRoot {
-    /// Create a workflow **definition** row. Requires `workflow:manage` or HR / tenant admin role.
+    /// Create a workflow **definition** row. Requires `workflow:manage`.
     async fn create_workflow(
         &self,
         ctx: &Context<'_>,
@@ -55,7 +55,7 @@ impl MutationRoot {
         Ok(WorkflowDto::from(m))
     }
 
-    /// Add a **step** to an existing workflow. Requires `workflow:manage` or HR / tenant admin role.
+    /// Add a **step** to an existing workflow. Requires `workflow:manage`.
     async fn create_workflow_step(
         &self,
         ctx: &Context<'_>,
@@ -88,6 +88,7 @@ impl MutationRoot {
             step_name,
             input.approver_type,
             role,
+            input.approver_permission,
             input.can_skip,
             input.sla_hours,
         )

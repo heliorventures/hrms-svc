@@ -3,13 +3,9 @@
 use chrono::{Datelike, NaiveDate, Utc};
 use kabipay_common::{
     client_data_scope::EmployeeScopeFilter,
-    workflow_approval,
+    workflow_approval::{self, WorkflowApprovalAuthority},
     workflow_current_step,
-    workflow_inbox::{
-        self,
-        NoWorkflowInstanceGate,
-        WorkflowActorCheckMode,
-    },
+    workflow_inbox,
     KabiPayError, KabiPayResult,
 };
 use kabipay_db_entities::tenant::d0007_employee_core::employee;
@@ -257,32 +253,6 @@ pub async fn submit_timesheet_week(
         .ok_or_else(|| KabiPayError::Internal("timesheet_week_batch not found after submit".into()))
 }
 
-async fn approve_without_workflow_permission_check(
-    txn: &impl ConnectionTrait,
-    tenant_id: Uuid,
-    batch_id: Uuid,
-    approver_user_id: Uuid,
-    subject_employee_id: Uuid,
-    now: chrono::DateTime<Utc>,
-) -> KabiPayResult<()> {
-    if !workflow_approval::user_has_permission_via_roles(
-        txn,
-        tenant_id,
-        approver_user_id,
-        "timesheet",
-        "approve",
-    )
-    .await?
-    {
-        return Err(KabiPayError::Forbidden(
-            "timesheet approval requires timesheet:approve (or tenant HR role)".into(),
-        ));
-    }
-    let _ = subject_employee_id;
-    finalize_batch_approved(txn, tenant_id, batch_id, now).await?;
-    Ok(())
-}
-
 async fn finalize_batch_approved(
     txn: &impl ConnectionTrait,
     tenant_id: Uuid,
@@ -323,7 +293,7 @@ pub async fn approve_timesheet_week_batch(
     db: &DatabaseConnection,
     tenant_id: Uuid,
     batch_id: Uuid,
-    approver_user_id: Uuid,
+    authority: &WorkflowApprovalAuthority,
 ) -> KabiPayResult<timesheet_week_batch::Model> {
     let txn = db.begin().await?;
     let batch = timesheet_week_batch::Entity::find_by_id(batch_id)
@@ -340,6 +310,14 @@ pub async fn approve_timesheet_week_batch(
             "only pending submissions can be approved".into(),
         ));
     }
+    workflow_approval::assert_subject_in_approval_scope(
+        &txn,
+        tenant_id,
+        batch.employee_id,
+        authority,
+    )
+    .await?;
+    let approver_user_id = authority.actor_user_id;
     assert_actor_is_not_subject_employee(&txn, tenant_id, approver_user_id, batch.employee_id)
         .await?;
 
@@ -375,9 +353,9 @@ pub async fn approve_timesheet_week_batch(
         workflow_approval::assert_workflow_step_actor_with_timesheet_reporting_manager_fallback(
             &txn,
             tenant_id,
-            approver_user_id,
             batch.employee_id,
             &cur_step,
+            authority,
         )
         .await?;
 
@@ -430,15 +408,7 @@ pub async fn approve_timesheet_week_batch(
             .ok_or_else(|| KabiPayError::Internal("batch missing".into()));
     }
 
-    approve_without_workflow_permission_check(
-        &txn,
-        tenant_id,
-        batch_id,
-        approver_user_id,
-        batch.employee_id,
-        now,
-    )
-    .await?;
+    finalize_batch_approved(&txn, tenant_id, batch_id, now).await?;
     txn.commit().await?;
 
     timesheet_week_batch::Entity::find_by_id(batch_id)
@@ -451,7 +421,7 @@ pub async fn reject_timesheet_week_batch(
     db: &DatabaseConnection,
     tenant_id: Uuid,
     batch_id: Uuid,
-    rejector_user_id: Uuid,
+    authority: &WorkflowApprovalAuthority,
     rejection_reason: Option<String>,
 ) -> KabiPayResult<bool> {
     let txn = db.begin().await?;
@@ -469,6 +439,14 @@ pub async fn reject_timesheet_week_batch(
             "only pending submissions can be rejected".into(),
         ));
     }
+    workflow_approval::assert_subject_in_approval_scope(
+        &txn,
+        tenant_id,
+        batch.employee_id,
+        authority,
+    )
+    .await?;
+    let rejector_user_id = authority.actor_user_id;
     assert_actor_is_not_subject_employee(&txn, tenant_id, rejector_user_id, batch.employee_id)
         .await?;
 
@@ -494,9 +472,9 @@ pub async fn reject_timesheet_week_batch(
                     workflow_approval::assert_workflow_step_actor_with_timesheet_reporting_manager_fallback(
                         &txn,
                         tenant_id,
-                        rejector_user_id,
                         batch.employee_id,
                         &st,
+                        authority,
                     )
                     .await?;
                     let act = workflow_action::ActiveModel {
@@ -520,18 +498,6 @@ pub async fn reject_timesheet_week_batch(
                 am_inst.update(&txn).await?;
             }
         }
-    } else if !workflow_approval::user_has_permission_via_roles(
-        &txn,
-        tenant_id,
-        rejector_user_id,
-        "timesheet",
-        "approve",
-    )
-    .await?
-    {
-        return Err(KabiPayError::Forbidden(
-            "timesheet reject requires timesheet:approve (or tenant HR role)".into(),
-        ));
     }
 
     let rows = timesheet_entry::Entity::find()
@@ -636,10 +602,10 @@ pub async fn resolve_timesheet_pending_approval_stage(
 pub async fn timesheet_week_batch_viewer_may_approve(
     db: &DatabaseConnection,
     tenant_id: Uuid,
-    viewer_user_id: Uuid,
     status: &str,
     subject_employee_id: Uuid,
     workflow_instance_id: Option<Uuid>,
+    authority: &WorkflowApprovalAuthority,
 ) -> KabiPayResult<bool> {
     if let Some(subject) = employee::Entity::find_by_id(subject_employee_id)
         .filter(employee::Column::TenantId.eq(tenant_id))
@@ -647,7 +613,7 @@ pub async fn timesheet_week_batch_viewer_may_approve(
         .one(db)
         .await?
     {
-        if subject.user_id == Some(viewer_user_id) {
+        if subject.user_id == Some(authority.actor_user_id) {
             return Ok(false);
         }
     }
@@ -655,16 +621,11 @@ pub async fn timesheet_week_batch_viewer_may_approve(
     workflow_inbox::viewer_may_approve_pending_row(
         db,
         tenant_id,
-        viewer_user_id,
         subject_employee_id,
         status,
         BATCH_PENDING_STATUS,
         workflow_instance_id,
-        WorkflowActorCheckMode::TimesheetReportingManagerFallback,
-        NoWorkflowInstanceGate::ResourceAction {
-            resource: "timesheet",
-            action: "approve",
-        },
+        authority,
     )
     .await
 }

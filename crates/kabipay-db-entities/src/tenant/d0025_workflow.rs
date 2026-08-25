@@ -36,6 +36,7 @@ pub mod workflow_step {
         pub step_name: String,
         pub approver_type: Option<String>,
         pub approver_role_id: Option<Uuid>,
+        pub approver_permission: Option<String>,
         pub can_skip: bool,
         pub sla_hours: Option<i32>,
         pub created_at: DateTimeUtc,

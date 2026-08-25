@@ -1,7 +1,8 @@
 //! Transaction-scoped attendance adjustment validation and audit writes.
 
-use chrono::{DateTime, NaiveDate, NaiveTime, Utc};
+use chrono::{DateTime, NaiveDate, NaiveTime, Timelike, Utc};
 use kabipay_common::{KabiPayError, KabiPayResult};
+use kabipay_common::tenant_business_clock::TenantBusinessClock;
 use kabipay_db_entities::tenant::{
     d0010_time_shift_roster::attendance,
     d0063_attendance_management::attendance_adjustment_audit,
@@ -30,12 +31,55 @@ pub struct SegmentTimes {
     pub check_out_time: NaiveTime,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SegmentInstants {
+    pub check_in_at: DateTime<Utc>,
+    pub check_out_at: DateTime<Utc>,
+}
+
+impl SegmentTimes {
+    /// Builds an employee-entered or HR-entered segment using the precision exposed by the UI.
+    /// Live punch instants remain second-precise; manual boundaries are intentionally minute-precise.
+    pub fn for_manual_input(
+        work_date: NaiveDate,
+        check_in_time: NaiveTime,
+        check_out_time: NaiveTime,
+    ) -> Self {
+        Self {
+            work_date,
+            check_in_time: truncate_to_minute(check_in_time),
+            check_out_time: truncate_to_minute(check_out_time),
+        }
+    }
+
+    pub fn to_instants(self, clock: TenantBusinessClock) -> KabiPayResult<SegmentInstants> {
+        let check_in_at = clock.to_utc(self.work_date, self.check_in_time)?;
+        let check_out_at = clock.to_utc(self.work_date, self.check_out_time)?;
+        if check_out_at <= check_in_at {
+            return Err(KabiPayError::Validation(
+                "checkInTime must be before checkOutTime (same-day segment only)".into(),
+            ));
+        }
+        Ok(SegmentInstants {
+            check_in_at,
+            check_out_at,
+        })
+    }
+}
+
+fn truncate_to_minute(time: NaiveTime) -> NaiveTime {
+    NaiveTime::from_hms_opt(time.hour(), time.minute(), 0)
+        .expect("hour and minute from NaiveTime are always valid")
+}
+
 #[derive(Clone, Debug)]
 pub struct ManagedCreateCommand {
     pub tenant_id: Uuid,
     pub target_employee_id: Uuid,
     pub actor_user_id: Uuid,
     pub segment: SegmentTimes,
+    pub instants: SegmentInstants,
+    pub today: NaiveDate,
     pub reason: String,
     pub request_id: Option<String>,
 }
@@ -48,6 +92,8 @@ pub(crate) struct ManagedUpdateCommand {
     pub actor_user_id: Uuid,
     pub initial_work_date: NaiveDate,
     pub segment: SegmentTimes,
+    pub instants: SegmentInstants,
+    pub today: NaiveDate,
     pub reason: String,
     pub request_id: Option<String>,
     pub expected_updated_at: DateTime<Utc>,
@@ -149,8 +195,6 @@ pub(crate) fn assert_locked_attendance_identity(
 }
 
 fn segment_minutes(check_in_time: NaiveTime, check_out_time: NaiveTime) -> KabiPayResult<i32> {
-    use chrono::Timelike;
-
     if check_in_time >= check_out_time {
         return Err(KabiPayError::Validation(
             "checkInTime must be before checkOutTime (same-day segment only)".into(),
@@ -206,7 +250,20 @@ fn validate_segment_against_rows(
             continue;
         }
         match (row.check_in_time, row.check_out_time) {
-            (Some(existing_in), Some(existing_out)) => {
+            (Some(stored_in), Some(stored_out)) => {
+                let is_manual = row
+                    .source
+                    .as_deref()
+                    .is_some_and(|source| {
+                        source
+                            .trim()
+                            .eq_ignore_ascii_case(MANUAL_ATTENDANCE_SOURCE)
+                    });
+                let (existing_in, existing_out) = if is_manual {
+                    (truncate_to_minute(stored_in), truncate_to_minute(stored_out))
+                } else {
+                    (stored_in, stored_out)
+                };
                 if segment.check_in_time < existing_out && segment.check_out_time > existing_in {
                     return Err(KabiPayError::Validation(
                         "manual attendance overlaps with an existing segment for this day".into(),
@@ -237,11 +294,11 @@ pub(crate) async fn validate_segment_with_connection<C>(
     segment: SegmentTimes,
     excluded_attendance_id: Option<Uuid>,
     bypass_self_service_age_window: bool,
+    today: NaiveDate,
 ) -> KabiPayResult<()>
 where
     C: ConnectionTrait,
 {
-    let today = Utc::now().date_naive();
     validate_segment_date_and_time(segment, today)?;
     let policy = hrms_master_service::load_attendance_adjustment_policy(db, tenant_id).await?;
     let existing = attendance::Entity::find()
@@ -288,6 +345,7 @@ pub(crate) async fn insert_manual_segment<C>(
     tenant_id: Uuid,
     employee_id: Uuid,
     segment: SegmentTimes,
+    instants: SegmentInstants,
     regularization_status: &'static str,
     now: DateTime<Utc>,
 ) -> KabiPayResult<attendance::Model>
@@ -302,6 +360,8 @@ where
         work_date: Set(segment.work_date),
         check_in_time: Set(Some(segment.check_in_time)),
         check_out_time: Set(Some(segment.check_out_time)),
+        check_in_at: Set(Some(instants.check_in_at)),
+        check_out_at: Set(Some(instants.check_out_at)),
         check_in_lat: Set(None),
         check_in_lng: Set(None),
         check_out_lat: Set(None),
@@ -325,6 +385,7 @@ pub(crate) async fn update_manual_segment<C>(
     db: &C,
     row: attendance::Model,
     segment: SegmentTimes,
+    instants: SegmentInstants,
     regularization_status: &'static str,
     now: DateTime<Utc>,
 ) -> KabiPayResult<attendance::Model>
@@ -335,6 +396,8 @@ where
     active.work_date = Set(segment.work_date);
     active.check_in_time = Set(Some(segment.check_in_time));
     active.check_out_time = Set(Some(segment.check_out_time));
+    active.check_in_at = Set(Some(instants.check_in_at));
+    active.check_out_at = Set(Some(instants.check_out_at));
     active.check_in_lat = Set(None);
     active.check_in_lng = Set(None);
     active.check_out_lat = Set(None);
@@ -366,12 +429,14 @@ trait AttendanceRegularizationStore {
         segment: SegmentTimes,
         excluded_attendance_id: Option<Uuid>,
         bypass_self_service_age_window: bool,
+        today: NaiveDate,
     ) -> KabiPayResult<()>;
     async fn insert_segment(
         &mut self,
         tenant_id: Uuid,
         employee_id: Uuid,
         segment: SegmentTimes,
+        instants: SegmentInstants,
         regularization_status: &'static str,
         now: DateTime<Utc>,
     ) -> KabiPayResult<attendance::Model>;
@@ -379,6 +444,7 @@ trait AttendanceRegularizationStore {
         &mut self,
         row: attendance::Model,
         segment: SegmentTimes,
+        instants: SegmentInstants,
         regularization_status: &'static str,
         now: DateTime<Utc>,
     ) -> KabiPayResult<attendance::Model>;
@@ -414,6 +480,7 @@ impl AttendanceRegularizationStore for DatabaseTransaction {
         segment: SegmentTimes,
         excluded_attendance_id: Option<Uuid>,
         bypass_self_service_age_window: bool,
+        today: NaiveDate,
     ) -> KabiPayResult<()> {
         validate_segment_with_connection(
             self,
@@ -422,6 +489,7 @@ impl AttendanceRegularizationStore for DatabaseTransaction {
             segment,
             excluded_attendance_id,
             bypass_self_service_age_window,
+            today,
         )
         .await
     }
@@ -431,6 +499,7 @@ impl AttendanceRegularizationStore for DatabaseTransaction {
         tenant_id: Uuid,
         employee_id: Uuid,
         segment: SegmentTimes,
+        instants: SegmentInstants,
         regularization_status: &'static str,
         now: DateTime<Utc>,
     ) -> KabiPayResult<attendance::Model> {
@@ -439,6 +508,7 @@ impl AttendanceRegularizationStore for DatabaseTransaction {
             tenant_id,
             employee_id,
             segment,
+            instants,
             regularization_status,
             now,
         )
@@ -449,10 +519,11 @@ impl AttendanceRegularizationStore for DatabaseTransaction {
         &mut self,
         row: attendance::Model,
         segment: SegmentTimes,
+        instants: SegmentInstants,
         regularization_status: &'static str,
         now: DateTime<Utc>,
     ) -> KabiPayResult<attendance::Model> {
-        update_manual_segment(self, row, segment, regularization_status, now).await
+        update_manual_segment(self, row, segment, instants, regularization_status, now).await
     }
 
     async fn insert_audit(&mut self, audit: AttendanceAuditInsert) -> KabiPayResult<()> {
@@ -498,6 +569,7 @@ where
             command.segment,
             None,
             true,
+            command.today,
         )
         .await?;
     let created = store
@@ -505,6 +577,7 @@ where
             command.tenant_id,
             command.target_employee_id,
             command.segment,
+            command.instants,
             MANUAL_REGULARIZED,
             now,
         )
@@ -566,10 +639,17 @@ where
             command.segment,
             Some(command.attendance_id),
             true,
+            command.today,
         )
         .await?;
     let updated = store
-        .update_segment(before, command.segment, MANUAL_REGULARIZED, now)
+        .update_segment(
+            before,
+            command.segment,
+            command.instants,
+            MANUAL_REGULARIZED,
+            now,
+        )
         .await?;
     let after_values = serde_json::to_value(AttendanceAuditSnapshot::try_from(&updated)?)?;
     store
@@ -643,6 +723,8 @@ mod tests {
             work_date,
             check_in_time: Some(time(9, 0)),
             check_out_time: Some(time(17, 0)),
+            check_in_at: None,
+            check_out_at: None,
             check_in_lat: None,
             check_in_lng: None,
             check_out_lat: None,
@@ -748,6 +830,55 @@ mod tests {
         ));
         assert!(matches!(
             validate_segment_against_rows(invalid_order, today, 5, &[], None, false),
+            Err(KabiPayError::Validation(_))
+        ));
+    }
+
+    #[test]
+    fn manual_segment_times_are_normalized_to_minute_precision() {
+        let segment = SegmentTimes::for_manual_input(
+            date(2026, 8, 24),
+            NaiveTime::from_hms_opt(9, 0, 45).expect("valid check-in time"),
+            NaiveTime::from_hms_nano_opt(17, 30, 59, 999_999_999)
+                .expect("valid check-out time"),
+        );
+
+        assert_eq!(segment.check_in_time, time(9, 0));
+        assert_eq!(segment.check_out_time, time(17, 30));
+    }
+
+    #[test]
+    fn legacy_manual_rows_use_minute_precision_but_live_rows_keep_seconds() {
+        let work_date = date(2026, 8, 24);
+        let requested = SegmentTimes::for_manual_input(work_date, time(9, 0), time(10, 0));
+        let mut existing = attendance_model(work_date, timestamp(12));
+        existing.check_in_time = Some(
+            NaiveTime::from_hms_opt(8, 0, 45).expect("valid legacy manual check-in"),
+        );
+        existing.check_out_time = Some(
+            NaiveTime::from_hms_opt(9, 0, 45).expect("valid legacy manual check-out"),
+        );
+
+        assert!(validate_segment_against_rows(
+            requested,
+            work_date,
+            5,
+            &[existing.clone()],
+            None,
+            true,
+        )
+        .is_ok());
+
+        existing.source = Some("BIOMETRIC".into());
+        assert!(matches!(
+            validate_segment_against_rows(
+                requested,
+                work_date,
+                5,
+                &[existing],
+                None,
+                true,
+            ),
             Err(KabiPayError::Validation(_))
         ));
     }
@@ -869,6 +1000,7 @@ mod tests {
             _segment: SegmentTimes,
             _excluded_attendance_id: Option<Uuid>,
             bypass_self_service_age_window: bool,
+            _today: NaiveDate,
         ) -> kabipay_common::KabiPayResult<()> {
             self.operations.push(Operation::Validate {
                 bypass_self_service_age_window,
@@ -881,6 +1013,7 @@ mod tests {
             tenant_id: Uuid,
             employee_id: Uuid,
             segment: SegmentTimes,
+            instants: SegmentInstants,
             regularization_status: &'static str,
             now: chrono::DateTime<Utc>,
         ) -> kabipay_common::KabiPayResult<attendance::Model> {
@@ -890,6 +1023,8 @@ mod tests {
             row.employee_id = employee_id;
             row.check_in_time = Some(segment.check_in_time);
             row.check_out_time = Some(segment.check_out_time);
+            row.check_in_at = Some(instants.check_in_at);
+            row.check_out_at = Some(instants.check_out_at);
             row.regularization_status = Some(regularization_status.into());
             self.row = Some(row.clone());
             Ok(row)
@@ -899,6 +1034,7 @@ mod tests {
             &mut self,
             mut row: attendance::Model,
             segment: SegmentTimes,
+            instants: SegmentInstants,
             regularization_status: &'static str,
             now: chrono::DateTime<Utc>,
         ) -> kabipay_common::KabiPayResult<attendance::Model> {
@@ -906,6 +1042,8 @@ mod tests {
             row.work_date = segment.work_date;
             row.check_in_time = Some(segment.check_in_time);
             row.check_out_time = Some(segment.check_out_time);
+            row.check_in_at = Some(instants.check_in_at);
+            row.check_out_at = Some(instants.check_out_at);
             row.regularization_status = Some(regularization_status.into());
             row.updated_at = now;
             self.row = Some(row.clone());
@@ -922,17 +1060,22 @@ mod tests {
     }
 
     fn managed_update_command(expected_updated_at: chrono::DateTime<Utc>) -> ManagedUpdateCommand {
+        let segment = SegmentTimes {
+            work_date: date(2026, 8, 20),
+            check_in_time: time(10, 0),
+            check_out_time: time(18, 0),
+        };
         ManagedUpdateCommand {
             tenant_id: TENANT_ID,
             attendance_id: ATTENDANCE_ID,
             target_employee_id: EMPLOYEE_ID,
             actor_user_id: ACTOR_USER_ID,
             initial_work_date: date(2026, 8, 24),
-            segment: SegmentTimes {
-                work_date: date(2026, 8, 20),
-                check_in_time: time(10, 0),
-                check_out_time: time(18, 0),
-            },
+            segment,
+            instants: segment
+                .to_instants(TenantBusinessClock::from_name("UTC").unwrap())
+                .unwrap(),
+            today: date(2026, 8, 24),
             reason: "  approved payroll correction  ".into(),
             request_id: Some("request-123".into()),
             expected_updated_at,
@@ -967,15 +1110,20 @@ mod tests {
     #[tokio::test]
     async fn managed_create_orchestrates_lock_validation_write_and_create_audit() {
         let mut store = FakeStore::new(None);
+        let segment = SegmentTimes {
+            work_date: date(2026, 8, 20),
+            check_in_time: time(9, 30),
+            check_out_time: time(17, 30),
+        };
         let command = ManagedCreateCommand {
             tenant_id: TENANT_ID,
             target_employee_id: EMPLOYEE_ID,
             actor_user_id: ACTOR_USER_ID,
-            segment: SegmentTimes {
-                work_date: date(2026, 8, 20),
-                check_in_time: time(9, 30),
-                check_out_time: time(17, 30),
-            },
+            segment,
+            instants: segment
+                .to_instants(TenantBusinessClock::from_name("UTC").unwrap())
+                .unwrap(),
+            today: date(2026, 8, 24),
             reason: "  approved missed punch  ".into(),
             request_id: Some("request-123".into()),
         };

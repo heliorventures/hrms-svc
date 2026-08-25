@@ -10,10 +10,25 @@ use sea_orm::{ColumnTrait, ConnectionTrait, DatabaseConnection, EntityTrait, Que
 use uuid::Uuid;
 
 /// Dev / probe: no JWT → treat as **ALL** (unchanged from subgraph conventions).
-pub fn data_scope_from_context(ctx: &Context<'_>, resource: &str) -> ScopeType {
-    ctx.data_opt::<ClientClaims>()
-        .map(|c| c.data_scope(resource))
-        .unwrap_or(ScopeType::All)
+pub fn data_scope_from_claims(
+    claims: Option<&ClientClaims>,
+    permission: &str,
+) -> KabiPayResult<ScopeType> {
+    let claims = claims.ok_or(KabiPayError::Unauthorised)?;
+    if !claims.has_any_permission(&[permission]) {
+        return Err(KabiPayError::Forbidden(format!(
+            "{permission} permission required"
+        )));
+    }
+    Ok(claims.scope_for_permission(permission))
+}
+
+pub fn data_scope_from_context(
+    ctx: &Context<'_>,
+    permission: &str,
+) -> async_graphql::Result<ScopeType> {
+    data_scope_from_claims(ctx.data_opt::<ClientClaims>(), permission)
+        .map_err(KabiPayError::into_graphql)
 }
 
 /// Caller’s employee row for **TEAM** / **DEPARTMENT** filters. **`None`** when unauthenticated
@@ -24,6 +39,38 @@ pub async fn resolve_viewer_employee(
     tenant_id: Uuid,
 ) -> async_graphql::Result<Option<ClientViewerEmployee>> {
     resolve_viewer_employee_with_connection(ctx, db, tenant_id).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn protected_scope_lookup_rejects_missing_claims() {
+        let error = data_scope_from_claims(None, "attendance:read").unwrap_err();
+        assert!(matches!(error, KabiPayError::Unauthorised));
+    }
+
+    #[test]
+    fn protected_scope_lookup_rejects_claims_without_the_requested_permission() {
+        let claims = ClientClaims {
+            sub: Uuid::nil(),
+            iss: crate::context::CLIENT_JWT_ISSUER.into(),
+            exp: 0,
+            iat: 0,
+            tenant_id: Uuid::nil(),
+            email: String::new(),
+            employee_id: None,
+            must_change_password: false,
+            roles: vec!["TENANT_ADMIN".into()],
+            permissions: vec![],
+            permission_scopes: Default::default(),
+            resource_scopes: Default::default(),
+        };
+
+        let error = data_scope_from_claims(Some(&claims), "attendance:read").unwrap_err();
+        assert!(matches!(error, KabiPayError::Forbidden(_)));
+    }
 }
 
 /// Connection-generic form of [`resolve_viewer_employee`] for callers that

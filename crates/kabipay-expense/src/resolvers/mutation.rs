@@ -11,7 +11,7 @@ use crate::resolvers::types::{
     ExpenseCategoryDto, ExpenseDto, ExpensePolicyDto, SubmitExpenseInput, SubmitTravelRequestInput,
     TravelRequestDto, UpsertExpenseCategoryAdminInput, UpsertExpensePolicyAdminInput,
 };
-use crate::services::{expense_service, travel_request_service};
+use crate::services::{approval_authority::ExpenseApprovalAuthority, expense_service, travel_request_service};
 
 fn parse_uuid(id: &ID, field: &'static str) -> Result<Uuid> {
     Uuid::parse_str(id.as_str())
@@ -27,6 +27,11 @@ fn require_expense_admin(ctx: &Context<'_>) -> Result<()> {
         );
     }
     Ok(())
+}
+
+fn require_expense_approval_authority(ctx: &Context<'_>) -> Result<ExpenseApprovalAuthority> {
+    ExpenseApprovalAuthority::from_claims(require_client_claims(ctx)?)
+        .map_err(KabiPayError::into_graphql)
 }
 
 pub struct MutationRoot;
@@ -82,7 +87,7 @@ impl MutationRoot {
         expense_id: ID,
         approved_amount: Option<String>,
     ) -> Result<ExpenseDto> {
-        let claims = require_client_claims(ctx)?;
+        let authority = require_expense_approval_authority(ctx)?;
         let tenant_id = require_tenant_id(ctx)?;
         let db = tenant_db(ctx, tenant_id).await?;
         let id = parse_uuid(&expense_id, "expenseId")?;
@@ -97,8 +102,7 @@ impl MutationRoot {
             &db,
             tenant_id,
             id,
-            claims.sub,
-            claims.can_approve_expense(),
+            &authority,
             approved_dec,
         )
         .await
@@ -112,7 +116,7 @@ impl MutationRoot {
         expense_id: ID,
         reason: Option<String>,
     ) -> Result<ExpenseDto> {
-        let claims = require_client_claims(ctx)?;
+        let authority = require_expense_approval_authority(ctx)?;
         let tenant_id = require_tenant_id(ctx)?;
         let db = tenant_db(ctx, tenant_id).await?;
         let id = parse_uuid(&expense_id, "expenseId")?;
@@ -120,8 +124,7 @@ impl MutationRoot {
             &db,
             tenant_id,
             id,
-            claims.sub,
-            claims.can_approve_expense(),
+            &authority,
             reason,
         )
         .await
@@ -172,7 +175,7 @@ impl MutationRoot {
         ctx: &Context<'_>,
         travel_request_id: ID,
     ) -> Result<TravelRequestDto> {
-        let claims = require_client_claims(ctx)?;
+        let authority = require_expense_approval_authority(ctx)?;
         let tenant_id = require_tenant_id(ctx)?;
         let db = tenant_db(ctx, tenant_id).await?;
         let id = parse_uuid(&travel_request_id, "travelRequestId")?;
@@ -180,8 +183,7 @@ impl MutationRoot {
             &db,
             tenant_id,
             id,
-            claims.sub,
-            claims.can_approve_expense(),
+            &authority,
         )
         .await
         .map_err(KabiPayError::into_graphql)?;
@@ -194,7 +196,7 @@ impl MutationRoot {
         travel_request_id: ID,
         reason: Option<String>,
     ) -> Result<TravelRequestDto> {
-        let claims = require_client_claims(ctx)?;
+        let authority = require_expense_approval_authority(ctx)?;
         let tenant_id = require_tenant_id(ctx)?;
         let db = tenant_db(ctx, tenant_id).await?;
         let id = parse_uuid(&travel_request_id, "travelRequestId")?;
@@ -202,8 +204,7 @@ impl MutationRoot {
             &db,
             tenant_id,
             id,
-            claims.sub,
-            claims.can_approve_expense(),
+            &authority,
             reason,
         )
         .await

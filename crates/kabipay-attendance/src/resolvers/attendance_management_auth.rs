@@ -6,7 +6,7 @@ use kabipay_common::{
         resolve_employee_scope_filter_with_connection, resolve_viewer_employee_with_connection,
         EmployeeScopeFilter,
     },
-    context::{ClientClaims, ClientViewerEmployee, ScopeType, SCOPE_RES_ATTENDANCE},
+    context::{ClientClaims, ClientViewerEmployee, ScopeType, PERM_ATTENDANCE_REGULARIZE},
     subgraph::require_client_claims,
     KabiPayError,
 };
@@ -33,7 +33,7 @@ pub fn require_regularizer(ctx: &Context<'_>) -> Result<()> {
 
 fn require_explicit_attendance_scope(claims: &ClientClaims) -> Result<ScopeType> {
     claims
-        .explicit_data_scope(SCOPE_RES_ATTENDANCE)
+        .explicit_scope_for_permission(PERM_ATTENDANCE_REGULARIZE)
         .ok_or_else(access_denied)
 }
 
@@ -429,8 +429,13 @@ mod tests {
     }
 
     fn claims(scope: Option<&str>) -> ClientClaims {
-        let resource_scopes = scope
-            .map(|scope| HashMap::from([(SCOPE_RES_ATTENDANCE.to_string(), scope.to_string())]))
+        let permission_scopes = scope
+            .map(|scope| {
+                HashMap::from([(
+                    PERM_ATTENDANCE_REGULARIZE.to_string(),
+                    scope.to_string(),
+                )])
+            })
             .unwrap_or_default();
         ClientClaims {
             sub: Uuid::from_u128(99),
@@ -443,7 +448,8 @@ mod tests {
             must_change_password: false,
             roles: vec![],
             permissions: vec![PERM_ATTENDANCE_REGULARIZE.to_string()],
-            resource_scopes,
+            permission_scopes,
+            resource_scopes: HashMap::new(),
         }
     }
 
@@ -472,6 +478,8 @@ mod tests {
             check_out_time: Some(
                 NaiveTime::from_hms_opt(17, 0, 0).expect("valid test time"),
             ),
+            check_in_at: None,
+            check_out_at: None,
             check_in_lat: None,
             check_in_lng: None,
             check_out_lat: None,

@@ -1,20 +1,22 @@
 //! Root query resolvers for kabipay-attendance.
 
 use async_graphql::{Context, Object, Result, ID};
-use chrono::{Duration, NaiveDate, Utc};
+use chrono::{Duration, NaiveDate};
 use kabipay_common::{
     client_data_scope::{
         data_scope_from_context, resolve_employee_scope_filter, resolve_viewer_employee,
     },
-    context::{SCOPE_RES_ATTENDANCE, SCOPE_RES_TIMESHEET},
-    subgraph::{require_client_claims, require_tenant_id, resolve_client_employee_id, tenant_db},
+    context::{PERM_ATTENDANCE_READ, PERM_TIMESHEET_APPROVE, PERM_TIMESHEET_READ},
+    subgraph::{ops_db, require_client_claims, require_tenant_id, resolve_client_employee_id, tenant_db},
+    tenant_business_clock::TenantBusinessClock,
     KabiPayError,
 };
 use uuid::Uuid;
 
 use crate::resolvers::types::{
     AttendanceAdjustmentPolicyDto, AttendanceConnectionDto, AttendanceDto, AttendanceEdgeDto,
-    AttendancePageInfoDto, AttendancePunchPolicyDto, HolidayCalendarDto, HolidayDayDto,
+    AttendanceDailyReportConnectionDto, AttendanceDailyReportEdgeDto, AttendancePageInfoDto,
+    AttendancePunchPolicyDto, AttendanceReportSummaryDto, HolidayCalendarDto, HolidayDayDto,
     HolidayEntryDto, ManagedAttendanceConnectionDto, ManagedAttendanceDto,
     ManagedAttendanceEdgeDto, PunchDaySummaryDto, ShiftDto, TimesheetEntryDto,
     TimesheetLockPolicyDto, TimesheetProjectOptionDto, TimesheetWeekBatchDto,
@@ -22,15 +24,16 @@ use crate::resolvers::types::{
 use crate::resolvers::attendance_management_auth;
 use crate::resolvers::timesheet_assignment_auth;
 use crate::services::{
-    attendance_management_service, attendance_service, hrms_master_service, punch_policy, timesheet_batch_service,
-    timesheet_project_assignment_service,
+    attendance_management_service, attendance_report_service, attendance_service,
+    hrms_master_service, punch_policy, timesheet_batch_service, timesheet_project_assignment_service,
 };
 
 fn self_attendance_date_range(
     from_date: Option<NaiveDate>,
     to_date: Option<NaiveDate>,
+    today: NaiveDate,
 ) -> Result<(NaiveDate, NaiveDate)> {
-    let to_date = to_date.unwrap_or_else(|| Utc::now().date_naive());
+    let to_date = to_date.unwrap_or(today);
     let from_date = match from_date {
         Some(value) => value,
         None => to_date.checked_sub_signed(Duration::days(91)).ok_or_else(|| {
@@ -50,13 +53,13 @@ impl QueryRoot {
         "ok"
     }
 
-    /// Live punch policy (geofence + IP). **HR / tenant admin only** — not exposed to every employee.
+    /// Live punch policy (geofence + IP). Requires `attendance:punch_policy`.
     async fn attendance_punch_policy(&self, ctx: &Context<'_>) -> Result<AttendancePunchPolicyDto> {
         let tenant_id = require_tenant_id(ctx)?;
         let claims = require_client_claims(ctx)?;
         if !claims.can_configure_attendance_punch_policy() {
             return Err(KabiPayError::Forbidden(
-                "attendance punch policy is restricted to HR / tenant admins".into(),
+                "attendance punch policy permission is required".into(),
             )
             .into_graphql());
         }
@@ -94,7 +97,7 @@ impl QueryRoot {
     ) -> Result<Vec<AttendanceDto>> {
         let tenant_id = require_tenant_id(ctx)?;
         let db = tenant_db(ctx, tenant_id).await?;
-        let scope = data_scope_from_context(ctx, SCOPE_RES_ATTENDANCE);
+        let scope = data_scope_from_context(ctx, PERM_ATTENDANCE_READ)?;
         let viewer = resolve_viewer_employee(ctx, &db, tenant_id).await?;
         let filt = resolve_employee_scope_filter(&db, tenant_id, scope, viewer)
             .await
@@ -119,7 +122,11 @@ impl QueryRoot {
         let employee_id = resolve_client_employee_id(ctx, &db, tenant_id)
             .await
             .map_err(KabiPayError::into_graphql)?;
-        let (from_date, to_date) = self_attendance_date_range(from_date, to_date)?;
+        let clock = TenantBusinessClock::load(ops_db(ctx)?, tenant_id)
+            .await
+            .map_err(KabiPayError::into_graphql)?;
+        let (from_date, to_date) =
+            self_attendance_date_range(from_date, to_date, clock.now_date())?;
         let page = attendance_management_service::list_my_attendance(
             &db,
             tenant_id,
@@ -217,8 +224,106 @@ impl QueryRoot {
         })
     }
 
+    /// Policy-derived, cursor-paginated daily attendance report for the caller's
+    /// exact `attendance:read` scope.
+    async fn attendance_daily_report(
+        &self,
+        ctx: &Context<'_>,
+        from_date: NaiveDate,
+        to_date: NaiveDate,
+        employee_id: Option<ID>,
+        employee_search: Option<String>,
+        first: Option<i32>,
+        after: Option<String>,
+    ) -> Result<AttendanceDailyReportConnectionDto> {
+        let tenant_id = require_tenant_id(ctx)?;
+        let db = tenant_db(ctx, tenant_id).await?;
+        let scope = data_scope_from_context(ctx, PERM_ATTENDANCE_READ)?;
+        let viewer = resolve_viewer_employee(ctx, &db, tenant_id).await?;
+        let filter = resolve_employee_scope_filter(&db, tenant_id, scope, viewer)
+            .await
+            .map_err(KabiPayError::into_graphql)?;
+        let employee_id = employee_id
+            .as_ref()
+            .map(|value| parse_uuid(value, "employeeId"))
+            .transpose()?;
+        let clock = TenantBusinessClock::load(ops_db(ctx)?, tenant_id)
+            .await
+            .map_err(KabiPayError::into_graphql)?;
+        let report = attendance_report_service::attendance_report(
+            &db,
+            tenant_id,
+            &filter,
+            clock,
+            from_date,
+            to_date,
+            employee_id,
+            employee_search.as_deref(),
+            first,
+            after.as_deref(),
+        )
+        .await
+        .map_err(KabiPayError::into_graphql)?;
+        Ok(AttendanceDailyReportConnectionDto {
+            edges: report
+                .page
+                .rows
+                .into_iter()
+                .map(|row| AttendanceDailyReportEdgeDto {
+                    cursor: attendance_report_service::cursor_for_row(&row),
+                    node: row.into(),
+                })
+                .collect(),
+            page_info: AttendancePageInfoDto {
+                end_cursor: report.page.end_cursor,
+                has_next_page: report.page.has_next_page,
+            },
+        })
+    }
+
+    /// Complete summary over the same authorized and filtered projection used
+    /// by `attendanceDailyReport`; it is never derived from a browser page.
+    async fn attendance_report_summary(
+        &self,
+        ctx: &Context<'_>,
+        from_date: NaiveDate,
+        to_date: NaiveDate,
+        employee_id: Option<ID>,
+        employee_search: Option<String>,
+    ) -> Result<AttendanceReportSummaryDto> {
+        let tenant_id = require_tenant_id(ctx)?;
+        let db = tenant_db(ctx, tenant_id).await?;
+        let scope = data_scope_from_context(ctx, PERM_ATTENDANCE_READ)?;
+        let viewer = resolve_viewer_employee(ctx, &db, tenant_id).await?;
+        let filter = resolve_employee_scope_filter(&db, tenant_id, scope, viewer)
+            .await
+            .map_err(KabiPayError::into_graphql)?;
+        let employee_id = employee_id
+            .as_ref()
+            .map(|value| parse_uuid(value, "employeeId"))
+            .transpose()?;
+        let clock = TenantBusinessClock::load(ops_db(ctx)?, tenant_id)
+            .await
+            .map_err(KabiPayError::into_graphql)?;
+        let report = attendance_report_service::attendance_report(
+            &db,
+            tenant_id,
+            &filter,
+            clock,
+            from_date,
+            to_date,
+            employee_id,
+            employee_search.as_deref(),
+            Some(1),
+            None,
+        )
+        .await
+        .map_err(KabiPayError::into_graphql)?;
+        Ok(report.summary.into())
+    }
+
     /// Multi-segment punch for one work day: total worked minutes and all segments
-    /// (JWT employee; `workDate` defaults to today, UTC `work_date` calendar).
+    /// (JWT employee; `workDate` defaults to today in the tenant business timezone).
     async fn punch_day_summary(
         &self,
         ctx: &Context<'_>,
@@ -238,7 +343,10 @@ impl QueryRoot {
         let employee_id = resolve_client_employee_id(ctx, &db, tenant_id)
             .await
             .map_err(KabiPayError::into_graphql)?;
-        let date = work_date.unwrap_or_else(|| Utc::now().date_naive());
+        let clock = TenantBusinessClock::load(ops_db(ctx)?, tenant_id)
+            .await
+            .map_err(KabiPayError::into_graphql)?;
+        let date = work_date.unwrap_or_else(|| clock.now_date());
         let s = attendance_service::punch_day_summary(&db, tenant_id, employee_id, date)
             .await
             .map_err(KabiPayError::into_graphql)?;
@@ -254,7 +362,10 @@ impl QueryRoot {
     ) -> Result<Vec<HolidayEntryDto>> {
         let tenant_id = require_tenant_id(ctx)?;
         let db = tenant_db(ctx, tenant_id).await?;
-        let from = from_date.unwrap_or_else(|| Utc::now().naive_utc().date());
+        let clock = TenantBusinessClock::load(ops_db(ctx)?, tenant_id)
+            .await
+            .map_err(KabiPayError::into_graphql)?;
+        let from = from_date.unwrap_or_else(|| clock.now_date());
         let rows = attendance_service::list_upcoming_holidays(&db, tenant_id, from, limit)
             .await
             .map_err(KabiPayError::into_graphql)?;
@@ -282,7 +393,7 @@ impl QueryRoot {
                 .await
                 .map_err(KabiPayError::into_graphql)?
         };
-        let scope = data_scope_from_context(ctx, SCOPE_RES_TIMESHEET);
+        let scope = data_scope_from_context(ctx, PERM_TIMESHEET_READ)?;
         let viewer = resolve_viewer_employee(ctx, &db, tenant_id).await?;
         let filt = resolve_employee_scope_filter(&db, tenant_id, scope, viewer)
             .await
@@ -433,7 +544,7 @@ impl QueryRoot {
         let db = tenant_db(ctx, tenant_id).await?;
         // Use `timesheet` resource so JWT `resource_scopes` matches `permission_scope` (e.g. LINE_MANAGER TEAM).
         // `attendance` defaults to Self for managers and would hide direct reports' batches.
-        let scope = data_scope_from_context(ctx, SCOPE_RES_TIMESHEET);
+        let scope = data_scope_from_context(ctx, PERM_TIMESHEET_APPROVE)?;
         let viewer = resolve_viewer_employee(ctx, &db, tenant_id).await?;
         let filt = resolve_employee_scope_filter(&db, tenant_id, scope, viewer)
             .await

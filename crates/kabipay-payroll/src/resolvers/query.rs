@@ -5,7 +5,7 @@ use kabipay_common::{
     client_data_scope::{
         data_scope_from_context, resolve_employee_scope_filter, resolve_viewer_employee,
     },
-    context::SCOPE_RES_EMPLOYEE,
+    context::PERM_EMPLOYEE_READ,
     file_download_token::{file_download_claims, public_employee_file_download_url},
     subgraph::{require_client_claims, require_tenant_id, resolve_client_employee_id, tenant_db},
     KabiPayError,
@@ -223,7 +223,7 @@ impl QueryRoot {
         let Some((p, c)) = row else {
             return Ok(None);
         };
-        let scope = data_scope_from_context(ctx, SCOPE_RES_EMPLOYEE);
+        let scope = data_scope_from_context(ctx, PERM_EMPLOYEE_READ)?;
         let viewer = resolve_viewer_employee(ctx, &db, tenant_id).await?;
         let filt = resolve_employee_scope_filter(&db, tenant_id, scope, viewer)
             .await
@@ -251,7 +251,7 @@ impl QueryRoot {
                 .await
                 .map_err(KabiPayError::into_graphql)?
         };
-        let scope = data_scope_from_context(ctx, SCOPE_RES_EMPLOYEE);
+        let scope = data_scope_from_context(ctx, PERM_EMPLOYEE_READ)?;
         let viewer = resolve_viewer_employee(ctx, &db, tenant_id).await?;
         let filt = resolve_employee_scope_filter(&db, tenant_id, scope, viewer)
             .await
@@ -277,7 +277,7 @@ impl QueryRoot {
     }
 
     /// **India — monthly TDS summary (CSV).** All payslips for the payroll cycle matching
-    /// `month` + `calendar year`. Requires `payroll:statutory_export` or HR / tenant admin role.
+    /// `month` + `calendar year`. Requires `payroll:statutory_export`.
     /// Stub for statutory filing prep — not a filed Form 24Q; values come from `payslip.tds_amount`.
     async fn india_tds_monthly_summary_csv(
         &self,
@@ -290,7 +290,7 @@ impl QueryRoot {
         if !claims.can_export_payroll_statutory() {
             return Err(
                 KabiPayError::Forbidden(
-                    "payroll statutory export requires payroll:statutory_export or HR / tenant admin role"
+                    "payroll statutory export requires payroll:statutory_export"
                         .into(),
                 )
                 .into_graphql(),
@@ -315,7 +315,7 @@ impl QueryRoot {
         if !claims.can_export_payroll_statutory() {
             return Err(
                 KabiPayError::Forbidden(
-                    "payroll statutory export requires payroll:statutory_export or HR / tenant admin role"
+                    "payroll statutory export requires payroll:statutory_export"
                         .into(),
                 )
                 .into_graphql(),
@@ -341,7 +341,7 @@ impl QueryRoot {
         if !claims.can_export_payroll_statutory() {
             return Err(
                 KabiPayError::Forbidden(
-                    "payroll bank transfer export requires payroll:statutory_export or HR / tenant admin role"
+                    "payroll bank transfer export requires payroll:statutory_export"
                         .into(),
                 )
                 .into_graphql(),
@@ -366,7 +366,7 @@ impl QueryRoot {
         if !claims.can_export_payroll_statutory() {
             return Err(
                 KabiPayError::Forbidden(
-                    "payroll bulk credit export requires payroll:statutory_export or HR / tenant admin role"
+                    "payroll bulk credit export requires payroll:statutory_export"
                         .into(),
                 )
                 .into_graphql(),
@@ -390,7 +390,7 @@ impl QueryRoot {
         if !claims.can_export_payroll_statutory() {
             return Err(
                 KabiPayError::Forbidden(
-                    "payroll FY totals export requires payroll:statutory_export or HR / tenant admin role"
+                    "payroll FY totals export requires payroll:statutory_export"
                         .into(),
                 )
                 .into_graphql(),
@@ -414,7 +414,7 @@ impl QueryRoot {
         if !claims.can_export_payroll_statutory() {
             return Err(
                 KabiPayError::Forbidden(
-                    "payroll FY quarter totals export requires payroll:statutory_export or HR / tenant admin role"
+                    "payroll FY quarter totals export requires payroll:statutory_export"
                         .into(),
                 )
                 .into_graphql(),
@@ -442,7 +442,7 @@ impl QueryRoot {
         if !claims.can_export_payroll_statutory() {
             return Err(
                 KabiPayError::Forbidden(
-                    "payroll Form 16 Part B prep export requires payroll:statutory_export or HR / tenant admin role"
+                    "payroll Form 16 Part B prep export requires payroll:statutory_export"
                         .into(),
                 )
                 .into_graphql(),
@@ -467,7 +467,7 @@ impl QueryRoot {
         if !claims.can_export_payroll_statutory() {
             return Err(
                 KabiPayError::Forbidden(
-                    "payroll Form 24Q stub export requires payroll:statutory_export or HR / tenant admin role"
+                    "payroll Form 24Q stub export requires payroll:statutory_export"
                         .into(),
                 )
                 .into_graphql(),
@@ -492,7 +492,7 @@ impl QueryRoot {
         if !claims.can_export_payroll_statutory() {
             return Err(
                 KabiPayError::Forbidden(
-                    "payroll EPF ECR prep export requires payroll:statutory_export or HR / tenant admin role"
+                    "payroll EPF ECR prep export requires payroll:statutory_export"
                         .into(),
                 )
                 .into_graphql(),
@@ -515,7 +515,7 @@ impl QueryRoot {
         if !claims.can_export_payroll_statutory() {
             return Err(
                 KabiPayError::Forbidden(
-                    "payroll arrear list requires payroll:statutory_export or HR / tenant admin"
+                    "payroll arrear list requires payroll:statutory_export"
                         .into(),
                 )
                 .into_graphql(),

@@ -16,6 +16,7 @@ use crate::resolvers::types::{
 };
 use crate::services::announcement_storage;
 use crate::services::notification_preference;
+use crate::services::notification_action;
 use crate::services::notification_service;
 
 fn parse_uuid(id: &ID, field: &'static str) -> Result<Uuid> {
@@ -464,7 +465,7 @@ impl MutationRoot {
         let claims = require_client_claims(ctx)?;
         if !claims.can_manage_notifications() {
             return Err(
-                KabiPayError::Forbidden("notification:manage or equivalent role required".into())
+                KabiPayError::Forbidden("notification:manage permission required".into())
                     .into_graphql(),
             );
         }
@@ -475,6 +476,11 @@ impl MutationRoot {
             .iter()
             .map(|id| parse_uuid(id, "userId"))
             .collect();
+        let action_url = match input.action_url {
+            Some(raw) => notification_action::NotificationAction::parse_internal_route(&raw)
+                .map_err(KabiPayError::into_graphql)?,
+            None => None,
+        };
         notification_service::create_notifications_for_users(
             &db,
             tenant_id,
@@ -482,7 +488,7 @@ impl MutationRoot {
             input.kind,
             input.title,
             input.message,
-            input.action_url,
+            action_url,
         )
         .await
         .map_err(KabiPayError::into_graphql)
@@ -496,7 +502,7 @@ impl MutationRoot {
         let claims = require_client_claims(ctx)?;
         if !claims.can_manage_notifications() {
             return Err(
-                KabiPayError::Forbidden("notification:manage or equivalent role required".into())
+                KabiPayError::Forbidden("notification:manage permission required".into())
                     .into_graphql(),
             );
         }
@@ -511,7 +517,14 @@ impl MutationRoot {
                 kind: input.kind,
                 title: input.title,
                 message: input.message,
-                action_url: input.action_url,
+                action_url: match input.action_url {
+                    Some(raw) => Some(
+                        notification_action::NotificationAction::parse_internal_route(&raw)
+                            .map_err(KabiPayError::into_graphql)?
+                            .map(notification_action::NotificationAction::into_string),
+                    ),
+                    None => None,
+                },
             },
         )
         .await
@@ -523,7 +536,7 @@ impl MutationRoot {
         let claims = require_client_claims(ctx)?;
         if !claims.can_manage_notifications() {
             return Err(
-                KabiPayError::Forbidden("notification:manage or equivalent role required".into())
+                KabiPayError::Forbidden("notification:manage permission required".into())
                     .into_graphql(),
             );
         }

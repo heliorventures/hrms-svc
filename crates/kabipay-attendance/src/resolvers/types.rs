@@ -2,7 +2,10 @@
 
 use async_graphql::{ComplexObject, Context, InputObject, Result, SimpleObject, ID};
 use chrono::{DateTime, NaiveDate, NaiveTime, Utc};
+use kabipay_common::client_data_scope::{data_scope_from_context, resolve_viewer_employee};
+use kabipay_common::context::PERM_TIMESHEET_APPROVE;
 use kabipay_common::subgraph::{require_client_claims, require_tenant_id, tenant_db};
+use kabipay_common::workflow_approval::WorkflowApprovalAuthority;
 use kabipay_common::KabiPayError;
 use kabipay_db_entities::tenant::d0010_time_shift_roster::{
     attendance, holiday, holiday_calendar, shift, timesheet_entry, timesheet_week_batch,
@@ -18,6 +21,9 @@ use crate::services::timesheet_batch_service;
 
 use crate::services::attendance_service::PunchDaySummary;
 use crate::services::attendance_management_service::ManagedAttendanceRow;
+use crate::services::attendance_report_service::{
+    AttendanceDailyReportRow, AttendanceReportSummary,
+};
 
 #[derive(SimpleObject, Clone, Debug)]
 #[graphql(name = "Shift")]
@@ -127,6 +133,86 @@ pub struct AttendanceConnectionDto {
 pub struct ManagedAttendanceConnectionDto {
     pub edges: Vec<ManagedAttendanceEdgeDto>,
     pub page_info: AttendancePageInfoDto,
+}
+
+#[derive(SimpleObject, Clone, Debug)]
+#[graphql(name = "AttendanceDailyReportRow")]
+pub struct AttendanceDailyReportRowDto {
+    pub employee_id: ID,
+    pub employee_name: String,
+    pub employee_code: String,
+    pub work_date: NaiveDate,
+    pub timezone: String,
+    pub first_check_in_at: Option<DateTime<Utc>>,
+    pub last_check_out_at: Option<DateTime<Utc>>,
+    pub logged_minutes: i32,
+    pub expected_minutes: Option<i32>,
+    pub status: String,
+    pub segment_count: i32,
+}
+
+impl From<AttendanceDailyReportRow> for AttendanceDailyReportRowDto {
+    fn from(row: AttendanceDailyReportRow) -> Self {
+        Self {
+            employee_id: ID(row.employee_id.to_string()),
+            employee_name: row.employee_name,
+            employee_code: row.employee_code,
+            work_date: row.work_date,
+            timezone: row.timezone,
+            first_check_in_at: row.first_check_in_at,
+            last_check_out_at: row.last_check_out_at,
+            logged_minutes: row.logged_minutes,
+            expected_minutes: row.expected_minutes,
+            status: row.status.as_str().into(),
+            segment_count: row.segment_count,
+        }
+    }
+}
+
+#[derive(SimpleObject, Clone, Debug)]
+#[graphql(name = "AttendanceDailyReportEdge")]
+pub struct AttendanceDailyReportEdgeDto {
+    pub cursor: String,
+    pub node: AttendanceDailyReportRowDto,
+}
+
+#[derive(SimpleObject, Clone, Debug)]
+#[graphql(name = "AttendanceDailyReportConnection")]
+pub struct AttendanceDailyReportConnectionDto {
+    pub edges: Vec<AttendanceDailyReportEdgeDto>,
+    pub page_info: AttendancePageInfoDto,
+}
+
+#[derive(SimpleObject, Clone, Debug)]
+#[graphql(name = "AttendanceReportSummary")]
+pub struct AttendanceReportSummaryDto {
+    pub total_days: i32,
+    pub present_days: i32,
+    pub half_days: i32,
+    pub absent_days: i32,
+    pub on_leave_days: i32,
+    pub holiday_days: i32,
+    pub weekly_off_days: i32,
+    pub incomplete_days: i32,
+    pub unscheduled_days: i32,
+    pub total_logged_minutes: i64,
+}
+
+impl From<AttendanceReportSummary> for AttendanceReportSummaryDto {
+    fn from(summary: AttendanceReportSummary) -> Self {
+        Self {
+            total_days: summary.total_days,
+            present_days: summary.present_days,
+            half_days: summary.half_days,
+            absent_days: summary.absent_days,
+            on_leave_days: summary.on_leave_days,
+            holiday_days: summary.holiday_days,
+            weekly_off_days: summary.weekly_off_days,
+            incomplete_days: summary.incomplete_days,
+            unscheduled_days: summary.unscheduled_days,
+            total_logged_minutes: summary.total_logged_minutes,
+        }
+    }
 }
 
 /// Optional client GPS (browser / mobile) for the **current** punch (in or out).
@@ -249,6 +335,12 @@ impl TimesheetWeekBatchDto {
         let tenant_id = require_tenant_id(ctx)?;
         let db = tenant_db(ctx, tenant_id).await?;
         let claims = require_client_claims(ctx)?;
+        let authority = WorkflowApprovalAuthority {
+            actor_user_id: claims.sub,
+            actor_employee: resolve_viewer_employee(ctx, &db, tenant_id).await?,
+            scope: data_scope_from_context(ctx, PERM_TIMESHEET_APPROVE)?,
+            permission: PERM_TIMESHEET_APPROVE,
+        };
         let employee_id = parse_uuid(&self.employee_id, "employeeId")?;
         let wf = self
             .workflow_instance_id
@@ -258,10 +350,10 @@ impl TimesheetWeekBatchDto {
         timesheet_batch_service::timesheet_week_batch_viewer_may_approve(
             &db,
             tenant_id,
-            claims.sub,
             &self.status,
             employee_id,
             wf,
+            &authority,
         )
         .await
         .map_err(KabiPayError::into_graphql)

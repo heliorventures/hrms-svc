@@ -6,12 +6,14 @@ use anyhow::Context;
 use chrono::{Duration as ChronoDuration, Utc};
 use hmac::{Hmac, Mac};
 use kabipay_common::db::{connect_ops_db, resolve_tenant_db, TenantDbCache, TenantDbConfig};
+use kabipay_common::due_offboarding::process_due_separations;
 use kabipay_common::load_dotenv;
 use kabipay_common::private_file_cleanup::{
     process_private_file_cleanup_tasks, sweep_expired_company_upload_stages,
 };
 use kabipay_common::subgraph::{ops_dsn_from_env, tenant_db_config_from_env};
 use kabipay_common::telemetry::init_tracing;
+use kabipay_common::tenant_business_clock::TenantBusinessClock;
 use kabipay_db_entities::ops::tenant_database;
 use kabipay_db_entities::tenant::d0026_integrations::{webhook_delivery_log, webhook_subscription};
 use kabipay_db_entities::tenant::d0030_outbox_events::outbox_event;
@@ -514,6 +516,16 @@ async fn main() -> anyhow::Result<()> {
                 for tid in tenants {
                     match resolve_tenant_db(tid, &ops_db, &cache, &fallback).await {
                         Ok(tdb) => {
+                            match TenantBusinessClock::load(&ops_db, tid).await {
+                                Ok(clock) => match process_due_separations(&tdb, tid, clock.now_date()).await {
+                                    Ok(result) if result.processed > 0 => {
+                                        tracing::info!(%tid, processed = result.processed, "due employee offboarding completed");
+                                    }
+                                    Ok(_) => {}
+                                    Err(error) => tracing::error!(%tid, code = error.code(), "due employee offboarding sweep failed"),
+                                },
+                                Err(error) => tracing::error!(%tid, code = error.code(), "tenant business clock unavailable for offboarding sweep"),
+                            }
                             if let Err(error) = sweep_expired_company_upload_stages(&tdb, tid, 25).await {
                                 tracing::error!(%tid, code = error.code(), "expired file-upload stage sweep failed");
                             }

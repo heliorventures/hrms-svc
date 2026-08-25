@@ -598,6 +598,7 @@ async fn issue_client_tokens(
         must_change_password,
         authorization.roles,
         authorization.permissions,
+        authorization.permission_scopes,
         authorization.resource_scopes,
     )?;
     // Prefix refresh with tenant id so `client_refresh` / `client_logout`

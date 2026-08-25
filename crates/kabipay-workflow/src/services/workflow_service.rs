@@ -68,7 +68,7 @@ pub async fn get_workflow(
         .map_err(KabiPayError::from)
 }
 
-/// HR / tenant admin: new approval **definition** row.
+/// Create a new approval definition after resolver permission enforcement.
 pub async fn create_workflow(
     db: &DatabaseConnection,
     tenant_id: Uuid,
@@ -99,16 +99,46 @@ pub async fn create_workflow_step(
     step_name: String,
     approver_type: Option<String>,
     approver_role_id: Option<Uuid>,
+    approver_permission: Option<String>,
     can_skip: bool,
     sla_hours: Option<i32>,
 ) -> KabiPayResult<workflow_step::Model> {
-    if get_workflow(db, tenant_id, workflow_id).await?.is_none() {
-        return Err(KabiPayError::NotFound {
+    let workflow = get_workflow(db, tenant_id, workflow_id).await?.ok_or_else(|| {
+        KabiPayError::NotFound {
             entity: "workflow",
             id: workflow_id.to_string(),
-        });
+        }
+    })?;
+    let inferred_permission = match workflow.entity_type.trim().to_ascii_uppercase().as_str() {
+        "LEAVE_REQUEST" => Some("leave:approve"),
+        "EXPENSE" | "TRAVEL_REQUEST" => Some("expense:approve"),
+        "TIMESHEET_WEEK_BATCH" => Some("timesheet:approve"),
+        _ => None,
+    };
+    let approver_permission = approver_permission
+        .and_then(|value| {
+            let normalized = value.trim().to_ascii_lowercase();
+            (!normalized.is_empty()).then_some(normalized)
+        })
+        .or_else(|| inferred_permission.map(str::to_owned));
+    let approver_type = approver_type.map(|value| {
+        match value.trim().to_ascii_uppercase().as_str() {
+            "ROLE" => "PERMISSION".to_owned(),
+            "REPORTING_MANAGER_OR_ROLE" | "MANAGER_OR_ROLE" => {
+                "REPORTING_MANAGER_OR_PERMISSION".to_owned()
+            }
+            other => other.to_owned(),
+        }
+    });
+    let permission_type = matches!(
+        approver_type.as_deref(),
+        Some("PERMISSION" | "REPORTING_MANAGER_OR_PERMISSION" | "MANAGER_OR_PERMISSION")
+    );
+    if permission_type && approver_permission.is_none() {
+        return Err(KabiPayError::Validation(
+            "permission-based workflow steps require approverPermission".into(),
+        ));
     }
-
     let dupe = workflow_step::Entity::find()
         .filter(workflow_step::Column::TenantId.eq(tenant_id))
         .filter(workflow_step::Column::WorkflowId.eq(workflow_id))
@@ -131,7 +161,8 @@ pub async fn create_workflow_step(
         sequence_order: Set(sequence_order),
         step_name: Set(step_name),
         approver_type: Set(approver_type),
-        approver_role_id: Set(approver_role_id),
+        approver_role_id: Set(if permission_type { None } else { approver_role_id }),
+        approver_permission: Set(approver_permission),
         can_skip: Set(can_skip),
         sla_hours: Set(sla_hours),
         created_at: Set(now),

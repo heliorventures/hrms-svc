@@ -5,7 +5,7 @@ use kabipay_common::{
     client_data_scope::{
         data_scope_from_context, resolve_employee_scope_filter, resolve_viewer_employee,
     },
-    context::SCOPE_RES_EXPENSE,
+    context::PERM_EXPENSE_READ,
     subgraph::{
         require_client_claims, require_tenant_id, resolve_client_employee_id, tenant_db,
     },
@@ -62,7 +62,7 @@ impl QueryRoot {
     ) -> Result<Vec<ExpenseDto>> {
         let tenant_id = require_tenant_id(ctx)?;
         let db = tenant_db(ctx, tenant_id).await?;
-        let scope = data_scope_from_context(ctx, SCOPE_RES_EXPENSE);
+        let scope = data_scope_from_context(ctx, PERM_EXPENSE_READ)?;
         let viewer = resolve_viewer_employee(ctx, &db, tenant_id).await?;
         let filt = resolve_employee_scope_filter(&db, tenant_id, scope, viewer)
             .await
@@ -81,7 +81,7 @@ impl QueryRoot {
     ) -> Result<Vec<TravelRequestDto>> {
         let tenant_id = require_tenant_id(ctx)?;
         let db = tenant_db(ctx, tenant_id).await?;
-        let scope = data_scope_from_context(ctx, SCOPE_RES_EXPENSE);
+        let scope = data_scope_from_context(ctx, PERM_EXPENSE_READ)?;
         let viewer = resolve_viewer_employee(ctx, &db, tenant_id).await?;
         let filt = resolve_employee_scope_filter(&db, tenant_id, scope, viewer)
             .await

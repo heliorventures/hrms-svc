@@ -33,7 +33,7 @@ impl MutationRoot {
         if !claims.can_export_payroll_statutory() {
             return Err(
                 KabiPayError::Forbidden(
-                    "create payroll arrear requires payroll:statutory_export or HR / tenant admin"
+                    "create payroll arrear requires payroll:statutory_export"
                         .into(),
                 )
                 .into_graphql(),
@@ -185,7 +185,7 @@ impl MutationRoot {
     }
 
     /// Create a **DRAFT** payroll cycle for a calendar month/year (one per tenant per period in v1).
-    /// Same RBAC as **run payroll** (statutory export / HR / tenant admin).
+    /// Same authorization as **run payroll**: `payroll:statutory_export`.
     async fn create_payroll_cycle(
         &self,
         ctx: &Context<'_>,
@@ -195,7 +195,7 @@ impl MutationRoot {
         if !claims.can_export_payroll_statutory() {
             return Err(
                 KabiPayError::Forbidden(
-                    "create payroll cycle requires payroll:statutory_export or HR / tenant admin role"
+                    "create payroll cycle requires payroll:statutory_export"
                         .into(),
                 )
                 .into_graphql(),
@@ -226,7 +226,7 @@ impl MutationRoot {
         if !claims.can_export_payroll_statutory() {
             return Err(
                 KabiPayError::Forbidden(
-                    "upsert payroll compliance setting requires payroll:statutory_export or HR / tenant admin role"
+                    "upsert payroll compliance setting requires payroll:statutory_export"
                         .into(),
                 )
                 .into_graphql(),
@@ -267,7 +267,7 @@ impl MutationRoot {
         if !claims.can_export_payroll_statutory() {
             return Err(
                 KabiPayError::Forbidden(
-                    "run payroll requires payroll:statutory_export or HR / tenant admin role"
+                    "run payroll requires payroll:statutory_export"
                         .into(),
                 )
                 .into_graphql(),

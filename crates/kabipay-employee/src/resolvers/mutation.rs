@@ -4,7 +4,10 @@ use async_graphql::{Context, Object, Result, ID};
 use kabipay_common::{
     context::ClientClaims,
     password,
-    subgraph::{require_client_claims, require_tenant_id, resolve_client_employee_id, tenant_db},
+    subgraph::{
+        ops_db, require_client_claims, require_tenant_id, resolve_client_employee_id, tenant_db,
+    },
+    tenant_business_clock::TenantBusinessClock,
     KabiPayError,
 };
 use uuid::Uuid;
@@ -190,8 +193,7 @@ async fn hash_password_async(plaintext: String) -> Result<String> {
 
 /// Enforce RBAC for directory-changing employee writes.
 ///
-/// - Valid **client JWT** must include `employee:write` or `employee:manage`, **or** role
-///   `HR_ADMIN` / `TENANT_ADMIN` / `ORG_ADMIN` (from loaded `user_role` at login).
+/// - Valid **client JWT** must include `employee:write` or `employee:manage`.
 /// - **Dev only:** set `KABIPAY_EMPLOYEE_MUTATION_HEADER_OK=1` to allow unauthenticated
 ///   `x-tenant-id` (no claims) for local automation — never in production.
 fn require_employee_mutation_rbac(ctx: &Context<'_>) -> Result<()> {
@@ -204,7 +206,7 @@ fn require_employee_mutation_rbac(ctx: &Context<'_>) -> Result<()> {
     let claims = require_client_claims(ctx)?;
     if !claims.can_manage_employee_directory() {
         return Err(KabiPayError::Forbidden(
-            "employee:write, employee:manage, or HR_ADMIN / TENANT_ADMIN role required".into(),
+            "employee:write or employee:manage permission is required".into(),
         )
         .into_graphql());
     }
@@ -1307,7 +1309,7 @@ impl MutationRoot {
                 e
             } else {
                 return Err(KabiPayError::Forbidden(
-                    "only HR can file separation for another employee".into(),
+                    "employee directory or onboarding management permission is required to file for another employee".into(),
                 )
                 .into_graphql());
             }
@@ -1356,10 +1358,21 @@ impl MutationRoot {
         let claims = require_client_claims(ctx)?;
         let tenant_id = require_tenant_id(ctx)?;
         let db = tenant_db(ctx, tenant_id).await?;
-        let sid = parse_uuid(&separation_id, "separationId")?;
-        let m = separation_service::resolve_separation(&db, tenant_id, sid, true, claims.sub)
+        let business_date = TenantBusinessClock::load(ops_db(ctx)?, tenant_id)
             .await
-            .map_err(KabiPayError::into_graphql)?;
+            .map_err(KabiPayError::into_graphql)?
+            .now_date();
+        let sid = parse_uuid(&separation_id, "separationId")?;
+        let m = separation_service::resolve_separation(
+            &db,
+            tenant_id,
+            sid,
+            true,
+            claims.sub,
+            business_date,
+        )
+        .await
+        .map_err(KabiPayError::into_graphql)?;
         Ok(SeparationDto::from(m))
     }
 
@@ -1374,9 +1387,16 @@ impl MutationRoot {
         let tenant_id = require_tenant_id(ctx)?;
         let db = tenant_db(ctx, tenant_id).await?;
         let sid = parse_uuid(&separation_id, "separationId")?;
-        let m = separation_service::resolve_separation(&db, tenant_id, sid, false, claims.sub)
-            .await
-            .map_err(KabiPayError::into_graphql)?;
+        let m = separation_service::resolve_separation(
+            &db,
+            tenant_id,
+            sid,
+            false,
+            claims.sub,
+            chrono::Utc::now().date_naive(),
+        )
+        .await
+        .map_err(KabiPayError::into_graphql)?;
         Ok(SeparationDto::from(m))
     }
 

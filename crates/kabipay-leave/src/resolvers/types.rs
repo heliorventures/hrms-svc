@@ -1,9 +1,17 @@
 //! GraphQL DTOs for kabipay-leave.
 
-use async_graphql::{InputObject, SimpleObject, ID};
+use async_graphql::{ComplexObject, Context, InputObject, Result, SimpleObject, ID};
 use chrono::{DateTime, NaiveDate, Utc};
+use kabipay_common::client_data_scope::resolve_viewer_employee;
+use kabipay_common::context::PERM_LEAVE_APPROVE;
+use kabipay_common::subgraph::{require_client_claims, require_tenant_id, tenant_db};
+use kabipay_common::workflow_approval::WorkflowApprovalAuthority;
+use kabipay_common::KabiPayError;
 use kabipay_db_entities::tenant::d0011_leave::{leave_balance, leave_policy, leave_request, leave_type};
 use kabipay_db_entities::tenant::d0025_workflow::workflow_action;
+
+use crate::resolvers::query::parse_uuid;
+use crate::services::leave_service;
 
 #[derive(SimpleObject, Clone, Debug)]
 #[graphql(name = "LeaveType")]
@@ -98,6 +106,7 @@ impl LeaveWorkflowActionDto {
 }
 
 #[derive(SimpleObject, Clone, Debug)]
+#[graphql(complex)]
 #[graphql(name = "LeaveRequest")]
 pub struct LeaveRequestDto {
     pub id: ID,
@@ -155,6 +164,58 @@ impl From<leave_balance::Model> for LeaveBalanceDto {
             created_at: m.created_at,
             updated_at: m.updated_at,
         }
+    }
+}
+
+#[ComplexObject]
+impl LeaveRequestDto {
+    async fn pending_approval_stage(&self, ctx: &Context<'_>) -> Result<Option<String>> {
+        let tenant_id = require_tenant_id(ctx)?;
+        let db = tenant_db(ctx, tenant_id).await?;
+        let workflow_instance_id = self
+            .workflow_instance_id
+            .as_ref()
+            .map(|id| parse_uuid(id, "workflowInstanceId"))
+            .transpose()?;
+        leave_service::resolve_leave_pending_approval_stage(
+            &db,
+            tenant_id,
+            &self.status,
+            workflow_instance_id,
+        )
+        .await
+        .map_err(KabiPayError::into_graphql)
+    }
+
+    async fn viewer_may_approve(&self, ctx: &Context<'_>) -> Result<bool> {
+        let tenant_id = require_tenant_id(ctx)?;
+        let db = tenant_db(ctx, tenant_id).await?;
+        let claims = require_client_claims(ctx)?;
+        if !claims.has_any_permission(&[PERM_LEAVE_APPROVE]) {
+            return Ok(false);
+        }
+        let authority = WorkflowApprovalAuthority {
+            actor_user_id: claims.sub,
+            actor_employee: resolve_viewer_employee(ctx, &db, tenant_id).await?,
+            scope: claims.scope_for_permission(PERM_LEAVE_APPROVE),
+            permission: PERM_LEAVE_APPROVE,
+        };
+        let subject_employee_id = parse_uuid(&self.employee_id, "employeeId")?;
+        let workflow_instance_id = self
+            .workflow_instance_id
+            .as_ref()
+            .map(|id| parse_uuid(id, "workflowInstanceId"))
+            .transpose()?;
+        leave_service::leave_viewer_may_approve(
+            &db,
+            tenant_id,
+            &self.status,
+            subject_employee_id,
+            workflow_instance_id,
+            &authority,
+        )
+        .await
+        .map_err(KabiPayError::into_graphql)
     }
 }
 

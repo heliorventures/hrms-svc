@@ -224,6 +224,8 @@ pub mod attendance {
         pub work_date: NaiveDate,
         pub check_in_time: Option<NaiveTime>,
         pub check_out_time: Option<NaiveTime>,
+        pub check_in_at: Option<DateTimeUtc>,
+        pub check_out_at: Option<DateTimeUtc>,
         pub check_in_lat: Option<Decimal>,
         pub check_in_lng: Option<Decimal>,
         pub check_out_lat: Option<Decimal>,

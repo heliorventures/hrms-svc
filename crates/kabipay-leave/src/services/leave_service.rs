@@ -4,8 +4,9 @@
 
 use chrono::{Datelike, Duration, NaiveDate, Utc, Weekday};
 use kabipay_common::context::{ClientViewerEmployee, ScopeType};
-use kabipay_common::workflow_approval;
+use kabipay_common::workflow_approval::{self, WorkflowApprovalAuthority};
 use kabipay_common::workflow_current_step;
+use kabipay_common::workflow_inbox;
 use kabipay_common::{KabiPayError, KabiPayResult};
 use kabipay_db_entities::tenant::d0007_employee_core::employee;
 use kabipay_db_entities::tenant::d0010_time_shift_roster::{holiday, holiday_calendar};
@@ -349,6 +350,42 @@ const STATUS_APPROVED: &str = "APPROVED";
 const STATUS_REJECTED: &str = "REJECTED";
 const STATUS_CANCELLED: &str = "CANCELLED";
 
+pub async fn resolve_leave_pending_approval_stage(
+    db: &DatabaseConnection,
+    tenant_id: Uuid,
+    status: &str,
+    workflow_instance_id: Option<Uuid>,
+) -> KabiPayResult<Option<String>> {
+    workflow_inbox::pending_workflow_step_title(
+        db,
+        tenant_id,
+        status,
+        STATUS_PENDING,
+        workflow_instance_id,
+    )
+    .await
+}
+
+pub async fn leave_viewer_may_approve(
+    db: &DatabaseConnection,
+    tenant_id: Uuid,
+    status: &str,
+    subject_employee_id: Uuid,
+    workflow_instance_id: Option<Uuid>,
+    authority: &WorkflowApprovalAuthority,
+) -> KabiPayResult<bool> {
+    workflow_inbox::viewer_may_approve_pending_row(
+        db,
+        tenant_id,
+        subject_employee_id,
+        status,
+        STATUS_PENDING,
+        workflow_instance_id,
+        authority,
+    )
+    .await
+}
+
 fn normalize_half_day_request(
     from_date: NaiveDate,
     to_date: NaiveDate,
@@ -663,10 +700,18 @@ pub async fn approve_leave_request(
     db: &DatabaseConnection,
     tenant_id: Uuid,
     request_id: Uuid,
-    approver_user_id: Uuid,
+    authority: &WorkflowApprovalAuthority,
 ) -> KabiPayResult<leave_request::Model> {
     let txn = db.begin().await?;
     let model = load_pending_request_in_txn(&txn, tenant_id, request_id).await?;
+    workflow_approval::assert_subject_in_approval_scope(
+        &txn,
+        tenant_id,
+        model.employee_id,
+        authority,
+    )
+    .await?;
+    let approver_user_id = authority.actor_user_id;
     let now = Utc::now();
 
     if let Some(inst_id) = model.workflow_instance_id {
@@ -698,9 +743,9 @@ pub async fn approve_leave_request(
         workflow_approval::assert_workflow_step_actor(
             &txn,
             tenant_id,
-            approver_user_id,
             model.employee_id,
             &cur_step,
+            authority,
         )
         .await?;
 
@@ -763,20 +808,6 @@ pub async fn approve_leave_request(
         )
         .await?;
     } else {
-        if !workflow_approval::user_has_permission_via_roles(
-            &txn,
-            tenant_id,
-            approver_user_id,
-            "leave",
-            "approve",
-        )
-        .await?
-        {
-            return Err(KabiPayError::Forbidden(
-                "only users with leave approval permission may approve requests without a workflow"
-                    .into(),
-            ));
-        }
         let bal = if request_uses_leave_balance(&txn, tenant_id, &model).await? {
             Some(load_balance_for_request(&txn, tenant_id, &model).await?)
         } else {
@@ -817,28 +848,19 @@ pub async fn reject_leave_request(
     db: &DatabaseConnection,
     tenant_id: Uuid,
     request_id: Uuid,
-    rejector_user_id: Uuid,
+    authority: &WorkflowApprovalAuthority,
     rejection_reason: Option<String>,
 ) -> KabiPayResult<leave_request::Model> {
     let txn = db.begin().await?;
     let model = load_pending_request_in_txn(&txn, tenant_id, request_id).await?;
-
-    if model.workflow_instance_id.is_none() {
-        if !workflow_approval::user_has_permission_via_roles(
-            &txn,
-            tenant_id,
-            rejector_user_id,
-            "leave",
-            "approve",
-        )
-        .await?
-        {
-            return Err(KabiPayError::Forbidden(
-                "only users with leave approval permission may reject requests without a workflow"
-                    .into(),
-            ));
-        }
-    }
+    workflow_approval::assert_subject_in_approval_scope(
+        &txn,
+        tenant_id,
+        model.employee_id,
+        authority,
+    )
+    .await?;
+    let rejector_user_id = authority.actor_user_id;
 
     if let Some(inst_id) = model.workflow_instance_id {
         if let Some(mut inst) = workflow_instance::Entity::find_by_id(inst_id)
@@ -861,9 +883,9 @@ pub async fn reject_leave_request(
                     workflow_approval::assert_workflow_step_actor(
                         &txn,
                         tenant_id,
-                        rejector_user_id,
                         model.employee_id,
                         &st,
+                        authority,
                     )
                     .await?;
                     let act = workflow_action::ActiveModel {

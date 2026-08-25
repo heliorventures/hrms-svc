@@ -100,7 +100,7 @@ impl QueryRoot {
     }
 
     /// Deduction proof lines (declared vs actual) for an employee. Omit `employeeId` for self;
-    /// viewing another employee requires `tax:approve` (or HR / tenant admin role).
+    /// viewing another employee requires `tax:approve`.
     async fn tax_proof_lines(
         &self,
         ctx: &Context<'_>,

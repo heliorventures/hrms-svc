@@ -13,7 +13,22 @@ use uuid::Uuid;
 pub struct ClientAuthorization {
     pub roles: Vec<String>,
     pub permissions: Vec<String>,
+    pub permission_scopes: HashMap<String, String>,
     pub resource_scopes: HashMap<String, String>,
+}
+
+fn merge_permission_scope(
+    best: &mut HashMap<String, ScopeType>,
+    permission: String,
+    candidate: ScopeType,
+) {
+    best.entry(permission)
+        .and_modify(|current| {
+            if candidate.rank() > current.rank() {
+                *current = candidate;
+            }
+        })
+        .or_insert(candidate);
 }
 
 fn merge_resource_scope(
@@ -47,6 +62,7 @@ pub async fn load_client_authorization(
         return Ok(ClientAuthorization {
             roles: vec![],
             permissions: vec![],
+            permission_scopes: HashMap::new(),
             resource_scopes: HashMap::new(),
         });
     }
@@ -83,30 +99,45 @@ pub async fn load_client_authorization(
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect::<Vec<_>>();
-    let permissions = if permission_ids.is_empty() {
-        vec![]
+    let permission_rows = if permission_ids.is_empty() {
+        Vec::new()
     } else {
         permission::Entity::find()
             .filter(permission::Column::Id.is_in(permission_ids))
             .all(db)
             .await
             .map_err(|error| KabiPayError::from_tenant_db(tenant_id, error))?
-            .into_iter()
-            .map(|row| format!("{}:{}", row.resource, row.action))
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect()
     };
 
-    let mut best_scopes: HashMap<String, ScopeType> = HashMap::new();
+    let granted_permissions = permission_rows
+        .iter()
+        .map(|row| format!("{}:{}", row.resource, row.action).to_ascii_lowercase())
+        .collect::<BTreeSet<_>>();
+    let permissions = granted_permissions.iter().cloned().collect();
+
+    let mut best_permission_scopes: HashMap<String, ScopeType> = HashMap::new();
+    let mut best_resource_scopes: HashMap<String, ScopeType> = HashMap::new();
     for row in permission_scope_rows {
+        let permission = format!("{}:{}", row.resource, row.action).to_ascii_lowercase();
+        if !granted_permissions.contains(&permission) {
+            continue;
+        }
         let Some(scope) = ScopeType::parse_loose(&row.scope_type) else {
             continue;
         };
-        merge_resource_scope(&mut best_scopes, row.resource, scope);
+        merge_permission_scope(&mut best_permission_scopes, permission, scope);
+        merge_resource_scope(
+            &mut best_resource_scopes,
+            row.resource.to_ascii_lowercase(),
+            scope,
+        );
     }
 
-    let resource_scopes = best_scopes
+    let permission_scopes = best_permission_scopes
+        .into_iter()
+        .map(|(permission, scope)| (permission, scope.to_wire().to_string()))
+        .collect();
+    let resource_scopes = best_resource_scopes
         .into_iter()
         .map(|(resource, scope)| (resource, scope.to_wire().to_string()))
         .collect();
@@ -114,6 +145,7 @@ pub async fn load_client_authorization(
     Ok(ClientAuthorization {
         roles,
         permissions,
+        permission_scopes,
         resource_scopes,
     })
 }
@@ -129,5 +161,26 @@ mod tests {
         merge_resource_scope(&mut scopes, "employee".into(), ScopeType::All);
         merge_resource_scope(&mut scopes, "employee".into(), ScopeType::Team);
         assert_eq!(scopes.get("employee"), Some(&ScopeType::All));
+    }
+
+    #[test]
+    fn permission_scopes_do_not_broaden_other_actions() {
+        let mut scopes = HashMap::new();
+        merge_permission_scope(
+            &mut scopes,
+            "attendance:read".into(),
+            ScopeType::All,
+        );
+        merge_permission_scope(
+            &mut scopes,
+            "attendance:regularize".into(),
+            ScopeType::Self_,
+        );
+
+        assert_eq!(scopes.get("attendance:read"), Some(&ScopeType::All));
+        assert_eq!(
+            scopes.get("attendance:regularize"),
+            Some(&ScopeType::Self_)
+        );
     }
 }

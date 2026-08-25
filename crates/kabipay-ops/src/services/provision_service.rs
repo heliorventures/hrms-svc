@@ -118,7 +118,7 @@ pub async fn provision_tenant(
         status: Set("PROVISIONING".into()),
         plan: Set(None),
         country: Set(Some(country.clone())),
-        timezone: Set(None),
+        timezone: Set(Some("UTC".into())),
         currency: Set(Some(currency.clone())),
         gstin: Set(None),
         pan: Set(None),

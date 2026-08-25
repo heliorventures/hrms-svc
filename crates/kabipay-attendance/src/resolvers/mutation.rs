@@ -2,10 +2,14 @@
 
 use async_graphql::{Context, Object, Result, ID};
 use kabipay_common::{
+    client_data_scope::{data_scope_from_context, resolve_viewer_employee},
+    context::PERM_TIMESHEET_APPROVE,
     subgraph::{
         client_request_hints, require_client_claims, require_tenant_id, resolve_client_employee_id,
-        tenant_db,
+        ops_db, tenant_db,
     },
+    tenant_business_clock::TenantBusinessClock,
+    workflow_approval::WorkflowApprovalAuthority,
     KabiPayError,
 };
 use kabipay_db_entities::tenant::{
@@ -121,6 +125,9 @@ impl MutationRoot {
             );
         }
         let db = tenant_db(ctx, tenant_id).await?;
+        let clock = TenantBusinessClock::load(ops_db(ctx)?, tenant_id)
+            .await
+            .map_err(KabiPayError::into_graphql)?;
         let employee_id = resolve_client_employee_id(ctx, &db, tenant_id)
             .await
             .map_err(KabiPayError::into_graphql)?;
@@ -131,9 +138,16 @@ impl MutationRoot {
         };
         let hints = client_request_hints(ctx);
         let client_ip = hints.client_ip.as_deref();
-        let m = attendance_service::punch_today(&db, tenant_id, employee_id, geo, client_ip)
-            .await
-            .map_err(KabiPayError::into_graphql)?;
+        let m = attendance_service::punch_today(
+            &db,
+            tenant_id,
+            employee_id,
+            clock,
+            geo,
+            client_ip,
+        )
+        .await
+        .map_err(KabiPayError::into_graphql)?;
         Ok(AttendanceDto::from(m))
     }
 
@@ -147,7 +161,7 @@ impl MutationRoot {
         let claims = require_client_claims(ctx)?;
         if !claims.can_configure_attendance_punch_policy() {
             return Err(KabiPayError::Forbidden(
-                "attendance punch policy is restricted to HR / tenant admins".into(),
+                "attendance punch policy permission is required".into(),
             )
             .into_graphql());
         }
@@ -184,6 +198,9 @@ impl MutationRoot {
             );
         }
         let db = tenant_db(ctx, tenant_id).await?;
+        let clock = TenantBusinessClock::load(ops_db(ctx)?, tenant_id)
+            .await
+            .map_err(KabiPayError::into_graphql)?;
         let employee_id = resolve_client_employee_id(ctx, &db, tenant_id)
             .await
             .map_err(KabiPayError::into_graphql)?;
@@ -191,6 +208,7 @@ impl MutationRoot {
             &db,
             tenant_id,
             employee_id,
+            clock,
             input.work_date,
             input.check_in_time,
             input.check_out_time,
@@ -217,6 +235,9 @@ impl MutationRoot {
             );
         }
         let db = tenant_db(ctx, tenant_id).await?;
+        let clock = TenantBusinessClock::load(ops_db(ctx)?, tenant_id)
+            .await
+            .map_err(KabiPayError::into_graphql)?;
         let employee_id = resolve_client_employee_id(ctx, &db, tenant_id)
             .await
             .map_err(KabiPayError::into_graphql)?;
@@ -226,6 +247,7 @@ impl MutationRoot {
             tenant_id,
             attendance_id,
             employee_id,
+            clock,
             input.work_date,
             input.check_in_time,
             input.check_out_time,
@@ -246,6 +268,15 @@ impl MutationRoot {
         let target_employee_id = parse_uuid(&input.employee_id, "employeeId")?;
         let request_id = client_request_hints(ctx).request_id;
         let db = tenant_db(ctx, tenant_id).await?;
+        let clock = TenantBusinessClock::load(ops_db(ctx)?, tenant_id)
+            .await
+            .map_err(KabiPayError::into_graphql)?;
+        let segment = SegmentTimes::for_manual_input(
+            input.work_date,
+            input.check_in_time,
+            input.check_out_time,
+        );
+        let instants = segment.to_instants(clock).map_err(KabiPayError::into_graphql)?;
         let mut txn = db
             .begin()
             .await
@@ -264,11 +295,9 @@ impl MutationRoot {
                 tenant_id,
                 target_employee_id,
                 actor_user_id,
-                segment: SegmentTimes {
-                    work_date: input.work_date,
-                    check_in_time: input.check_in_time,
-                    check_out_time: input.check_out_time,
-                },
+                segment,
+                instants,
+                today: clock.now_date(),
                 reason: input.reason,
                 request_id,
             },
@@ -294,6 +323,15 @@ impl MutationRoot {
         let attendance_id = parse_uuid(&input.id, "id")?;
         let request_id = client_request_hints(ctx).request_id;
         let db = tenant_db(ctx, tenant_id).await?;
+        let clock = TenantBusinessClock::load(ops_db(ctx)?, tenant_id)
+            .await
+            .map_err(KabiPayError::into_graphql)?;
+        let segment = SegmentTimes::for_manual_input(
+            input.work_date,
+            input.check_in_time,
+            input.check_out_time,
+        );
+        let instants = segment.to_instants(clock).map_err(KabiPayError::into_graphql)?;
         let mut txn = db
             .begin()
             .await
@@ -314,11 +352,9 @@ impl MutationRoot {
                 target_employee_id: initial.employee_id,
                 actor_user_id,
                 initial_work_date: initial.work_date,
-                segment: SegmentTimes {
-                    work_date: input.work_date,
-                    check_in_time: input.check_in_time,
-                    check_out_time: input.check_out_time,
-                },
+                segment,
+                instants,
+                today: clock.now_date(),
                 reason: input.reason,
                 request_id,
                 expected_updated_at: input.expected_updated_at,
@@ -422,9 +458,19 @@ impl MutationRoot {
         let tenant_id = require_tenant_id(ctx)?;
         let claims = require_client_claims(ctx)?;
         let db = tenant_db(ctx, tenant_id).await?;
-        let uid = claims.sub;
+        let authority = WorkflowApprovalAuthority {
+            actor_user_id: claims.sub,
+            actor_employee: resolve_viewer_employee(ctx, &db, tenant_id).await?,
+            scope: data_scope_from_context(ctx, PERM_TIMESHEET_APPROVE)?,
+            permission: PERM_TIMESHEET_APPROVE,
+        };
         let bid = parse_uuid(&id, "id")?;
-        let m = timesheet_batch_service::approve_timesheet_week_batch(&db, tenant_id, bid, uid)
+        let m = timesheet_batch_service::approve_timesheet_week_batch(
+            &db,
+            tenant_id,
+            bid,
+            &authority,
+        )
             .await
             .map_err(KabiPayError::into_graphql)?;
         Ok(TimesheetWeekBatchDto::from(m))
@@ -439,9 +485,20 @@ impl MutationRoot {
         let tenant_id = require_tenant_id(ctx)?;
         let claims = require_client_claims(ctx)?;
         let db = tenant_db(ctx, tenant_id).await?;
-        let uid = claims.sub;
+        let authority = WorkflowApprovalAuthority {
+            actor_user_id: claims.sub,
+            actor_employee: resolve_viewer_employee(ctx, &db, tenant_id).await?,
+            scope: data_scope_from_context(ctx, PERM_TIMESHEET_APPROVE)?,
+            permission: PERM_TIMESHEET_APPROVE,
+        };
         let bid = parse_uuid(&id, "id")?;
-        timesheet_batch_service::reject_timesheet_week_batch(&db, tenant_id, bid, uid, rejection_reason)
+        timesheet_batch_service::reject_timesheet_week_batch(
+            &db,
+            tenant_id,
+            bid,
+            &authority,
+            rejection_reason,
+        )
             .await
             .map_err(KabiPayError::into_graphql)
     }

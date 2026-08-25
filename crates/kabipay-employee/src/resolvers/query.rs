@@ -101,7 +101,7 @@ impl QueryRoot {
         let viewer_id = resolve_client_employee_id(ctx, &db, tenant_id).await.ok();
         let is_self = viewer_id == Some(target_id);
         let viewer = resolve_viewer_employee(ctx, &db, tenant_id).await?;
-        let in_scope = employee_service::is_employee_in_scope(data_scope_employee(ctx), viewer, &target);
+        let in_scope = employee_service::is_employee_in_scope(data_scope_employee(ctx)?, viewer, &target);
         let can_manage = claims.can_manage_employee_directory() && in_scope;
         let mut entries = enrich_directory_entries(&db, tenant_id, vec![target]).await?;
         let directory_entry = entries.pop().ok_or_else(|| {
@@ -162,7 +162,7 @@ impl QueryRoot {
         let tenant_id = require_tenant_id(ctx)?;
         let db = tenant_db(ctx, tenant_id).await?;
         let viewer = resolve_viewer_employee(ctx, &db, tenant_id).await?;
-        let scope = data_scope_employee(ctx);
+        let scope = data_scope_employee(ctx)?;
         let employee_ids = employee_service::employee_ids_in_scope(&db, tenant_id, scope, viewer)
             .await.map_err(KabiPayError::into_graphql)?;
         let rows = profile_change_service::list_review_queue(
@@ -245,7 +245,7 @@ impl QueryRoot {
         }
         let tenant_id = require_tenant_id(ctx)?;
         let db = tenant_db(ctx, tenant_id).await?;
-        let scope = data_scope_employee(ctx);
+        let scope = data_scope_employee(ctx)?;
         let viewer = resolve_viewer_employee(ctx, &db, tenant_id).await?;
         let employee_ids = employee_service::employee_ids_in_scope(&db, tenant_id, scope, viewer)
             .await.map_err(KabiPayError::into_graphql)?;
@@ -397,7 +397,7 @@ impl QueryRoot {
     ) -> Result<Vec<EmployeeDto>> {
         let tenant_id = require_tenant_id(ctx)?;
         let db = tenant_db(ctx, tenant_id).await?;
-        let scope = data_scope_employee(ctx);
+        let scope = data_scope_employee(ctx)?;
         let viewer = resolve_viewer_employee(ctx, &db, tenant_id).await?;
         let models = employee_service::list(&db, tenant_id, limit, scope, viewer)
             .await
@@ -635,7 +635,7 @@ impl QueryRoot {
     ) -> Result<Vec<OrgChartRowDto>> {
         let tenant_id = require_tenant_id(ctx)?;
         let db = tenant_db(ctx, tenant_id).await?;
-        let scope = data_scope_employee(ctx);
+        let scope = data_scope_employee(ctx)?;
         let viewer = resolve_viewer_employee(ctx, &db, tenant_id).await?;
         let models = employee_service::list_for_org_chart(&db, tenant_id, limit, scope, viewer)
             .await
@@ -1061,7 +1061,7 @@ async fn resolve_employee_dto(ctx: &Context<'_>, id: ID) -> Result<Option<Employ
         .await
         .map_err(KabiPayError::into_graphql)?;
     let model = if let Some(ref m) = model {
-        let scope = data_scope_employee(ctx);
+        let scope = data_scope_employee(ctx)?;
         let viewer = resolve_viewer_employee(ctx, &db, tenant_id).await?;
         if employee_service::is_employee_in_scope(scope, viewer, m) {
             model

@@ -10,7 +10,7 @@ use chrono::{NaiveDate, NaiveTime};
 use kabipay_attendance::attendance_management::{
     create_managed_attendance_segment_in_transaction, ManagedCreateCommand, SegmentTimes,
 };
-use kabipay_common::{KabiPayError, KabiPayResult};
+use kabipay_common::{tenant_business_clock::TenantBusinessClock, KabiPayError, KabiPayResult};
 use sea_orm::{
     ConnectOptions, ConnectionTrait, Database, DatabaseConnection, DbBackend, Statement,
     TransactionTrait, TryGetable,
@@ -80,6 +80,8 @@ impl Fixture {
                 work_date DATE NOT NULL,
                 check_in_time TIME,
                 check_out_time TIME,
+                check_in_at TIMESTAMPTZ,
+                check_out_at TIMESTAMPTZ,
                 check_in_lat NUMERIC,
                 check_in_lng NUMERIC,
                 check_out_lat NUMERIC,
@@ -144,16 +146,22 @@ impl Fixture {
         check_out_time: NaiveTime,
         actor_user_id: Uuid,
     ) -> ManagedCreateCommand {
+        let segment = SegmentTimes {
+            work_date: NaiveDate::from_ymd_opt(2026, 8, 20)
+                .expect("fixed harness date is valid"),
+            check_in_time,
+            check_out_time,
+        };
         ManagedCreateCommand {
             tenant_id: self.tenant_id,
             target_employee_id: self.employee_id,
             actor_user_id,
-            segment: SegmentTimes {
-                work_date: NaiveDate::from_ymd_opt(2026, 8, 20)
-                    .expect("fixed harness date is valid"),
-                check_in_time,
-                check_out_time,
-            },
+            segment,
+            instants: segment
+                .to_instants(TenantBusinessClock::from_name("UTC").expect("valid timezone"))
+                .expect("valid segment instants"),
+            today: NaiveDate::from_ymd_opt(2026, 8, 24)
+                .expect("fixed harness date is valid"),
             reason: "approved external harness adjustment".into(),
             request_id: Some(Uuid::new_v4().to_string()),
         }

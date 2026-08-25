@@ -207,6 +207,7 @@ mod tests {
                 .iter()
                 .map(|permission| (*permission).to_string())
                 .collect(),
+            permission_scopes: HashMap::new(),
             resource_scopes: HashMap::new(),
         }
     }

@@ -8,7 +8,9 @@ use kabipay_common::{
 use chrono::{DateTime, NaiveDate, Utc};
 
 use crate::resolvers::query::parse_uuid;
-use crate::services::{expense_service, travel_request_service};
+use crate::services::{
+    approval_authority::ExpenseApprovalAuthority, expense_service, travel_request_service,
+};
 use kabipay_db_entities::tenant::d0015_expense::{expense, expense_category, expense_policy};
 
 #[derive(SimpleObject, Clone, Debug)]
@@ -227,6 +229,9 @@ impl ExpenseDto {
         let tenant_id = require_tenant_id(ctx)?;
         let db = tenant_db(ctx, tenant_id).await?;
         let claims = require_client_claims(ctx)?;
+        let Ok(authority) = ExpenseApprovalAuthority::from_claims(claims) else {
+            return Ok(false);
+        };
         let employee_id = parse_uuid(&self.employee_id, "employeeId")?;
         let wf = self
             .workflow_instance_id
@@ -236,8 +241,7 @@ impl ExpenseDto {
         expense_service::expense_viewer_may_approve(
             &db,
             tenant_id,
-            claims.sub,
-            claims.can_approve_expense(),
+            &authority,
             &self.status,
             employee_id,
             wf,
@@ -266,6 +270,9 @@ impl TravelRequestDto {
         let tenant_id = require_tenant_id(ctx)?;
         let db = tenant_db(ctx, tenant_id).await?;
         let claims = require_client_claims(ctx)?;
+        let Ok(authority) = ExpenseApprovalAuthority::from_claims(claims) else {
+            return Ok(false);
+        };
         let employee_id = parse_uuid(&self.employee_id, "employeeId")?;
         let wf = self
             .workflow_instance_id
@@ -275,8 +282,7 @@ impl TravelRequestDto {
         travel_request_service::travel_viewer_may_approve(
             &db,
             tenant_id,
-            claims.sub,
-            claims.can_approve_expense(),
+            &authority,
             &self.status,
             employee_id,
             wf,

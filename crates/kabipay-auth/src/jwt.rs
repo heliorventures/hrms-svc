@@ -93,6 +93,7 @@ impl JwtConfig {
         must_change_password: bool,
         roles: Vec<String>,
         permissions: Vec<String>,
+        permission_scopes: HashMap<String, String>,
         resource_scopes: HashMap<String, String>,
     ) -> KabiPayResult<String> {
         let now = Utc::now();
@@ -107,6 +108,7 @@ impl JwtConfig {
             must_change_password,
             roles,
             permissions,
+            permission_scopes,
             resource_scopes,
         };
         encode_client_jwt(&claims, &self.secret)
@@ -175,6 +177,7 @@ mod tests {
                 false,
                 vec![],
                 vec![],
+                HashMap::new(),
                 HashMap::new(),
             )
             .unwrap();

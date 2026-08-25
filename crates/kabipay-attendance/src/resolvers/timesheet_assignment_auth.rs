@@ -5,7 +5,7 @@ use kabipay_common::{
     client_data_scope::{
         data_scope_from_context, resolve_employee_scope_filter, resolve_viewer_employee,
     },
-    context::SCOPE_RES_TIMESHEET,
+    context::PERM_TIMESHEET_APPROVE,
     subgraph::{require_client_claims, resolve_client_employee_id},
     KabiPayError,
 };
@@ -89,7 +89,7 @@ async fn assert_target_in_timesheet_scope(
     tenant_id: Uuid,
     target_employee_id: Uuid,
 ) -> Result<()> {
-    let scope = data_scope_from_context(ctx, SCOPE_RES_TIMESHEET);
+    let scope = data_scope_from_context(ctx, PERM_TIMESHEET_APPROVE)?;
     let viewer = resolve_viewer_employee(ctx, db, tenant_id).await?;
     let filt = resolve_employee_scope_filter(db, tenant_id, scope, viewer)
         .await

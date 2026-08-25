@@ -2,7 +2,10 @@
 
 use async_graphql::{Context, Object, Result, ID};
 use kabipay_common::{
+    client_data_scope::{data_scope_from_context, resolve_viewer_employee},
+    context::PERM_LEAVE_APPROVE,
     subgraph::{require_client_claims, require_tenant_id, resolve_client_employee_id, tenant_db},
+    workflow_approval::WorkflowApprovalAuthority,
     KabiPayError,
 };
 use rust_decimal::Decimal;
@@ -76,8 +79,14 @@ impl MutationRoot {
         let claims = require_client_claims(ctx)?;
         let tenant_id = require_tenant_id(ctx)?;
         let db = tenant_db(ctx, tenant_id).await?;
+        let authority = WorkflowApprovalAuthority {
+            actor_user_id: claims.sub,
+            actor_employee: resolve_viewer_employee(ctx, &db, tenant_id).await?,
+            scope: data_scope_from_context(ctx, PERM_LEAVE_APPROVE)?,
+            permission: PERM_LEAVE_APPROVE,
+        };
         let id = parse_uuid(&leave_request_id, "leaveRequestId")?;
-        let m = leave_service::approve_leave_request(&db, tenant_id, id, claims.sub)
+        let m = leave_service::approve_leave_request(&db, tenant_id, id, &authority)
             .await
             .map_err(KabiPayError::into_graphql)?;
         Ok(LeaveRequestDto::from(m))
@@ -93,8 +102,14 @@ impl MutationRoot {
         let claims = require_client_claims(ctx)?;
         let tenant_id = require_tenant_id(ctx)?;
         let db = tenant_db(ctx, tenant_id).await?;
+        let authority = WorkflowApprovalAuthority {
+            actor_user_id: claims.sub,
+            actor_employee: resolve_viewer_employee(ctx, &db, tenant_id).await?,
+            scope: data_scope_from_context(ctx, PERM_LEAVE_APPROVE)?,
+            permission: PERM_LEAVE_APPROVE,
+        };
         let id = parse_uuid(&leave_request_id, "leaveRequestId")?;
-        let m = leave_service::reject_leave_request(&db, tenant_id, id, claims.sub, reason)
+        let m = leave_service::reject_leave_request(&db, tenant_id, id, &authority, reason)
             .await
             .map_err(KabiPayError::into_graphql)?;
         Ok(LeaveRequestDto::from(m))

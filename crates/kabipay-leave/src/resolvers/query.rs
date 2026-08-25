@@ -5,7 +5,7 @@ use chrono::{Datelike, NaiveDate};
 use kabipay_common::client_data_scope::{
     data_scope_from_context, resolve_employee_scope_filter, resolve_viewer_employee,
 };
-use kabipay_common::context::SCOPE_RES_LEAVE;
+use kabipay_common::context::PERM_LEAVE_READ;
 use kabipay_common::{
     subgraph::{require_tenant_id, resolve_client_employee_id, tenant_db},
     KabiPayError,
@@ -67,7 +67,7 @@ impl QueryRoot {
     ) -> Result<Vec<LeaveRequestDto>> {
         let tenant_id = require_tenant_id(ctx)?;
         let db = tenant_db(ctx, tenant_id).await?;
-        let scope = data_scope_from_context(ctx, SCOPE_RES_LEAVE);
+        let scope = data_scope_from_context(ctx, PERM_LEAVE_READ)?;
         let viewer = resolve_viewer_employee(ctx, &db, tenant_id).await?;
         let rows = leave_service::list_requests(
             &db,
@@ -134,7 +134,7 @@ impl QueryRoot {
                 .await
                 .map_err(KabiPayError::into_graphql)?,
         };
-        let scope = data_scope_from_context(ctx, SCOPE_RES_LEAVE);
+        let scope = data_scope_from_context(ctx, PERM_LEAVE_READ)?;
         let viewer = resolve_viewer_employee(ctx, &db, tenant_id).await?;
         let filt = resolve_employee_scope_filter(&db, tenant_id, scope, viewer)
             .await
@@ -174,7 +174,7 @@ impl QueryRoot {
     ) -> Result<Vec<LeaveWorkflowActionDto>> {
         let tenant_id = require_tenant_id(ctx)?;
         let db = tenant_db(ctx, tenant_id).await?;
-        let scope = data_scope_from_context(ctx, SCOPE_RES_LEAVE);
+        let scope = data_scope_from_context(ctx, PERM_LEAVE_READ)?;
         let viewer = resolve_viewer_employee(ctx, &db, tenant_id).await?;
         let rid = parse_uuid(&leave_request_id, "leaveRequestId")?;
         let req = leave_service::load_leave_request_for_viewer(&db, tenant_id, rid, scope, viewer)

@@ -15,6 +15,8 @@ use sea_orm::{
 use std::collections::HashSet;
 use uuid::Uuid;
 
+use super::notification_action::NotificationAction;
+
 use crate::services::notification_preference;
 
 pub async fn list_announcements_visible(
@@ -512,7 +514,7 @@ pub async fn create_notifications_for_users(
     kind: Option<String>,
     title: Option<String>,
     message: Option<String>,
-    action_url: Option<String>,
+    action_url: Option<NotificationAction>,
 ) -> KabiPayResult<u64> {
     if user_ids.is_empty() {
         return Err(KabiPayError::Validation(
@@ -524,7 +526,16 @@ pub async fn create_notifications_for_users(
             "too many recipients (max 500)".into(),
         ));
     }
-    insert_notifications_for_users(db, tenant_id, user_ids, kind, title, message, action_url).await
+    insert_notifications_for_users(
+        db,
+        tenant_id,
+        user_ids,
+        kind,
+        title,
+        message,
+        action_url.map(NotificationAction::into_string),
+    )
+    .await
 }
 
 async fn insert_notifications_for_users(
@@ -566,7 +577,7 @@ pub struct NotificationPatch {
     pub kind: Option<String>,
     pub title: Option<String>,
     pub message: Option<String>,
-    pub action_url: Option<String>,
+    pub action_url: Option<Option<String>>,
 }
 
 pub async fn update_notification_admin(
@@ -594,8 +605,8 @@ pub async fn update_notification_admin(
     if let Some(m) = patch.message {
         am.message = Set(Some(m));
     }
-    if let Some(u) = patch.action_url {
-        am.action_url = Set(Some(u));
+    if let Some(value) = patch.action_url {
+        am.action_url = Set(value);
     }
     am.updated_at = Set(Utc::now());
     am.update(db).await.map_err(KabiPayError::from)?;
