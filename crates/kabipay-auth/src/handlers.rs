@@ -72,8 +72,8 @@ pub struct ClientLoginInput {
 #[derive(Debug, Deserialize)]
 pub struct MfaInput {
     #[serde(rename = "mfaToken")]
-    pub mfa_token: String,
-    pub code: String,
+    pub _mfa_token: String,
+    pub _code: String,
 }
 
 #[derive(Debug, Deserialize)]

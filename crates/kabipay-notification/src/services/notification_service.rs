@@ -636,25 +636,6 @@ pub async fn delete_notification_admin(
     Ok(())
 }
 
-/// `true` when `file_id` is linked from an announcement in this tenant (for signed read URLs).
-pub async fn announcement_links_file_storage(
-    db: &DatabaseConnection,
-    tenant_id: Uuid,
-    file_id: Uuid,
-) -> KabiPayResult<bool> {
-    let row = announcement::Entity::find()
-        .filter(announcement::Column::TenantId.eq(tenant_id))
-        .filter(
-            Condition::any()
-                .add(announcement::Column::ImageFileStorageId.eq(file_id))
-                .add(announcement::Column::DocumentFileStorageId.eq(file_id)),
-        )
-        .one(db)
-        .await
-        .map_err(KabiPayError::from)?;
-    Ok(row.is_some())
-}
-
 /// Mark a single row read; returns `NotFound` if wrong id/tenant or not owned by `user_id`.
 pub async fn mark_read(
     db: &DatabaseConnection,
