@@ -2,8 +2,7 @@
 
 use chrono::{Datelike, NaiveDate, Utc};
 use kabipay_common::client_data_scope::EmployeeScopeFilter;
-use kabipay_common::workflow_current_step;
-use kabipay_common::workflow_inbox;
+use kabipay_common::workflow_approval;
 use kabipay_common::{KabiPayError, KabiPayResult};
 use kabipay_db_entities::tenant::d0005_auth_rbac::user_role;
 use kabipay_db_entities::tenant::d0007_employee_core::employee;
@@ -25,8 +24,8 @@ use std::str::FromStr;
 use uuid::Uuid;
 
 use super::approval_authority::{
-    assert_target_allowed, lock_matching_workflow_transition, snapshot_workflow_transition,
-    target_is_allowed, ExpenseApprovalAuthority,
+    after_successful_commit, lock_and_validate_decision_employees, lock_current_workflow,
+    workflow_authority, ExpenseApprovalAuthority,
 };
 
 pub async fn list_categories(
@@ -345,39 +344,6 @@ const STATUS_PENDING: &str = "PENDING";
 const STATUS_APPROVED: &str = "APPROVED";
 const STATUS_PARTIAL_APPROVED: &str = "PARTIAL_APPROVED";
 const STATUS_REJECTED: &str = "REJECTED";
-
-/// Configured `workflow_step.step_name` when **`PENDING`** and the linked instance is **`IN_PROGRESS`**.
-pub async fn resolve_expense_pending_approval_stage(
-    db: &DatabaseConnection,
-    tenant_id: Uuid,
-    status: &str,
-    workflow_instance_id: Option<Uuid>,
-) -> KabiPayResult<Option<String>> {
-    workflow_inbox::pending_workflow_step_title(db, tenant_id, status, STATUS_PENDING, workflow_instance_id)
-        .await
-}
-
-/// Whether **this** user satisfies the workflow step actor rule or legacy **`expense:approve`** on claims without workflows.
-pub async fn expense_viewer_may_approve(
-    db: &DatabaseConnection,
-    tenant_id: Uuid,
-    authority: &ExpenseApprovalAuthority,
-    status: &str,
-    subject_employee_id: Uuid,
-    workflow_instance_id: Option<Uuid>,
-) -> KabiPayResult<bool> {
-    if !workflow_inbox::entity_row_is_pending(status, STATUS_PENDING)
-        || !target_is_allowed(db, tenant_id, authority, subject_employee_id).await?
-    {
-        return Ok(false);
-    }
-    match workflow_instance_id {
-        Some(instance_id) => {
-            workflow_inbox::workflow_instance_accepts_actions(db, tenant_id, instance_id).await
-        }
-        None => Ok(true),
-    }
-}
 
 pub const PAYMENT_STATUS_NONE: &str = "NONE";
 pub const PAYMENT_STATUS_PENDING: &str = "PENDING_PAYMENT";
@@ -719,242 +685,185 @@ pub async fn approve_expense(
     db: &DatabaseConnection,
     tenant_id: Uuid,
     expense_id: Uuid,
+    expected_workflow_step_id: Uuid,
     authority: &ExpenseApprovalAuthority,
     approved_amount: Option<Decimal>,
 ) -> KabiPayResult<expense::Model> {
-    let preflight = load_pending_expense_conn(db, tenant_id, expense_id).await?;
-    let expected_workflow = match preflight.workflow_instance_id {
-        Some(instance_id) => Some(snapshot_workflow_transition(db, tenant_id, instance_id).await?),
-        None => None,
-    };
     let txn = db.begin().await?;
     let model = lock_pending_expense(&txn, tenant_id, expense_id).await?;
-    if model.workflow_instance_id != preflight.workflow_instance_id {
-        return Err(KabiPayError::Conflict(
-            "expense approval state changed; refresh and try again".into(),
-        ));
-    }
-    assert_target_allowed(&txn, tenant_id, authority, model.employee_id).await?;
-    let now = Utc::now();
-
-    if let Some(inst_id) = model.workflow_instance_id {
-        let expected = expected_workflow.ok_or_else(|| {
-            KabiPayError::Conflict("expense workflow state changed; refresh and try again".into())
-        })?;
-        if expected.instance_id != inst_id {
-            return Err(KabiPayError::Conflict(
-                "expense workflow state changed; refresh and try again".into(),
-            ));
-        }
-        let mut inst = lock_matching_workflow_transition(&txn, tenant_id, expected).await?;
-        if inst.status != WF_STATUS_IN_PROGRESS {
-            return Err(KabiPayError::Validation(
-                "workflow instance is not in progress — cannot approve this expense".into(),
-            ));
-        }
-        inst = workflow_current_step::ensure_workflow_instance_current_step_repaired(
-            &txn, tenant_id, &inst, now,
-        )
-        .await?;
-        let cur_step_id = inst.current_step_id.ok_or_else(|| {
-            KabiPayError::Validation("workflow instance has no current step".into())
-        })?;
-        let cur_step = workflow_step::Entity::find_by_id(cur_step_id)
-            .filter(workflow_step::Column::TenantId.eq(tenant_id))
-            .one(&txn)
-            .await?
-            .ok_or_else(|| KabiPayError::Validation("workflow step not found".into()))?;
-
-        let act = workflow_action::ActiveModel {
-            id: Set(Uuid::new_v4()),
-            tenant_id: Set(tenant_id),
-            instance_id: Set(inst_id),
-            workflow_step_id: Set(cur_step_id),
-            performed_by: Set(Some(authority.actor_user_id)),
-            action: Set(WF_ACTION_APPROVE.into()),
-            remarks: Set(None),
-            acted_at: Set(now),
-            created_at: Set(now),
-            updated_at: Set(now),
-        };
-        act.insert(&txn).await?;
-
-        let next_step = workflow_step::Entity::find()
-            .filter(workflow_step::Column::TenantId.eq(tenant_id))
-            .filter(workflow_step::Column::WorkflowId.eq(inst.workflow_id))
-            .filter(workflow_step::Column::SequenceOrder.gt(cur_step.sequence_order))
-            .order_by_asc(workflow_step::Column::SequenceOrder)
-            .one(&txn)
-            .await?;
-
-        if let Some(next) = next_step {
-            if approved_amount.is_some() {
-                return Err(KabiPayError::Validation(
-                    "approved financial amount applies only on the final approval step".into(),
-                ));
-            }
-            let mut am_inst: workflow_instance::ActiveModel = inst.into();
-            am_inst.current_step_id = Set(Some(next.id));
-            am_inst.updated_at = Set(now);
-            am_inst.update(&txn).await?;
-            txn.commit().await?;
-            return expense::Entity::find_by_id(expense_id)
-                .one(db)
-                .await?
-                .ok_or_else(|| KabiPayError::Internal("expense missing after workflow step".into()));
-        }
-
-        let mut am_inst: workflow_instance::ActiveModel = inst.into();
-        am_inst.status = Set(WF_STATUS_COMPLETED.into());
-        am_inst.current_step_id = Set(None);
-        am_inst.completed_at = Set(Some(now));
-        am_inst.updated_at = Set(now);
-        am_inst.update(&txn).await?;
-
-        let fin = resolve_final_approved_amount(model.amount, approved_amount)?;
-        finalize_expense_approval(
-            &txn,
-            tenant_id,
-            expense_id,
-            authority.actor_user_id,
-            fin,
-            now,
-        )
-        .await?;
-    } else {
-        let fin = resolve_final_approved_amount(model.amount, approved_amount)?;
-        finalize_expense_approval(
-            &txn,
-            tenant_id,
-            expense_id,
-            authority.actor_user_id,
-            fin,
-            now,
-        )
-        .await?;
-    }
-
-    txn.commit().await?;
-
-    let out = expense::Entity::find_by_id(expense_id)
-        .one(db)
-        .await?
-        .ok_or_else(|| KabiPayError::Internal("expense missing after approve".into()))?;
-
-    let note = match out.status.as_str() {
-        STATUS_PARTIAL_APPROVED => format!(
-            "Partially approved — reimbursable amount {} {}.",
-            out.approved_amount
-                .map(|d| d.to_string())
-                .unwrap_or_else(|| "?".into()),
-            out.currency
-        ),
-        _ => "Approved.".to_string(),
-    };
-    expense_notify_employee(
-        db,
-        tenant_id,
-        out.employee_id,
-        "Expense approved",
-        &format!("Your expense claim \"{}\" {}", out.title, note),
+    let (actor, _subject) = lock_and_validate_decision_employees(
+        &txn, tenant_id, authority, model.employee_id,
     )
-    .await;
-    Ok(out)
+    .await?;
+    let action_authority = workflow_authority(authority, actor);
+    let now = Utc::now();
+    let (instance, current_step) = lock_current_workflow(
+        &txn,
+        tenant_id,
+        WF_ENTITY_EXPENSE,
+        expense_id,
+        model.workflow_instance_id,
+        expected_workflow_step_id,
+    )
+    .await?;
+    workflow_approval::assert_workflow_step_actor(
+        &txn, tenant_id, model.employee_id, &current_step, &action_authority,
+    )
+    .await?;
+    workflow_action::ActiveModel {
+        id: Set(Uuid::new_v4()),
+        tenant_id: Set(tenant_id),
+        instance_id: Set(instance.id),
+        workflow_step_id: Set(current_step.id),
+        performed_by: Set(Some(authority.actor_user_id)),
+        action: Set(WF_ACTION_APPROVE.into()),
+        remarks: Set(None),
+        acted_at: Set(now),
+        created_at: Set(now),
+        updated_at: Set(now),
+    }
+    .insert(&txn)
+    .await?;
+    let next_step = workflow_step::Entity::find()
+        .filter(workflow_step::Column::TenantId.eq(tenant_id))
+        .filter(workflow_step::Column::WorkflowId.eq(instance.workflow_id))
+        .filter(workflow_step::Column::SequenceOrder.gt(current_step.sequence_order))
+        .order_by_asc(workflow_step::Column::SequenceOrder)
+        .lock_exclusive()
+        .one(&txn)
+        .await?;
+    if let Some(next) = next_step {
+        if approved_amount.is_some() {
+            return Err(KabiPayError::Validation(
+                "approved financial amount applies only on the final approval step".into(),
+            ));
+        }
+        let mut active_instance: workflow_instance::ActiveModel = instance.into();
+        active_instance.current_step_id = Set(Some(next.id));
+        active_instance.updated_at = Set(now);
+        active_instance.update(&txn).await?;
+        txn.commit().await?;
+        return expense::Entity::find_by_id(expense_id)
+            .one(db)
+            .await?
+            .ok_or_else(|| KabiPayError::Internal("expense missing after workflow step".into()));
+    }
+    let mut active_instance: workflow_instance::ActiveModel = instance.into();
+    active_instance.status = Set(WF_STATUS_COMPLETED.into());
+    active_instance.current_step_id = Set(None);
+    active_instance.completed_at = Set(Some(now));
+    active_instance.updated_at = Set(now);
+    active_instance.update(&txn).await?;
+    let approved_financial = resolve_final_approved_amount(model.amount, approved_amount)?;
+    finalize_expense_approval(
+        &txn, tenant_id, expense_id, authority.actor_user_id, approved_financial, now,
+    )
+    .await?;
+    after_successful_commit(txn.commit(), || async {
+        let out = expense::Entity::find_by_id(expense_id)
+            .one(db)
+            .await?
+            .ok_or_else(|| KabiPayError::Internal("expense missing after approve".into()))?;
+        let note = match out.status.as_str() {
+            STATUS_PARTIAL_APPROVED => format!(
+                "Partially approved; reimbursable amount {} {}.",
+                out.approved_amount
+                    .map(|amount| amount.to_string())
+                    .unwrap_or_else(|| "?".into()),
+                out.currency
+            ),
+            _ => "Approved.".to_string(),
+        };
+        expense_notify_employee(
+            db,
+            tenant_id,
+            out.employee_id,
+            "Expense approved",
+            &format!("Your expense claim \"{}\" {}", out.title, note),
+        )
+        .await;
+        Ok(out)
+    })
+    .await
 }
 
 pub async fn reject_expense(
     db: &DatabaseConnection,
     tenant_id: Uuid,
     expense_id: Uuid,
+    expected_workflow_step_id: Uuid,
     authority: &ExpenseApprovalAuthority,
     rejection_reason: Option<String>,
 ) -> KabiPayResult<expense::Model> {
-    let preflight = load_pending_expense_conn(db, tenant_id, expense_id).await?;
-    let expected_workflow = match preflight.workflow_instance_id {
-        Some(instance_id) => Some(snapshot_workflow_transition(db, tenant_id, instance_id).await?),
-        None => None,
-    };
     let txn = db.begin().await?;
     let model = lock_pending_expense(&txn, tenant_id, expense_id).await?;
-    if model.workflow_instance_id != preflight.workflow_instance_id {
-        return Err(KabiPayError::Conflict(
-            "expense rejection state changed; refresh and try again".into(),
-        ));
-    }
-    assert_target_allowed(&txn, tenant_id, authority, model.employee_id).await?;
-
-    if let Some(inst_id) = model.workflow_instance_id {
-        if let Some(expected) = expected_workflow {
-            if expected.instance_id != inst_id {
-                return Err(KabiPayError::Conflict(
-                    "expense workflow state changed; refresh and try again".into(),
-                ));
-            }
-            let mut inst = lock_matching_workflow_transition(&txn, tenant_id, expected).await?;
-            if inst.status == WF_STATUS_IN_PROGRESS {
-                let now = Utc::now();
-                inst = workflow_current_step::ensure_workflow_instance_current_step_repaired(
-                    &txn, tenant_id, &inst, now,
-                )
-                .await?;
-                if let Some(step_id) = inst.current_step_id {
-                    let _st = workflow_step::Entity::find_by_id(step_id)
-                        .filter(workflow_step::Column::TenantId.eq(tenant_id))
-                        .one(&txn)
-                        .await?
-                        .ok_or_else(|| KabiPayError::Validation("workflow step not found".into()))?;
-                    let act = workflow_action::ActiveModel {
-                        id: Set(Uuid::new_v4()),
-                        tenant_id: Set(tenant_id),
-                        instance_id: Set(inst_id),
-                        workflow_step_id: Set(step_id),
-                        performed_by: Set(Some(authority.actor_user_id)),
-                        action: Set(WF_ACTION_REJECT.into()),
-                        remarks: Set(rejection_reason.clone()),
-                        acted_at: Set(now),
-                        created_at: Set(now),
-                        updated_at: Set(now),
-                    };
-                    act.insert(&txn).await?;
-                }
-                let mut am_inst: workflow_instance::ActiveModel = inst.into();
-                am_inst.status = Set(WF_STATUS_CANCELLED.into());
-                am_inst.completed_at = Set(Some(now));
-                am_inst.updated_at = Set(now);
-                am_inst.update(&txn).await?;
-            }
-        }
-    }
-
+    let (actor, _subject) = lock_and_validate_decision_employees(
+        &txn, tenant_id, authority, model.employee_id,
+    )
+    .await?;
+    let action_authority = workflow_authority(authority, actor);
+    let (instance, current_step) = lock_current_workflow(
+        &txn,
+        tenant_id,
+        WF_ENTITY_EXPENSE,
+        expense_id,
+        model.workflow_instance_id,
+        expected_workflow_step_id,
+    )
+    .await?;
+    workflow_approval::assert_workflow_step_actor(
+        &txn, tenant_id, model.employee_id, &current_step, &action_authority,
+    )
+    .await?;
     let now = Utc::now();
-    let mut am: expense::ActiveModel = model.into();
-    am.status = Set(STATUS_REJECTED.into());
-    am.rejection_reason = Set(rejection_reason.clone());
-    am.approved_by = Set(None);
-    am.approved_amount = Set(None);
-    am.payment_status = Set(PAYMENT_STATUS_NONE.into());
-    am.paid_at = Set(None);
-    am.payment_reference = Set(None);
-    am.updated_at = Set(now);
-    am.update(&txn).await?;
-
+    workflow_action::ActiveModel {
+        id: Set(Uuid::new_v4()),
+        tenant_id: Set(tenant_id),
+        instance_id: Set(instance.id),
+        workflow_step_id: Set(current_step.id),
+        performed_by: Set(Some(authority.actor_user_id)),
+        action: Set(WF_ACTION_REJECT.into()),
+        remarks: Set(rejection_reason.clone()),
+        acted_at: Set(now),
+        created_at: Set(now),
+        updated_at: Set(now),
+    }
+    .insert(&txn)
+    .await?;
+    let mut active_instance: workflow_instance::ActiveModel = instance.into();
+    active_instance.status = Set(WF_STATUS_CANCELLED.into());
+    active_instance.current_step_id = Set(None);
+    active_instance.completed_at = Set(Some(now));
+    active_instance.updated_at = Set(now);
+    active_instance.update(&txn).await?;
+    let mut active_expense: expense::ActiveModel = model.into();
+    active_expense.status = Set(STATUS_REJECTED.into());
+    active_expense.rejection_reason = Set(rejection_reason.clone());
+    active_expense.approved_by = Set(None);
+    active_expense.approved_amount = Set(None);
+    active_expense.payment_status = Set(PAYMENT_STATUS_NONE.into());
+    active_expense.paid_at = Set(None);
+    active_expense.payment_reference = Set(None);
+    active_expense.updated_at = Set(now);
+    active_expense.update(&txn).await?;
     let out = expense::Entity::find_by_id(expense_id)
         .one(&txn)
         .await?
         .ok_or_else(|| KabiPayError::Internal("updated expense not found".into()))?;
-
-    txn.commit().await?;
-
-    let msg = format!(
-        "Your expense claim \"{}\" was rejected.{}",
-        out.title,
-        match &out.rejection_reason {
-            Some(s) if !s.is_empty() => format!(" Reason: {s}"),
-            _ => String::new(),
-        }
-    );
-    expense_notify_employee(db, tenant_id, out.employee_id, "Expense rejected", &msg).await;
-    Ok(out)
+    after_successful_commit(txn.commit(), || async {
+        let msg = format!(
+            "Your expense claim \"{}\" was rejected.{}",
+            out.title,
+            out.rejection_reason
+                .as_ref()
+                .filter(|reason| !reason.is_empty())
+                .map(|reason| format!(" Reason: {reason}"))
+                .unwrap_or_default()
+        );
+        expense_notify_employee(db, tenant_id, out.employee_id, "Expense rejected", &msg).await;
+        Ok(out)
+    })
+    .await
 }
 
 async fn lock_pending_expense(
@@ -962,11 +871,7 @@ async fn lock_pending_expense(
     tenant_id: Uuid,
     expense_id: Uuid,
 ) -> KabiPayResult<expense::Model> {
-    let model = expense::Entity::find()
-        .filter(expense::Column::Id.eq(expense_id))
-        .filter(expense::Column::TenantId.eq(tenant_id))
-        .filter(expense::Column::IsDeleted.eq(false))
-        .lock(LockType::Update)
+    let model = pending_expense_for_decision_query(expense_id, tenant_id)
         .one(txn)
         .await?
         .ok_or_else(|| KabiPayError::NotFound {
@@ -981,27 +886,30 @@ async fn lock_pending_expense(
     Ok(model)
 }
 
-async fn load_pending_expense_conn(
-    db: &impl ConnectionTrait,
-    tenant_id: Uuid,
+fn pending_expense_for_decision_query(
     expense_id: Uuid,
-) -> KabiPayResult<expense::Model> {
-    let m = expense::Entity::find()
+    tenant_id: Uuid,
+) -> sea_orm::Select<expense::Entity> {
+    expense::Entity::find()
         .filter(expense::Column::Id.eq(expense_id))
         .filter(expense::Column::TenantId.eq(tenant_id))
         .filter(expense::Column::IsDeleted.eq(false))
-        .one(db)
-        .await?
-        .ok_or_else(|| KabiPayError::NotFound {
-            entity: "expense",
-            id: expense_id.to_string(),
-        })?;
-    if m.status != STATUS_PENDING {
-        return Err(KabiPayError::Validation(
-            "only PENDING expenses can be approved or rejected".into(),
-        ));
+        .lock(LockType::Update)
+}
+
+#[cfg(test)]
+mod approval_decision_tests {
+    use super::*;
+    use sea_orm::{DbBackend, QueryTrait};
+
+    #[test]
+    fn expense_decision_locks_only_the_pending_tenant_request() {
+        let sql = pending_expense_for_decision_query(Uuid::new_v4(), Uuid::new_v4())
+            .build(DbBackend::Postgres)
+            .to_string();
+        assert!(sql.contains("\"is_deleted\" = FALSE"));
+        assert!(sql.ends_with("FOR UPDATE"));
     }
-    Ok(m)
 }
 
 /// Upsert **`expense_category`** (tenant master data for claim types). Caller enforces **`expense:manage`**.

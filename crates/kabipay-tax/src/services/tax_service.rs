@@ -1,7 +1,13 @@
 //! Tenant-scoped SeaORM queries and commands for tax configuration, slabs, and employee computations.
 
 use chrono::Utc;
-use kabipay_common::{KabiPayError, KabiPayResult};
+use kabipay_common::{
+    client_data_scope::{
+        resolve_employee_scope_filter_with_connection, EmployeeScopeFilter,
+    },
+    context::{ClientViewerEmployee, ScopeType},
+    KabiPayError, KabiPayResult,
+};
 use kabipay_db_entities::tenant::d0007_employee_core::employee;
 use kabipay_db_entities::tenant::d0013_tax_statutory::{
     tax_computation, tax_configuration_version, tax_section_definition, tax_slab,
@@ -11,9 +17,10 @@ use kabipay_db_entities::tenant::d0027_communication_audit::notification;
 use kabipay_db_entities::tenant::d0031_tax_proof::tax_proof_line;
 use rust_decimal::Decimal;
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, QueryOrder,
-    QuerySelect, Set,
+    ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseConnection, DatabaseTransaction,
+    EntityTrait, QueryFilter, QueryOrder, QuerySelect, Select, Set, TransactionTrait,
 };
+use sea_orm::sea_query::LockType;
 use sea_orm::PaginatorTrait;
 use std::str::FromStr;
 use uuid::Uuid;
@@ -326,56 +333,137 @@ pub async fn submit_tax_proof_line(
     Ok(out)
 }
 
-async fn load_pending_tax_proof(
-    db: &DatabaseConnection,
+fn tax_proof_for_decision_query(
+    tenant_id: Uuid,
+    line_id: Uuid,
+) -> Select<tax_proof_line::Entity> {
+    tax_proof_line::Entity::find()
+        .filter(tax_proof_line::Column::Id.eq(line_id))
+        .filter(tax_proof_line::Column::TenantId.eq(tenant_id))
+        .lock(LockType::Update)
+}
+
+fn require_pending_tax_proof_status(status: &str) -> KabiPayResult<()> {
+    if status != PROOF_PENDING {
+        return Err(KabiPayError::Conflict(
+            "tax proof is no longer pending; refresh before taking another action".into(),
+        ));
+    }
+    Ok(())
+}
+
+async fn lock_pending_tax_proof(
+    txn: &DatabaseTransaction,
     tenant_id: Uuid,
     line_id: Uuid,
 ) -> KabiPayResult<tax_proof_line::Model> {
-    let m = tax_proof_line::Entity::find()
-        .filter(tax_proof_line::Column::Id.eq(line_id))
-        .filter(tax_proof_line::Column::TenantId.eq(tenant_id))
-        .one(db)
+    let model = tax_proof_for_decision_query(tenant_id, line_id)
+        .one(txn)
         .await?
         .ok_or_else(|| KabiPayError::NotFound {
             entity: "tax_proof_line",
             id: line_id.to_string(),
         })?;
-    if m.status != PROOF_PENDING {
-        return Err(KabiPayError::Validation(
-            "only PENDING tax proof lines can be approved or rejected".into(),
+    require_pending_tax_proof_status(&model.status)?;
+    Ok(model)
+}
+
+pub(crate) fn require_tax_approval_target(
+    target_scope: &EmployeeScopeFilter,
+    approver_employee_id: Uuid,
+    target_employee_id: Uuid,
+) -> KabiPayResult<()> {
+    if approver_employee_id == target_employee_id {
+        return Err(KabiPayError::Forbidden(
+            "tax proof self-approval is not allowed".into(),
         ));
     }
-    Ok(m)
+    if !target_scope.allows_employee(target_employee_id) {
+        return Err(KabiPayError::Forbidden(
+            "tax:approve scope does not include target employee".into(),
+        ));
+    }
+    Ok(())
+}
+
+async fn require_tax_approval_target_in_txn(
+    txn: &DatabaseTransaction,
+    tenant_id: Uuid,
+    scope: ScopeType,
+    approver_employee_id: Uuid,
+    target_employee_id: Uuid,
+) -> KabiPayResult<()> {
+    let target_scope = resolve_employee_scope_filter_with_connection(
+        txn,
+        tenant_id,
+        scope,
+        Some(ClientViewerEmployee {
+            employee_id: approver_employee_id,
+            department_id: None,
+        }),
+    )
+    .await?;
+    require_tax_approval_target(
+        &target_scope,
+        approver_employee_id,
+        target_employee_id,
+    )
 }
 
 pub async fn approve_tax_proof_line(
     db: &DatabaseConnection,
     tenant_id: Uuid,
     line_id: Uuid,
+    scope: ScopeType,
+    approver_employee_id: Uuid,
     approver_user_id: Uuid,
 ) -> KabiPayResult<tax_proof_line::Model> {
-    let model = load_pending_tax_proof(db, tenant_id, line_id).await?;
-    let file_storage_id = model.file_storage_id.ok_or_else(|| {
-        KabiPayError::Validation("tax proof file is required before approval".into())
-    })?;
-    assert_tax_proof_file(db, tenant_id, file_storage_id, None).await?;
-    let tid = model.tax_config_version_id;
-    let eid = model.employee_id;
-    let fy = model.fiscal_year;
-    let mut am: tax_proof_line::ActiveModel = model.into();
-    am.status = Set(PROOF_APPROVED.into());
-    am.rejection_reason = Set(None);
-    am.approved_by = Set(Some(approver_user_id));
-    am.update(db).await?;
-    let out = tax_proof_line::Entity::find_by_id(line_id)
-        .one(db)
-        .await?
-        .ok_or_else(|| KabiPayError::Internal("updated tax_proof_line not found".into()))?;
-    recompute_total_deductions_from_approved_proofs(db, tenant_id, eid, tid, fy).await?;
+    let txn = db.begin().await?;
+    let decision = async {
+        let model = lock_pending_tax_proof(&txn, tenant_id, line_id).await?;
+        require_tax_approval_target_in_txn(
+            &txn,
+            tenant_id,
+            scope,
+            approver_employee_id,
+            model.employee_id,
+        )
+        .await?;
+        let file_storage_id = model.file_storage_id.ok_or_else(|| {
+            KabiPayError::Validation("tax proof file is required before approval".into())
+        })?;
+        assert_tax_proof_file(&txn, tenant_id, file_storage_id, None).await?;
+        let tid = model.tax_config_version_id;
+        let eid = model.employee_id;
+        let fy = model.fiscal_year;
+        let mut am: tax_proof_line::ActiveModel = model.into();
+        am.status = Set(PROOF_APPROVED.into());
+        am.rejection_reason = Set(None);
+        am.approved_by = Set(Some(approver_user_id));
+        am.update(&txn).await?;
+        let out = tax_proof_line::Entity::find_by_id(line_id)
+            .filter(tax_proof_line::Column::TenantId.eq(tenant_id))
+            .one(&txn)
+            .await?
+            .ok_or_else(|| KabiPayError::Internal("updated tax_proof_line not found".into()))?;
+        recompute_total_deductions_from_approved_proofs(&txn, tenant_id, eid, tid, fy).await?;
+        Ok::<_, KabiPayError>(out)
+    }
+    .await;
+    let out = match decision {
+        Ok(out) => {
+            txn.commit().await?;
+            out
+        }
+        Err(error) => {
+            txn.rollback().await?;
+            return Err(error);
+        }
+    };
     tax_proof_notify_employee(
         db,
         tenant_id,
-        eid,
+        out.employee_id,
         "Tax proof approved",
         &format!(
             "Your {} deduction proof (FY {}) was approved and counts toward year-end tax.",
@@ -386,12 +474,15 @@ pub async fn approve_tax_proof_line(
     Ok(out)
 }
 
-async fn assert_tax_proof_file(
-    db: &DatabaseConnection,
+async fn assert_tax_proof_file<C>(
+    db: &C,
     tenant_id: Uuid,
     file_storage_id: Uuid,
     required_uploader_user_id: Option<Uuid>,
-) -> KabiPayResult<()> {
+) -> KabiPayResult<()>
+where
+    C: ConnectionTrait,
+{
     let file = file_storage::Entity::find_by_id(file_storage_id)
         .filter(file_storage::Column::TenantId.eq(tenant_id))
         .one(db)
@@ -437,22 +528,48 @@ pub async fn reject_tax_proof_line(
     db: &DatabaseConnection,
     tenant_id: Uuid,
     line_id: Uuid,
+    scope: ScopeType,
+    approver_employee_id: Uuid,
     rejection_reason: Option<String>,
 ) -> KabiPayResult<tax_proof_line::Model> {
-    let model = load_pending_tax_proof(db, tenant_id, line_id).await?;
-    let tid = model.tax_config_version_id;
-    let eid = model.employee_id;
-    let fy = model.fiscal_year;
-    let mut am: tax_proof_line::ActiveModel = model.into();
-    am.status = Set(PROOF_REJECTED.into());
-    am.rejection_reason = Set(rejection_reason);
-    am.approved_by = Set(None);
-    am.update(db).await?;
-    let out = tax_proof_line::Entity::find_by_id(line_id)
-        .one(db)
-        .await?
-        .ok_or_else(|| KabiPayError::Internal("updated tax_proof_line not found".into()))?;
-    recompute_total_deductions_from_approved_proofs(db, tenant_id, eid, tid, fy).await?;
+    let txn = db.begin().await?;
+    let decision = async {
+        let model = lock_pending_tax_proof(&txn, tenant_id, line_id).await?;
+        require_tax_approval_target_in_txn(
+            &txn,
+            tenant_id,
+            scope,
+            approver_employee_id,
+            model.employee_id,
+        )
+        .await?;
+        let tid = model.tax_config_version_id;
+        let eid = model.employee_id;
+        let fy = model.fiscal_year;
+        let mut am: tax_proof_line::ActiveModel = model.into();
+        am.status = Set(PROOF_REJECTED.into());
+        am.rejection_reason = Set(rejection_reason);
+        am.approved_by = Set(None);
+        am.update(&txn).await?;
+        let out = tax_proof_line::Entity::find_by_id(line_id)
+            .filter(tax_proof_line::Column::TenantId.eq(tenant_id))
+            .one(&txn)
+            .await?
+            .ok_or_else(|| KabiPayError::Internal("updated tax_proof_line not found".into()))?;
+        recompute_total_deductions_from_approved_proofs(&txn, tenant_id, eid, tid, fy).await?;
+        Ok::<_, KabiPayError>(out)
+    }
+    .await;
+    let out = match decision {
+        Ok(out) => {
+            txn.commit().await?;
+            out
+        }
+        Err(error) => {
+            txn.rollback().await?;
+            return Err(error);
+        }
+    };
     let msg = match &out.rejection_reason {
         Some(s) if !s.is_empty() => format!(
             "Your {} proof (FY {}) was rejected. Reason: {s}",
@@ -463,20 +580,30 @@ pub async fn reject_tax_proof_line(
             out.section_code, out.fiscal_year
         ),
     };
-    tax_proof_notify_employee(db, tenant_id, eid, "Tax proof rejected", &msg).await;
+    tax_proof_notify_employee(
+        db,
+        tenant_id,
+        out.employee_id,
+        "Tax proof rejected",
+        &msg,
+    )
+    .await;
     Ok(out)
 }
 
 /// Sums `actual_amount` for **APPROVED** lines and writes the result to
 /// `tax_computation.total_deductions` for the same employee / config / fiscal year.
 /// Year-end and payroll logic should use that column (not unapproved `actual_amount` values).
-pub async fn recompute_total_deductions_from_approved_proofs(
-    db: &DatabaseConnection,
+pub async fn recompute_total_deductions_from_approved_proofs<C>(
+    db: &C,
     tenant_id: Uuid,
     employee_id: Uuid,
     tax_config_version_id: Uuid,
     fiscal_year: i32,
-) -> KabiPayResult<()> {
+) -> KabiPayResult<()>
+where
+    C: ConnectionTrait,
+{
     let lines = tax_proof_line::Entity::find()
         .filter(tax_proof_line::Column::TenantId.eq(tenant_id))
         .filter(tax_proof_line::Column::EmployeeId.eq(employee_id))
@@ -807,5 +934,205 @@ async fn tax_proof_notify_employee(
     };
     if let Err(e) = am.insert(db).await {
         tracing::warn!(error = %e, "insert notification (tax proof) failed");
+    }
+}
+
+#[cfg(test)]
+mod decision_transaction_tests {
+    use super::*;
+    use kabipay_common::context::ScopeType;
+    use sea_orm::entity::prelude::async_trait;
+    use sea_orm::{
+        Database, DbBackend, DbErr, ProxyDatabaseTrait, ProxyExecResult, ProxyRow, QueryTrait,
+    };
+    use std::collections::{BTreeMap, VecDeque};
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Debug)]
+    struct ScriptedProxy {
+        query_results: Mutex<VecDeque<Result<Vec<ProxyRow>, DbErr>>>,
+        events: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ProxyDatabaseTrait for ScriptedProxy {
+        async fn query(&self, statement: sea_orm::Statement) -> Result<Vec<ProxyRow>, DbErr> {
+            self.events
+                .lock()
+                .expect("event recorder")
+                .push(format!("QUERY {statement}"));
+            self.query_results
+                .lock()
+                .expect("query script")
+                .pop_front()
+                .unwrap_or_else(|| Ok(Vec::new()))
+        }
+
+        async fn execute(
+            &self,
+            statement: sea_orm::Statement,
+        ) -> Result<ProxyExecResult, DbErr> {
+            self.events
+                .lock()
+                .expect("event recorder")
+                .push(format!("EXECUTE {statement}"));
+            Ok(ProxyExecResult {
+                last_insert_id: 0,
+                rows_affected: 1,
+            })
+        }
+
+        async fn begin(&self) {
+            self.events.lock().expect("event recorder").push("BEGIN".into());
+        }
+
+        async fn commit(&self) {
+            self.events.lock().expect("event recorder").push("COMMIT".into());
+        }
+
+        async fn rollback(&self) {
+            self.events
+                .lock()
+                .expect("event recorder")
+                .push("ROLLBACK".into());
+        }
+    }
+
+    async fn scripted_connection(
+        query_results: Vec<Result<Vec<ProxyRow>, DbErr>>,
+    ) -> (DatabaseConnection, Arc<Mutex<Vec<String>>>) {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let db = Database::connect_proxy(
+            DbBackend::Postgres,
+            Arc::new(Box::new(ScriptedProxy {
+                query_results: Mutex::new(query_results.into()),
+                events: Arc::clone(&events),
+            })),
+        )
+        .await
+        .expect("PostgreSQL proxy connection");
+        (db, events)
+    }
+
+    fn proof_model(status: &str) -> tax_proof_line::Model {
+        let now = Utc::now();
+        tax_proof_line::Model {
+            id: Uuid::new_v4(),
+            tenant_id: Uuid::new_v4(),
+            employee_id: Uuid::new_v4(),
+            tax_config_version_id: Uuid::new_v4(),
+            fiscal_year: 2026,
+            section_code: "80C".into(),
+            declared_amount: Decimal::new(1000, 0),
+            actual_amount: Decimal::new(900, 0),
+            file_storage_id: Some(Uuid::new_v4()),
+            status: status.into(),
+            rejection_reason: None,
+            approved_by: None,
+            submitted_at: now,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    fn proof_row(model: &tax_proof_line::Model) -> ProxyRow {
+        ProxyRow::new(BTreeMap::from([
+            ("id".into(), model.id.into()),
+            ("tenant_id".into(), model.tenant_id.into()),
+            ("employee_id".into(), model.employee_id.into()),
+            (
+                "tax_config_version_id".into(),
+                model.tax_config_version_id.into(),
+            ),
+            ("fiscal_year".into(), model.fiscal_year.into()),
+            ("section_code".into(), model.section_code.clone().into()),
+            ("declared_amount".into(), model.declared_amount.into()),
+            ("actual_amount".into(), model.actual_amount.into()),
+            ("file_storage_id".into(), model.file_storage_id.into()),
+            ("status".into(), model.status.clone().into()),
+            (
+                "rejection_reason".into(),
+                model.rejection_reason.clone().into(),
+            ),
+            ("approved_by".into(), model.approved_by.into()),
+            ("submitted_at".into(), model.submitted_at.into()),
+            ("created_at".into(), model.created_at.into()),
+            ("updated_at".into(), model.updated_at.into()),
+        ]))
+    }
+
+    #[test]
+    fn concurrent_decisions_lock_the_same_tenant_proof_row_for_update() {
+        let model = proof_model(PROOF_PENDING);
+        let sql = tax_proof_for_decision_query(model.tenant_id, model.id)
+            .build(DbBackend::Postgres)
+            .to_string();
+        assert!(sql.contains(&model.tenant_id.to_string()));
+        assert!(sql.contains(&model.id.to_string()));
+        assert!(sql.ends_with("FOR UPDATE"));
+    }
+
+    #[test]
+    fn duplicate_and_stale_decisions_share_a_stable_conflict() {
+        assert!(require_pending_tax_proof_status(PROOF_PENDING).is_ok());
+        for stale_status in [PROOF_APPROVED, PROOF_REJECTED] {
+            let error = require_pending_tax_proof_status(stale_status)
+                .expect_err("a serialized second decision must be rejected");
+            assert_eq!(error.code(), "CONFLICT");
+        }
+    }
+
+    #[tokio::test]
+    async fn recompute_failure_rolls_back_the_proof_update() {
+        let pending = proof_model(PROOF_PENDING);
+        let mut rejected = pending.clone();
+        rejected.status = PROOF_REJECTED.into();
+        rejected.rejection_reason = Some("invalid".into());
+        let (db, events) = scripted_connection(vec![
+            Ok(vec![proof_row(&pending)]),
+            Ok(vec![proof_row(&rejected)]),
+            Err(DbErr::Custom("forced recompute failure".into())),
+        ])
+        .await;
+
+        let error = reject_tax_proof_line(
+            &db,
+            pending.tenant_id,
+            pending.id,
+            ScopeType::All,
+            Uuid::new_v4(),
+            Some("invalid".into()),
+        )
+        .await
+        .expect_err("recompute failure must abort the entire decision");
+        assert_eq!(error.code(), "DATABASE_ERROR");
+
+        let events = events.lock().expect("event recorder");
+        assert!(events.iter().any(|event| event == "BEGIN"));
+        assert!(events.iter().any(|event| event == "ROLLBACK"));
+        assert!(!events.iter().any(|event| event == "COMMIT"));
+    }
+
+    #[tokio::test]
+    async fn stale_decision_rolls_back_without_updating_or_recomputing() {
+        let stale = proof_model(PROOF_APPROVED);
+        let (db, events) = scripted_connection(vec![Ok(vec![proof_row(&stale)])]).await;
+
+        let error = reject_tax_proof_line(
+            &db,
+            stale.tenant_id,
+            stale.id,
+            ScopeType::All,
+            Uuid::new_v4(),
+            None,
+        )
+        .await
+        .expect_err("stale proof decision must fail");
+        assert_eq!(error.code(), "CONFLICT");
+
+        let events = events.lock().expect("event recorder");
+        assert!(events.iter().any(|event| event == "ROLLBACK"));
+        assert!(!events.iter().any(|event| event.starts_with("EXECUTE")));
+        assert!(!events.iter().any(|event| event == "COMMIT"));
     }
 }

@@ -2,12 +2,15 @@
 
 use async_graphql::{Context, Object, Result, ID};
 use kabipay_common::{
-    subgraph::{require_client_claims, require_tenant_id, tenant_db},
-    KabiPayError,
+    client_data_scope::data_scope_from_claims,
+    context::{ClientClaims, ScopeType, PERM_PAYROLL_MANAGE},
+    subgraph::{require_tenant_id, tenant_db},
+    KabiPayError, KabiPayResult,
 };
 
 use rust_decimal::Decimal;
 use std::str::FromStr;
+use uuid::Uuid;
 
 use crate::resolvers::types::{
     AssignEmployeeSalaryStructureInput, EmployeeSalaryStructureDto,
@@ -19,6 +22,25 @@ use crate::services::arrear_service;
 use crate::services::payroll_service;
 use crate::resolvers::query::parse_uuid;
 
+fn payroll_manage_all_from_claims(claims: Option<&ClientClaims>) -> KabiPayResult<()> {
+    let scope = data_scope_from_claims(claims, PERM_PAYROLL_MANAGE)?;
+    if scope != ScopeType::All {
+        return Err(KabiPayError::Forbidden(format!(
+            "{PERM_PAYROLL_MANAGE} permission requires ALL scope"
+        )));
+    }
+    Ok(())
+}
+
+fn require_payroll_manage_all(ctx: &Context<'_>) -> Result<Uuid> {
+    payroll_manage_all_from_claims(ctx.data_opt::<ClientClaims>())
+        .map_err(KabiPayError::into_graphql)?;
+    Ok(ctx
+        .data::<ClientClaims>()
+        .map_err(|_| KabiPayError::Unauthorised.into_graphql())?
+        .sub)
+}
+
 pub struct MutationRoot;
 
 #[Object]
@@ -29,16 +51,7 @@ impl MutationRoot {
         ctx: &Context<'_>,
         input: CreatePayrollArrearInput,
     ) -> Result<PayrollArrearDto> {
-        let claims = require_client_claims(ctx)?;
-        if !claims.can_export_payroll_statutory() {
-            return Err(
-                KabiPayError::Forbidden(
-                    "create payroll arrear requires payroll:statutory_export"
-                        .into(),
-                )
-                .into_graphql(),
-            );
-        }
+        require_payroll_manage_all(ctx)?;
         let tenant_id = require_tenant_id(ctx)?;
         let db = tenant_db(ctx, tenant_id).await?;
         let eid = parse_uuid(&input.employee_id, "employeeId")?;
@@ -55,15 +68,7 @@ impl MutationRoot {
         ctx: &Context<'_>,
         input: UpsertSalaryComponentInput,
     ) -> Result<SalaryComponentDto> {
-        let claims = require_client_claims(ctx)?;
-        if !claims.can_export_payroll_statutory() && !claims.can_manage_compensation_admin() {
-            return Err(
-                KabiPayError::Forbidden(
-                    "upsert salary component requires payroll:statutory_export or compensation:manage".into(),
-                )
-                .into_graphql(),
-            );
-        }
+        require_payroll_manage_all(ctx)?;
         let tenant_id = require_tenant_id(ctx)?;
         let db = tenant_db(ctx, tenant_id).await?;
         let id = input
@@ -93,15 +98,7 @@ impl MutationRoot {
         ctx: &Context<'_>,
         input: UpsertSalaryStructureInput,
     ) -> Result<SalaryStructureDto> {
-        let claims = require_client_claims(ctx)?;
-        if !claims.can_export_payroll_statutory() && !claims.can_manage_compensation_admin() {
-            return Err(
-                KabiPayError::Forbidden(
-                    "upsert salary structure requires payroll:statutory_export or compensation:manage".into(),
-                )
-                .into_graphql(),
-            );
-        }
+        require_payroll_manage_all(ctx)?;
         let tenant_id = require_tenant_id(ctx)?;
         let db = tenant_db(ctx, tenant_id).await?;
         let id = input
@@ -143,15 +140,7 @@ impl MutationRoot {
         ctx: &Context<'_>,
         input: AssignEmployeeSalaryStructureInput,
     ) -> Result<EmployeeSalaryStructureDto> {
-        let claims = require_client_claims(ctx)?;
-        if !claims.can_export_payroll_statutory() && !claims.can_manage_compensation_admin() {
-            return Err(
-                KabiPayError::Forbidden(
-                    "assign employee salary structure requires payroll:statutory_export or compensation:manage".into(),
-                )
-                .into_graphql(),
-            );
-        }
+        require_payroll_manage_all(ctx)?;
         let tenant_id = require_tenant_id(ctx)?;
         let db = tenant_db(ctx, tenant_id).await?;
         let employee_id = parse_uuid(&input.employee_id, "employeeId")?;
@@ -185,22 +174,13 @@ impl MutationRoot {
     }
 
     /// Create a **DRAFT** payroll cycle for a calendar month/year (one per tenant per period in v1).
-    /// Same authorization as **run payroll**: `payroll:statutory_export`.
+    /// Same authorization as **run payroll**: `payroll:manage` with `ALL` scope.
     async fn create_payroll_cycle(
         &self,
         ctx: &Context<'_>,
         input: CreatePayrollCycleInput,
     ) -> Result<PayrollCycleDto> {
-        let claims = require_client_claims(ctx)?;
-        if !claims.can_export_payroll_statutory() {
-            return Err(
-                KabiPayError::Forbidden(
-                    "create payroll cycle requires payroll:statutory_export"
-                        .into(),
-                )
-                .into_graphql(),
-            );
-        }
+        require_payroll_manage_all(ctx)?;
         let tenant_id = require_tenant_id(ctx)?;
         let db = tenant_db(ctx, tenant_id).await?;
         let m = payroll_service::create_payroll_cycle(
@@ -222,16 +202,7 @@ impl MutationRoot {
         ctx: &Context<'_>,
         input: UpsertPayrollComplianceSettingInput,
     ) -> Result<PayrollComplianceSettingDto> {
-        let claims = require_client_claims(ctx)?;
-        if !claims.can_export_payroll_statutory() {
-            return Err(
-                KabiPayError::Forbidden(
-                    "upsert payroll compliance setting requires payroll:statutory_export"
-                        .into(),
-                )
-                .into_graphql(),
-            );
-        }
+        require_payroll_manage_all(ctx)?;
         let tenant_id = require_tenant_id(ctx)?;
         let db = tenant_db(ctx, tenant_id).await?;
         let logo = input
@@ -263,16 +234,7 @@ impl MutationRoot {
         ctx: &Context<'_>,
         payroll_cycle_id: ID,
     ) -> Result<PayrollCycleDto> {
-        let claims = require_client_claims(ctx)?;
-        if !claims.can_export_payroll_statutory() {
-            return Err(
-                KabiPayError::Forbidden(
-                    "run payroll requires payroll:statutory_export"
-                        .into(),
-                )
-                .into_graphql(),
-            );
-        }
+        let actor_user_id = require_payroll_manage_all(ctx)?;
         let tenant_id = require_tenant_id(ctx)?;
         let db = tenant_db(ctx, tenant_id).await?;
         let cid = parse_uuid(&payroll_cycle_id, "payrollCycleId")?;
@@ -280,10 +242,147 @@ impl MutationRoot {
             &db,
             tenant_id,
             cid,
-            claims.sub,
+            actor_user_id,
         )
         .await
         .map_err(KabiPayError::into_graphql)?;
         Ok(PayrollCycleDto::from(m))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use async_graphql::{EmptySubscription, Request, Schema};
+    use kabipay_common::context::{
+        ClientClaims, CLIENT_JWT_ISSUER, PERM_COMPENSATION_MANAGE, PERM_PAYROLL_MANAGE,
+        PERM_PAYROLL_STATUTORY_EXPORT,
+    };
+    use kabipay_common::subgraph::TenantId;
+    use std::collections::HashMap;
+    use crate::resolvers::query::QueryRoot;
+
+    fn claims(permission: &str, scope: Option<&str>) -> ClientClaims {
+        let permission_scopes = scope
+            .map(|scope| HashMap::from([(permission.to_string(), scope.to_string())]))
+            .unwrap_or_default();
+        ClientClaims {
+            sub: Uuid::new_v4(),
+            iss: CLIENT_JWT_ISSUER.into(),
+            exp: 0,
+            iat: 0,
+            tenant_id: Uuid::new_v4(),
+            email: String::new(),
+            employee_id: None,
+            must_change_password: false,
+            roles: vec![],
+            permissions: vec![permission.into()],
+            permission_scopes,
+            resource_scopes: HashMap::new(),
+        }
+    }
+
+    async fn execute_mutation(claims: ClientClaims, mutation: &str) -> async_graphql::Response {
+        let tenant_id = claims.tenant_id;
+        Schema::build(QueryRoot, MutationRoot, EmptySubscription)
+            .data(TenantId(tenant_id))
+            .data(claims)
+            .finish()
+            .execute(Request::new(mutation))
+            .await
+    }
+
+    fn assert_permission_denied_before_db(
+        response: &async_graphql::Response,
+        expected_message: &str,
+    ) {
+        assert_eq!(response.errors.len(), 1, "unexpected response: {response:?}");
+        let message = &response.errors[0].message;
+        assert!(
+            message.contains(expected_message),
+            "unexpected denial: {message}"
+        );
+        assert!(!message.contains("TenantDbCache"));
+        assert!(!message.contains("database"));
+    }
+
+    fn assert_authorization_reached_db(response: &async_graphql::Response) {
+        assert_eq!(response.errors.len(), 1, "unexpected response: {response:?}");
+        let code = response.errors[0]
+            .extensions
+            .as_ref()
+            .and_then(|extensions| extensions.get("code"))
+            .cloned();
+        assert_eq!(
+            code,
+            Some(async_graphql::Value::from("INTERNAL_ERROR")),
+            "exact payroll:manage ALL authority did not reach the database boundary: {response:?}"
+        );
+    }
+
+    fn protected_mutations() -> [&'static str; 7] {
+        [
+            r#"mutation { createPayrollArrear(input: { employeeId: "00000000-0000-0000-0000-000000000001", amount: "1" }) { id } }"#,
+            r#"mutation { upsertSalaryComponent(input: { name: "Base", code: "BASIC", componentType: "EARNING", isTaxable: true, isFixed: true, isActive: true }) { id } }"#,
+            r#"mutation { upsertSalaryStructure(input: { name: "Default", components: [] }) { id } }"#,
+            r#"mutation { assignEmployeeSalaryStructure(input: { employeeId: "00000000-0000-0000-0000-000000000001", salaryStructureId: "00000000-0000-0000-0000-000000000002", annualCtc: "1", effectiveFrom: "2026-01-01", overrides: [] }) { id } }"#,
+            r#"mutation { createPayrollCycle(input: { name: "January", month: 1, year: 2026 }) { id } }"#,
+            r#"mutation { upsertPayrollComplianceSetting(input: {}) { employerTan } }"#,
+            r#"mutation { runPayrollForCycle(payrollCycleId: "00000000-0000-0000-0000-000000000003") { id } }"#,
+        ]
+    }
+
+    #[test]
+    fn payroll_manage_requires_exact_all_scope() {
+        assert!(payroll_manage_all_from_claims(Some(&claims(
+            PERM_PAYROLL_MANAGE,
+            Some("ALL")
+        )))
+        .is_ok());
+
+        for denied in [
+            claims(PERM_PAYROLL_MANAGE, None),
+            claims(PERM_PAYROLL_MANAGE, Some("INVALID")),
+            claims(PERM_PAYROLL_MANAGE, Some("SELF")),
+            claims(PERM_PAYROLL_MANAGE, Some("TEAM")),
+            claims(PERM_PAYROLL_STATUTORY_EXPORT, Some("ALL")),
+        ] {
+            assert!(payroll_manage_all_from_claims(Some(&denied)).is_err());
+        }
+        assert!(payroll_manage_all_from_claims(None).is_err());
+    }
+
+    #[tokio::test]
+    async fn every_payroll_mutation_rejects_sibling_permission_before_database_access() {
+        for sibling_permission in [PERM_PAYROLL_STATUTORY_EXPORT, PERM_COMPENSATION_MANAGE] {
+            for mutation in protected_mutations() {
+                let response =
+                    execute_mutation(claims(sibling_permission, Some("ALL")), mutation).await;
+                assert_permission_denied_before_db(
+                    &response,
+                    &format!("{PERM_PAYROLL_MANAGE} permission required"),
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn every_payroll_mutation_rejects_non_all_scope_before_database_access() {
+        for denied_scope in [None, Some("SELF"), Some("TEAM"), Some("DEPARTMENT")] {
+            for mutation in protected_mutations() {
+                let response =
+                    execute_mutation(claims(PERM_PAYROLL_MANAGE, denied_scope), mutation).await;
+                assert_permission_denied_before_db(&response, PERM_PAYROLL_MANAGE);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn every_payroll_mutation_with_exact_all_scope_reaches_database_boundary() {
+        for mutation in protected_mutations() {
+            let response =
+                execute_mutation(claims(PERM_PAYROLL_MANAGE, Some("ALL")), mutation).await;
+            assert_authorization_reached_db(&response);
+        }
     }
 }

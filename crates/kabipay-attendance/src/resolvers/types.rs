@@ -2,9 +2,9 @@
 
 use async_graphql::{ComplexObject, Context, InputObject, Result, SimpleObject, ID};
 use chrono::{DateTime, NaiveDate, NaiveTime, Utc};
-use kabipay_common::client_data_scope::{data_scope_from_context, resolve_viewer_employee};
-use kabipay_common::context::PERM_TIMESHEET_APPROVE;
-use kabipay_common::subgraph::{require_client_claims, require_tenant_id, tenant_db};
+use kabipay_common::client_data_scope::resolve_viewer_employee;
+use kabipay_common::context::{ClientClaims, ScopeType, PERM_TIMESHEET_APPROVE};
+use kabipay_common::subgraph::{require_tenant_id, tenant_db};
 use kabipay_common::workflow_approval::WorkflowApprovalAuthority;
 use kabipay_common::KabiPayError;
 use kabipay_db_entities::tenant::d0010_time_shift_roster::{
@@ -14,16 +14,46 @@ use kabipay_db_entities::tenant::d0007_employee_core::employee;
 use kabipay_db_entities::tenant::d0032_attendance_punch_policy::attendance_punch_policy;
 use rust_decimal::prelude::ToPrimitive;
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+use std::future::Future;
+use std::sync::Arc;
+use tokio::sync::OnceCell;
 use uuid::Uuid;
 
 use crate::resolvers::query::parse_uuid;
-use crate::services::timesheet_batch_service;
+use crate::services::timesheet_batch_service::{self, TimesheetApprovalSnapshot};
 
 use crate::services::attendance_service::PunchDaySummary;
 use crate::services::attendance_management_service::ManagedAttendanceRow;
 use crate::services::attendance_report_service::{
     AttendanceDailyReportRow, AttendanceReportSummary,
 };
+
+#[derive(Clone, Debug, Default)]
+struct TimesheetApprovalSnapshotCache {
+    value: Arc<OnceCell<TimesheetApprovalSnapshot>>,
+}
+
+impl TimesheetApprovalSnapshotCache {
+    async fn get_or_try_init<E, F, Fut>(
+        &self,
+        init: F,
+    ) -> std::result::Result<TimesheetApprovalSnapshot, E>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = std::result::Result<TimesheetApprovalSnapshot, E>>,
+    {
+        self.value.get_or_try_init(init).await.cloned()
+    }
+}
+
+fn timesheet_approval_scope_from_claims(claims: &ClientClaims) -> Option<ScopeType> {
+    if !claims.has_any_permission(&[PERM_TIMESHEET_APPROVE]) {
+        return None;
+    }
+    claims
+        .scope_for_permission(PERM_TIMESHEET_APPROVE)
+        .filter(|scope| matches!(scope, ScopeType::Team | ScopeType::All))
+}
 
 #[derive(SimpleObject, Clone, Debug)]
 #[graphql(name = "Shift")]
@@ -297,6 +327,8 @@ pub struct TimesheetWeekBatchDto {
     pub workflow_instance_id: Option<ID>,
     pub submitted_at: Option<DateTime<Utc>>,
     pub rejection_reason: Option<String>,
+    #[graphql(skip)]
+    approval_snapshot_cache: TimesheetApprovalSnapshotCache,
 }
 
 impl From<timesheet_week_batch::Model> for TimesheetWeekBatchDto {
@@ -310,53 +342,72 @@ impl From<timesheet_week_batch::Model> for TimesheetWeekBatchDto {
             workflow_instance_id: m.workflow_instance_id.map(|u| ID(u.to_string())),
             submitted_at: m.submitted_at,
             rejection_reason: m.rejection_reason,
+            approval_snapshot_cache: TimesheetApprovalSnapshotCache::default(),
         }
+    }
+}
+
+impl TimesheetWeekBatchDto {
+    async fn approval_snapshot(&self, ctx: &Context<'_>) -> Result<TimesheetApprovalSnapshot> {
+        let claims = ctx.data_opt::<ClientClaims>();
+        let approval_scope = claims.and_then(timesheet_approval_scope_from_claims);
+        self.approval_snapshot_cache
+            .get_or_try_init(|| async {
+                let tenant_id = require_tenant_id(ctx)?;
+                let db = tenant_db(ctx, tenant_id).await?;
+                let authority = if let (Some(claims), Some(scope)) = (claims, approval_scope) {
+                    Some(WorkflowApprovalAuthority {
+                        actor_user_id: claims.sub,
+                        actor_employee: resolve_viewer_employee(ctx, &db, tenant_id).await?,
+                        scope,
+                        permission: PERM_TIMESHEET_APPROVE,
+                    })
+                } else {
+                    None
+                };
+                let batch_id = parse_uuid(&self.id, "timesheetWeekBatchId")?;
+                let employee_id = parse_uuid(&self.employee_id, "employeeId")?;
+                let workflow_instance_id = self
+                    .workflow_instance_id
+                    .as_ref()
+                    .map(|id| parse_uuid(id, "workflowInstanceId"))
+                    .transpose()?;
+                timesheet_batch_service::resolve_timesheet_approval_snapshot(
+                    &db,
+                    tenant_id,
+                    batch_id,
+                    &self.status,
+                    employee_id,
+                    workflow_instance_id,
+                    authority.as_ref(),
+                )
+                .await
+                .map_err(KabiPayError::into_graphql)
+            })
+            .await
     }
 }
 
 #[ComplexObject]
 impl TimesheetWeekBatchDto {
     async fn pending_approval_stage(&self, ctx: &Context<'_>) -> Result<Option<String>> {
-        let tenant_id = require_tenant_id(ctx)?;
-        let db = tenant_db(ctx, tenant_id).await?;
-        let wf = self
-            .workflow_instance_id
-            .as_ref()
-            .map(|id| parse_uuid(id, "workflowInstanceId"))
-            .transpose()?;
-        timesheet_batch_service::resolve_timesheet_pending_approval_stage(
-            &db, tenant_id, &self.status, wf,
-        )
-        .await
-        .map_err(KabiPayError::into_graphql)
+        Ok(self.approval_snapshot(ctx).await?.pending_stage)
     }
 
     async fn viewer_may_approve(&self, ctx: &Context<'_>) -> Result<bool> {
-        let tenant_id = require_tenant_id(ctx)?;
-        let db = tenant_db(ctx, tenant_id).await?;
-        let claims = require_client_claims(ctx)?;
-        let authority = WorkflowApprovalAuthority {
-            actor_user_id: claims.sub,
-            actor_employee: resolve_viewer_employee(ctx, &db, tenant_id).await?,
-            scope: data_scope_from_context(ctx, PERM_TIMESHEET_APPROVE)?,
-            permission: PERM_TIMESHEET_APPROVE,
-        };
-        let employee_id = parse_uuid(&self.employee_id, "employeeId")?;
-        let wf = self
-            .workflow_instance_id
-            .as_ref()
-            .map(|id| parse_uuid(id, "workflowInstanceId"))
-            .transpose()?;
-        timesheet_batch_service::timesheet_week_batch_viewer_may_approve(
-            &db,
-            tenant_id,
-            &self.status,
-            employee_id,
-            wf,
-            &authority,
-        )
-        .await
-        .map_err(KabiPayError::into_graphql)
+        Ok(self
+            .approval_snapshot(ctx)
+            .await?
+            .actionable_step_id
+            .is_some())
+    }
+
+    async fn pending_approval_step_id(&self, ctx: &Context<'_>) -> Result<Option<ID>> {
+        Ok(self
+            .approval_snapshot(ctx)
+            .await?
+            .actionable_step_id
+            .map(|id| ID(id.to_string())))
     }
 
     async fn employee_code(&self, ctx: &Context<'_>) -> Result<Option<String>> {
@@ -584,6 +635,133 @@ impl From<ManagedAttendanceRow> for ManagedAttendanceDto {
             created_at: attendance.created_at,
             updated_at: attendance.updated_at,
         }
+    }
+}
+
+#[cfg(test)]
+mod timesheet_approval_snapshot_tests {
+    use super::*;
+    use async_graphql::{EmptyMutation, EmptySubscription, Object, Schema};
+    use kabipay_common::context::{
+        ClientClaims, ScopeType, CLIENT_JWT_ISSUER, PERM_TIMESHEET_APPROVE,
+    };
+    use std::collections::HashMap;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+
+    fn approval_claims(scope: Option<&str>) -> ClientClaims {
+        ClientClaims {
+            sub: Uuid::new_v4(),
+            iss: CLIENT_JWT_ISSUER.into(),
+            exp: 0,
+            iat: 0,
+            tenant_id: Uuid::new_v4(),
+            email: String::new(),
+            employee_id: Some(Uuid::new_v4()),
+            must_change_password: false,
+            roles: vec![],
+            permissions: vec![PERM_TIMESHEET_APPROVE.into()],
+            permission_scopes: scope
+                .map(|scope| HashMap::from([(PERM_TIMESHEET_APPROVE.into(), scope.into())]))
+                .unwrap_or_default(),
+            resource_scopes: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn timesheet_approval_scope_fails_closed_without_exact_team_or_all_authority() {
+        let mut missing_permission = approval_claims(Some("TEAM"));
+        missing_permission.permissions.clear();
+        missing_permission.permission_scopes.clear();
+        assert_eq!(
+            timesheet_approval_scope_from_claims(&missing_permission),
+            None
+        );
+        assert_eq!(
+            timesheet_approval_scope_from_claims(&approval_claims(None)),
+            None
+        );
+        assert_eq!(
+            timesheet_approval_scope_from_claims(&approval_claims(Some("INVALID"))),
+            None
+        );
+        assert_eq!(
+            timesheet_approval_scope_from_claims(&approval_claims(Some("SELF"))),
+            None
+        );
+        assert_eq!(
+            timesheet_approval_scope_from_claims(&approval_claims(Some("DEPARTMENT"))),
+            None
+        );
+        assert_eq!(
+            timesheet_approval_scope_from_claims(&approval_claims(Some("TEAM"))),
+            Some(ScopeType::Team)
+        );
+        assert_eq!(
+            timesheet_approval_scope_from_claims(&approval_claims(Some("ALL"))),
+            Some(ScopeType::All)
+        );
+    }
+
+    #[tokio::test]
+    async fn timesheet_approval_snapshot_cache_shares_one_concurrent_lookup() {
+        let cache = TimesheetApprovalSnapshotCache::default();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let step_id = Uuid::new_v4();
+        let expected = TimesheetApprovalSnapshot {
+            pending_stage: Some("Reporting manager".into()),
+            actionable_step_id: Some(step_id),
+        };
+
+        let first_calls = Arc::clone(&calls);
+        let second_calls = Arc::clone(&calls);
+        let first_expected = expected.clone();
+        let (first, second) = tokio::join!(
+            cache.get_or_try_init(|| async move {
+                first_calls.fetch_add(1, Ordering::SeqCst);
+                tokio::task::yield_now().await;
+                Ok::<_, KabiPayError>(first_expected)
+            }),
+            cache.get_or_try_init(|| async move {
+                second_calls.fetch_add(1, Ordering::SeqCst);
+                Ok::<_, KabiPayError>(TimesheetApprovalSnapshot::default())
+            })
+        );
+
+        assert_eq!(first.expect("first snapshot"), expected);
+        assert_eq!(second.expect("second snapshot"), expected);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    struct TestQuery;
+
+    #[Object]
+    impl TestQuery {
+        async fn timesheet_week_batch(&self) -> TimesheetWeekBatchDto {
+            TimesheetWeekBatchDto {
+                id: ID(Uuid::new_v4().to_string()),
+                tenant_id: ID(Uuid::new_v4().to_string()),
+                employee_id: ID(Uuid::new_v4().to_string()),
+                week_start_date: NaiveDate::from_ymd_opt(2026, 8, 24).expect("valid date"),
+                status: "PENDING".into(),
+                workflow_instance_id: Some(ID(Uuid::new_v4().to_string())),
+                submitted_at: Some(Utc::now()),
+                rejection_reason: None,
+                approval_snapshot_cache: TimesheetApprovalSnapshotCache::default(),
+            }
+        }
+    }
+
+    #[test]
+    fn timesheet_schema_exposes_server_authoritative_pending_approval_step_id() {
+        let schema = Schema::build(TestQuery, EmptyMutation, EmptySubscription).finish();
+        let sdl = schema.sdl();
+        assert!(
+            sdl.contains("pendingApprovalStepId: ID"),
+            "TimesheetWeekBatch must expose its actionable workflow step: {sdl}"
+        );
     }
 }
 

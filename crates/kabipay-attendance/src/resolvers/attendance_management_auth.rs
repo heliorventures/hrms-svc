@@ -204,7 +204,8 @@ async fn attendance_target_in_scope_with<R: AttendanceManagementRepository>(
     Ok(attendance)
 }
 
-pub async fn scope_filter(
+#[cfg(test)]
+async fn scope_filter(
     ctx: &Context<'_>,
     db: &DatabaseConnection,
     tenant_id: Uuid,
@@ -214,7 +215,6 @@ pub async fn scope_filter(
 
 /// Transaction-compatible managed attendance scope resolution for Task 4B.
 ///
-/// The public [`scope_filter`] wrapper remains available to existing callers.
 pub(crate) async fn scope_filter_with_connection<C>(
     ctx: &Context<'_>,
     db: &C,

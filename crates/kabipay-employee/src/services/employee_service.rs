@@ -4,20 +4,24 @@
 //! schema isolation) and the `is_deleted = false` filter (Gap B — soft-delete policy).
 
 use chrono::{NaiveDate, Utc};
-use kabipay_common::client_data_scope::employee_model_in_scope;
-use kabipay_common::context::ClientViewerEmployee;
-use kabipay_common::context::ScopeType;
+use kabipay_common::client_data_scope::{
+    resolve_employee_scope_filter, EmployeeScopeFilter,
+};
+use kabipay_common::context::{
+    canonical_employment_status, is_active_employment_status, ClientViewerEmployee, ScopeType,
+};
 use kabipay_common::db_constraint::constraint_name;
 use kabipay_common::{KabiPayError, KabiPayResult};
-use kabipay_db_entities::tenant::d0005_auth_rbac::{role, user, user_role, user_session};
+use kabipay_db_entities::tenant::d0005_auth_rbac::{user, user_role, user_session};
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait, DatabaseConnection, EntityTrait,
+    ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseConnection, EntityTrait,
     QueryFilter, QueryOrder, QuerySelect, Set, TransactionTrait,
 };
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use uuid::Uuid;
 
 use crate::entities::d0007_employee_core::employee;
+use crate::services::rbac_admin_service;
 
 fn employee_conflict_for_constraint(constraint: &str) -> Option<KabiPayError> {
     let (code, message) = match constraint {
@@ -76,12 +80,398 @@ mod constraint_mapping_tests {
     }
 }
 
-/// Keep an already linked auth user enabled only for active employee statuses.
-fn employee_login_is_active(status: &str) -> bool {
-    matches!(
-        status.trim().to_ascii_uppercase().as_str(),
-        "ACTIVE" | "PROBATION"
-    )
+#[cfg(test)]
+mod employee_scope_filter_tests {
+    use super::*;
+    use kabipay_common::client_data_scope::EmployeeScopeFilter;
+
+    #[test]
+    fn employee_id_scope_adapter_preserves_empty_bounded_and_unrestricted_filters() {
+        let first = Uuid::new_v4();
+        let second = Uuid::new_v4();
+
+        assert_eq!(
+            employee_ids_from_scope_filter(EmployeeScopeFilter::Empty),
+            Some(vec![])
+        );
+        assert_eq!(
+            employee_ids_from_scope_filter(EmployeeScopeFilter::EmployeeIds(vec![first, second])),
+            Some(vec![first, second])
+        );
+        assert_eq!(
+            employee_ids_from_scope_filter(EmployeeScopeFilter::Unrestricted),
+            None
+        );
+    }
+}
+
+#[cfg(test)]
+mod employee_status_boundary_tests {
+    use super::*;
+    use sea_orm::entity::prelude::async_trait;
+    use sea_orm::{Database, DbBackend, DbErr, ProxyDatabaseTrait, ProxyExecResult, ProxyRow, Statement};
+    use std::sync::{Arc, Mutex};
+
+    fn new_employee(status: &str) -> NewEmployee {
+        NewEmployee {
+            employee_code: "EMP-STATUS-TEST".into(),
+            first_name: "Status".into(),
+            last_name: "Test".into(),
+            date_of_joining: NaiveDate::from_ymd_opt(2026, 1, 1).expect("valid date"),
+            department_id: None,
+            designation_id: None,
+            reporting_manager_id: None,
+            employment_type: Some("FULL_TIME".into()),
+            status: status.into(),
+            user_id: None,
+        }
+    }
+
+    fn status_only_patch(status: &str) -> EmployeePatch {
+        EmployeePatch {
+            first_name: None,
+            last_name: None,
+            department_id: None,
+            designation_id: None,
+            reporting_manager_id: None,
+            employment_type: None,
+            status: Some(status.into()),
+            user_id: None,
+            linked_user_email: None,
+        }
+    }
+
+    #[derive(Debug)]
+    struct StatementRecorder {
+        statements: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ProxyDatabaseTrait for StatementRecorder {
+        async fn query(&self, statement: Statement) -> Result<Vec<ProxyRow>, DbErr> {
+            self.statements
+                .lock()
+                .expect("statement recorder")
+                .push(format!("{statement}"));
+            Ok(Vec::new())
+        }
+
+        async fn execute(&self, statement: Statement) -> Result<ProxyExecResult, DbErr> {
+            self.statements
+                .lock()
+                .expect("statement recorder")
+                .push(format!("{statement}"));
+            Ok(ProxyExecResult {
+                last_insert_id: 0,
+                rows_affected: 1,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn create_rejects_unknown_status_before_database_access() {
+        let error = create(
+            &DatabaseConnection::Disconnected,
+            Uuid::new_v4(),
+            new_employee("NOTICE"),
+        )
+        .await
+        .expect_err("unknown status must be rejected at the create boundary");
+        assert_eq!(error.code(), "VALIDATION_ERROR");
+    }
+
+    #[tokio::test]
+    async fn update_rejects_empty_status_before_transaction_or_lookup() {
+        let error = update(
+            &DatabaseConnection::Disconnected,
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            status_only_patch("   "),
+        )
+        .await
+        .expect_err("empty status must be rejected at the update boundary");
+        assert_eq!(error.code(), "VALIDATION_ERROR");
+    }
+
+    #[tokio::test]
+    async fn create_normalizes_supported_status_before_insert() {
+        let statements = Arc::new(Mutex::new(Vec::new()));
+        let db = Database::connect_proxy(
+            DbBackend::Postgres,
+            Arc::new(Box::new(StatementRecorder {
+                statements: Arc::clone(&statements),
+            })),
+        )
+        .await
+        .expect("proxy database");
+
+        let _ = create(&db, Uuid::new_v4(), new_employee(" probation ")).await;
+
+        let statements = statements.lock().expect("statement recorder");
+        let insert = statements
+            .iter()
+            .find(|statement| statement.contains("INSERT INTO \"employee\""))
+            .expect("employee insert statement");
+        assert!(insert.contains("'PROBATION'"), "insert={insert}");
+        assert!(!insert.contains("' probation '"), "insert={insert}");
+    }
+}
+
+#[cfg(test)]
+mod login_role_integrity_tests {
+    use super::*;
+    use sea_orm::entity::prelude::async_trait;
+    use sea_orm::{Database, DbBackend, DbErr, ProxyDatabaseTrait, ProxyExecResult, ProxyRow, Statement};
+    use std::collections::{BTreeMap, VecDeque};
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Debug)]
+    struct ScriptedProxy {
+        query_results: Mutex<VecDeque<Result<Vec<ProxyRow>, DbErr>>>,
+        events: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ProxyDatabaseTrait for ScriptedProxy {
+        async fn query(&self, statement: Statement) -> Result<Vec<ProxyRow>, DbErr> {
+            self.events
+                .lock()
+                .expect("event recorder")
+                .push(format!("QUERY {statement}"));
+            self.query_results
+                .lock()
+                .expect("query script")
+                .pop_front()
+                .unwrap_or_else(|| Ok(Vec::new()))
+        }
+
+        async fn execute(&self, statement: Statement) -> Result<ProxyExecResult, DbErr> {
+            self.events
+                .lock()
+                .expect("event recorder")
+                .push(format!("EXECUTE {statement}"));
+            Ok(ProxyExecResult {
+                last_insert_id: 0,
+                rows_affected: 1,
+            })
+        }
+    }
+
+    async fn scripted_connection(
+        query_results: Vec<Result<Vec<ProxyRow>, DbErr>>,
+    ) -> (DatabaseConnection, Arc<Mutex<Vec<String>>>) {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let db = Database::connect_proxy(
+            DbBackend::Postgres,
+            Arc::new(Box::new(ScriptedProxy {
+                query_results: Mutex::new(query_results.into()),
+                events: Arc::clone(&events),
+            })),
+        )
+        .await
+        .expect("PostgreSQL proxy connection");
+        (db, events)
+    }
+
+    fn user_row(user_id: Uuid, tenant_id: Uuid, is_active: bool) -> ProxyRow {
+        let now = Utc::now();
+        ProxyRow::new(BTreeMap::from([
+            ("id".into(), user_id.into()),
+            ("tenant_id".into(), tenant_id.into()),
+            ("username".into(), "role-test-user".to_string().into()),
+            ("email".into(), Option::<String>::None.into()),
+            ("password_hash".into(), "hash".to_string().into()),
+            ("must_change_password".into(), false.into()),
+            ("is_active".into(), is_active.into()),
+            ("mfa_enabled".into(), false.into()),
+            ("mfa_secret".into(), Option::<String>::None.into()),
+            ("last_login_at".into(), Option::<chrono::DateTime<Utc>>::None.into()),
+            ("is_deleted".into(), false.into()),
+            ("deleted_at".into(), Option::<chrono::DateTime<Utc>>::None.into()),
+            ("deleted_by".into(), Option::<Uuid>::None.into()),
+            ("created_at".into(), now.into()),
+            ("updated_at".into(), now.into()),
+        ]))
+    }
+
+    fn role_row(role_id: Uuid, tenant_id: Uuid, is_deleted: bool) -> ProxyRow {
+        let now = Utc::now();
+        ProxyRow::new(BTreeMap::from([
+            ("id".into(), role_id.into()),
+            ("tenant_id".into(), tenant_id.into()),
+            ("name".into(), "EMPLOYEE".to_string().into()),
+            ("description".into(), Option::<String>::None.into()),
+            ("is_system_role".into(), true.into()),
+            ("is_deleted".into(), is_deleted.into()),
+            ("deleted_at".into(), Option::<chrono::DateTime<Utc>>::None.into()),
+            ("deleted_by".into(), Option::<Uuid>::None.into()),
+            ("created_at".into(), now.into()),
+            ("updated_at".into(), now.into()),
+        ]))
+    }
+
+    fn login_account(role_ids: Vec<Uuid>) -> NewLoginAccount {
+        NewLoginAccount {
+            username: "role-test-user".into(),
+            email: None,
+            password_hash: "hash".into(),
+            role_ids,
+        }
+    }
+
+    fn active_employee() -> NewEmployee {
+        NewEmployee {
+            employee_code: "EMP-ROLE-TEST".into(),
+            first_name: "Role".into(),
+            last_name: "Test".into(),
+            date_of_joining: NaiveDate::from_ymd_opt(2026, 1, 1).expect("valid date"),
+            department_id: None,
+            designation_id: None,
+            reporting_manager_id: None,
+            employment_type: Some("FULL_TIME".into()),
+            status: "ACTIVE".into(),
+            user_id: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn create_with_login_rejects_empty_roles_before_opening_a_transaction() {
+        let error = create_with_login(
+            &DatabaseConnection::Disconnected,
+            Uuid::new_v4(),
+            active_employee(),
+            login_account(Vec::new()),
+        )
+        .await
+        .expect_err("login creation requires at least one role");
+
+        assert_eq!(error.code(), "ACTIVE_LOGIN_ROLE_REQUIRED");
+    }
+
+    #[tokio::test]
+    async fn provision_login_rejects_empty_roles_before_opening_a_transaction() {
+        let error = provision_login(
+            &DatabaseConnection::Disconnected,
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            login_account(Vec::new()),
+        )
+        .await
+        .expect_err("login provisioning requires at least one role");
+
+        assert_eq!(error.code(), "ACTIVE_LOGIN_ROLE_REQUIRED");
+    }
+
+    #[tokio::test]
+    async fn create_with_login_rejects_cross_tenant_role_before_account_writes() {
+        let tenant_id = Uuid::new_v4();
+        let role_id = Uuid::new_v4();
+        let (db, events) = scripted_connection(vec![Ok(vec![role_row(
+            role_id,
+            Uuid::new_v4(),
+            false,
+        )])])
+        .await;
+
+        let error = create_with_login(
+            &db,
+            tenant_id,
+            active_employee(),
+            login_account(vec![role_id]),
+        )
+        .await
+        .expect_err("cross-tenant role must be rejected");
+
+        assert_eq!(error.code(), "NOT_FOUND");
+        let events = events.lock().expect("event recorder");
+        assert!(
+            !events.iter().any(|event| event.contains("INSERT INTO \"user\"")),
+            "events={events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn provision_login_rejects_deleted_role_before_employee_or_account_writes() {
+        let tenant_id = Uuid::new_v4();
+        let role_id = Uuid::new_v4();
+        let (db, events) =
+            scripted_connection(vec![Ok(vec![role_row(role_id, tenant_id, true)])]).await;
+
+        let error = provision_login(
+            &db,
+            tenant_id,
+            Uuid::new_v4(),
+            login_account(vec![role_id]),
+        )
+        .await
+        .expect_err("deleted role must be rejected");
+
+        assert_eq!(error.code(), "NOT_FOUND");
+        let events = events.lock().expect("event recorder");
+        assert!(
+            !events.iter().any(|event| event.contains("FROM \"employee\"")),
+            "events={events:?}"
+        );
+        assert!(
+            !events.iter().any(|event| event.contains("INSERT INTO \"user\"")),
+            "events={events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn active_employee_linked_login_rejects_zero_active_roles() {
+        let tenant_id = Uuid::new_v4();
+        let user_id = Uuid::new_v4();
+        let (db, _events) =
+            scripted_connection(vec![Ok(vec![user_row(user_id, tenant_id, true)]), Ok(vec![])])
+                .await;
+
+        let error = sync_linked_user_status(&db, tenant_id, Some(user_id), "ACTIVE")
+            .await
+            .expect_err("an active employee-linked login must retain an active role");
+
+        assert_eq!(error.code(), "ACTIVE_LOGIN_ROLE_REQUIRED");
+    }
+
+    #[tokio::test]
+    async fn deactivation_without_roles_is_allowed_and_revokes_sessions() {
+        let tenant_id = Uuid::new_v4();
+        let user_id = Uuid::new_v4();
+        let (db, events) = scripted_connection(vec![
+            Ok(vec![user_row(user_id, tenant_id, true)]),
+            Ok(vec![user_row(user_id, tenant_id, false)]),
+        ])
+        .await;
+
+        sync_linked_user_status(&db, tenant_id, Some(user_id), "INACTIVE")
+            .await
+            .expect("canonical deactivation must not require a role assignment");
+
+        let events = events.lock().expect("event recorder");
+        assert!(
+            events
+                .iter()
+                .any(|event| event.contains("DELETE FROM \"user_session\"")),
+            "events={events:?}"
+        );
+        assert!(
+            !events.iter().any(|event| event.contains("FROM \"user_role\"")),
+            "deactivation must not be blocked by role lookup: events={events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn linked_user_from_another_tenant_is_rejected() {
+        let tenant_id = Uuid::new_v4();
+        let user_id = Uuid::new_v4();
+        let (db, _events) = scripted_connection(vec![Ok(Vec::new())]).await;
+
+        let error = sync_linked_user_status(&db, tenant_id, Some(user_id), "ACTIVE")
+            .await
+            .expect_err("an employee cannot link a user outside the tenant");
+
+        assert_eq!(error.code(), "NOT_FOUND");
+    }
 }
 
 async fn sync_linked_user_status<C: ConnectionTrait>(
@@ -93,15 +483,20 @@ async fn sync_linked_user_status<C: ConnectionTrait>(
     let Some(user_id) = user_id else {
         return Ok(());
     };
-    let should_be_active = employee_login_is_active(employee_status);
-    let Some(found) = user::Entity::find_by_id(user_id)
+    let should_be_active = is_active_employment_status(employee_status);
+    let found = user::Entity::find_by_id(user_id)
         .filter(user::Column::TenantId.eq(tenant_id))
         .filter(user::Column::IsDeleted.eq(false))
         .one(db)
         .await?
-    else {
-        return Ok(());
-    };
+        .filter(|row| row.tenant_id == tenant_id && !row.is_deleted)
+        .ok_or_else(|| KabiPayError::NotFound {
+            entity: "user",
+            id: user_id.to_string(),
+        })?;
+    if should_be_active {
+        rbac_admin_service::require_user_active_tenant_role(db, tenant_id, user_id).await?;
+    }
     if found.is_active != should_be_active {
         let mut am: user::ActiveModel = found.into();
         am.is_active = Set(should_be_active);
@@ -113,6 +508,31 @@ async fn sync_linked_user_status<C: ConnectionTrait>(
             .filter(user_session::Column::UserId.eq(user_id))
             .exec(db)
             .await?;
+    }
+    Ok(())
+}
+
+async fn ensure_linked_user_role_integrity<C: ConnectionTrait>(
+    db: &C,
+    tenant_id: Uuid,
+    user_id: Option<Uuid>,
+    employee_status: &str,
+) -> KabiPayResult<()> {
+    let Some(user_id) = user_id else {
+        return Ok(());
+    };
+    user::Entity::find_by_id(user_id)
+        .filter(user::Column::TenantId.eq(tenant_id))
+        .filter(user::Column::IsDeleted.eq(false))
+        .one(db)
+        .await?
+        .filter(|row| row.tenant_id == tenant_id && !row.is_deleted)
+        .ok_or_else(|| KabiPayError::NotFound {
+            entity: "user",
+            id: user_id.to_string(),
+        })?;
+    if is_active_employment_status(employee_status) {
+        rbac_admin_service::require_user_active_tenant_role(db, tenant_id, user_id).await?;
     }
     Ok(())
 }
@@ -229,41 +649,6 @@ pub async fn find_by_ids<C: ConnectionTrait>(
         .map_err(KabiPayError::from)
 }
 
-/// Every employee in the reporting subtree under `root_employee_id` (including the root).
-/// Assumes an acyclic manager chain; terminates when no new direct reports appear.
-async fn collect_team_subtree_employee_ids(
-    db: &DatabaseConnection,
-    tenant_id: Uuid,
-    root_employee_id: Uuid,
-) -> KabiPayResult<Vec<Uuid>> {
-    let mut seen: HashSet<Uuid> = HashSet::new();
-    seen.insert(root_employee_id);
-    let mut frontier = vec![root_employee_id];
-
-    loop {
-        if frontier.is_empty() {
-            break;
-        }
-
-        let children = employee::Entity::find()
-            .filter(employee::Column::TenantId.eq(tenant_id))
-            .filter(employee::Column::IsDeleted.eq(false))
-            .filter(employee::Column::ReportingManagerId.is_in(frontier.clone()))
-            .all(db)
-            .await
-            .map_err(KabiPayError::from)?;
-
-        frontier.clear();
-        for m in children {
-            if seen.insert(m.id) {
-                frontier.push(m.id);
-            }
-        }
-    }
-
-    Ok(seen.into_iter().collect())
-}
-
 /// Full display names for referenced employees (e.g. reporting manager labels).
 pub async fn map_full_names(
     db: &DatabaseConnection,
@@ -291,13 +676,12 @@ pub async fn map_full_names(
         .collect())
 }
 
-/// Whether a fetched employee row is visible under `scope` (used for `employee(id:)` / IDOR checks).
-pub fn is_employee_in_scope(
-    scope: ScopeType,
-    viewer: Option<ClientViewerEmployee>,
-    target: &employee::Model,
-) -> bool {
-    employee_model_in_scope(scope, viewer, target)
+fn employee_ids_from_scope_filter(filter: EmployeeScopeFilter) -> Option<Vec<Uuid>> {
+    match filter {
+        EmployeeScopeFilter::Unrestricted => None,
+        EmployeeScopeFilter::Empty => Some(Vec::new()),
+        EmployeeScopeFilter::EmployeeIds(ids) => Some(ids),
+    }
 }
 
 /// Resolve all employee IDs visible to a caller for cross-record approval queues.
@@ -308,33 +692,8 @@ pub async fn employee_ids_in_scope(
     scope: ScopeType,
     viewer: Option<ClientViewerEmployee>,
 ) -> KabiPayResult<Option<Vec<Uuid>>> {
-    let Some(viewer) = viewer else {
-        return Ok(match scope {
-            ScopeType::All => None,
-            _ => Some(Vec::new()),
-        });
-    };
-    let mut query = employee::Entity::find()
-        .filter(employee::Column::TenantId.eq(tenant_id))
-        .filter(employee::Column::IsDeleted.eq(false));
-    query = match scope {
-        ScopeType::All => return Ok(None),
-        ScopeType::Self_ => query.filter(employee::Column::Id.eq(viewer.employee_id)),
-        ScopeType::Team => query.filter(
-            Condition::any()
-                .add(employee::Column::Id.eq(viewer.employee_id))
-                .add(employee::Column::ReportingManagerId.eq(viewer.employee_id)),
-        ),
-        ScopeType::Department => match viewer.department_id {
-            Some(department_id) => query.filter(
-                Condition::any()
-                    .add(employee::Column::Id.eq(viewer.employee_id))
-                    .add(employee::Column::DepartmentId.eq(department_id)),
-            ),
-            None => query.filter(employee::Column::Id.eq(viewer.employee_id)),
-        },
-    };
-    Ok(Some(query.all(db).await?.into_iter().map(|row| row.id).collect()))
+    let filter = resolve_employee_scope_filter(db, tenant_id, scope, viewer).await?;
+    Ok(employee_ids_from_scope_filter(filter))
 }
 
 /// List the first `limit` non-deleted employees, filtered by the caller’s data scope
@@ -350,41 +709,17 @@ pub async fn list(
     viewer: Option<ClientViewerEmployee>,
 ) -> KabiPayResult<Vec<employee::Model>> {
     let limit = limit.clamp(1, 100);
+    let filter = resolve_employee_scope_filter(db, tenant_id, scope, viewer).await?;
     let mut q = employee::Entity::find()
         .filter(employee::Column::TenantId.eq(tenant_id))
         .filter(employee::Column::IsDeleted.eq(false));
 
-    match scope {
-        ScopeType::All => {}
-        ScopeType::Self_ => {
-            let Some(v) = viewer else {
-                return Ok(vec![]);
-            };
-            q = q.filter(employee::Column::Id.eq(v.employee_id));
-        }
-        ScopeType::Team => {
-            let Some(v) = viewer else {
-                return Ok(vec![]);
-            };
-            q = q.filter(
-                Condition::any()
-                    .add(employee::Column::Id.eq(v.employee_id))
-                    .add(employee::Column::ReportingManagerId.eq(v.employee_id)),
-            );
-        }
-        ScopeType::Department => {
-            let Some(v) = viewer else {
-                return Ok(vec![]);
-            };
-            q = if let Some(d) = v.department_id {
-                q.filter(
-                    Condition::any()
-                        .add(employee::Column::Id.eq(v.employee_id))
-                        .add(employee::Column::DepartmentId.eq(Some(d))),
-                )
-            } else {
-                q.filter(employee::Column::Id.eq(v.employee_id))
-            };
+    match filter {
+        EmployeeScopeFilter::Unrestricted => {}
+        EmployeeScopeFilter::Empty => return Ok(Vec::new()),
+        EmployeeScopeFilter::EmployeeIds(ids) if ids.is_empty() => return Ok(Vec::new()),
+        EmployeeScopeFilter::EmployeeIds(ids) => {
+            q = q.filter(employee::Column::Id.is_in(ids));
         }
     }
 
@@ -401,41 +736,17 @@ pub async fn list_for_org_chart(
     viewer: Option<ClientViewerEmployee>,
 ) -> KabiPayResult<Vec<employee::Model>> {
     let limit = limit.clamp(1, 500);
+    let filter = resolve_employee_scope_filter(db, tenant_id, scope, viewer).await?;
     let mut q = employee::Entity::find()
         .filter(employee::Column::TenantId.eq(tenant_id))
         .filter(employee::Column::IsDeleted.eq(false));
 
-    match scope {
-        ScopeType::All => {}
-        ScopeType::Self_ => {
-            let Some(v) = viewer else {
-                return Ok(vec![]);
-            };
-            q = q.filter(employee::Column::Id.eq(v.employee_id));
-        }
-        ScopeType::Team => {
-            let Some(v) = viewer else {
-                return Ok(vec![]);
-            };
-            let ids = collect_team_subtree_employee_ids(db, tenant_id, v.employee_id).await?;
-            if ids.is_empty() {
-                return Ok(vec![]);
-            }
+    match filter {
+        EmployeeScopeFilter::Unrestricted => {}
+        EmployeeScopeFilter::Empty => return Ok(Vec::new()),
+        EmployeeScopeFilter::EmployeeIds(ids) if ids.is_empty() => return Ok(Vec::new()),
+        EmployeeScopeFilter::EmployeeIds(ids) => {
             q = q.filter(employee::Column::Id.is_in(ids));
-        }
-        ScopeType::Department => {
-            let Some(v) = viewer else {
-                return Ok(vec![]);
-            };
-            q = if let Some(d) = v.department_id {
-                q.filter(
-                    Condition::any()
-                        .add(employee::Column::Id.eq(v.employee_id))
-                        .add(employee::Column::DepartmentId.eq(Some(d))),
-                )
-            } else {
-                q.filter(employee::Column::Id.eq(v.employee_id))
-            };
         }
     }
 
@@ -486,46 +797,16 @@ fn normalize_email(raw: Option<String>) -> Option<String> {
     })
 }
 
-async fn ensure_role_ids_in_tenant<C: ConnectionTrait>(
+async fn assign_validated_roles<C: ConnectionTrait>(
     db: &C,
-    tenant_id: Uuid,
-    role_ids: &[Uuid],
-) -> KabiPayResult<Vec<Uuid>> {
-    let unique: Vec<Uuid> = role_ids
-        .iter()
-        .copied()
-        .collect::<HashSet<_>>()
-        .into_iter()
-        .collect();
-    for role_id in &unique {
-        let role_exists = role::Entity::find_by_id(*role_id)
-            .filter(role::Column::TenantId.eq(tenant_id))
-            .filter(role::Column::IsDeleted.eq(false))
-            .one(db)
-            .await?
-            .is_some();
-        if !role_exists {
-            return Err(KabiPayError::NotFound {
-                entity: "role",
-                id: role_id.to_string(),
-            });
-        }
-    }
-    Ok(unique)
-}
-
-async fn assign_roles<C: ConnectionTrait>(
-    db: &C,
-    tenant_id: Uuid,
     user_id: Uuid,
     role_ids: &[Uuid],
 ) -> KabiPayResult<()> {
-    let roles = ensure_role_ids_in_tenant(db, tenant_id, role_ids).await?;
     let now = Utc::now();
-    for role_id in roles {
+    for role_id in role_ids {
         user_role::ActiveModel {
             user_id: Set(user_id),
-            role_id: Set(role_id),
+            role_id: Set(*role_id),
             assigned_at: Set(now),
         }
         .insert(db)
@@ -538,12 +819,12 @@ async fn insert_login_user<C: ConnectionTrait>(
     db: &C,
     tenant_id: Uuid,
     account: NewLoginAccount,
+    validated_role_ids: Vec<Uuid>,
     employee_status: &str,
 ) -> KabiPayResult<Uuid> {
     let username = normalize_username(&account.username)?;
     let email = normalize_email(account.email);
     let password_hash = account.password_hash;
-    let role_ids = account.role_ids;
     if user::Entity::find()
         .filter(user::Column::TenantId.eq(tenant_id))
         .filter(user::Column::Username.eq(&username))
@@ -580,7 +861,7 @@ async fn insert_login_user<C: ConnectionTrait>(
         email: Set(email),
         password_hash: Set(password_hash),
         must_change_password: Set(true),
-        is_active: Set(employee_login_is_active(employee_status)),
+        is_active: Set(is_active_employment_status(employee_status)),
         mfa_enabled: Set(false),
         mfa_secret: Set(None),
         last_login_at: Set(None),
@@ -593,15 +874,17 @@ async fn insert_login_user<C: ConnectionTrait>(
     .insert(db)
     .await
     .map_err(map_employee_db_error)?;
-    assign_roles(db, tenant_id, id, &role_ids).await?;
+    assign_validated_roles(db, id, &validated_role_ids).await?;
     Ok(id)
 }
 
 pub async fn create<C: ConnectionTrait>(
     db: &C,
     tenant_id: Uuid,
-    data: NewEmployee,
+    mut data: NewEmployee,
 ) -> KabiPayResult<employee::Model> {
+    data.status = canonical_employment_status(&data.status)?.to_owned();
+    ensure_linked_user_role_integrity(db, tenant_id, data.user_id, &data.status).await?;
     if employee::Entity::find()
         .filter(employee::Column::TenantId.eq(tenant_id))
         .filter(employee::Column::EmployeeCode.eq(&data.employee_code))
@@ -688,8 +971,19 @@ pub async fn create_with_login(
             "userId cannot be supplied when loginAccount is used".into(),
         ));
     }
+    rbac_admin_service::require_nonempty_role_assignment(&account.role_ids)?;
+    data.status = canonical_employment_status(&data.status)?.to_owned();
     let txn = db.begin().await?;
-    let user_id = insert_login_user(&txn, tenant_id, account, &data.status).await?;
+    let validated_role_ids =
+        rbac_admin_service::validated_active_role_ids(&txn, tenant_id, &account.role_ids).await?;
+    let user_id = insert_login_user(
+        &txn,
+        tenant_id,
+        account,
+        validated_role_ids,
+        &data.status,
+    )
+    .await?;
     data.user_id = Some(user_id);
     let created = create(&txn, tenant_id, data).await?;
     txn.commit().await?;
@@ -702,7 +996,10 @@ pub async fn provision_login(
     employee_id: Uuid,
     account: NewLoginAccount,
 ) -> KabiPayResult<employee::Model> {
+    rbac_admin_service::require_nonempty_role_assignment(&account.role_ids)?;
     let txn = db.begin().await?;
+    let validated_role_ids =
+        rbac_admin_service::validated_active_role_ids(&txn, tenant_id, &account.role_ids).await?;
     let existing = find_by_id(&txn, tenant_id, employee_id)
         .await?
         .ok_or_else(|| KabiPayError::NotFound {
@@ -714,7 +1011,14 @@ pub async fn provision_login(
             "employee already has a linked login user".into(),
         ));
     }
-    let user_id = insert_login_user(&txn, tenant_id, account, &existing.status).await?;
+    let user_id = insert_login_user(
+        &txn,
+        tenant_id,
+        account,
+        validated_role_ids,
+        &existing.status,
+    )
+    .await?;
     let mut am: employee::ActiveModel = existing.into();
     am.user_id = Set(Some(user_id));
     am.updated_at = Set(Utc::now());
@@ -768,8 +1072,11 @@ pub async fn update(
     db: &DatabaseConnection,
     tenant_id: Uuid,
     employee_id: Uuid,
-    patch: EmployeePatch,
+    mut patch: EmployeePatch,
 ) -> KabiPayResult<employee::Model> {
+    if let Some(status) = patch.status.as_mut() {
+        *status = canonical_employment_status(status)?.to_owned();
+    }
     let txn = db.begin().await?;
     let existing = find_by_id(&txn, tenant_id, employee_id)
         .await?

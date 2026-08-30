@@ -2,8 +2,12 @@
 
 use async_graphql::{Context, Object, Result, ID};
 use kabipay_common::{
-    client_data_scope::{data_scope_from_context, resolve_viewer_employee},
-    context::PERM_TIMESHEET_APPROVE,
+    client_data_scope::{data_scope_from_claims, resolve_viewer_employee},
+    context::{
+        ScopeType, PERM_ATTENDANCE_PUNCH_POLICY, PERM_ATTENDANCE_PUNCH_SELF,
+        PERM_ATTENDANCE_REGULARIZE, PERM_LEAVE_MANAGE, PERM_TIMESHEET_APPROVE,
+        PERM_TIMESHEET_MANAGE, PERM_TIMESHEET_WRITE,
+    },
     subgraph::{
         client_request_hints, require_client_claims, require_tenant_id, resolve_client_employee_id,
         ops_db, tenant_db,
@@ -73,29 +77,48 @@ where
     }))
 }
 
-fn require_leave_configuration_admin(ctx: &Context<'_>) -> Result<()> {
+fn require_mutation_authority(
+    ctx: &Context<'_>,
+    permission: &'static str,
+    allowed_scopes: &[ScopeType],
+    require_employee_link: bool,
+) -> Result<ScopeType> {
     let claims = require_client_claims(ctx)?;
-    if !claims.can_manage_leave_configuration() {
-        return Err(
-            KabiPayError::Forbidden("missing permission to manage leave configuration".into())
-                .into_graphql(),
-        );
+    let scope = data_scope_from_claims(Some(claims), permission)
+        .map_err(KabiPayError::into_graphql)?;
+    if !allowed_scopes.contains(&scope) {
+        return Err(KabiPayError::Forbidden(format!(
+            "{permission} permission requires one of these explicit scopes: {}",
+            allowed_scopes
+                .iter()
+                .map(|scope| scope.to_wire())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))
+        .into_graphql());
     }
-    Ok(())
+    if require_employee_link && claims.employee_id.is_none() {
+        return Err(KabiPayError::Forbidden(format!(
+            "{permission} permission requires a JWT-linked employee"
+        ))
+        .into_graphql());
+    }
+    Ok(scope)
 }
 
-fn require_hrms_timesheet_settings(ctx: &Context<'_>) -> Result<()> {
-    let claims = require_client_claims(ctx)?;
-    if claims.can_configure_attendance_punch_policy() || claims.can_manage_timesheet_configuration()
-    {
-        return Ok(());
-    }
-    Err(
-        KabiPayError::Forbidden(
-            "missing permission — needs attendance punch policy or timesheet manage".into(),
-        )
-        .into_graphql(),
-    )
+fn require_self_authority(ctx: &Context<'_>, permission: &'static str) -> Result<()> {
+    require_mutation_authority(ctx, permission, &[ScopeType::Self_], true).map(|_| ())
+}
+
+fn require_team_or_all_authority(
+    ctx: &Context<'_>,
+    permission: &'static str,
+) -> Result<ScopeType> {
+    require_mutation_authority(ctx, permission, &[ScopeType::Team, ScopeType::All], false)
+}
+
+fn require_all_authority(ctx: &Context<'_>, permission: &'static str) -> Result<()> {
+    require_mutation_authority(ctx, permission, &[ScopeType::All], false).map(|_| ())
 }
 
 pub struct MutationRoot;
@@ -115,15 +138,7 @@ impl MutationRoot {
         input: Option<PunchTodayInput>,
     ) -> Result<AttendanceDto> {
         let tenant_id = require_tenant_id(ctx)?;
-        let claims = require_client_claims(ctx)?;
-        if !claims.can_record_own_attendance_punches() {
-            return Err(
-                KabiPayError::Forbidden(
-                    "attendance:punch_self permission required".into(),
-                )
-                .into_graphql(),
-            );
-        }
+        require_self_authority(ctx, PERM_ATTENDANCE_PUNCH_SELF)?;
         let db = tenant_db(ctx, tenant_id).await?;
         let clock = TenantBusinessClock::load(ops_db(ctx)?, tenant_id)
             .await
@@ -158,13 +173,7 @@ impl MutationRoot {
         input: UpsertAttendancePunchPolicyInput,
     ) -> Result<AttendancePunchPolicyDto> {
         let tenant_id = require_tenant_id(ctx)?;
-        let claims = require_client_claims(ctx)?;
-        if !claims.can_configure_attendance_punch_policy() {
-            return Err(KabiPayError::Forbidden(
-                "attendance punch policy permission is required".into(),
-            )
-            .into_graphql());
-        }
+        require_all_authority(ctx, PERM_ATTENDANCE_PUNCH_POLICY)?;
         let db = tenant_db(ctx, tenant_id).await?;
         let m = punch_policy::upsert_punch_policy(
             &db,
@@ -188,15 +197,7 @@ impl MutationRoot {
         input: AddManualAttendanceSegmentInput,
     ) -> Result<AttendanceDto> {
         let tenant_id = require_tenant_id(ctx)?;
-        let claims = require_client_claims(ctx)?;
-        if !claims.can_record_own_attendance_punches() {
-            return Err(
-                KabiPayError::Forbidden(
-                    "attendance:punch_self permission required".into(),
-                )
-                .into_graphql(),
-            );
-        }
+        require_self_authority(ctx, PERM_ATTENDANCE_PUNCH_SELF)?;
         let db = tenant_db(ctx, tenant_id).await?;
         let clock = TenantBusinessClock::load(ops_db(ctx)?, tenant_id)
             .await
@@ -225,15 +226,7 @@ impl MutationRoot {
         input: UpdateManualAttendanceSegmentInput,
     ) -> Result<AttendanceDto> {
         let tenant_id = require_tenant_id(ctx)?;
-        let claims = require_client_claims(ctx)?;
-        if !claims.can_record_own_attendance_punches() {
-            return Err(
-                KabiPayError::Forbidden(
-                    "attendance:punch_self permission required".into(),
-                )
-                .into_graphql(),
-            );
-        }
+        require_self_authority(ctx, PERM_ATTENDANCE_PUNCH_SELF)?;
         let db = tenant_db(ctx, tenant_id).await?;
         let clock = TenantBusinessClock::load(ops_db(ctx)?, tenant_id)
             .await
@@ -263,7 +256,7 @@ impl MutationRoot {
         input: AddManagedAttendanceSegmentInput,
     ) -> Result<ManagedAttendanceDto> {
         let tenant_id = require_tenant_id(ctx)?;
-        attendance_management_auth::require_regularizer(ctx)?;
+        require_team_or_all_authority(ctx, PERM_ATTENDANCE_REGULARIZE)?;
         let actor_user_id = require_client_claims(ctx)?.sub;
         let target_employee_id = parse_uuid(&input.employee_id, "employeeId")?;
         let request_id = client_request_hints(ctx).request_id;
@@ -318,7 +311,7 @@ impl MutationRoot {
         input: UpdateManagedAttendanceSegmentInput,
     ) -> Result<ManagedAttendanceDto> {
         let tenant_id = require_tenant_id(ctx)?;
-        attendance_management_auth::require_regularizer(ctx)?;
+        require_team_or_all_authority(ctx, PERM_ATTENDANCE_REGULARIZE)?;
         let actor_user_id = require_client_claims(ctx)?.sub;
         let attendance_id = parse_uuid(&input.id, "id")?;
         let request_id = client_request_hints(ctx).request_id;
@@ -376,6 +369,7 @@ impl MutationRoot {
         input: CreateTimesheetEntryInput,
     ) -> Result<TimesheetEntryDto> {
         let tenant_id = require_tenant_id(ctx)?;
+        require_self_authority(ctx, PERM_TIMESHEET_WRITE)?;
         let db = tenant_db(ctx, tenant_id).await?;
         let employee_id = resolve_client_employee_id(ctx, &db, tenant_id)
             .await
@@ -399,6 +393,7 @@ impl MutationRoot {
     /// Soft-deletes a row; it must belong to the caller’s employee.
     async fn delete_timesheet_entry(&self, ctx: &Context<'_>, id: ID) -> Result<bool> {
         let tenant_id = require_tenant_id(ctx)?;
+        require_self_authority(ctx, PERM_TIMESHEET_WRITE)?;
         let db = tenant_db(ctx, tenant_id).await?;
         let employee_id = resolve_client_employee_id(ctx, &db, tenant_id)
             .await
@@ -415,6 +410,7 @@ impl MutationRoot {
         input: UpdateTimesheetEntryInput,
     ) -> Result<TimesheetEntryDto> {
         let tenant_id = require_tenant_id(ctx)?;
+        require_self_authority(ctx, PERM_TIMESHEET_WRITE)?;
         let db = tenant_db(ctx, tenant_id).await?;
         let employee_id = resolve_client_employee_id(ctx, &db, tenant_id)
             .await
@@ -443,6 +439,7 @@ impl MutationRoot {
         week_start_date: chrono::NaiveDate,
     ) -> Result<TimesheetWeekBatchDto> {
         let tenant_id = require_tenant_id(ctx)?;
+        require_self_authority(ctx, PERM_TIMESHEET_WRITE)?;
         let db = tenant_db(ctx, tenant_id).await?;
         let employee_id = resolve_client_employee_id(ctx, &db, tenant_id)
             .await
@@ -454,21 +451,30 @@ impl MutationRoot {
         Ok(TimesheetWeekBatchDto::from(m))
     }
 
-    async fn approve_timesheet_week_batch(&self, ctx: &Context<'_>, id: ID) -> Result<TimesheetWeekBatchDto> {
+    async fn approve_timesheet_week_batch(
+        &self,
+        ctx: &Context<'_>,
+        id: ID,
+        expected_workflow_step_id: ID,
+    ) -> Result<TimesheetWeekBatchDto> {
         let tenant_id = require_tenant_id(ctx)?;
         let claims = require_client_claims(ctx)?;
+        let scope = require_team_or_all_authority(ctx, PERM_TIMESHEET_APPROVE)?;
         let db = tenant_db(ctx, tenant_id).await?;
         let authority = WorkflowApprovalAuthority {
             actor_user_id: claims.sub,
             actor_employee: resolve_viewer_employee(ctx, &db, tenant_id).await?,
-            scope: data_scope_from_context(ctx, PERM_TIMESHEET_APPROVE)?,
+            scope,
             permission: PERM_TIMESHEET_APPROVE,
         };
         let bid = parse_uuid(&id, "id")?;
+        let expected_step_id =
+            parse_uuid(&expected_workflow_step_id, "expectedWorkflowStepId")?;
         let m = timesheet_batch_service::approve_timesheet_week_batch(
             &db,
             tenant_id,
             bid,
+            expected_step_id,
             &authority,
         )
             .await
@@ -480,22 +486,27 @@ impl MutationRoot {
         &self,
         ctx: &Context<'_>,
         id: ID,
+        expected_workflow_step_id: ID,
         rejection_reason: Option<String>,
     ) -> Result<bool> {
         let tenant_id = require_tenant_id(ctx)?;
         let claims = require_client_claims(ctx)?;
+        let scope = require_team_or_all_authority(ctx, PERM_TIMESHEET_APPROVE)?;
         let db = tenant_db(ctx, tenant_id).await?;
         let authority = WorkflowApprovalAuthority {
             actor_user_id: claims.sub,
             actor_employee: resolve_viewer_employee(ctx, &db, tenant_id).await?,
-            scope: data_scope_from_context(ctx, PERM_TIMESHEET_APPROVE)?,
+            scope,
             permission: PERM_TIMESHEET_APPROVE,
         };
         let bid = parse_uuid(&id, "id")?;
+        let expected_step_id =
+            parse_uuid(&expected_workflow_step_id, "expectedWorkflowStepId")?;
         timesheet_batch_service::reject_timesheet_week_batch(
             &db,
             tenant_id,
             bid,
+            expected_step_id,
             &authority,
             rejection_reason,
         )
@@ -508,7 +519,7 @@ impl MutationRoot {
         ctx: &Context<'_>,
         input: UpsertAttendanceAdjustmentPolicyInput,
     ) -> Result<AttendanceAdjustmentPolicyDto> {
-        require_hrms_timesheet_settings(ctx)?;
+        require_all_authority(ctx, PERM_ATTENDANCE_PUNCH_POLICY)?;
         let tenant_id = require_tenant_id(ctx)?;
         let db = tenant_db(ctx, tenant_id).await?;
         let json = serde_json::to_string(&hrms_master_service::AttendanceAdjustmentPolicy {
@@ -533,10 +544,7 @@ impl MutationRoot {
         ctx: &Context<'_>,
         input: UpsertTimesheetLockPolicyInput,
     ) -> Result<TimesheetLockPolicyDto> {
-        let claims = require_client_claims(ctx)?;
-        if !claims.can_manage_timesheet_configuration() {
-            return Err(KabiPayError::Forbidden("timesheet:manage required".into()).into_graphql());
-        }
+        require_all_authority(ctx, PERM_TIMESHEET_MANAGE)?;
         let tenant_id = require_tenant_id(ctx)?;
         let db = tenant_db(ctx, tenant_id).await?;
         let json = serde_json::to_string(&hrms_master_service::TimesheetLockPolicy {
@@ -560,10 +568,7 @@ impl MutationRoot {
         name: String,
         #[graphql(default)] display_order: Option<i32>,
     ) -> Result<bool> {
-        let claims = require_client_claims(ctx)?;
-        if !claims.can_manage_timesheet_configuration() {
-            return Err(KabiPayError::Forbidden("timesheet:manage required".into()).into_graphql());
-        }
+        require_all_authority(ctx, PERM_TIMESHEET_MANAGE)?;
         let tenant_id = require_tenant_id(ctx)?;
         let db = tenant_db(ctx, tenant_id).await?;
         let c = code.trim().to_uppercase();
@@ -589,10 +594,7 @@ impl MutationRoot {
         project_code: String,
         task_codes: Vec<String>,
     ) -> Result<bool> {
-        let claims = require_client_claims(ctx)?;
-        if !claims.can_manage_timesheet_configuration() {
-            return Err(KabiPayError::Forbidden("timesheet:manage required".into()).into_graphql());
-        }
+        require_all_authority(ctx, PERM_TIMESHEET_MANAGE)?;
         let tenant_id = require_tenant_id(ctx)?;
         let db = tenant_db(ctx, tenant_id).await?;
         let pc = project_code.trim().to_uppercase();
@@ -623,6 +625,7 @@ impl MutationRoot {
         project_codes: Vec<String>,
     ) -> Result<bool> {
         let tenant_id = require_tenant_id(ctx)?;
+        require_all_authority(ctx, PERM_TIMESHEET_MANAGE)?;
         let db = tenant_db(ctx, tenant_id).await?;
         let target = parse_uuid(&employee_id, "employeeId")?;
         timesheet_assignment_auth::assert_can_write_employee_assignment_target(ctx, &db, tenant_id, target)
@@ -645,7 +648,7 @@ impl MutationRoot {
         ctx: &Context<'_>,
         input: UpsertHolidayCalendarInput,
     ) -> Result<HolidayCalendarDto> {
-        require_leave_configuration_admin(ctx)?;
+        require_all_authority(ctx, PERM_LEAVE_MANAGE)?;
         let tenant_id = require_tenant_id(ctx)?;
         let db = tenant_db(ctx, tenant_id).await?;
         let id = input.id.as_ref().map(|i| parse_uuid(i, "calendarId")).transpose()?;
@@ -668,7 +671,7 @@ impl MutationRoot {
     }
 
     async fn delete_holiday_calendar(&self, ctx: &Context<'_>, calendar_id: ID) -> Result<bool> {
-        require_leave_configuration_admin(ctx)?;
+        require_all_authority(ctx, PERM_LEAVE_MANAGE)?;
         let tenant_id = require_tenant_id(ctx)?;
         let db = tenant_db(ctx, tenant_id).await?;
         let cid = parse_uuid(&calendar_id, "calendarId")?;
@@ -683,7 +686,7 @@ impl MutationRoot {
         ctx: &Context<'_>,
         input: UpsertHolidayDayInput,
     ) -> Result<HolidayDayDto> {
-        require_leave_configuration_admin(ctx)?;
+        require_all_authority(ctx, PERM_LEAVE_MANAGE)?;
         let tenant_id = require_tenant_id(ctx)?;
         let db = tenant_db(ctx, tenant_id).await?;
         let calendar_id = parse_uuid(&input.calendar_id, "calendarId")?;
@@ -703,7 +706,7 @@ impl MutationRoot {
     }
 
     async fn delete_holiday_day(&self, ctx: &Context<'_>, holiday_id: ID) -> Result<bool> {
-        require_leave_configuration_admin(ctx)?;
+        require_all_authority(ctx, PERM_LEAVE_MANAGE)?;
         let tenant_id = require_tenant_id(ctx)?;
         let db = tenant_db(ctx, tenant_id).await?;
         let hid = parse_uuid(&holiday_id, "holidayId")?;
@@ -711,5 +714,288 @@ impl MutationRoot {
             .await
             .map_err(KabiPayError::into_graphql)?;
         Ok(n > 0)
+    }
+}
+
+#[cfg(test)]
+mod authorization_tests {
+    use super::*;
+    use async_graphql::{EmptySubscription, Object, Request, Schema};
+    use kabipay_common::{
+        context::{
+            ClientClaims, CLIENT_JWT_ISSUER, PERM_ATTENDANCE_PUNCH_POLICY,
+            PERM_ATTENDANCE_PUNCH_SELF, PERM_ATTENDANCE_REGULARIZE, PERM_LEAVE_MANAGE,
+            PERM_TIMESHEET_APPROVE, PERM_TIMESHEET_MANAGE, PERM_TIMESHEET_READ,
+            PERM_TIMESHEET_WRITE,
+        },
+        subgraph::TenantId,
+    };
+    use std::collections::HashMap;
+
+    struct TestQuery;
+
+    #[Object]
+    impl TestQuery {
+        async fn api_version(&self) -> &str {
+            "test"
+        }
+    }
+
+    fn claims(
+        permission: Option<&str>,
+        scope: Option<&str>,
+        employee_id: Option<Uuid>,
+    ) -> ClientClaims {
+        let permissions = permission.into_iter().map(str::to_owned).collect();
+        let permission_scopes = permission
+            .zip(scope)
+            .map(|(permission, scope)| {
+                HashMap::from([(permission.to_owned(), scope.to_owned())])
+            })
+            .unwrap_or_default();
+        ClientClaims {
+            sub: Uuid::new_v4(),
+            iss: CLIENT_JWT_ISSUER.into(),
+            exp: 0,
+            iat: 0,
+            tenant_id: Uuid::new_v4(),
+            email: String::new(),
+            employee_id,
+            must_change_password: false,
+            roles: vec![],
+            permissions,
+            permission_scopes,
+            resource_scopes: HashMap::new(),
+        }
+    }
+
+    async fn execute_mutation(
+        claims: ClientClaims,
+        mutation: &str,
+    ) -> async_graphql::Response {
+        let tenant_id = claims.tenant_id;
+        Schema::build(TestQuery, MutationRoot, EmptySubscription)
+            .data(TenantId(tenant_id))
+            .data(claims)
+            .finish()
+            .execute(Request::new(mutation))
+            .await
+    }
+
+    fn mutation_inventory() -> Vec<(&'static str, String)> {
+        let id = Uuid::new_v4();
+        let step_id = Uuid::new_v4();
+        vec![
+            (PERM_ATTENDANCE_PUNCH_SELF, "mutation { punchToday { id } }".into()),
+            (
+                PERM_ATTENDANCE_PUNCH_POLICY,
+                "mutation { upsertAttendancePunchPolicy(input: { isEnforced: false }) { id } }"
+                    .into(),
+            ),
+            (
+                PERM_ATTENDANCE_PUNCH_SELF,
+                "mutation { addManualAttendanceSegment(input: { workDate: \"2026-08-27\", checkInTime: \"09:00:00\", checkOutTime: \"17:00:00\" }) { id } }".into(),
+            ),
+            (
+                PERM_ATTENDANCE_PUNCH_SELF,
+                format!("mutation {{ updateManualAttendanceSegment(input: {{ id: \"{id}\", workDate: \"2026-08-27\", checkInTime: \"09:00:00\", checkOutTime: \"17:00:00\" }}) {{ id }} }}"),
+            ),
+            (
+                PERM_ATTENDANCE_REGULARIZE,
+                format!("mutation {{ addManagedAttendanceSegment(input: {{ employeeId: \"{id}\", workDate: \"2026-08-27\", checkInTime: \"09:00:00\", checkOutTime: \"17:00:00\", reason: \"approved correction\" }}) {{ id }} }}"),
+            ),
+            (
+                PERM_ATTENDANCE_REGULARIZE,
+                format!("mutation {{ updateManagedAttendanceSegment(input: {{ id: \"{id}\", workDate: \"2026-08-27\", checkInTime: \"09:00:00\", checkOutTime: \"17:00:00\", reason: \"approved correction\", expectedUpdatedAt: \"2026-08-27T09:00:00Z\" }}) {{ id }} }}"),
+            ),
+            (
+                PERM_TIMESHEET_WRITE,
+                "mutation { createTimesheetEntry(input: { workDate: \"2026-08-27\", hoursWorked: \"8\" }) { id } }".into(),
+            ),
+            (
+                PERM_TIMESHEET_WRITE,
+                format!("mutation {{ deleteTimesheetEntry(id: \"{id}\") }}"),
+            ),
+            (
+                PERM_TIMESHEET_WRITE,
+                format!("mutation {{ updateTimesheetEntry(input: {{ id: \"{id}\", workDate: \"2026-08-27\", hoursWorked: \"8\" }}) {{ id }} }}"),
+            ),
+            (
+                PERM_TIMESHEET_WRITE,
+                "mutation { submitTimesheetWeek(weekStartDate: \"2026-08-24\") { id } }".into(),
+            ),
+            (
+                PERM_TIMESHEET_APPROVE,
+                format!("mutation {{ approveTimesheetWeekBatch(id: \"{id}\", expectedWorkflowStepId: \"{step_id}\") {{ id }} }}"),
+            ),
+            (
+                PERM_TIMESHEET_APPROVE,
+                format!("mutation {{ rejectTimesheetWeekBatch(id: \"{id}\", expectedWorkflowStepId: \"{step_id}\", rejectionReason: \"invalid\") }}"),
+            ),
+            (
+                PERM_ATTENDANCE_PUNCH_POLICY,
+                "mutation { upsertAttendanceAdjustmentPolicy(input: { maxSelfAdjustDays: 7 }) { maxSelfAdjustDays } }".into(),
+            ),
+            (
+                PERM_TIMESHEET_MANAGE,
+                "mutation { upsertTimesheetLockPolicy(input: { editableWeekSpan: 2, lockApprovedEntries: true }) { editableWeekSpan } }".into(),
+            ),
+            (
+                PERM_TIMESHEET_MANAGE,
+                "mutation { upsertTimesheetProject(code: \"P1\", name: \"Project\") }".into(),
+            ),
+            (
+                PERM_TIMESHEET_MANAGE,
+                "mutation { upsertTimesheetTaskTypes(projectCode: \"P1\", taskCodes: [\"DEV\"]) }".into(),
+            ),
+            (
+                PERM_TIMESHEET_MANAGE,
+                format!("mutation {{ setEmployeeTimesheetProjects(employeeId: \"{id}\", projectCodes: [\"P1\"]) }}"),
+            ),
+            (
+                PERM_LEAVE_MANAGE,
+                "mutation { upsertHolidayCalendar(input: { name: \"India\", year: 2026 }) { id } }".into(),
+            ),
+            (
+                PERM_LEAVE_MANAGE,
+                format!("mutation {{ deleteHolidayCalendar(calendarId: \"{id}\") }}"),
+            ),
+            (
+                PERM_LEAVE_MANAGE,
+                format!("mutation {{ upsertHolidayDay(input: {{ calendarId: \"{id}\", holidayDate: \"2026-08-15\", name: \"Holiday\" }}) {{ id }} }}"),
+            ),
+            (
+                PERM_LEAVE_MANAGE,
+                format!("mutation {{ deleteHolidayDay(holidayId: \"{id}\") }}"),
+            ),
+        ]
+    }
+
+    fn allowed_scopes(permission: &str) -> &'static [&'static str] {
+        match permission {
+            PERM_ATTENDANCE_PUNCH_SELF | PERM_TIMESHEET_WRITE => &["SELF"],
+            PERM_ATTENDANCE_REGULARIZE | PERM_TIMESHEET_APPROVE => &["TEAM", "ALL"],
+            PERM_ATTENDANCE_PUNCH_POLICY | PERM_TIMESHEET_MANAGE | PERM_LEAVE_MANAGE => {
+                &["ALL"]
+            }
+            _ => unreachable!("mutation inventory contains only attendance authorities"),
+        }
+    }
+
+    fn assert_exact_permission_denied_before_db(
+        response: &async_graphql::Response,
+        permission: &str,
+    ) {
+        assert_eq!(response.errors.len(), 1, "unexpected response: {response:?}");
+        let message = &response.errors[0].message;
+        assert!(
+            message.contains(permission),
+            "expected exact {permission} denial, got: {message}"
+        );
+        assert!(!message.contains("TenantDbCache"));
+        assert!(!message.contains("database"));
+    }
+
+    fn assert_authorization_reached_db(response: &async_graphql::Response, permission: &str) {
+        assert_eq!(response.errors.len(), 1, "unexpected response: {response:?}");
+        let message = &response.errors[0].message;
+        assert!(
+            !message.contains(permission),
+            "valid exact authority was rejected: {message}"
+        );
+        let code = response.errors[0]
+            .extensions
+            .as_ref()
+            .and_then(|extensions| extensions.get("code"))
+            .cloned();
+        assert_eq!(
+            code,
+            Some(async_graphql::Value::from("INTERNAL_ERROR")),
+            "valid authority did not reach the tenant database boundary: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn every_mutation_denies_missing_and_sibling_permissions_before_db_access() {
+        for (required_permission, mutation) in mutation_inventory() {
+            let employee_id = Some(Uuid::new_v4());
+            let missing = execute_mutation(claims(None, None, employee_id), &mutation).await;
+            assert_exact_permission_denied_before_db(&missing, required_permission);
+
+            let sibling = execute_mutation(
+                claims(Some(PERM_TIMESHEET_READ), Some("ALL"), employee_id),
+                &mutation,
+            )
+            .await;
+            assert_exact_permission_denied_before_db(&sibling, required_permission);
+        }
+    }
+
+    #[tokio::test]
+    async fn every_mutation_rejects_missing_malformed_or_unsuitable_exact_scope_before_db() {
+        for (required_permission, mutation) in mutation_inventory() {
+            for scope in [None, Some("INVALID"), Some("SELF"), Some("TEAM"), Some("DEPARTMENT"), Some("ALL")] {
+                if scope.is_some_and(|scope| allowed_scopes(required_permission).contains(&scope)) {
+                    continue;
+                }
+                let response = execute_mutation(
+                    claims(Some(required_permission), scope, Some(Uuid::new_v4())),
+                    &mutation,
+                )
+                .await;
+                assert_exact_permission_denied_before_db(&response, required_permission);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn suitable_exact_scopes_allow_every_mutation_to_reach_its_database_boundary() {
+        assert_eq!(mutation_inventory().len(), 21);
+        for (required_permission, mutation) in mutation_inventory() {
+            for scope in allowed_scopes(required_permission) {
+                let response = execute_mutation(
+                    claims(
+                        Some(required_permission),
+                        Some(scope),
+                        Some(Uuid::new_v4()),
+                    ),
+                    &mutation,
+                )
+                .await;
+                assert_authorization_reached_db(&response, required_permission);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn self_service_mutations_require_a_jwt_employee_link_before_db_access() {
+        for (required_permission, mutation) in mutation_inventory().into_iter().filter(
+            |(permission, _)| {
+                matches!(
+                    *permission,
+                    PERM_ATTENDANCE_PUNCH_SELF | PERM_TIMESHEET_WRITE
+                )
+            },
+        ) {
+            let response = execute_mutation(
+                claims(Some(required_permission), Some("SELF"), None),
+                &mutation,
+            )
+            .await;
+            assert_exact_permission_denied_before_db(&response, required_permission);
+        }
+    }
+
+    #[test]
+    fn timesheet_decisions_require_expected_workflow_step_id_in_graphql_schema() {
+        let schema = Schema::build(TestQuery, MutationRoot, EmptySubscription).finish();
+        let sdl = schema.sdl();
+
+        assert!(sdl.contains(
+            "approveTimesheetWeekBatch(id: ID!, expectedWorkflowStepId: ID!): TimesheetWeekBatch!"
+        ), "unexpected SDL: {sdl}");
+        assert!(sdl.contains(
+            "rejectTimesheetWeekBatch(id: ID!, expectedWorkflowStepId: ID!, rejectionReason: String): Boolean!"
+        ), "unexpected SDL: {sdl}");
     }
 }

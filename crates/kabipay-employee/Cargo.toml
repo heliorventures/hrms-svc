@@ -39,3 +39,6 @@ opendal = { version = "0.55.0", features = ["services-s3"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 # SigV4 for CreateBucket (OpenDAL only handles objects inside an existing bucket)
 reqsign = { version = "0.16.5", default-features = false, features = ["reqwest_request", "services-aws", "rustls"] }
+
+[dev-dependencies]
+sea-orm = { workspace = true, features = ["proxy"] }

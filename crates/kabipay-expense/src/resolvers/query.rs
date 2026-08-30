@@ -3,13 +3,13 @@
 use async_graphql::{Context, Object, Result, ID};
 use kabipay_common::{
     client_data_scope::{
-        data_scope_from_context, resolve_employee_scope_filter, resolve_viewer_employee,
+        data_scope_from_claims, resolve_employee_scope_filter, resolve_viewer_employee,
     },
-    context::PERM_EXPENSE_READ,
-    subgraph::{
-        require_client_claims, require_tenant_id, resolve_client_employee_id, tenant_db,
+    context::{
+        ClientClaims, ScopeType, PERM_EXPENSE_MANAGE, PERM_EXPENSE_READ, PERM_TRAVEL_READ,
     },
-    KabiPayError,
+    subgraph::{require_tenant_id, resolve_client_employee_id, tenant_db},
+    KabiPayError, KabiPayResult,
 };
 
 use crate::resolvers::types::{
@@ -23,15 +23,40 @@ pub(crate) fn parse_uuid(id: &ID, field: &'static str) -> Result<Uuid> {
         .map_err(|e| KabiPayError::Validation(format!("invalid {field}: {e}")).into_graphql())
 }
 
-fn require_expense_configuration(ctx: &Context<'_>) -> Result<()> {
-    let claims = require_client_claims(ctx)?;
-    if !claims.can_manage_expense_configuration() {
-        return Err(
-            KabiPayError::Forbidden("missing permission to manage expense configuration".into())
-                .into_graphql(),
-        );
+fn expense_read_scope_from_claims(claims: Option<&ClientClaims>) -> KabiPayResult<ScopeType> {
+    data_scope_from_claims(claims, PERM_EXPENSE_READ)
+}
+
+fn travel_read_scope_from_claims(claims: Option<&ClientClaims>) -> KabiPayResult<ScopeType> {
+    data_scope_from_claims(claims, PERM_TRAVEL_READ)
+}
+
+fn expense_read_scope(ctx: &Context<'_>) -> Result<ScopeType> {
+    expense_read_scope_from_claims(ctx.data_opt::<ClientClaims>())
+        .map_err(KabiPayError::into_graphql)
+}
+
+fn travel_read_scope(ctx: &Context<'_>) -> Result<ScopeType> {
+    travel_read_scope_from_claims(ctx.data_opt::<ClientClaims>())
+        .map_err(KabiPayError::into_graphql)
+}
+
+fn expense_manage_all_scope_from_claims(
+    claims: Option<&ClientClaims>,
+) -> KabiPayResult<ScopeType> {
+    let scope = data_scope_from_claims(claims, PERM_EXPENSE_MANAGE)?;
+    if scope != ScopeType::All {
+        return Err(KabiPayError::Forbidden(format!(
+            "{PERM_EXPENSE_MANAGE} permission requires ALL scope"
+        )));
     }
-    Ok(())
+    Ok(scope)
+}
+
+fn require_expense_configuration(ctx: &Context<'_>) -> Result<()> {
+    expense_manage_all_scope_from_claims(ctx.data_opt::<ClientClaims>())
+        .map(|_| ())
+        .map_err(KabiPayError::into_graphql)
 }
 
 pub struct QueryRoot;
@@ -48,6 +73,7 @@ impl QueryRoot {
         #[graphql(default = 100)] limit: u64,
     ) -> Result<Vec<ExpenseCategoryDto>> {
         let tenant_id = require_tenant_id(ctx)?;
+        expense_read_scope(ctx)?;
         let db = tenant_db(ctx, tenant_id).await?;
         let rows = expense_service::list_categories(&db, tenant_id, limit)
             .await
@@ -61,8 +87,8 @@ impl QueryRoot {
         #[graphql(default = 100)] limit: u64,
     ) -> Result<Vec<ExpenseDto>> {
         let tenant_id = require_tenant_id(ctx)?;
+        let scope = expense_read_scope(ctx)?;
         let db = tenant_db(ctx, tenant_id).await?;
-        let scope = data_scope_from_context(ctx, PERM_EXPENSE_READ)?;
         let viewer = resolve_viewer_employee(ctx, &db, tenant_id).await?;
         let filt = resolve_employee_scope_filter(&db, tenant_id, scope, viewer)
             .await
@@ -73,15 +99,15 @@ impl QueryRoot {
         Ok(rows.into_iter().map(ExpenseDto::from).collect())
     }
 
-    /// Travel / trip requests for the caller’s **expense** data scope (same as `expenses`).
+    /// Travel / trip requests for the caller's exact `travel:read` data scope.
     async fn travel_requests(
         &self,
         ctx: &Context<'_>,
         #[graphql(default = 100)] limit: u64,
     ) -> Result<Vec<TravelRequestDto>> {
         let tenant_id = require_tenant_id(ctx)?;
+        let scope = travel_read_scope(ctx)?;
         let db = tenant_db(ctx, tenant_id).await?;
-        let scope = data_scope_from_context(ctx, PERM_EXPENSE_READ)?;
         let viewer = resolve_viewer_employee(ctx, &db, tenant_id).await?;
         let filt = resolve_employee_scope_filter(&db, tenant_id, scope, viewer)
             .await
@@ -98,6 +124,7 @@ impl QueryRoot {
         expense_category_id: ID,
     ) -> Result<ExpenseSubmissionHints> {
         let tenant_id = require_tenant_id(ctx)?;
+        expense_read_scope(ctx)?;
         let db = tenant_db(ctx, tenant_id).await?;
         let employee_id = resolve_client_employee_id(ctx, &db, tenant_id)
             .await
@@ -138,5 +165,225 @@ impl QueryRoot {
             .await
             .map_err(KabiPayError::into_graphql)?;
         Ok(rows.into_iter().map(ExpensePolicyDto::from).collect())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use async_graphql::{EmptyMutation, EmptySubscription, Request, Schema};
+    use kabipay_common::client_data_scope::EmployeeScopeFilter;
+    use kabipay_common::context::{
+        ClientClaims, ScopeType, CLIENT_JWT_ISSUER, PERM_EXPENSE_MANAGE, PERM_TRAVEL_READ,
+    };
+    use kabipay_common::subgraph::TenantId;
+    use std::collections::HashMap;
+
+    fn claims(permission: &str, scope: Option<&str>) -> ClientClaims {
+        let permission_scopes = scope
+            .map(|scope| HashMap::from([(permission.to_string(), scope.to_string())]))
+            .unwrap_or_default();
+        ClientClaims {
+            sub: Uuid::new_v4(),
+            iss: CLIENT_JWT_ISSUER.into(),
+            exp: 0,
+            iat: 0,
+            tenant_id: Uuid::new_v4(),
+            email: String::new(),
+            employee_id: Some(Uuid::new_v4()),
+            must_change_password: false,
+            roles: vec![],
+            permissions: vec![permission.into()],
+            permission_scopes,
+            resource_scopes: HashMap::new(),
+        }
+    }
+
+    fn claims_without_permissions() -> ClientClaims {
+        let mut claims = claims("unrelated:read", Some("ALL"));
+        claims.permissions.clear();
+        claims.permission_scopes.clear();
+        claims
+    }
+
+    async fn execute_query(claims: ClientClaims, query: &str) -> async_graphql::Response {
+        let tenant_id = claims.tenant_id;
+        Schema::build(QueryRoot, EmptyMutation, EmptySubscription)
+            .data(TenantId(tenant_id))
+            .data(claims)
+            .finish()
+            .execute(Request::new(query))
+            .await
+    }
+
+    fn assert_permission_denied_before_db(
+        response: &async_graphql::Response,
+        expected_message: &str,
+    ) {
+        assert_eq!(response.errors.len(), 1, "unexpected response: {response:?}");
+        let message = &response.errors[0].message;
+        assert!(
+            message.contains(expected_message),
+            "unexpected denial: {message}"
+        );
+        assert!(!message.contains("TenantDbCache"));
+        assert!(!message.contains("database"));
+    }
+
+    #[test]
+    fn expense_and_travel_read_gates_require_their_own_exact_scopes() {
+        for (gate, permission) in [
+            (
+                expense_read_scope_from_claims
+                    as fn(Option<&ClientClaims>) -> KabiPayResult<ScopeType>,
+                PERM_EXPENSE_READ,
+            ),
+            (
+                travel_read_scope_from_claims
+                    as fn(Option<&ClientClaims>) -> KabiPayResult<ScopeType>,
+                PERM_TRAVEL_READ,
+            ),
+        ] {
+            for (wire_scope, expected) in [
+                ("SELF", ScopeType::Self_),
+                ("TEAM", ScopeType::Team),
+                ("ALL", ScopeType::All),
+            ] {
+                assert_eq!(
+                    gate(Some(&claims(permission, Some(wire_scope))))
+                        .expect("valid exact read scope"),
+                    expected
+                );
+            }
+
+            assert!(matches!(
+                gate(Some(&claims(permission, None))),
+                Err(KabiPayError::Forbidden(_))
+            ));
+        }
+
+        assert!(matches!(
+            expense_read_scope_from_claims(Some(&claims(PERM_TRAVEL_READ, Some("ALL")))),
+            Err(KabiPayError::Forbidden(_))
+        ));
+        assert!(matches!(
+            travel_read_scope_from_claims(Some(&claims(PERM_EXPENSE_READ, Some("ALL")))),
+            Err(KabiPayError::Forbidden(_))
+        ));
+    }
+
+    #[test]
+    fn expense_policy_admin_requires_exact_all_manage_scope() {
+        assert!(expense_manage_all_scope_from_claims(Some(&claims(
+            PERM_EXPENSE_MANAGE,
+            Some("ALL"),
+        )))
+        .is_ok());
+
+        for scope in [None, Some("INVALID"), Some("SELF"), Some("TEAM"), Some("DEPARTMENT")] {
+            assert!(matches!(
+                expense_manage_all_scope_from_claims(Some(&claims(PERM_EXPENSE_MANAGE, scope))),
+                Err(KabiPayError::Forbidden(_))
+            ));
+        }
+
+        assert!(matches!(
+            expense_manage_all_scope_from_claims(Some(&claims(PERM_EXPENSE_READ, Some("ALL")))),
+            Err(KabiPayError::Forbidden(_))
+        ));
+    }
+
+    #[test]
+    fn expense_and_travel_target_filters_enforce_self_recursive_team_and_all() {
+        let viewer_id = Uuid::new_v4();
+        let descendant_id = Uuid::new_v4();
+        let outside_id = Uuid::new_v4();
+
+        let self_filter = EmployeeScopeFilter::EmployeeIds(vec![viewer_id]);
+        let team_filter = EmployeeScopeFilter::EmployeeIds(vec![viewer_id, descendant_id]);
+
+        assert!(self_filter.allows_employee(viewer_id));
+        assert!(!self_filter.allows_employee(descendant_id));
+        assert!(team_filter.allows_employee(viewer_id));
+        assert!(team_filter.allows_employee(descendant_id));
+        assert!(!team_filter.allows_employee(outside_id));
+        assert!(EmployeeScopeFilter::Unrestricted.allows_employee(outside_id));
+    }
+
+    #[tokio::test]
+    async fn every_protected_expense_query_uses_its_exact_permission_before_db_access() {
+        let category_id = Uuid::new_v4();
+        let fields = vec![
+            (
+                "{ expenseCategories { __typename } }".to_string(),
+                PERM_EXPENSE_READ,
+                PERM_TRAVEL_READ,
+                true,
+            ),
+            (
+                "{ expenses { __typename } }".to_string(),
+                PERM_EXPENSE_READ,
+                PERM_TRAVEL_READ,
+                true,
+            ),
+            (
+                "{ travelRequests { __typename } }".to_string(),
+                PERM_TRAVEL_READ,
+                PERM_EXPENSE_READ,
+                true,
+            ),
+            (
+                format!(
+                    "{{ expenseSubmissionHints(expenseCategoryId: \"{category_id}\") {{ __typename }} }}"
+                ),
+                PERM_EXPENSE_READ,
+                PERM_TRAVEL_READ,
+                true,
+            ),
+            (
+                format!(
+                    "{{ expensePoliciesForAdmin(expenseCategoryId: \"{category_id}\") {{ __typename }} }}"
+                ),
+                PERM_EXPENSE_MANAGE,
+                PERM_EXPENSE_READ,
+                true,
+            ),
+        ];
+
+        for (query, required_permission, sibling_permission, requires_scope) in fields {
+            for denied_claims in [
+                claims_without_permissions(),
+                claims(sibling_permission, Some("ALL")),
+            ] {
+                let response = execute_query(denied_claims, &query).await;
+                assert_permission_denied_before_db(
+                    &response,
+                    &format!("{required_permission} permission required"),
+                );
+            }
+
+            if requires_scope {
+                for scope in [None, Some("INVALID")] {
+                    let response = execute_query(claims(required_permission, scope), &query).await;
+                    assert_permission_denied_before_db(
+                        &response,
+                        &format!(
+                            "{required_permission} permission requires an explicit valid scope"
+                        ),
+                    );
+                }
+            }
+
+            if required_permission == PERM_EXPENSE_MANAGE {
+                for scope in ["SELF", "TEAM", "DEPARTMENT"] {
+                    let response =
+                        execute_query(claims(required_permission, Some(scope)), &query).await;
+                    assert_permission_denied_before_db(
+                        &response,
+                        &format!("{required_permission} permission requires ALL scope"),
+                    );
+                }
+            }
+        }
     }
 }

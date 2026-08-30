@@ -6,40 +6,12 @@ use kabipay_common::{
         data_scope_from_context, resolve_employee_scope_filter, resolve_viewer_employee,
     },
     context::PERM_TIMESHEET_APPROVE,
-    subgraph::{require_client_claims, resolve_client_employee_id},
+    subgraph::require_client_claims,
     KabiPayError,
 };
 use kabipay_db_entities::tenant::d0007_employee_core::employee;
 use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter};
 use uuid::Uuid;
-
-pub async fn assert_can_read_employee_assignment_target(
-    ctx: &Context<'_>,
-    db: &DatabaseConnection,
-    tenant_id: Uuid,
-    target_employee_id: Uuid,
-) -> Result<()> {
-    let claims = require_client_claims(ctx)?;
-    let viewer_id = resolve_client_employee_id(ctx, db, tenant_id)
-        .await
-        .map_err(KabiPayError::into_graphql)?;
-    if viewer_id == target_employee_id {
-        return Ok(());
-    }
-
-    if claims.can_manage_timesheet_configuration() {
-        return employee_exists(db, tenant_id, target_employee_id).await;
-    }
-
-    if !claims.can_approve_timesheet_requests() {
-        return Err(
-            KabiPayError::Forbidden("cannot view project assignments for this employee".into())
-                .into_graphql(),
-        );
-    }
-
-    assert_target_in_timesheet_scope(ctx, db, tenant_id, target_employee_id).await
-}
 
 pub async fn assert_can_write_employee_assignment_target(
     ctx: &Context<'_>,

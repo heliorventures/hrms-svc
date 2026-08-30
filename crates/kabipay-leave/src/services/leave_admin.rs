@@ -355,34 +355,6 @@ pub async fn provision_leave_balances_from_policies(
     Ok(touched)
 }
 
-/// Ensures the requested employee has current-year balance rows without requiring an
-/// administrator to run the tenant-wide provisioning action first. This is intentionally
-/// idempotent and preserves used, pending, and carried-forward days.
-pub async fn ensure_employee_leave_balances(
-    db: &DatabaseConnection,
-    tenant_id: Uuid,
-    employee_id: Uuid,
-    year: i32,
-) -> KabiPayResult<u32> {
-    let emp = employee::Entity::find_by_id(employee_id)
-        .filter(employee::Column::TenantId.eq(tenant_id))
-        .filter(employee::Column::IsDeleted.eq(false))
-        .one(db)
-        .await
-        .map_err(KabiPayError::from)?
-        .ok_or_else(|| KabiPayError::NotFound {
-            entity: "employee",
-            id: employee_id.to_string(),
-        })?;
-    let policies = list_leave_policies(db, tenant_id, 500).await?;
-    let mut seen_types = HashSet::new();
-    let unique_policies = policies
-        .into_iter()
-        .filter(|policy| seen_types.insert(policy.leave_type_id))
-        .collect::<Vec<_>>();
-    provision_for_employee(db, tenant_id, &emp, &unique_policies, year).await
-}
-
 async fn provision_for_employee(
     db: &DatabaseConnection,
     tenant_id: Uuid,
@@ -553,7 +525,6 @@ pub async fn adjust_leave_balance_entitlement(
     leave_type_id: Uuid,
     year: i32,
     entitled_delta: Decimal,
-    also_credit_balance: bool,
 ) -> KabiPayResult<leave_balance::Model> {
     let row = leave_balance::Entity::find()
         .filter(leave_balance::Column::TenantId.eq(tenant_id))
@@ -575,22 +546,12 @@ pub async fn adjust_leave_balance_entitlement(
             "entitled_days cannot go negative".into(),
         ));
     }
-    let balance = if also_credit_balance {
-        let b = row.balance_days + entitled_delta;
-        if b < Decimal::ZERO {
-            return Err(KabiPayError::Validation(
-                "balance_days cannot go negative after adjustment".into(),
-            ));
-        }
-        b
-    } else {
-        compute_balance_days(
-            entitled,
-            row.carried_forward_days,
-            row.used_days,
-            row.pending_days,
-        )?
-    };
+    let balance = compute_balance_days(
+        entitled,
+        row.carried_forward_days,
+        row.used_days,
+        row.pending_days,
+    )?;
 
     let mut am: leave_balance::ActiveModel = row.into();
     am.entitled_days = Set(entitled);

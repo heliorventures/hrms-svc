@@ -3,11 +3,111 @@
 //! Two planes, two contexts. JWTs issued by the two planes MUST NOT be interchangeable
 //! (different `iss` claim, different signing secret, validated by different middleware).
 
+use crate::{KabiPayError, KabiPayResult};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use uuid::Uuid;
 
-/// Data-level access control scope. Applied per resource per role via `PERMISSION_SCOPE`.
+/// Canonical employee status that permits login and active employment workflows.
+pub const EMPLOYMENT_STATUS_ACTIVE: &str = "ACTIVE";
+/// Canonical probation status; probationary employees remain actively employed.
+pub const EMPLOYMENT_STATUS_PROBATION: &str = "PROBATION";
+pub const EMPLOYMENT_STATUS_INACTIVE: &str = "INACTIVE";
+pub const EMPLOYMENT_STATUS_ON_LEAVE: &str = "ON_LEAVE";
+pub const EMPLOYMENT_STATUS_SUSPENDED: &str = "SUSPENDED";
+pub const EMPLOYMENT_STATUS_TERMINATED: &str = "TERMINATED";
+/// Complete set of employment statuses accepted at service write boundaries.
+pub const EMPLOYMENT_STATUSES: [&str; 6] = [
+    EMPLOYMENT_STATUS_ACTIVE,
+    EMPLOYMENT_STATUS_PROBATION,
+    EMPLOYMENT_STATUS_INACTIVE,
+    EMPLOYMENT_STATUS_ON_LEAVE,
+    EMPLOYMENT_STATUS_SUSPENDED,
+    EMPLOYMENT_STATUS_TERMINATED,
+];
+/// Canonical statuses treated as active employment across authentication and HRMS domains.
+pub const ACTIVE_EMPLOYMENT_STATUSES: [&str; 2] = [
+    EMPLOYMENT_STATUS_ACTIVE,
+    EMPLOYMENT_STATUS_PROBATION,
+];
+
+/// Normalize a supported employment status to its canonical persisted representation.
+pub fn canonical_employment_status(status: &str) -> KabiPayResult<&'static str> {
+    match status.trim().to_ascii_uppercase().as_str() {
+        EMPLOYMENT_STATUS_ACTIVE => Ok(EMPLOYMENT_STATUS_ACTIVE),
+        EMPLOYMENT_STATUS_PROBATION => Ok(EMPLOYMENT_STATUS_PROBATION),
+        EMPLOYMENT_STATUS_INACTIVE => Ok(EMPLOYMENT_STATUS_INACTIVE),
+        EMPLOYMENT_STATUS_ON_LEAVE => Ok(EMPLOYMENT_STATUS_ON_LEAVE),
+        EMPLOYMENT_STATUS_SUSPENDED => Ok(EMPLOYMENT_STATUS_SUSPENDED),
+        EMPLOYMENT_STATUS_TERMINATED => Ok(EMPLOYMENT_STATUS_TERMINATED),
+        _ => Err(KabiPayError::Validation(
+            "employment status must be ACTIVE, PROBATION, INACTIVE, ON_LEAVE, SUSPENDED, or TERMINATED"
+                .into(),
+        )),
+    }
+}
+
+/// Returns whether an employee status represents current active employment.
+pub fn is_active_employment_status(status: &str) -> bool {
+    canonical_employment_status(status)
+        .is_ok_and(|status| ACTIVE_EMPLOYMENT_STATUSES.contains(&status))
+}
+
+#[cfg(test)]
+mod active_employment_tests {
+    use super::*;
+
+    #[test]
+    fn employment_status_conversion_normalizes_every_supported_status() {
+        for (input, expected) in [
+            (" active ", EMPLOYMENT_STATUS_ACTIVE),
+            ("Probation", EMPLOYMENT_STATUS_PROBATION),
+            ("inactive", EMPLOYMENT_STATUS_INACTIVE),
+            (" on_leave ", EMPLOYMENT_STATUS_ON_LEAVE),
+            ("Suspended", EMPLOYMENT_STATUS_SUSPENDED),
+            ("terminated", EMPLOYMENT_STATUS_TERMINATED),
+        ] {
+            assert_eq!(
+                canonical_employment_status(input).expect("supported employment status"),
+                expected,
+                "input={input}"
+            );
+        }
+        assert_eq!(
+            EMPLOYMENT_STATUSES,
+            [
+                "ACTIVE",
+                "PROBATION",
+                "INACTIVE",
+                "ON_LEAVE",
+                "SUSPENDED",
+                "TERMINATED",
+            ]
+        );
+    }
+
+    #[test]
+    fn employment_status_conversion_rejects_empty_and_unknown_values() {
+        for input in ["", "   ", "NOTICE", "ACTIVE_EMPLOYEE"] {
+            let error = canonical_employment_status(input)
+                .expect_err("unsupported employment status must be rejected");
+            assert_eq!(error.code(), "VALIDATION_ERROR", "input={input}");
+        }
+    }
+
+    #[test]
+    fn canonical_active_employment_accepts_only_active_and_probation() {
+        for status in ["ACTIVE", "active", " PROBATION ", "probation"] {
+            assert!(is_active_employment_status(status), "status={status}");
+        }
+        for status in ["INACTIVE", "TERMINATED", "NOTICE", "", "ACTIVE_EMPLOYEE"] {
+            assert!(!is_active_employment_status(status), "status={status}");
+        }
+        assert_eq!(ACTIVE_EMPLOYMENT_STATUSES, ["ACTIVE", "PROBATION"]);
+    }
+}
+
+/// Data-level access control scope. Applied per exact permission per role via `PERMISSION_SCOPE`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "UPPERCASE")]
 pub enum ScopeType {
@@ -22,7 +122,7 @@ pub enum ScopeType {
 }
 
 impl ScopeType {
-    /// Wider access wins when merging several role rows for the same resource.
+    /// Wider access wins when merging several role rows for the same exact permission.
     pub fn rank(self) -> u8 {
         match self {
             ScopeType::Self_ => 1,
@@ -168,8 +268,8 @@ pub struct ClientClaims {
     /// Widest scope for each exact permission code, such as `attendance:read`.
     #[serde(default)]
     pub permission_scopes: HashMap<String, String>,
-    /// Widest `ScopeType` per `permission.resource` (keys: e.g. `employee`, `leave` — wire values
-    /// are `SELF` | `TEAM` | `DEPARTMENT` | `ALL`). Omitted in legacy tokens; treated as SELF.
+    /// Legacy per-resource scope field retained for token compatibility. New tokens do not derive
+    /// authorization from it; scoped decisions use `permission_scopes`.
     #[serde(default)]
     pub resource_scopes: HashMap<String, String>,
 }
@@ -178,6 +278,7 @@ pub const OPERATOR_JWT_ISSUER: &str = "kabipay-ops";
 pub const CLIENT_JWT_ISSUER: &str = "kabipay-client";
 
 /// JWT `permissions` claim uses `resource:action` to match `permission` rows.
+pub const PERM_EMPLOYEE_SELF: &str = "employee:self";
 pub const PERM_EMPLOYEE_WRITE: &str = "employee:write";
 pub const PERM_EMPLOYEE_READ: &str = "employee:read";
 /// Broader org directory edits (e.g. bulk / sensitive fields) — same gate as write for now.
@@ -185,17 +286,26 @@ pub const PERM_EMPLOYEE_MANAGE: &str = "employee:manage";
 /// Approve or reject other users' leave requests.
 pub const PERM_LEAVE_APPROVE: &str = "leave:approve";
 pub const PERM_LEAVE_READ: &str = "leave:read";
+pub const PERM_LEAVE_SUBMIT: &str = "leave:submit";
 /// Approve or reject expense claims submitted by others.
 pub const PERM_EXPENSE_APPROVE: &str = "expense:approve";
 pub const PERM_EXPENSE_READ: &str = "expense:read";
+pub const PERM_EXPENSE_SUBMIT: &str = "expense:submit";
 /// Configure expense categories (travel/meal/other claim types employees select).
 pub const PERM_EXPENSE_MANAGE: &str = "expense:manage";
 /// Mark expense reimbursements as paid / failed / on hold (payroll or accounting path).
 pub const PERM_EXPENSE_PAY: &str = "expense:pay";
 /// Approve or reject **tax proof** lines (submitted actuals vs declared deductions).
-pub const PERM_TAX_PROOF_APPROVE: &str = "tax:approve";
+pub const PERM_TAX_APPROVE: &str = "tax:approve";
+/// Backward-compatible name for the canonical `tax:approve` permission.
+pub const PERM_TAX_PROOF_APPROVE: &str = PERM_TAX_APPROVE;
+pub const PERM_TAX_READ: &str = "tax:read";
+pub const PERM_TAX_SUBMIT: &str = "tax:submit";
+pub const PERM_TAX_MANAGE: &str = "tax:manage";
 /// Export India payroll statutory artefacts (e.g. monthly TDS summary CSV) for the tenant.
 pub const PERM_PAYROLL_STATUTORY_EXPORT: &str = "payroll:statutory_export";
+pub const PERM_PAYROLL_READ: &str = "payroll:read";
+pub const PERM_PAYROLL_MANAGE: &str = "payroll:manage";
 /// Configure live punch enforcement (geofence / IP allowlist) for the tenant.
 pub const PERM_ATTENDANCE_PUNCH_POLICY: &str = "attendance:punch_policy";
 pub const PERM_ATTENDANCE_READ: &str = "attendance:read";
@@ -242,10 +352,16 @@ pub const PERM_ATTENDANCE_REGULARIZE: &str = "attendance:regularize";
 /// Approve or reject submitted weekly timesheets.
 pub const PERM_TIMESHEET_APPROVE: &str = "timesheet:approve";
 pub const PERM_TIMESHEET_READ: &str = "timesheet:read";
+pub const PERM_TIMESHEET_WRITE: &str = "timesheet:write";
 /// Configure timesheet catalogs (projects / tasks) and lock policy (`master_data` backed).
 pub const PERM_TIMESHEET_MANAGE: &str = "timesheet:manage";
 /// Create or edit **tenant announcements**, send **direct in-app notifications**, and remove broadcasts.
 pub const PERM_NOTIFICATION_MANAGE: &str = "notification:manage";
+pub const PERM_NOTIFICATION_READ: &str = "notification:read";
+pub const PERM_TRAVEL_READ: &str = "travel:read";
+pub const PERM_TRAVEL_SUBMIT: &str = "travel:submit";
+pub const PERM_TRAVEL_APPROVE: &str = "travel:approve";
+pub const PERM_TRAVEL_MANAGE: &str = "travel:manage";
 
 /// HTTP-derived metadata attached to each GraphQL request by [`crate::subgraph::tenant_graphql_post`].
 /// Values come from gateway headers, not from GraphQL variables (so they are suitable for policy).
@@ -431,18 +547,18 @@ impl ClientClaims {
             .and_then(|scope| ScopeType::parse_loose(scope))
     }
 
-    /// Effective scope for one exact permission. Missing or malformed values
-    /// remain SELF so legacy tokens cannot gain broader access.
-    pub fn scope_for_permission(&self, permission: &str) -> ScopeType {
-        self.explicit_scope_for_permission(permission)
-            .unwrap_or(ScopeType::Self_)
-    }
-
-    pub fn explicit_scope_for_permission(&self, permission: &str) -> Option<ScopeType> {
+    /// Parsed scope for one exact permission. Missing or malformed values remain absent so
+    /// callers cannot silently broaden or default scoped authorization.
+    pub fn scope_for_permission(&self, permission: &str) -> Option<ScopeType> {
         let key = permission.trim().to_ascii_lowercase();
         self.permission_scopes
             .get(&key)
             .and_then(|scope| ScopeType::parse_loose(scope))
+    }
+
+    /// Compatibility alias for callers that already use the explicit-scope name.
+    pub fn explicit_scope_for_permission(&self, permission: &str) -> Option<ScopeType> {
+        self.scope_for_permission(permission)
     }
 }
 
@@ -468,6 +584,121 @@ mod tests {
             permission_scopes: HashMap::new(),
             resource_scopes: HashMap::new(),
         }
+    }
+
+    #[test]
+    fn canonical_permission_constants_match_the_runtime_vocabulary() {
+        let actual = [
+            PERM_EMPLOYEE_SELF,
+            PERM_EMPLOYEE_READ,
+            PERM_EMPLOYEE_WRITE,
+            PERM_EMPLOYEE_MANAGE,
+            PERM_ATTENDANCE_READ,
+            PERM_ATTENDANCE_PUNCH_SELF,
+            PERM_ATTENDANCE_REGULARIZE,
+            PERM_ATTENDANCE_PUNCH_POLICY,
+            PERM_TIMESHEET_READ,
+            PERM_TIMESHEET_WRITE,
+            PERM_TIMESHEET_APPROVE,
+            PERM_TIMESHEET_MANAGE,
+            PERM_LEAVE_READ,
+            PERM_LEAVE_SUBMIT,
+            PERM_LEAVE_APPROVE,
+            PERM_LEAVE_MANAGE,
+            PERM_EXPENSE_READ,
+            PERM_EXPENSE_SUBMIT,
+            PERM_EXPENSE_APPROVE,
+            PERM_EXPENSE_MANAGE,
+            PERM_EXPENSE_PAY,
+            PERM_TRAVEL_READ,
+            PERM_TRAVEL_SUBMIT,
+            PERM_TRAVEL_APPROVE,
+            PERM_TRAVEL_MANAGE,
+            PERM_PAYROLL_READ,
+            PERM_PAYROLL_MANAGE,
+            PERM_PAYROLL_STATUTORY_EXPORT,
+            PERM_TAX_READ,
+            PERM_TAX_SUBMIT,
+            PERM_TAX_APPROVE,
+            PERM_TAX_MANAGE,
+            PERM_NOTIFICATION_READ,
+            PERM_NOTIFICATION_MANAGE,
+            PERM_ROLE_MANAGE,
+            PERM_WORKFLOW_MANAGE,
+        ];
+        let expected = [
+            "employee:self",
+            "employee:read",
+            "employee:write",
+            "employee:manage",
+            "attendance:read",
+            "attendance:punch_self",
+            "attendance:regularize",
+            "attendance:punch_policy",
+            "timesheet:read",
+            "timesheet:write",
+            "timesheet:approve",
+            "timesheet:manage",
+            "leave:read",
+            "leave:submit",
+            "leave:approve",
+            "leave:manage",
+            "expense:read",
+            "expense:submit",
+            "expense:approve",
+            "expense:manage",
+            "expense:pay",
+            "travel:read",
+            "travel:submit",
+            "travel:approve",
+            "travel:manage",
+            "payroll:read",
+            "payroll:manage",
+            "payroll:statutory_export",
+            "tax:read",
+            "tax:submit",
+            "tax:approve",
+            "tax:manage",
+            "notification:read",
+            "notification:manage",
+            "role:manage",
+            "workflow:manage",
+        ];
+
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn exact_permission_scope_is_missing_when_absent_or_malformed() {
+        let mut claims = client_claims(&[], &[PERM_LEAVE_READ]);
+
+        assert_eq!(claims.scope_for_permission(PERM_LEAVE_READ), None);
+
+        claims
+            .permission_scopes
+            .insert(PERM_LEAVE_READ.into(), "INVALID".into());
+        assert_eq!(claims.scope_for_permission(PERM_LEAVE_READ), None);
+    }
+
+    #[test]
+    fn exact_permission_scope_does_not_inherit_from_other_actions_or_resources() {
+        let mut claims = client_claims(&[], &[PERM_LEAVE_APPROVE]);
+        claims
+            .permission_scopes
+            .insert(PERM_LEAVE_APPROVE.into(), "TEAM".into());
+        claims
+            .resource_scopes
+            .insert(SCOPE_RES_LEAVE.into(), "ALL".into());
+        claims
+            .resource_scopes
+            .insert(SCOPE_RES_EXPENSE.into(), "ALL".into());
+
+        assert_eq!(
+            claims.scope_for_permission(PERM_LEAVE_APPROVE),
+            Some(ScopeType::Team)
+        );
+        assert_eq!(claims.scope_for_permission(PERM_LEAVE_READ), None);
+        assert_eq!(claims.scope_for_permission(PERM_EXPENSE_READ), None);
     }
 
     #[test]

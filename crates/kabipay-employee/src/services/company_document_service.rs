@@ -273,21 +273,23 @@ pub async fn delete_company_document(
     Ok(true)
 }
 
-pub async fn find_company_document(
+/// Find a company document through the caller-selected visibility predicate.
+/// `include_hidden` is authorized by the resolver and never inferred from roles here.
+pub async fn find_visible_company_document(
     db: &DatabaseConnection,
     tenant_id: Uuid,
     document_id: Uuid,
-) -> KabiPayResult<company_document::Model> {
-    company_document::Entity::find_by_id(document_id)
+    include_hidden: bool,
+) -> KabiPayResult<Option<company_document::Model>> {
+    let mut query = company_document::Entity::find_by_id(document_id)
         .filter(company_document::Column::TenantId.eq(tenant_id))
-        .filter(company_document::Column::IsDeleted.eq(false))
-        .one(db)
-        .await
-        .map_err(KabiPayError::from)?
-        .ok_or_else(|| KabiPayError::NotFound {
-            entity: "companyDocument",
-            id: document_id.to_string(),
-        })
+        .filter(company_document::Column::IsDeleted.eq(false));
+    if !include_hidden {
+        query = query
+            .filter(company_document::Column::VisibleToEmployees.eq(true))
+            .filter(company_document::Column::Status.eq(ACTIVE_STATUS));
+    }
+    query.one(db).await.map_err(KabiPayError::from)
 }
 
 #[cfg(test)]

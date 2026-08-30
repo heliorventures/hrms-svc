@@ -1,6 +1,8 @@
 //! Tenant-scoped SeaORM queries for payroll catalog and cycles.
 
-use kabipay_common::{KabiPayError, KabiPayResult};
+use kabipay_common::{
+    client_data_scope::EmployeeScopeFilter, KabiPayError, KabiPayResult,
+};
 use kabipay_db_entities::tenant::d0007_employee_core::{
     employee, employee_bank, employee_pan, employment_history,
 };
@@ -14,9 +16,10 @@ use chrono::{NaiveDate, Utc};
 use rust_decimal::Decimal;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait, DatabaseConnection, EntityTrait,
-    QueryFilter, QueryOrder, QuerySelect, Set, TransactionTrait,
+    QueryFilter, QueryOrder, QuerySelect, Select, Set, TransactionTrait,
 };
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::str::FromStr;
 use uuid::Uuid;
 
@@ -396,27 +399,64 @@ pub async fn list_payslips(
         .map_err(KabiPayError::from)
 }
 
-/// One payslip with its `payslip_component` rows.
-pub async fn find_payslip_detail(
-    db: &DatabaseConnection,
+fn scoped_payslip_head_query(
     tenant_id: Uuid,
     id: Uuid,
-) -> KabiPayResult<Option<(payslip::Model, Vec<payslip_component::Model>)>> {
-    let Some(m) = payslip::Entity::find()
+    scope: &EmployeeScopeFilter,
+) -> Option<Select<payslip::Entity>> {
+    let query = payslip::Entity::find()
         .filter(payslip::Column::Id.eq(id))
-        .filter(payslip::Column::TenantId.eq(tenant_id))
-        .one(db)
-        .await?
-    else {
+        .filter(payslip::Column::TenantId.eq(tenant_id));
+    match scope {
+        EmployeeScopeFilter::Unrestricted => Some(query),
+        EmployeeScopeFilter::Empty => None,
+        EmployeeScopeFilter::EmployeeIds(employee_ids) if employee_ids.is_empty() => None,
+        EmployeeScopeFilter::EmployeeIds(employee_ids) => {
+            Some(query.filter(payslip::Column::EmployeeId.is_in(employee_ids.clone())))
+        }
+    }
+}
+
+async fn load_payslip_lines_after_scoped_head<LoadLines, LoadFuture>(
+    head: Option<payslip::Model>,
+    load_lines: LoadLines,
+) -> KabiPayResult<Option<(payslip::Model, Vec<payslip_component::Model>)>>
+where
+    LoadLines: FnOnce(Uuid) -> LoadFuture,
+    LoadFuture: Future<Output = KabiPayResult<Vec<payslip_component::Model>>>,
+{
+    let Some(head) = head else {
         return Ok(None);
     };
-    let comps = payslip_component::Entity::find()
-        .filter(payslip_component::Column::TenantId.eq(tenant_id))
-        .filter(payslip_component::Column::PayslipId.eq(id))
-        .order_by_asc(payslip_component::Column::CreatedAt)
-        .all(db)
-        .await?;
-    Ok(Some((m, comps)))
+    let lines = load_lines(head.id).await?;
+    Ok(Some((head, lines)))
+}
+
+/// One payslip with its component rows, with the employee scope enforced in the head query.
+/// Out-of-scope and nonexistent ids both return `None`; components load only for a visible head.
+pub async fn find_scoped_payslip_detail<C>(
+    db: &C,
+    tenant_id: Uuid,
+    id: Uuid,
+    scope: &EmployeeScopeFilter,
+) -> KabiPayResult<Option<(payslip::Model, Vec<payslip_component::Model>)>>
+where
+    C: ConnectionTrait,
+{
+    let Some(query) = scoped_payslip_head_query(tenant_id, id, scope) else {
+        return Ok(None);
+    };
+    let head = query.one(db).await.map_err(KabiPayError::from)?;
+    load_payslip_lines_after_scoped_head(head, |payslip_id| async move {
+        payslip_component::Entity::find()
+            .filter(payslip_component::Column::TenantId.eq(tenant_id))
+            .filter(payslip_component::Column::PayslipId.eq(payslip_id))
+            .order_by_asc(payslip_component::Column::CreatedAt)
+            .all(db)
+            .await
+            .map_err(KabiPayError::from)
+    })
+    .await
 }
 
 /// Batch lines for all payslips returned by [`list_payslips`].
@@ -2315,4 +2355,116 @@ pub async fn run_payroll_for_cycle(
 
     txn.commit().await.map_err(KabiPayError::from)?;
     Ok(updated)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kabipay_common::client_data_scope::EmployeeScopeFilter;
+    use sea_orm::{DbBackend, QueryTrait};
+    use std::cell::Cell;
+
+    fn payslip_fixture(tenant_id: Uuid, employee_id: Uuid, id: Uuid) -> payslip::Model {
+        let now = Utc::now();
+        payslip::Model {
+            id,
+            tenant_id,
+            employee_id,
+            payroll_cycle_id: Uuid::new_v4(),
+            gross_salary: Decimal::ZERO,
+            total_deductions: Decimal::ZERO,
+            net_salary: Decimal::ZERO,
+            pf_employee: None,
+            pf_employer: None,
+            esi_employee: None,
+            esi_employer: None,
+            tds_amount: None,
+            professional_tax: None,
+            uan_number: None,
+            esic_number: None,
+            status: "GENERATED".into(),
+            generated_at: now,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    #[test]
+    fn scoped_payslip_head_query_applies_tenant_id_and_employee_predicate() {
+        let tenant_id = Uuid::new_v4();
+        let payslip_id = Uuid::new_v4();
+        let employee_id = Uuid::new_v4();
+        let statement = scoped_payslip_head_query(
+            tenant_id,
+            payslip_id,
+            &EmployeeScopeFilter::EmployeeIds(vec![employee_id]),
+        )
+        .expect("non-empty employee scope builds a query")
+        .build(DbBackend::Postgres)
+        .to_string();
+
+        assert!(statement.contains(&format!("\"tenant_id\" = '{tenant_id}'")));
+        assert!(statement.contains(&format!("\"id\" = '{payslip_id}'")));
+        assert!(statement.contains(&format!("\"employee_id\" IN ('{employee_id}')")));
+
+        let unrestricted = scoped_payslip_head_query(
+            tenant_id,
+            payslip_id,
+            &EmployeeScopeFilter::Unrestricted,
+        )
+        .expect("ALL scope builds a tenant-and-id query")
+        .build(DbBackend::Postgres)
+        .to_string();
+        assert!(!unrestricted.contains("\"employee_id\" IN"));
+    }
+
+    #[tokio::test]
+    async fn empty_payslip_scope_returns_none_without_touching_connection() {
+        for filter in [
+            EmployeeScopeFilter::Empty,
+            EmployeeScopeFilter::EmployeeIds(vec![]),
+        ] {
+            let result = find_scoped_payslip_detail(
+                &DatabaseConnection::Disconnected,
+                Uuid::new_v4(),
+                Uuid::new_v4(),
+                &filter,
+            )
+            .await
+            .expect("empty scope must short-circuit before database access");
+            assert!(result.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_scoped_head_and_nonexistent_head_share_none_and_skip_lines() {
+        let line_loads = Cell::new(0);
+        let result = load_payslip_lines_after_scoped_head(None, |_| {
+            line_loads.set(line_loads.get() + 1);
+            std::future::ready(Ok(Vec::new()))
+        })
+        .await
+        .expect("missing scoped head is not an error");
+
+        assert!(result.is_none());
+        assert_eq!(line_loads.get(), 0, "component lines must not load before an authorized head exists");
+    }
+
+    #[tokio::test]
+    async fn visible_scoped_head_loads_lines_once_after_authorization() {
+        let head = payslip_fixture(Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let expected_id = head.id;
+        let line_loads = Cell::new(0);
+        let result = load_payslip_lines_after_scoped_head(Some(head), |payslip_id| {
+            assert_eq!(payslip_id, expected_id);
+            line_loads.set(line_loads.get() + 1);
+            std::future::ready(Ok(Vec::new()))
+        })
+        .await
+        .expect("authorized head loads component lines")
+        .expect("authorized head remains visible");
+
+        assert_eq!(result.0.id, expected_id);
+        assert_eq!(line_loads.get(), 1);
+    }
 }

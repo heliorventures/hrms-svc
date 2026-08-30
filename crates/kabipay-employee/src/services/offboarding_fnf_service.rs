@@ -130,6 +130,52 @@ pub async fn get_separation_tenant(
         .map_err(KabiPayError::from)
 }
 
+/// Load a separation only when it matches the resolver-supplied employee predicate.
+/// `None` means tenant-wide authority; `Some` is JWT-bound self-service.
+pub async fn get_visible_separation(
+    db: &DatabaseConnection,
+    tenant_id: Uuid,
+    separation_id: Uuid,
+    employee_id: Option<Uuid>,
+) -> KabiPayResult<Option<separation::Model>> {
+    let mut query = separation::Entity::find_by_id(separation_id)
+        .filter(separation::Column::TenantId.eq(tenant_id));
+    if let Some(employee_id) = employee_id {
+        query = query.filter(separation::Column::EmployeeId.eq(employee_id));
+    }
+    query.one(db).await.map_err(KabiPayError::from)
+}
+
+pub async fn get_visible_fnf_by_separation(
+    db: &DatabaseConnection,
+    tenant_id: Uuid,
+    separation_id: Uuid,
+    employee_id: Option<Uuid>,
+) -> KabiPayResult<Option<fnf_settlement::Model>> {
+    if get_visible_separation(db, tenant_id, separation_id, employee_id)
+        .await?
+        .is_none()
+    {
+        return Ok(None);
+    }
+    get_fnf_by_separation(db, tenant_id, separation_id).await
+}
+
+pub async fn list_visible_clearance(
+    db: &DatabaseConnection,
+    tenant_id: Uuid,
+    separation_id: Uuid,
+    employee_id: Option<Uuid>,
+) -> KabiPayResult<Vec<clearance_checklist::Model>> {
+    if get_visible_separation(db, tenant_id, separation_id, employee_id)
+        .await?
+        .is_none()
+    {
+        return Ok(Vec::new());
+    }
+    list_clearance(db, tenant_id, separation_id).await
+}
+
 /// For legacy `APPROVED` separations (before auto-seed): HR may create DRAFT FNF + default clearance once.
 pub async fn backfill_approved_artifacts(
     db: &DatabaseConnection,

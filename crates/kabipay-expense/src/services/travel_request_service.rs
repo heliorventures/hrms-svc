@@ -2,8 +2,7 @@
 
 use chrono::Utc;
 use kabipay_common::client_data_scope::EmployeeScopeFilter;
-use kabipay_common::workflow_current_step;
-use kabipay_common::workflow_inbox;
+use kabipay_common::workflow_approval;
 use kabipay_common::{KabiPayError, KabiPayResult};
 use kabipay_db_entities::tenant::d0007_employee_core::employee;
 use kabipay_db_entities::tenant::d0025_workflow::{
@@ -20,46 +19,13 @@ use sea_orm::sea_query::LockType;
 use uuid::Uuid;
 
 use super::approval_authority::{
-    assert_target_allowed, lock_matching_workflow_transition, snapshot_workflow_transition,
-    target_is_allowed, ExpenseApprovalAuthority,
+    after_successful_commit, lock_and_validate_decision_employees, lock_current_workflow,
+    workflow_authority, ExpenseApprovalAuthority,
 };
 
 const STATUS_PENDING: &str = "PENDING";
 const STATUS_APPROVED: &str = "APPROVED";
 const STATUS_REJECTED: &str = "REJECTED";
-
-/// Configured `workflow_step.step_name` when **`PENDING`** and the linked instance is **`IN_PROGRESS`**.
-pub async fn resolve_travel_pending_approval_stage(
-    db: &DatabaseConnection,
-    tenant_id: Uuid,
-    status: &str,
-    workflow_instance_id: Option<Uuid>,
-) -> KabiPayResult<Option<String>> {
-    workflow_inbox::pending_workflow_step_title(db, tenant_id, status, STATUS_PENDING, workflow_instance_id)
-        .await
-}
-
-/// Whether **this** user may **approve**/**reject** travel right now (workflow step actor or non-workflow travel rules).
-pub async fn travel_viewer_may_approve(
-    db: &DatabaseConnection,
-    tenant_id: Uuid,
-    authority: &ExpenseApprovalAuthority,
-    status: &str,
-    subject_employee_id: Uuid,
-    workflow_instance_id: Option<Uuid>,
-) -> KabiPayResult<bool> {
-    if !workflow_inbox::entity_row_is_pending(status, STATUS_PENDING)
-        || !target_is_allowed(db, tenant_id, authority, subject_employee_id).await?
-    {
-        return Ok(false);
-    }
-    match workflow_instance_id {
-        Some(instance_id) => {
-            workflow_inbox::workflow_instance_accepts_actions(db, tenant_id, instance_id).await
-        }
-        None => Ok(true),
-    }
-}
 
 /// Matches `workflow.entity_type` / `workflow_instance.entity_type` for travel (**M32**).
 pub const WF_ENTITY_TRAVEL_REQUEST: &str = "TRAVEL_REQUEST";
@@ -250,219 +216,171 @@ pub async fn approve_travel_request(
     db: &DatabaseConnection,
     tenant_id: Uuid,
     travel_request_id: Uuid,
+    expected_workflow_step_id: Uuid,
     authority: &ExpenseApprovalAuthority,
 ) -> KabiPayResult<travel_request::Model> {
-    let preflight = load_pending_travel_conn(db, tenant_id, travel_request_id).await?;
-    let expected_workflow = match preflight.workflow_instance_id {
-        Some(instance_id) => Some(snapshot_workflow_transition(db, tenant_id, instance_id).await?),
-        None => None,
-    };
     let txn = db.begin().await?;
     let model = lock_pending_travel(&txn, tenant_id, travel_request_id).await?;
-    if model.workflow_instance_id != preflight.workflow_instance_id {
-        return Err(KabiPayError::Conflict(
-            "travel approval state changed; refresh and try again".into(),
-        ));
-    }
-    assert_target_allowed(&txn, tenant_id, authority, model.employee_id).await?;
-    let now = Utc::now();
-
-    if let Some(inst_id) = model.workflow_instance_id {
-        let expected = expected_workflow.ok_or_else(|| {
-            KabiPayError::Conflict("travel workflow state changed; refresh and try again".into())
-        })?;
-        if expected.instance_id != inst_id {
-            return Err(KabiPayError::Conflict(
-                "travel workflow state changed; refresh and try again".into(),
-            ));
-        }
-        let mut inst = lock_matching_workflow_transition(&txn, tenant_id, expected).await?;
-        if inst.status != WF_STATUS_IN_PROGRESS {
-            return Err(KabiPayError::Validation(
-                "workflow instance is not in progress — cannot approve this travel request".into(),
-            ));
-        }
-        inst = workflow_current_step::ensure_workflow_instance_current_step_repaired(
-            &txn, tenant_id, &inst, now,
-        )
-        .await?;
-        let cur_step_id = inst.current_step_id.ok_or_else(|| {
-            KabiPayError::Validation("workflow instance has no current step".into())
-        })?;
-        let cur_step = workflow_step::Entity::find_by_id(cur_step_id)
-            .filter(workflow_step::Column::TenantId.eq(tenant_id))
-            .one(&txn)
-            .await?
-            .ok_or_else(|| KabiPayError::Validation("workflow step not found".into()))?;
-
-        let act = workflow_action::ActiveModel {
-            id: Set(Uuid::new_v4()),
-            tenant_id: Set(tenant_id),
-            instance_id: Set(inst_id),
-            workflow_step_id: Set(cur_step_id),
-            performed_by: Set(Some(authority.actor_user_id)),
-            action: Set(WF_ACTION_APPROVE.into()),
-            remarks: Set(None),
-            acted_at: Set(now),
-            created_at: Set(now),
-            updated_at: Set(now),
-        };
-        act.insert(&txn).await?;
-
-        let next_step = workflow_step::Entity::find()
-            .filter(workflow_step::Column::TenantId.eq(tenant_id))
-            .filter(workflow_step::Column::WorkflowId.eq(inst.workflow_id))
-            .filter(workflow_step::Column::SequenceOrder.gt(cur_step.sequence_order))
-            .order_by_asc(workflow_step::Column::SequenceOrder)
-            .one(&txn)
-            .await?;
-
-        if let Some(next) = next_step {
-            let mut am_inst: workflow_instance::ActiveModel = inst.into();
-            am_inst.current_step_id = Set(Some(next.id));
-            am_inst.updated_at = Set(now);
-            am_inst.update(&txn).await?;
-            txn.commit().await?;
-            return travel_request::Entity::find_by_id(travel_request_id)
-                .one(db)
-                .await?
-                .ok_or_else(|| {
-                    KabiPayError::Internal("travel_request missing after workflow step".into())
-                });
-        }
-
-        let mut am_inst: workflow_instance::ActiveModel = inst.into();
-        am_inst.status = Set(WF_STATUS_COMPLETED.into());
-        am_inst.current_step_id = Set(None);
-        am_inst.completed_at = Set(Some(now));
-        am_inst.updated_at = Set(now);
-        am_inst.update(&txn).await?;
-
-        finalize_travel_approval(
-            &txn,
-            tenant_id,
-            travel_request_id,
-            authority.actor_user_id,
-            now,
-        )
-        .await?;
-    } else {
-        finalize_travel_approval(
-            &txn,
-            tenant_id,
-            travel_request_id,
-            authority.actor_user_id,
-            now,
-        )
-        .await?;
-    }
-
-    txn.commit().await?;
-
-    let out = travel_request::Entity::find_by_id(travel_request_id)
-        .one(db)
-        .await?
-        .ok_or_else(|| KabiPayError::Internal("travel_request missing after approve".into()))?;
-
-    travel_notify_employee(
-        db,
-        tenant_id,
-        out.employee_id,
-        "Travel request approved",
-        "Your travel request was approved.",
+    let (actor, _subject) = lock_and_validate_decision_employees(
+        &txn, tenant_id, authority, model.employee_id,
     )
-    .await;
-    Ok(out)
+    .await?;
+    let action_authority = workflow_authority(authority, actor);
+    let now = Utc::now();
+    let (instance, current_step) = lock_current_workflow(
+        &txn,
+        tenant_id,
+        WF_ENTITY_TRAVEL_REQUEST,
+        travel_request_id,
+        model.workflow_instance_id,
+        expected_workflow_step_id,
+    )
+    .await?;
+    workflow_approval::assert_workflow_step_actor(
+        &txn, tenant_id, model.employee_id, &current_step, &action_authority,
+    )
+    .await?;
+    workflow_action::ActiveModel {
+        id: Set(Uuid::new_v4()),
+        tenant_id: Set(tenant_id),
+        instance_id: Set(instance.id),
+        workflow_step_id: Set(current_step.id),
+        performed_by: Set(Some(authority.actor_user_id)),
+        action: Set(WF_ACTION_APPROVE.into()),
+        remarks: Set(None),
+        acted_at: Set(now),
+        created_at: Set(now),
+        updated_at: Set(now),
+    }
+    .insert(&txn)
+    .await?;
+    let next_step = workflow_step::Entity::find()
+        .filter(workflow_step::Column::TenantId.eq(tenant_id))
+        .filter(workflow_step::Column::WorkflowId.eq(instance.workflow_id))
+        .filter(workflow_step::Column::SequenceOrder.gt(current_step.sequence_order))
+        .order_by_asc(workflow_step::Column::SequenceOrder)
+        .lock_exclusive()
+        .one(&txn)
+        .await?;
+    if let Some(next) = next_step {
+        let mut active_instance: workflow_instance::ActiveModel = instance.into();
+        active_instance.current_step_id = Set(Some(next.id));
+        active_instance.updated_at = Set(now);
+        active_instance.update(&txn).await?;
+        txn.commit().await?;
+        return travel_request::Entity::find_by_id(travel_request_id)
+            .one(db)
+            .await?
+            .ok_or_else(|| {
+                KabiPayError::Internal("travel_request missing after workflow step".into())
+            });
+    }
+    let mut active_instance: workflow_instance::ActiveModel = instance.into();
+    active_instance.status = Set(WF_STATUS_COMPLETED.into());
+    active_instance.current_step_id = Set(None);
+    active_instance.completed_at = Set(Some(now));
+    active_instance.updated_at = Set(now);
+    active_instance.update(&txn).await?;
+    finalize_travel_approval(
+        &txn,
+        tenant_id,
+        travel_request_id,
+        authority.actor_user_id,
+        now,
+    )
+    .await?;
+    after_successful_commit(txn.commit(), || async {
+        let out = travel_request::Entity::find_by_id(travel_request_id)
+            .one(db)
+            .await?
+            .ok_or_else(|| KabiPayError::Internal("travel_request missing after approve".into()))?;
+        travel_notify_employee(
+            db,
+            tenant_id,
+            out.employee_id,
+            "Travel request approved",
+            "Your travel request was approved.",
+        )
+        .await;
+        Ok(out)
+    })
+    .await
 }
 
 pub async fn reject_travel_request(
     db: &DatabaseConnection,
     tenant_id: Uuid,
     travel_request_id: Uuid,
+    expected_workflow_step_id: Uuid,
     authority: &ExpenseApprovalAuthority,
     rejection_reason: Option<String>,
 ) -> KabiPayResult<travel_request::Model> {
-    let preflight = load_pending_travel_conn(db, tenant_id, travel_request_id).await?;
-    let expected_workflow = match preflight.workflow_instance_id {
-        Some(instance_id) => Some(snapshot_workflow_transition(db, tenant_id, instance_id).await?),
-        None => None,
-    };
     let txn = db.begin().await?;
     let model = lock_pending_travel(&txn, tenant_id, travel_request_id).await?;
-    if model.workflow_instance_id != preflight.workflow_instance_id {
-        return Err(KabiPayError::Conflict(
-            "travel rejection state changed; refresh and try again".into(),
-        ));
-    }
-    assert_target_allowed(&txn, tenant_id, authority, model.employee_id).await?;
-
+    let (actor, _subject) = lock_and_validate_decision_employees(
+        &txn, tenant_id, authority, model.employee_id,
+    )
+    .await?;
+    let action_authority = workflow_authority(authority, actor);
+    let (instance, current_step) = lock_current_workflow(
+        &txn,
+        tenant_id,
+        WF_ENTITY_TRAVEL_REQUEST,
+        travel_request_id,
+        model.workflow_instance_id,
+        expected_workflow_step_id,
+    )
+    .await?;
+    workflow_approval::assert_workflow_step_actor(
+        &txn, tenant_id, model.employee_id, &current_step, &action_authority,
+    )
+    .await?;
     let now = Utc::now();
-    if let Some(inst_id) = model.workflow_instance_id {
-        if let Some(expected) = expected_workflow {
-            if expected.instance_id != inst_id {
-                return Err(KabiPayError::Conflict(
-                    "travel workflow state changed; refresh and try again".into(),
-                ));
-            }
-            let mut inst = lock_matching_workflow_transition(&txn, tenant_id, expected).await?;
-            if inst.status == WF_STATUS_IN_PROGRESS {
-                inst = workflow_current_step::ensure_workflow_instance_current_step_repaired(
-                    &txn, tenant_id, &inst, now,
-                )
-                .await?;
-                if let Some(step_id) = inst.current_step_id {
-                    let _st = workflow_step::Entity::find_by_id(step_id)
-                        .filter(workflow_step::Column::TenantId.eq(tenant_id))
-                        .one(&txn)
-                        .await?
-                        .ok_or_else(|| KabiPayError::Validation("workflow step not found".into()))?;
-                    let act = workflow_action::ActiveModel {
-                        id: Set(Uuid::new_v4()),
-                        tenant_id: Set(tenant_id),
-                        instance_id: Set(inst_id),
-                        workflow_step_id: Set(step_id),
-                        performed_by: Set(Some(authority.actor_user_id)),
-                        action: Set(WF_ACTION_REJECT.into()),
-                        remarks: Set(rejection_reason.clone()),
-                        acted_at: Set(now),
-                        created_at: Set(now),
-                        updated_at: Set(now),
-                    };
-                    act.insert(&txn).await?;
-                }
-                let mut am_inst: workflow_instance::ActiveModel = inst.into();
-                am_inst.status = Set(WF_STATUS_CANCELLED.into());
-                am_inst.completed_at = Set(Some(now));
-                am_inst.updated_at = Set(now);
-                am_inst.update(&txn).await?;
-            }
-        }
+    workflow_action::ActiveModel {
+        id: Set(Uuid::new_v4()),
+        tenant_id: Set(tenant_id),
+        instance_id: Set(instance.id),
+        workflow_step_id: Set(current_step.id),
+        performed_by: Set(Some(authority.actor_user_id)),
+        action: Set(WF_ACTION_REJECT.into()),
+        remarks: Set(rejection_reason.clone()),
+        acted_at: Set(now),
+        created_at: Set(now),
+        updated_at: Set(now),
     }
-
-    let mut am: travel_request::ActiveModel = model.into();
-    am.status = Set(STATUS_REJECTED.into());
-    am.rejection_reason = Set(rejection_reason.clone());
-    am.approved_by = Set(None);
-    am.updated_at = Set(now);
-    am.rejected_by = Set(Some(authority.actor_user_id));
-    am.update(&txn).await?;
-
+    .insert(&txn)
+    .await?;
+    let mut active_instance: workflow_instance::ActiveModel = instance.into();
+    active_instance.status = Set(WF_STATUS_CANCELLED.into());
+    active_instance.current_step_id = Set(None);
+    active_instance.completed_at = Set(Some(now));
+    active_instance.updated_at = Set(now);
+    active_instance.update(&txn).await?;
+    let mut active_request: travel_request::ActiveModel = model.into();
+    active_request.status = Set(STATUS_REJECTED.into());
+    active_request.rejection_reason = Set(rejection_reason.clone());
+    active_request.approved_by = Set(None);
+    active_request.rejected_by = Set(Some(authority.actor_user_id));
+    active_request.updated_at = Set(now);
+    active_request.update(&txn).await?;
     let out = travel_request::Entity::find_by_id(travel_request_id)
         .one(&txn)
         .await?
         .ok_or_else(|| KabiPayError::Internal("updated travel_request not found".into()))?;
-
-    txn.commit().await?;
-
-    let msg = format!(
-        "Your travel request was rejected.{}",
-        match &out.rejection_reason {
-            Some(s) if !s.is_empty() => format!(" Reason: {s}"),
-            _ => String::new(),
-        }
-    );
-    travel_notify_employee(db, tenant_id, out.employee_id, "Travel request rejected", &msg).await;
-    Ok(out)
+    after_successful_commit(txn.commit(), || async {
+        let msg = format!(
+            "Your travel request was rejected.{}",
+            out.rejection_reason
+                .as_ref()
+                .filter(|reason| !reason.is_empty())
+                .map(|reason| format!(" Reason: {reason}"))
+                .unwrap_or_default()
+        );
+        travel_notify_employee(db, tenant_id, out.employee_id, "Travel request rejected", &msg)
+            .await;
+        Ok(out)
+    })
+    .await
 }
 
 async fn lock_pending_travel(
@@ -470,10 +388,7 @@ async fn lock_pending_travel(
     tenant_id: Uuid,
     id: Uuid,
 ) -> KabiPayResult<travel_request::Model> {
-    let model = travel_request::Entity::find()
-        .filter(travel_request::Column::Id.eq(id))
-        .filter(travel_request::Column::TenantId.eq(tenant_id))
-        .lock(LockType::Update)
+    let model = pending_travel_for_decision_query(id, tenant_id)
         .one(txn)
         .await?
         .ok_or_else(|| KabiPayError::NotFound {
@@ -488,26 +403,28 @@ async fn lock_pending_travel(
     Ok(model)
 }
 
-async fn load_pending_travel_conn(
-    db: &impl ConnectionTrait,
-    tenant_id: Uuid,
+fn pending_travel_for_decision_query(
     id: Uuid,
-) -> KabiPayResult<travel_request::Model> {
-    let m = travel_request::Entity::find()
+    tenant_id: Uuid,
+) -> sea_orm::Select<travel_request::Entity> {
+    travel_request::Entity::find()
         .filter(travel_request::Column::Id.eq(id))
         .filter(travel_request::Column::TenantId.eq(tenant_id))
-        .one(db)
-        .await?
-        .ok_or_else(|| KabiPayError::NotFound {
-            entity: "travel_request",
-            id: id.to_string(),
-        })?;
-    if m.status != STATUS_PENDING {
-        return Err(KabiPayError::Validation(
-            "only PENDING travel requests can be approved or rejected".into(),
-        ));
+        .lock(LockType::Update)
+}
+
+#[cfg(test)]
+mod approval_decision_tests {
+    use super::*;
+    use sea_orm::{DbBackend, QueryTrait};
+
+    #[test]
+    fn travel_decision_locks_only_the_tenant_request() {
+        let sql = pending_travel_for_decision_query(Uuid::new_v4(), Uuid::new_v4())
+            .build(DbBackend::Postgres)
+            .to_string();
+        assert!(sql.ends_with("FOR UPDATE"));
     }
-    Ok(m)
 }
 
 async fn travel_notify_employee(

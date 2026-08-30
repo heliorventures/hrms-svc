@@ -10,7 +10,9 @@ use uuid::Uuid;
 use kabipay_db_entities::tenant::d0007_employee_core::employee;
 use kabipay_db_entities::tenant::d0025_workflow::workflow_step;
 
-use crate::client_data_scope::employee_model_in_scope;
+use crate::client_data_scope::{
+    resolve_employee_scope_filter_with_connection, EmployeeScopeFilter,
+};
 use crate::context::{ClientViewerEmployee, ScopeType};
 use crate::error::{KabiPayError, KabiPayResult};
 
@@ -20,6 +22,25 @@ pub struct WorkflowApprovalAuthority {
     pub actor_employee: Option<ClientViewerEmployee>,
     pub scope: ScopeType,
     pub permission: &'static str,
+}
+
+fn assert_not_self_approval(
+    authority: &WorkflowApprovalAuthority,
+    subject_employee_id: Uuid,
+) -> KabiPayResult<()> {
+    if authority
+        .actor_employee
+        .is_some_and(|actor| actor.employee_id == subject_employee_id)
+    {
+        return Err(KabiPayError::Forbidden(
+            "you cannot approve or reject your own request".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn approval_scope_allows(filter: &EmployeeScopeFilter, subject_employee_id: Uuid) -> bool {
+    filter.allows_employee(subject_employee_id)
 }
 
 fn normalize_approver_type(raw: &Option<String>) -> String {
@@ -72,21 +93,21 @@ async fn load_subject_employee(
 }
 
 pub async fn assert_subject_in_approval_scope(
-    conn: &impl ConnectionTrait,
+    conn: &(impl ConnectionTrait + Sync),
     tenant_id: Uuid,
     subject_employee_id: Uuid,
     authority: &WorkflowApprovalAuthority,
 ) -> KabiPayResult<()> {
+    assert_not_self_approval(authority, subject_employee_id)?;
     let subject = load_subject_employee(conn, tenant_id, subject_employee_id).await?;
-    if authority
-        .actor_employee
-        .is_some_and(|actor| actor.employee_id == subject.id)
-    {
-        return Err(KabiPayError::Forbidden(
-            "you cannot approve or reject your own request".into(),
-        ));
-    }
-    if !employee_model_in_scope(authority.scope, authority.actor_employee, &subject) {
+    let filter = resolve_employee_scope_filter_with_connection(
+        conn,
+        tenant_id,
+        authority.scope,
+        authority.actor_employee,
+    )
+    .await?;
+    if !approval_scope_allows(&filter, subject.id) {
         return Err(KabiPayError::Forbidden(
             "the request is outside your approval scope".into(),
         ));
@@ -95,7 +116,7 @@ pub async fn assert_subject_in_approval_scope(
 }
 
 async fn assert_is_reporting_manager_user(
-    conn: &impl ConnectionTrait,
+    conn: &(impl ConnectionTrait + Sync),
     tenant_id: Uuid,
     authority: &WorkflowApprovalAuthority,
     subject_employee_id: Uuid,
@@ -129,7 +150,7 @@ async fn assert_is_reporting_manager_user(
 /// Ensures the request is in the exact permission scope and that the actor matches the configured
 /// workflow relationship/permission rule. Legacy role-only steps fail closed until migrated.
 pub async fn assert_workflow_step_actor(
-    conn: &impl ConnectionTrait,
+    conn: &(impl ConnectionTrait + Sync),
     tenant_id: Uuid,
     subject_employee_id: Uuid,
     step: &workflow_step::Model,
@@ -165,7 +186,7 @@ pub async fn assert_workflow_step_actor(
 /// Compatibility entry point for existing timesheet callers. Runtime semantics are identical:
 /// exact permission/scope plus the configured manager relationship.
 pub async fn assert_workflow_step_actor_with_timesheet_reporting_manager_fallback(
-    conn: &impl ConnectionTrait,
+    conn: &(impl ConnectionTrait + Sync),
     tenant_id: Uuid,
     subject_employee_id: Uuid,
     step: &workflow_step::Model,
@@ -218,5 +239,38 @@ mod tests {
         )
         .is_err());
         assert!(step_requires_authority_permission(&step("PERMISSION", None), &auth).is_err());
+    }
+
+    #[test]
+    fn self_approval_is_denied_independently_of_the_resolved_scope() {
+        let actor_employee_id = Uuid::new_v4();
+        let auth = WorkflowApprovalAuthority {
+            actor_user_id: Uuid::new_v4(),
+            actor_employee: Some(ClientViewerEmployee {
+                employee_id: actor_employee_id,
+                department_id: None,
+            }),
+            scope: ScopeType::All,
+            permission: "leave:approve",
+        };
+
+        let error = assert_not_self_approval(&auth, actor_employee_id)
+            .expect_err("ALL scope must not permit self-approval");
+
+        assert!(matches!(error, KabiPayError::Forbidden(_)));
+    }
+
+    #[test]
+    fn approval_scope_consumes_resolved_recursive_employee_ids() {
+        let actor_employee_id = Uuid::new_v4();
+        let descendant_id = Uuid::new_v4();
+        let outside_id = Uuid::new_v4();
+        let filter = crate::client_data_scope::EmployeeScopeFilter::EmployeeIds(vec![
+            actor_employee_id,
+            descendant_id,
+        ]);
+
+        assert!(approval_scope_allows(&filter, descendant_id));
+        assert!(!approval_scope_allows(&filter, outside_id));
     }
 }

@@ -1,6 +1,7 @@
 //! Read-only access + HR resolution for `document_type`, `employee_document`.
 
 use chrono::Utc;
+use kabipay_common::client_data_scope::EmployeeScopeFilter;
 use kabipay_common::{KabiPayError, KabiPayResult};
 use sea_orm::{
     ActiveModelTrait, ActiveValue::Set, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter,
@@ -44,6 +45,32 @@ pub async fn list_employee_documents(
         .all(db)
         .await
         .map_err(KabiPayError::from)
+}
+
+/// Find one employee document only when its owner is inside the resolver-supplied scope.
+/// The service owns tenant and soft-delete predicates; callers own permission policy.
+pub async fn find_employee_document_in_scope(
+    db: &DatabaseConnection,
+    tenant_id: Uuid,
+    document_id: Uuid,
+    scope: &EmployeeScopeFilter,
+) -> KabiPayResult<Option<employee_document::Model>> {
+    let mut query = employee_document::Entity::find_by_id(document_id)
+        .filter(employee_document::Column::TenantId.eq(tenant_id))
+        .filter(employee_document::Column::IsDeleted.eq(false));
+    match scope {
+        EmployeeScopeFilter::Unrestricted => {}
+        EmployeeScopeFilter::Empty => return Ok(None),
+        EmployeeScopeFilter::EmployeeIds(employee_ids) if employee_ids.is_empty() => {
+            return Ok(None);
+        }
+        EmployeeScopeFilter::EmployeeIds(employee_ids) => {
+            query = query.filter(
+                employee_document::Column::EmployeeId.is_in(employee_ids.iter().copied()),
+            );
+        }
+    }
+    query.one(db).await.map_err(KabiPayError::from)
 }
 
 /// HR approval workflow: `PENDING` → `APPROVED` or `REJECTED`.
