@@ -103,6 +103,7 @@ pub struct EmployeeProfileAccessDto {
     pub directory_entry: EmployeeDirectoryEntryDto,
     pub is_self: bool,
     pub can_view_private_profile: bool,
+    pub can_view_payroll_sensitive: bool,
     pub can_edit_personal_profile: bool,
     pub can_manage_organization_fields: bool,
     pub can_review_profile_changes: bool,

@@ -277,8 +277,9 @@ pub struct ClientClaims {
 pub const OPERATOR_JWT_ISSUER: &str = "kabipay-ops";
 pub const CLIENT_JWT_ISSUER: &str = "kabipay-client";
 
+/// Tenant-wide non-sensitive employee directory visibility.
+pub const PERM_EMPLOYEE_DIRECTORY_READ: &str = "employee_directory:read";
 /// JWT `permissions` claim uses `resource:action` to match `permission` rows.
-pub const PERM_EMPLOYEE_SELF: &str = "employee:self";
 pub const PERM_EMPLOYEE_WRITE: &str = "employee:write";
 pub const PERM_EMPLOYEE_READ: &str = "employee:read";
 /// Broader org directory edits (e.g. bulk / sensitive fields) — same gate as write for now.
@@ -589,7 +590,7 @@ mod tests {
     #[test]
     fn canonical_permission_constants_match_the_runtime_vocabulary() {
         let actual = [
-            PERM_EMPLOYEE_SELF,
+            PERM_EMPLOYEE_DIRECTORY_READ,
             PERM_EMPLOYEE_READ,
             PERM_EMPLOYEE_WRITE,
             PERM_EMPLOYEE_MANAGE,
@@ -627,7 +628,7 @@ mod tests {
             PERM_WORKFLOW_MANAGE,
         ];
         let expected = [
-            "employee:self",
+            "employee_directory:read",
             "employee:read",
             "employee:write",
             "employee:manage",
@@ -666,6 +667,28 @@ mod tests {
         ];
 
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn employee_read_scope_does_not_accept_retired_employee_self() {
+        let mut current = client_claims(&[], &[PERM_EMPLOYEE_READ]);
+        current
+            .permission_scopes
+            .insert(PERM_EMPLOYEE_READ.into(), "SELF".into());
+
+        assert!(current.has_any_permission(&[PERM_EMPLOYEE_READ]));
+        assert_eq!(
+            current.scope_for_permission(PERM_EMPLOYEE_READ),
+            Some(ScopeType::Self_)
+        );
+
+        let mut retired = client_claims(&[], &["employee:self"]);
+        retired
+            .permission_scopes
+            .insert("employee:self".into(), "SELF".into());
+
+        assert!(!retired.has_any_permission(&[PERM_EMPLOYEE_READ]));
+        assert_eq!(retired.scope_for_permission(PERM_EMPLOYEE_READ), None);
     }
 
     #[test]

@@ -11,8 +11,8 @@ use kabipay_common::{
         EmployeeScopeFilter,
     },
     context::{
-        ScopeType, PERM_EMPLOYEE_MANAGE, PERM_EMPLOYEE_READ, PERM_EMPLOYEE_SELF,
-        PERM_EXPENSE_MANAGE, PERM_ONBOARDING_MANAGE, PERM_ONBOARDING_SELF, PERM_PAYROLL_READ,
+        ScopeType, PERM_EMPLOYEE_READ, PERM_EXPENSE_MANAGE, PERM_ONBOARDING_MANAGE,
+        PERM_ONBOARDING_SELF, PERM_PAYROLL_READ,
     },
     subgraph::{
         require_client_claims, require_tenant_id, resolve_client_employee_id, tenant_db,
@@ -44,8 +44,9 @@ use crate::entities::d0007_employee_core::employee;
 use crate::entities::d0008_document_system::employee_document;
 use crate::entities::d0029_file_storage::file_storage;
 use crate::resolvers::scope::{
-    assert_employee_in_data_scope, data_scope_employee, data_scope_employee_self,
-    require_any_exact_scope, require_employee_manage_all, require_exact_all_scope,
+    assert_employee_in_data_scope, data_scope_employee, employee_in_data_scope,
+    require_any_exact_scope,
+    require_employee_directory_read_all, require_employee_manage_all, require_exact_all_scope,
     require_exact_permission_scope, require_tenant_rbac_admin, resolve_viewer_employee,
 };
 use crate::services::{company_document_service, document_file_service};
@@ -86,12 +87,65 @@ fn employee_target_access(
     target_employee_id: Uuid,
 ) -> Result<EmployeeTargetAccess> {
     let claims = require_client_claims(ctx)?;
-    if claims.employee_id == Some(target_employee_id) {
-        data_scope_employee_self(ctx)?;
-        Ok(EmployeeTargetAccess::SelfBound)
+    data_scope_employee(ctx)?;
+    employee_target_access_from_claims(claims, target_employee_id).ok_or_else(|| {
+        KabiPayError::Forbidden(format!(
+            "{PERM_EMPLOYEE_READ} permission requires an explicit valid scope"
+        ))
+        .into_graphql()
+    })
+}
+
+fn employee_target_access_from_claims(
+    claims: &kabipay_common::context::ClientClaims,
+    target_employee_id: Uuid,
+) -> Option<EmployeeTargetAccess> {
+    if !claims.has_any_permission(&[PERM_EMPLOYEE_READ])
+        || claims.scope_for_permission(PERM_EMPLOYEE_READ).is_none()
+    {
+        return None;
+    }
+    Some(if claims.employee_id == Some(target_employee_id) {
+        EmployeeTargetAccess::SelfBound
     } else {
-        data_scope_employee(ctx)?;
-        Ok(EmployeeTargetAccess::ScopedRead)
+        EmployeeTargetAccess::ScopedRead
+    })
+}
+
+async fn can_view_private_employee_profile(
+    ctx: &Context<'_>,
+    db: &DatabaseConnection,
+    tenant_id: Uuid,
+    target_employee_id: Uuid,
+) -> Result<bool> {
+    let claims = require_client_claims(ctx)?;
+    match employee_target_access_from_claims(claims, target_employee_id) {
+        Some(EmployeeTargetAccess::SelfBound) => Ok(true),
+        Some(EmployeeTargetAccess::ScopedRead) => {
+            employee_in_data_scope(ctx, db, tenant_id, target_employee_id).await
+        }
+        None => Ok(false),
+    }
+}
+
+fn can_view_payroll_sensitive(ctx: &Context<'_>, target_employee_id: Uuid) -> bool {
+    let Ok(claims) = require_client_claims(ctx) else {
+        return false;
+    };
+    can_view_payroll_sensitive_from_claims(claims, target_employee_id)
+}
+
+fn can_view_payroll_sensitive_from_claims(
+    claims: &kabipay_common::context::ClientClaims,
+    target_employee_id: Uuid,
+) -> bool {
+    if !claims.has_any_permission(&[PERM_PAYROLL_READ]) {
+        return false;
+    }
+    match claims.scope_for_permission(PERM_PAYROLL_READ) {
+        Some(ScopeType::All) => true,
+        Some(ScopeType::Self_) => claims.employee_id == Some(target_employee_id),
+        _ => false,
     }
 }
 
@@ -101,42 +155,32 @@ fn employment_history_read_access(
 ) -> Result<EmploymentHistoryReadAccess> {
     let claims = require_client_claims(ctx)?;
     let is_self_target = claims.employee_id == Some(target_employee_id);
-    let has_self_permission = claims.has_any_permission(&[PERM_EMPLOYEE_SELF]);
-    if is_self_target
-        && has_self_permission
-        && claims.scope_for_permission(PERM_EMPLOYEE_SELF) == Some(ScopeType::Self_)
-    {
-        return Ok(EmploymentHistoryReadAccess::SelfBound);
-    }
-
-    let mut invalid_permission = None;
-    for permission in [PERM_EMPLOYEE_MANAGE, PERM_PAYROLL_READ] {
-        if !claims.has_any_permission(&[permission]) {
-            continue;
-        }
-        if claims.scope_for_permission(permission) == Some(ScopeType::All) {
-            return Ok(EmploymentHistoryReadAccess::TenantWide);
-        }
-        invalid_permission.get_or_insert(permission);
-    }
-    if is_self_target {
-        let message = if has_self_permission {
-            format!("{PERM_EMPLOYEE_SELF} permission requires SELF scope")
-        } else {
-            format!("{PERM_EMPLOYEE_SELF} permission required")
-        };
-        return Err(KabiPayError::Forbidden(message).into_graphql());
-    }
-    if let Some(permission) = invalid_permission {
+    if !claims.has_any_permission(&[PERM_PAYROLL_READ]) {
         return Err(KabiPayError::Forbidden(format!(
-            "{permission} permission requires ALL scope"
+            "{PERM_PAYROLL_READ} permission required"
         ))
         .into_graphql());
     }
-    Err(KabiPayError::Forbidden(format!(
-        "{PERM_EMPLOYEE_MANAGE} or {PERM_PAYROLL_READ} permission required"
-    ))
-    .into_graphql())
+    match claims.scope_for_permission(PERM_PAYROLL_READ) {
+        Some(ScopeType::All) => Ok(EmploymentHistoryReadAccess::TenantWide),
+        Some(ScopeType::Self_) if is_self_target => Ok(EmploymentHistoryReadAccess::SelfBound),
+        Some(ScopeType::Self_) => Err(KabiPayError::Forbidden(format!(
+            "{PERM_PAYROLL_READ} permission requires ALL scope"
+        ))
+        .into_graphql()),
+        Some(_) if is_self_target => Err(KabiPayError::Forbidden(format!(
+            "{PERM_PAYROLL_READ} permission requires SELF or ALL scope"
+        ))
+        .into_graphql()),
+        Some(_) => Err(KabiPayError::Forbidden(format!(
+            "{PERM_PAYROLL_READ} permission requires ALL scope"
+        ))
+        .into_graphql()),
+        None => Err(KabiPayError::Forbidden(format!(
+            "{PERM_PAYROLL_READ} permission requires an explicit valid scope"
+        ))
+        .into_graphql()),
+    }
 }
 
 async fn authorize_employee_target(
@@ -205,20 +249,6 @@ async fn employee_document_scope_filter(
     let mut has_valid_grant = false;
     let mut invalid_permission = None;
 
-    if claims.has_any_permission(&[PERM_EMPLOYEE_SELF]) {
-        if claims.scope_for_permission(PERM_EMPLOYEE_SELF).is_some() {
-            has_valid_grant = true;
-            if let Some(employee_id) = claims.employee_id {
-                filter = merge_employee_scope_filters(
-                    filter,
-                    EmployeeScopeFilter::EmployeeIds(vec![employee_id]),
-                );
-            }
-        } else {
-            invalid_permission.get_or_insert(PERM_EMPLOYEE_SELF);
-        }
-    }
-
     if claims.has_any_permission(&[PERM_EMPLOYEE_READ]) {
         if let Some(scope) = claims.scope_for_permission(PERM_EMPLOYEE_READ) {
             has_valid_grant = true;
@@ -247,17 +277,17 @@ async fn employee_document_scope_filter(
         .into_graphql());
     }
     Err(KabiPayError::Forbidden(format!(
-        "{PERM_EMPLOYEE_SELF} or {PERM_EMPLOYEE_READ} permission required"
+        "{PERM_EMPLOYEE_READ} permission required"
     ))
     .into_graphql())
 }
 
 fn require_employee_record_access_candidate(ctx: &Context<'_>) -> Result<()> {
-    require_any_exact_scope(ctx, &[PERM_EMPLOYEE_SELF, PERM_EMPLOYEE_READ]).map(|_| ())
+    require_any_exact_scope(ctx, &[PERM_EMPLOYEE_READ]).map(|_| ())
 }
 
 fn require_employee_reference_access(ctx: &Context<'_>) -> Result<()> {
-    require_any_exact_scope(ctx, &[PERM_EMPLOYEE_SELF, PERM_EMPLOYEE_READ]).map(|_| ())
+    require_any_exact_scope(ctx, &[PERM_EMPLOYEE_READ]).map(|_| ())
 }
 
 fn onboarding_read_access(ctx: &Context<'_>) -> Result<OnboardingReadAccess> {
@@ -430,18 +460,19 @@ impl QueryRoot {
         "ok"
     }
 
-    /// Scoped company directory protected by exact `employee:read` authority.
+    /// Company directory protected by exact `employee_directory:read=ALL` authority.
     async fn employee_directory_page(
         &self,
         ctx: &Context<'_>,
         #[graphql(default = 100)] limit: u64,
         after: Option<String>,
     ) -> Result<EmployeeDirectoryPageDto> {
-        let scope = data_scope_employee(ctx)?;
+        require_employee_directory_read_all(ctx)?;
         let tenant_id = require_tenant_id(ctx)?;
         let db = tenant_db(ctx, tenant_id).await?;
         let (page_rows, next_cursor) =
-            list_scoped_directory_page(ctx, &db, tenant_id, scope, limit, after.as_deref()).await?;
+            list_scoped_directory_page(ctx, &db, tenant_id, ScopeType::All, limit, after.as_deref())
+                .await?;
         let rows = enrich_directory_entries(&db, tenant_id, page_rows).await?;
         Ok(EmployeeDirectoryPageDto {
             has_more: next_cursor.is_some(),
@@ -450,15 +481,15 @@ impl QueryRoot {
         })
     }
 
-    /// Reporting hierarchy limited by the exact `employee:read` scope.
+    /// Reporting hierarchy limited by exact `employee_directory:read=ALL`.
     async fn organization_directory_chart(
         &self,
         ctx: &Context<'_>,
     ) -> Result<Vec<EmployeeDirectoryEntryDto>> {
-        let scope = data_scope_employee(ctx)?;
+        require_employee_directory_read_all(ctx)?;
         let tenant_id = require_tenant_id(ctx)?;
         let db = tenant_db(ctx, tenant_id).await?;
-        let rows = list_scoped_directory_hierarchy(ctx, &db, tenant_id, scope).await?;
+        let rows = list_scoped_directory_hierarchy(ctx, &db, tenant_id, ScopeType::All).await?;
         enrich_directory_entries(&db, tenant_id, rows).await
     }
 
@@ -468,20 +499,22 @@ impl QueryRoot {
         ctx: &Context<'_>,
         employee_id: ID,
     ) -> Result<Option<EmployeeProfileAccessDto>> {
+        require_employee_directory_read_all(ctx)?;
         let target_id = parse_uuid(&employee_id, "employeeId")?;
-        let access = employee_target_access(ctx, target_id)?;
-        let can_manage_all = require_employee_manage_all(ctx).is_ok();
         let tenant_id = require_tenant_id(ctx)?;
         let db = tenant_db(ctx, tenant_id).await?;
-        authorize_employee_target(ctx, &db, tenant_id, target_id, access).await?;
         let Some(target) = directory_service::find_current_by_id(&db, tenant_id, target_id)
             .await
             .map_err(KabiPayError::into_graphql)?
         else {
             return Ok(None);
         };
-        let is_self = access == EmployeeTargetAccess::SelfBound;
-        let can_manage = can_manage_all;
+        let claims = require_client_claims(ctx)?;
+        let is_self = claims.employee_id == Some(target_id);
+        let can_manage = require_employee_manage_all(ctx).is_ok();
+        let can_view_private =
+            can_view_private_employee_profile(ctx, &db, tenant_id, target_id).await?;
+        let can_view_payroll = can_view_payroll_sensitive(ctx, target_id);
         let mut entries = enrich_directory_entries(&db, tenant_id, vec![target]).await?;
         let directory_entry = entries.pop().ok_or_else(|| {
             KabiPayError::Internal("profile directory entry missing".into()).into_graphql()
@@ -489,7 +522,8 @@ impl QueryRoot {
         Ok(Some(EmployeeProfileAccessDto {
             directory_entry,
             is_self,
-            can_view_private_profile: is_self || can_manage,
+            can_view_private_profile: can_view_private,
+            can_view_payroll_sensitive: can_view_payroll,
             can_edit_personal_profile: is_self || can_manage,
             can_manage_organization_fields: can_manage,
             can_review_profile_changes: can_manage,
@@ -693,7 +727,7 @@ impl QueryRoot {
     /// optional denormalized `employee_id` access-token claim, so older tokens
     /// and repaired account links still reach the correct profile.
     async fn my_employee(&self, ctx: &Context<'_>) -> Result<Option<EmployeeDto>> {
-        data_scope_employee_self(ctx)?;
+        data_scope_employee(ctx)?;
         let claims = require_client_claims(ctx)?;
         let tenant_id = require_tenant_id(ctx)?;
         let db = tenant_db(ctx, tenant_id).await?;
@@ -743,9 +777,9 @@ impl QueryRoot {
 
     /// Salary-bearing employment history, newest first.
     ///
-    /// Access is limited to the JWT-linked employee (`employee:self=SELF`), tenant HR
-    /// (`employee:manage=ALL`), or tenant payroll (`payroll:read=ALL`). General employee
-    /// directory scope never grants salary access.
+    /// Access is limited to exact `payroll:read=SELF` for the JWT-linked employee or
+    /// exact `payroll:read=ALL` for tenant payroll/HR/admin users. Employee directory
+    /// and manager team scope never grant salary access.
     async fn employment_history_records(
         &self,
         ctx: &Context<'_>,
@@ -825,7 +859,7 @@ impl QueryRoot {
         let target_access = match requested_target {
             Some(employee_id) => Some(employee_target_access(ctx, employee_id)?),
             None => {
-                data_scope_employee_self(ctx)?;
+                data_scope_employee(ctx)?;
                 None
             }
         };
@@ -1467,8 +1501,8 @@ mod tests {
     use chrono::{NaiveDate, Utc};
     use kabipay_common::context::{
         ClientClaims, ClientViewerEmployee, CLIENT_JWT_ISSUER, EMPLOYMENT_STATUS_ACTIVE,
-        EMPLOYMENT_STATUS_PROBATION, PERM_EMPLOYEE_MANAGE,
-        PERM_EMPLOYEE_READ, PERM_EMPLOYEE_SELF, PERM_EXPENSE_MANAGE,
+        EMPLOYMENT_STATUS_PROBATION, PERM_EMPLOYEE_DIRECTORY_READ, PERM_EMPLOYEE_MANAGE,
+        PERM_EMPLOYEE_READ, PERM_EXPENSE_MANAGE,
         PERM_NOTIFICATION_READ, PERM_ONBOARDING_MANAGE, PERM_ONBOARDING_SELF, PERM_PAYROLL_READ,
         PERM_ROLE_MANAGE,
     };
@@ -1695,15 +1729,71 @@ mod tests {
 
     fn sibling_permission(required: &str) -> &'static str {
         match required {
-            PERM_EMPLOYEE_SELF => PERM_NOTIFICATION_READ,
-            PERM_EMPLOYEE_READ => PERM_EMPLOYEE_SELF,
+            PERM_EMPLOYEE_DIRECTORY_READ => PERM_EMPLOYEE_READ,
+            PERM_EMPLOYEE_READ => PERM_EMPLOYEE_DIRECTORY_READ,
             PERM_EMPLOYEE_MANAGE => PERM_EMPLOYEE_READ,
             PERM_EXPENSE_MANAGE => PERM_EMPLOYEE_MANAGE,
-            PERM_ONBOARDING_SELF => PERM_EMPLOYEE_SELF,
+            PERM_ONBOARDING_SELF => PERM_EMPLOYEE_READ,
             PERM_ONBOARDING_MANAGE => PERM_ONBOARDING_SELF,
+            PERM_PAYROLL_READ => PERM_EMPLOYEE_READ,
             PERM_ROLE_MANAGE => PERM_EMPLOYEE_MANAGE,
             _ => PERM_NOTIFICATION_READ,
         }
+    }
+
+    #[test]
+    fn private_profile_access_candidate_requires_employee_read_and_distinguishes_target() {
+        let own_id = Uuid::new_v4();
+        let other_id = Uuid::new_v4();
+
+        assert_eq!(
+            employee_target_access_from_claims(
+                &claims(PERM_EMPLOYEE_MANAGE, Some("ALL"), Some(own_id)),
+                other_id,
+            ),
+            None,
+            "employee management must not substitute for private employee reads"
+        );
+        assert_eq!(
+            employee_target_access_from_claims(
+                &claims(PERM_EMPLOYEE_READ, Some("SELF"), Some(own_id)),
+                own_id,
+            ),
+            Some(EmployeeTargetAccess::SelfBound)
+        );
+        assert_eq!(
+            employee_target_access_from_claims(
+                &claims(PERM_EMPLOYEE_READ, Some("TEAM"), Some(own_id)),
+                other_id,
+            ),
+            Some(EmployeeTargetAccess::ScopedRead)
+        );
+        assert_eq!(
+            employee_target_access_from_claims(
+                &claims(PERM_EMPLOYEE_READ, Some("ALL"), Some(own_id)),
+                other_id,
+            ),
+            Some(EmployeeTargetAccess::ScopedRead)
+        );
+    }
+
+    #[test]
+    fn payroll_sensitive_access_requires_permission_and_scope() {
+        let own_id = Uuid::new_v4();
+        let mut scope_only = claims(PERM_EMPLOYEE_READ, Some("SELF"), Some(own_id));
+        scope_only
+            .permission_scopes
+            .insert(PERM_PAYROLL_READ.into(), "ALL".into());
+
+        assert!(!can_view_payroll_sensitive_from_claims(&scope_only, own_id));
+        assert!(can_view_payroll_sensitive_from_claims(
+            &claims(PERM_PAYROLL_READ, Some("SELF"), Some(own_id)),
+            own_id
+        ));
+        assert!(can_view_payroll_sensitive_from_claims(
+            &claims(PERM_PAYROLL_READ, Some("ALL"), None),
+            own_id
+        ));
     }
 
     #[tokio::test]
@@ -1714,22 +1804,22 @@ mod tests {
         let fields = vec![
             (
                 "{ employeeDirectoryPage { __typename } }".to_string(),
-                PERM_EMPLOYEE_READ,
-                false,
+                PERM_EMPLOYEE_DIRECTORY_READ,
+                true,
             ),
             (
                 "{ organizationDirectoryChart { __typename } }".to_string(),
-                PERM_EMPLOYEE_READ,
-                false,
+                PERM_EMPLOYEE_DIRECTORY_READ,
+                true,
             ),
             (
                 format!("{{ employeeProfileAccess(employeeId: \"{other_id}\") {{ __typename }} }}"),
-                PERM_EMPLOYEE_READ,
-                false,
+                PERM_EMPLOYEE_DIRECTORY_READ,
+                true,
             ),
             (
                 format!("{{ employeeProfileChangeRequests(employeeId: \"{own_id}\") {{ __typename }} }}"),
-                PERM_EMPLOYEE_SELF,
+                PERM_EMPLOYEE_READ,
                 false,
             ),
             (
@@ -1749,12 +1839,12 @@ mod tests {
             ),
             (
                 format!("{{ employeeEducationRecords(employeeId: \"{own_id}\") {{ __typename }} }}"),
-                PERM_EMPLOYEE_SELF,
+                PERM_EMPLOYEE_READ,
                 false,
             ),
             (
                 format!("{{ employeeWorkExperienceRecords(employeeId: \"{own_id}\") {{ __typename }} }}"),
-                PERM_EMPLOYEE_SELF,
+                PERM_EMPLOYEE_READ,
                 false,
             ),
             (
@@ -1771,7 +1861,7 @@ mod tests {
             ),
             (
                 "{ myEmployee { __typename } }".to_string(),
-                PERM_EMPLOYEE_SELF,
+                PERM_EMPLOYEE_READ,
                 false,
             ),
             (
@@ -1781,12 +1871,12 @@ mod tests {
             ),
             (
                 format!("{{ employmentHistoryRecords(employeeId: \"{own_id}\") {{ __typename }} }}"),
-                PERM_EMPLOYEE_SELF,
+                PERM_PAYROLL_READ,
                 false,
             ),
             (
                 "{ documentTypes { __typename } }".to_string(),
-                PERM_EMPLOYEE_SELF,
+                PERM_EMPLOYEE_READ,
                 false,
             ),
             (
@@ -1796,27 +1886,27 @@ mod tests {
             ),
             (
                 "{ employeeDocuments { __typename } }".to_string(),
-                PERM_EMPLOYEE_SELF,
+                PERM_EMPLOYEE_READ,
                 false,
             ),
             (
                 format!("{{ employeePrimaryBank(employeeId: \"{own_id}\") {{ __typename }} }}"),
-                PERM_EMPLOYEE_SELF,
+                PERM_EMPLOYEE_READ,
                 false,
             ),
             (
                 format!("{{ employeeIdentityProfile(employeeId: \"{own_id}\") {{ __typename }} }}"),
-                PERM_EMPLOYEE_SELF,
+                PERM_EMPLOYEE_READ,
                 false,
             ),
             (
                 "{ departments { __typename } }".to_string(),
-                PERM_EMPLOYEE_SELF,
+                PERM_EMPLOYEE_READ,
                 false,
             ),
             (
                 "{ designations { __typename } }".to_string(),
-                PERM_EMPLOYEE_SELF,
+                PERM_EMPLOYEE_READ,
                 false,
             ),
             (
@@ -1831,7 +1921,7 @@ mod tests {
             ),
             (
                 format!("{{ employeeDocumentAttachment(employeeDocumentId: \"{record_id}\") {{ __typename }} }}"),
-                PERM_EMPLOYEE_SELF,
+                PERM_EMPLOYEE_READ,
                 false,
             ),
             (
@@ -1927,46 +2017,42 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn own_and_cross_employee_queries_do_not_substitute_each_others_permissions() {
+    async fn directory_employee_and_payroll_permissions_do_not_substitute_each_other() {
         let own_id = Uuid::new_v4();
         let other_id = Uuid::new_v4();
-        let own_queries = [
+        let employee_record_queries = [
             format!("{{ employeeProfileChangeRequests(employeeId: \"{own_id}\") {{ __typename }} }}"),
             format!("{{ employeeEducationRecords(employeeId: \"{own_id}\") {{ __typename }} }}"),
             format!("{{ employeeWorkExperienceRecords(employeeId: \"{own_id}\") {{ __typename }} }}"),
-            format!("{{ employmentHistoryRecords(employeeId: \"{own_id}\") {{ __typename }} }}"),
             format!("{{ employeePrimaryBank(employeeId: \"{own_id}\") {{ __typename }} }}"),
             format!("{{ employeeIdentityProfile(employeeId: \"{own_id}\") {{ __typename }} }}"),
         ];
-        for query in own_queries {
+        for query in employee_record_queries {
             let response = execute_query(
-                claims(PERM_EMPLOYEE_READ, Some("ALL"), Some(own_id)),
-                &query,
-            )
-            .await;
-            assert_forbidden_before_db(&response, PERM_EMPLOYEE_SELF);
-        }
-
-        let cross_queries = [
-            format!("{{ employeeProfileChangeRequests(employeeId: \"{other_id}\") {{ __typename }} }}"),
-            format!("{{ employeeEducationRecords(employeeId: \"{other_id}\") {{ __typename }} }}"),
-            format!("{{ employeeWorkExperienceRecords(employeeId: \"{other_id}\") {{ __typename }} }}"),
-            format!("{{ employeeDocuments(employeeId: \"{other_id}\") {{ __typename }} }}"),
-            format!("{{ employeePrimaryBank(employeeId: \"{other_id}\") {{ __typename }} }}"),
-            format!("{{ employeeIdentityProfile(employeeId: \"{other_id}\") {{ __typename }} }}"),
-        ];
-        for query in cross_queries {
-            let response = execute_query(
-                claims(PERM_EMPLOYEE_SELF, Some("SELF"), Some(own_id)),
+                claims(PERM_EMPLOYEE_DIRECTORY_READ, Some("ALL"), Some(own_id)),
                 &query,
             )
             .await;
             assert_forbidden_before_db(&response, PERM_EMPLOYEE_READ);
         }
+
+        let salary_response = execute_query(
+            claims(PERM_EMPLOYEE_READ, Some("ALL"), Some(own_id)),
+            &format!("{{ employmentHistoryRecords(employeeId: \"{own_id}\") {{ __typename }} }}"),
+        )
+        .await;
+        assert_forbidden_before_db(&salary_response, PERM_PAYROLL_READ);
+
+        let directory_response = execute_query(
+            claims(PERM_EMPLOYEE_READ, Some("ALL"), Some(own_id)),
+            &format!("{{ employeeProfileAccess(employeeId: \"{other_id}\") {{ __typename }} }}"),
+        )
+        .await;
+        assert_forbidden_before_db(&directory_response, PERM_EMPLOYEE_DIRECTORY_READ);
     }
 
     #[tokio::test]
-    async fn salary_history_accepts_only_jwt_self_hr_all_or_payroll_all() {
+    async fn salary_history_accepts_only_payroll_self_or_payroll_all() {
         let own_id = Uuid::new_v4();
         let other_id = Uuid::new_v4();
         let own_query = format!(
@@ -1978,15 +2064,8 @@ mod tests {
 
         assert_authorized_before_db(
             &execute_query(
-                claims(PERM_EMPLOYEE_SELF, Some("SELF"), Some(own_id)),
+                claims(PERM_PAYROLL_READ, Some("SELF"), Some(own_id)),
                 &own_query,
-            )
-            .await,
-        );
-        assert_authorized_before_db(
-            &execute_query(
-                claims(PERM_EMPLOYEE_MANAGE, Some("ALL"), Some(own_id)),
-                &other_query,
             )
             .await,
         );
@@ -2003,42 +2082,40 @@ mod tests {
             &other_query,
         )
         .await;
-        assert_forbidden_before_db(&manager_response, PERM_EMPLOYEE_MANAGE);
+        assert_forbidden_before_db(&manager_response, PERM_PAYROLL_READ);
+
+        let employee_admin_response = execute_query(
+            claims(PERM_EMPLOYEE_MANAGE, Some("ALL"), Some(own_id)),
+            &other_query,
+        )
+        .await;
+        assert_forbidden_before_db(&employee_admin_response, PERM_PAYROLL_READ);
     }
 
     #[tokio::test]
-    async fn salary_history_evaluates_independent_grants_monotonically_for_own_target() {
+    async fn salary_history_does_not_reuse_malformed_employee_read_grants() {
         let own_id = Uuid::new_v4();
         let own_query = format!(
             "{{ employmentHistoryRecords(employeeId: \"{own_id}\") {{ __typename }} }}"
         );
 
-        let hr_all = claims(PERM_EMPLOYEE_MANAGE, Some("ALL"), Some(own_id));
         let payroll_all = claims(PERM_PAYROLL_READ, Some("ALL"), Some(own_id));
 
-        let mut malformed_self_with_hr_all =
-            claims(PERM_EMPLOYEE_SELF, Some("INVALID"), Some(own_id));
-        malformed_self_with_hr_all
-            .permissions
-            .push(PERM_EMPLOYEE_MANAGE.into());
-        malformed_self_with_hr_all
-            .permission_scopes
-            .insert(PERM_EMPLOYEE_MANAGE.into(), "ALL".into());
-
-        let mut malformed_self_with_payroll_all =
-            claims(PERM_EMPLOYEE_SELF, Some("INVALID"), Some(own_id));
-        malformed_self_with_payroll_all
+        let mut malformed_employee_read_with_payroll_all =
+            claims(PERM_EMPLOYEE_READ, Some("INVALID"), Some(own_id));
+        malformed_employee_read_with_payroll_all
             .permissions
             .push(PERM_PAYROLL_READ.into());
-        malformed_self_with_payroll_all
+        malformed_employee_read_with_payroll_all
             .permission_scopes
             .insert(PERM_PAYROLL_READ.into(), "ALL".into());
 
         for (case, claims) in [
-            ("employee manage ALL", hr_all),
             ("payroll read ALL", payroll_all),
-            ("malformed self plus employee manage ALL", malformed_self_with_hr_all),
-            ("malformed self plus payroll read ALL", malformed_self_with_payroll_all),
+            (
+                "malformed employee read plus payroll read ALL",
+                malformed_employee_read_with_payroll_all,
+            ),
         ] {
             let response = execute_query(claims, &own_query).await;
             assert_eq!(
@@ -2064,24 +2141,22 @@ mod tests {
             "{{ employmentHistoryRecords(employeeId: \"{other_id}\") {{ __typename }} }}"
         );
 
-        for scope in [None, Some("INVALID"), Some("TEAM"), Some("ALL")] {
+        for scope in [None, Some("INVALID"), Some("TEAM"), Some("DEPARTMENT")] {
             let response = execute_query(
-                claims(PERM_EMPLOYEE_SELF, scope, Some(own_id)),
+                claims(PERM_PAYROLL_READ, scope, Some(own_id)),
                 &own_query,
             )
             .await;
-            assert_forbidden_before_db(&response, PERM_EMPLOYEE_SELF);
+            assert_forbidden_before_db(&response, PERM_PAYROLL_READ);
         }
 
-        for permission in [PERM_EMPLOYEE_MANAGE, PERM_PAYROLL_READ] {
-            for scope in [None, Some("INVALID"), Some("SELF"), Some("TEAM"), Some("DEPARTMENT")] {
-                let response = execute_query(
-                    claims(permission, scope, Some(own_id)),
-                    &other_query,
-                )
-                .await;
-                assert_forbidden_before_db(&response, permission);
-            }
+        for scope in [None, Some("INVALID"), Some("SELF"), Some("TEAM"), Some("DEPARTMENT")] {
+            let response = execute_query(
+                claims(PERM_PAYROLL_READ, scope, Some(own_id)),
+                &other_query,
+            )
+            .await;
+            assert_forbidden_before_db(&response, PERM_PAYROLL_READ);
         }
     }
 

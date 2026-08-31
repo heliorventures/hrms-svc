@@ -3,7 +3,8 @@
 use async_graphql::Context;
 use kabipay_common::client_data_scope::{data_scope_from_context, resolve_employee_scope_filter};
 use kabipay_common::context::{
-    ScopeType, PERM_EMPLOYEE_MANAGE, PERM_EMPLOYEE_READ, PERM_EMPLOYEE_SELF, PERM_ROLE_MANAGE,
+    ScopeType, PERM_EMPLOYEE_DIRECTORY_READ, PERM_EMPLOYEE_MANAGE, PERM_EMPLOYEE_READ,
+    PERM_ROLE_MANAGE,
 };
 use kabipay_common::KabiPayError;
 use sea_orm::DatabaseConnection;
@@ -14,11 +15,6 @@ pub use kabipay_common::client_data_scope::resolve_viewer_employee;
 /// Exact `employee:read` scope. Missing, malformed, or sibling scopes fail closed.
 pub fn data_scope_employee(ctx: &Context<'_>) -> async_graphql::Result<ScopeType> {
     data_scope_from_context(ctx, PERM_EMPLOYEE_READ)
-}
-
-/// Exact `employee:self` scope for JWT-bound profile and record reads.
-pub fn data_scope_employee_self(ctx: &Context<'_>) -> async_graphql::Result<ScopeType> {
-    data_scope_from_context(ctx, PERM_EMPLOYEE_SELF)
 }
 
 /// Require an exact permission and an explicit valid scope.
@@ -73,12 +69,12 @@ pub fn require_any_exact_scope<'a>(
 }
 
 /// `employee(id)`-style visibility: target employee row must be in caller’s `employee` data scope.
-pub async fn assert_employee_in_data_scope(
+pub async fn employee_in_data_scope(
     ctx: &Context<'_>,
     db: &DatabaseConnection,
     tenant_id: Uuid,
     target_emp_id: Uuid,
-) -> async_graphql::Result<()> {
+) -> async_graphql::Result<bool> {
     let scope = data_scope_employee(ctx)?;
     let viewer = if scope == ScopeType::All {
         None
@@ -88,7 +84,17 @@ pub async fn assert_employee_in_data_scope(
     let filter = resolve_employee_scope_filter(db, tenant_id, scope, viewer)
         .await
         .map_err(KabiPayError::into_graphql)?;
-    if !filter.allows_employee(target_emp_id) {
+    Ok(filter.allows_employee(target_emp_id))
+}
+
+/// Require an employee target to be included by the caller's exact `employee:read` scope.
+pub async fn assert_employee_in_data_scope(
+    ctx: &Context<'_>,
+    db: &DatabaseConnection,
+    tenant_id: Uuid,
+    target_emp_id: Uuid,
+) -> async_graphql::Result<()> {
+    if !employee_in_data_scope(ctx, db, tenant_id, target_emp_id).await? {
         return Err(KabiPayError::Forbidden(
             "not allowed to access this employee for documents".into(),
         )
@@ -105,4 +111,9 @@ pub fn require_tenant_rbac_admin(ctx: &Context<'_>) -> async_graphql::Result<()>
 /// Tenant-wide HR employee review/configuration queues require `employee:manage=ALL`.
 pub fn require_employee_manage_all(ctx: &Context<'_>) -> async_graphql::Result<()> {
     require_exact_all_scope(ctx, PERM_EMPLOYEE_MANAGE)
+}
+
+/// Tenant-wide non-sensitive employee directory reads require `employee_directory:read=ALL`.
+pub fn require_employee_directory_read_all(ctx: &Context<'_>) -> async_graphql::Result<()> {
+    require_exact_all_scope(ctx, PERM_EMPLOYEE_DIRECTORY_READ)
 }
