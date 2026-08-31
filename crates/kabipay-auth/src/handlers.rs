@@ -33,6 +33,7 @@ use kabipay_common::{
     db::resolve_required_tenant_db,
     error::{KabiPayError, KabiPayResult},
     jwt::{decode_client_jwt, extract_bearer},
+    tenant_business_clock::TenantBusinessClock,
 };
 use kabipay_db_entities::{
     ops::{operator_session, operator_user, tenant},
@@ -118,6 +119,7 @@ pub struct ResolvedTenant {
     pub logo_url: Option<String>,
     #[serde(rename = "primaryColor", skip_serializing_if = "Option::is_none")]
     pub primary_color: Option<String>,
+    pub timezone: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -224,6 +226,9 @@ pub async fn resolve_client_tenant(
     Path(slug): Path<String>,
 ) -> Result<Json<ResolvedTenant>, KabiPayError> {
     let row = find_tenant_by_slug(&state.ops_db, &slug).await?;
+    let timezone = TenantBusinessClock::from_configured_name(row.timezone.as_deref())?
+        .timezone_name()
+        .to_owned();
 
     Ok(Json(ResolvedTenant {
         id: row.id,
@@ -234,6 +239,7 @@ pub async fn resolve_client_tenant(
             .unwrap_or_else(|| normalize_tenant_slug(&slug).unwrap_or(slug)),
         logo_url: row.logo_url,
         primary_color: row.primary_color,
+        timezone,
     }))
 }
 
@@ -712,4 +718,26 @@ pub async fn introspect(
 /// Expose [`JwtConfig`] so tests / downstream crates can issue helpers.
 pub fn jwt_config_from_env() -> JwtConfig {
     JwtConfig::from_env()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolved_tenant_serializes_the_business_timezone_contract() {
+        let tenant = ResolvedTenant {
+            id: Uuid::nil(),
+            name: "Acme".into(),
+            status: "ACTIVE".into(),
+            subdomain: "acme".into(),
+            logo_url: None,
+            primary_color: None,
+            timezone: "Asia/Kolkata".into(),
+        };
+
+        let payload = serde_json::to_value(tenant).expect("resolved tenant must serialize");
+
+        assert_eq!(payload["timezone"], "Asia/Kolkata");
+    }
 }

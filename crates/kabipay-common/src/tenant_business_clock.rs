@@ -16,6 +16,10 @@ pub struct TenantBusinessClock {
 }
 
 impl TenantBusinessClock {
+    pub fn from_configured_name(name: Option<&str>) -> KabiPayResult<Self> {
+        Self::from_name(name.unwrap_or(DEFAULT_TENANT_TIMEZONE))
+    }
+
     pub fn from_name(name: &str) -> KabiPayResult<Self> {
         let normalized = name.trim();
         if normalized.is_empty() {
@@ -37,7 +41,7 @@ impl TenantBusinessClock {
             .one(ops_db)
             .await?
             .ok_or_else(|| KabiPayError::TenantNotFound(tenant_id.to_string()))?;
-        Self::from_name(row.timezone.as_deref().unwrap_or(DEFAULT_TENANT_TIMEZONE))
+        Self::from_configured_name(row.timezone.as_deref())
     }
 
     pub fn timezone_name(self) -> &'static str {
@@ -105,5 +109,12 @@ mod tests {
     fn invalid_or_blank_timezone_is_rejected() {
         assert!(TenantBusinessClock::from_name("").is_err());
         assert!(TenantBusinessClock::from_name("Asia/Not-A-Zone").is_err());
+    }
+
+    #[test]
+    fn missing_configuration_uses_the_documented_utc_default() {
+        let clock = TenantBusinessClock::from_configured_name(None).unwrap();
+
+        assert_eq!(clock.timezone_name(), "UTC");
     }
 }

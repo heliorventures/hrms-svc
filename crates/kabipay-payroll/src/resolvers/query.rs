@@ -11,7 +11,8 @@ use kabipay_common::{
         PERM_PAYROLL_STATUTORY_EXPORT,
     },
     file_download_token::{file_download_claims, public_employee_file_download_url},
-    subgraph::{require_tenant_id, resolve_client_employee_id, tenant_db},
+    subgraph::{ops_db, require_tenant_id, resolve_client_employee_id, tenant_db},
+    tenant_business_clock::TenantBusinessClock,
     KabiPayError, KabiPayResult,
 };
 use kabipay_db_entities::tenant::d0029_file_storage::file_storage;
@@ -169,20 +170,29 @@ impl QueryRoot {
     async fn employee_salary_breakup_preview(
         &self,
         ctx: &Context<'_>,
-        employee_id: ID,
+        employee_id: Option<ID>,
         as_of: Option<chrono::NaiveDate>,
     ) -> Result<Option<SalaryBreakupPreviewDto>> {
         let tenant_id = require_tenant_id(ctx)?;
         let scope = payroll_read_scope(ctx)?;
-        let eid = parse_uuid(&employee_id, "employeeId")?;
+        let requested_employee_id = employee_id
+            .as_ref()
+            .map(|id| parse_uuid(id, "employeeId"))
+            .transpose()?;
         let db = tenant_db(ctx, tenant_id).await?;
-        let as_of = as_of.unwrap_or_else(|| chrono::Utc::now().date_naive());
+        let as_of = match as_of {
+            Some(date) => date,
+            None => TenantBusinessClock::load(ops_db(ctx)?, tenant_id)
+                .await
+                .map_err(KabiPayError::into_graphql)?
+                .now_date(),
+        };
         let jwt_db = &db;
         let viewer_db = &db;
         let scope_db = &db;
         let load_db = &db;
         let preview = load_scoped_employee_target_with(
-            Some(eid),
+            requested_employee_id,
             scope,
             || async move {
                 resolve_client_employee_id(ctx, jwt_db, tenant_id)
@@ -330,7 +340,17 @@ impl QueryRoot {
         let Some((p, c)) = row else {
             return Ok(None);
         };
-        Ok(Some(PayslipDetailDto::from_head(p, c)))
+        let cycles = payroll_service::payroll_cycles_by_ids(&db, tenant_id, &[p.payroll_cycle_id])
+            .await
+            .map_err(KabiPayError::into_graphql)?;
+        let cycle = cycles.get(&p.payroll_cycle_id).ok_or_else(|| {
+            KabiPayError::NotFound {
+                entity: "payroll_cycle",
+                id: p.payroll_cycle_id.to_string(),
+            }
+            .into_graphql()
+        })?;
+        Ok(Some(PayslipDetailDto::from_head(p, cycle, c)))
     }
 
     /// When `employeeId` is omitted, uses the signed-in user’s employee id from the JWT
@@ -376,16 +396,31 @@ impl QueryRoot {
                 .await
                 .map_err(KabiPayError::into_graphql)?;
                 let ids: Vec<Uuid> = list.iter().map(|p| p.id).collect();
+                let cycle_ids: Vec<Uuid> = list.iter().map(|p| p.payroll_cycle_id).collect();
+                let cycles = payroll_service::payroll_cycles_by_ids(
+                    load_db,
+                    tenant_id,
+                    &cycle_ids,
+                )
+                .await
+                .map_err(KabiPayError::into_graphql)?;
                 let lines = payroll_service::payslip_lines_by_payslip_ids(load_db, tenant_id, &ids)
                     .await
                     .map_err(KabiPayError::into_graphql)?;
                 Ok(list
                     .into_iter()
-                    .map(|p| {
+                    .map(|p| -> Result<PayslipDetailDto> {
                         let c = lines.get(&p.id).cloned().unwrap_or_default();
-                        PayslipDetailDto::from_head(p, c)
+                        let cycle = cycles.get(&p.payroll_cycle_id).ok_or_else(|| {
+                            KabiPayError::NotFound {
+                                entity: "payroll_cycle",
+                                id: p.payroll_cycle_id.to_string(),
+                            }
+                            .into_graphql()
+                        })?;
+                        Ok(PayslipDetailDto::from_head(p, cycle, c))
                     })
-                    .collect())
+                    .collect::<Result<Vec<_>>>()?)
             },
         )
         .await
@@ -626,6 +661,17 @@ mod tests {
         );
         assert!(!message.contains("TenantDbCache"));
         assert!(!message.contains("database"));
+    }
+
+    #[test]
+    fn payroll_schema_exposes_period_metadata_and_self_salary_target_is_optional() {
+        let schema = Schema::build(QueryRoot, EmptyMutation, EmptySubscription)
+            .finish()
+            .sdl();
+
+        assert!(schema.contains("periodMonth: Int!"));
+        assert!(schema.contains("periodYear: Int!"));
+        assert!(schema.contains("employeeSalaryBreakupPreview(employeeId: ID, asOf: NaiveDate)"));
     }
 
     #[derive(Clone, Debug, PartialEq, Eq)]

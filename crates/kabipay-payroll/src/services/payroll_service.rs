@@ -1656,6 +1656,24 @@ async fn active_employee_salary_structure<C: ConnectionTrait + Send + Sync>(
         .map_err(KabiPayError::from)
 }
 
+/// Payroll cycles keyed by id for enriching authorized payslip rows without per-row queries.
+pub async fn payroll_cycles_by_ids(
+    db: &DatabaseConnection,
+    tenant_id: Uuid,
+    ids: &[Uuid],
+) -> KabiPayResult<HashMap<Uuid, payroll_cycle::Model>> {
+    if ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let rows = payroll_cycle::Entity::find()
+        .filter(payroll_cycle::Column::TenantId.eq(tenant_id))
+        .filter(payroll_cycle::Column::Id.is_in(ids.to_vec()))
+        .all(db)
+        .await
+        .map_err(KabiPayError::from)?;
+    Ok(rows.into_iter().map(|row| (row.id, row)).collect())
+}
+
 fn amount_from_rule(
     basis: &str,
     value: Decimal,

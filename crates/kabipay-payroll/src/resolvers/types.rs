@@ -202,6 +202,8 @@ pub struct PayslipDetailDto {
     pub tenant_id: ID,
     pub employee_id: ID,
     pub payroll_cycle_id: ID,
+    pub period_month: i32,
+    pub period_year: i32,
     pub gross_salary: String,
     pub total_deductions: String,
     pub net_salary: String,
@@ -221,7 +223,11 @@ pub struct PayslipDetailDto {
 }
 
 impl PayslipDetailDto {
-    pub fn from_head(m: payslip::Model, lines: Vec<payslip_component::Model>) -> Self {
+    pub fn from_head(
+        m: payslip::Model,
+        cycle: &payroll_cycle::Model,
+        lines: Vec<payslip_component::Model>,
+    ) -> Self {
         let lines = lines
             .into_iter()
             .map(PayslipComponentLineDto::from)
@@ -231,6 +237,8 @@ impl PayslipDetailDto {
             tenant_id: ID(m.tenant_id.to_string()),
             employee_id: ID(m.employee_id.to_string()),
             payroll_cycle_id: ID(m.payroll_cycle_id.to_string()),
+            period_month: cycle.month,
+            period_year: cycle.year,
             gross_salary: m.gross_salary.to_string(),
             total_deductions: m.total_deductions.to_string(),
             net_salary: m.net_salary.to_string(),
