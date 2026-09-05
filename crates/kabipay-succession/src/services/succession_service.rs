@@ -9,11 +9,14 @@ pub async fn list_competencies(
     db: &DatabaseConnection,
     tenant_id: Uuid,
     limit: u64,
+    offset: u64,
 ) -> KabiPayResult<Vec<competency::Model>> {
     let limit = limit.clamp(1, 200);
     competency::Entity::find()
         .filter(competency::Column::TenantId.eq(tenant_id))
         .order_by_asc(competency::Column::Name)
+        .order_by_asc(competency::Column::Id)
+        .offset(offset)
         .limit(limit)
         .all(db)
         .await
@@ -24,11 +27,14 @@ pub async fn list_pools(
     db: &DatabaseConnection,
     tenant_id: Uuid,
     limit: u64,
+    offset: u64,
 ) -> KabiPayResult<Vec<talent_pool::Model>> {
     let limit = limit.clamp(1, 100);
     talent_pool::Entity::find()
         .filter(talent_pool::Column::TenantId.eq(tenant_id))
         .order_by_asc(talent_pool::Column::Name)
+        .order_by_asc(talent_pool::Column::Id)
+        .offset(offset)
         .limit(limit)
         .all(db)
         .await

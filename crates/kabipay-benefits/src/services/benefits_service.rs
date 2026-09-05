@@ -15,12 +15,15 @@ pub async fn list_types(
     db: &DatabaseConnection,
     tenant_id: Uuid,
     limit: u64,
+    offset: u64,
 ) -> KabiPayResult<Vec<benefit_type::Model>> {
     let limit = limit.clamp(1, 100);
     benefit_type::Entity::find()
         .filter(benefit_type::Column::TenantId.eq(tenant_id))
         .order_by_asc(benefit_type::Column::Code)
+        .order_by_asc(benefit_type::Column::Id)
         .limit(limit)
+        .offset(offset)
         .all(db)
         .await
         .map_err(KabiPayError::from)
@@ -31,6 +34,7 @@ pub async fn list_plans(
     tenant_id: Uuid,
     active_only: bool,
     limit: u64,
+    offset: u64,
 ) -> KabiPayResult<Vec<benefit_plan::Model>> {
     let limit = limit.clamp(1, 100);
     let mut q = benefit_plan::Entity::find()
@@ -39,10 +43,28 @@ pub async fn list_plans(
         q = q.filter(benefit_plan::Column::IsActive.eq(true));
     }
     q.order_by_asc(benefit_plan::Column::Name)
+        .order_by_asc(benefit_plan::Column::Id)
         .limit(limit)
+        .offset(offset)
         .all(db)
         .await
         .map_err(KabiPayError::from)
+}
+
+pub async fn plan_names(
+    db: &DatabaseConnection,
+    tenant_id: Uuid,
+    plan_ids: Vec<Uuid>,
+) -> KabiPayResult<std::collections::HashMap<Uuid, String>> {
+    if plan_ids.is_empty() {
+        return Ok(std::collections::HashMap::new());
+    }
+    let rows = benefit_plan::Entity::find()
+        .filter(benefit_plan::Column::TenantId.eq(tenant_id))
+        .filter(benefit_plan::Column::Id.is_in(plan_ids))
+        .all(db)
+        .await?;
+    Ok(rows.into_iter().map(|row| (row.id, row.name)).collect())
 }
 
 const STATUS_ENROLLED: &str = "ENROLLED";

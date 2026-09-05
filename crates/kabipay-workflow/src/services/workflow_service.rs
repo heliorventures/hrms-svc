@@ -9,6 +9,32 @@ use sea_orm::{
 };
 use uuid::Uuid;
 
+fn approval_permission(entity: &str) -> KabiPayResult<&'static str> {
+    match entity {
+        "LEAVE_REQUEST" => Ok("leave:approve"),
+        "EXPENSE" => Ok("expense:approve"),
+        "TRAVEL_REQUEST" => Ok("travel:approve"),
+        "TIMESHEET_WEEK_BATCH" => Ok("timesheet:approve"),
+        _ => Err(KabiPayError::Validation(
+            "Choose Leave, Expenses, Travel, or Timesheets for approval.".into(),
+        )),
+    }
+}
+
+fn normalize_approver(value: &str) -> KabiPayResult<String> {
+    match value.trim().to_ascii_uppercase().as_str() {
+        "MANAGER" | "LINE_MANAGER" | "REPORTING_MANAGER" => Ok("REPORTING_MANAGER".into()),
+        "PERMISSION" | "ROLE" => Ok("PERMISSION".into()),
+        "REPORTING_MANAGER_OR_PERMISSION"
+        | "REPORTING_MANAGER_OR_ROLE"
+        | "MANAGER_OR_ROLE"
+        | "MANAGER_OR_PERMISSION" => Ok("REPORTING_MANAGER_OR_PERMISSION".into()),
+        _ => Err(KabiPayError::Validation(
+            "Choose a reporting manager or an eligible approver.".into(),
+        )),
+    }
+}
+
 pub async fn list_workflows(
     db: &DatabaseConnection,
     tenant_id: Uuid,
@@ -75,7 +101,35 @@ pub async fn create_workflow(
     name: String,
     entity_type: String,
     is_active: bool,
+    initial_approver_type: Option<String>,
 ) -> KabiPayResult<workflow::Model> {
+    use sea_orm::{ConnectionTrait, DbBackend, Statement};
+    let entity_type = entity_type.trim().to_ascii_uppercase();
+    let permission = approval_permission(&entity_type)?;
+    let first_approver = initial_approver_type
+        .as_deref()
+        .map(normalize_approver)
+        .transpose()?;
+    let txn = db.begin().await?;
+    txn.execute(Statement::from_sql_and_values(
+        DbBackend::Postgres,
+        "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+        vec![format!("workflow-definition:{tenant_id}:{entity_type}").into()],
+    ))
+    .await?;
+    let active_exists = workflow::Entity::find()
+        .filter(workflow::Column::TenantId.eq(tenant_id))
+        .filter(workflow::Column::EntityType.eq(&entity_type))
+        .filter(workflow::Column::IsActive.eq(true))
+        .one(&txn)
+        .await?
+        .is_some();
+    if is_active && active_exists {
+        return Err(KabiPayError::BusinessRule {
+            code: "WORKFLOW_ALREADY_CONFIGURED",
+            message: "An active approval workflow already exists for this request type.".into(),
+        });
+    }
     let id = Uuid::new_v4();
     let now = Utc::now();
     let m = workflow::ActiveModel {
@@ -87,7 +141,27 @@ pub async fn create_workflow(
         created_at: Set(now),
         updated_at: Set(now),
     };
-    m.insert(db).await.map_err(KabiPayError::from)
+    let created = m.insert(&txn).await?;
+    if let Some(approver) = first_approver {
+        workflow_step::ActiveModel {
+            id: Set(Uuid::new_v4()),
+            tenant_id: Set(tenant_id),
+            workflow_id: Set(id),
+            sequence_order: Set(1),
+            step_name: Set("Approval".into()),
+            approver_type: Set(Some(approver)),
+            approver_role_id: Set(None),
+            approver_permission: Set(Some(permission.into())),
+            can_skip: Set(false),
+            sla_hours: Set(None),
+            created_at: Set(now),
+            updated_at: Set(now),
+        }
+        .insert(&txn)
+        .await?;
+    }
+    txn.commit().await?;
+    Ok(created)
 }
 
 /// Append a **step** to a definition. Fails if `workflow_id` is not in tenant.
@@ -111,7 +185,8 @@ pub async fn create_workflow_step(
     })?;
     let inferred_permission = match workflow.entity_type.trim().to_ascii_uppercase().as_str() {
         "LEAVE_REQUEST" => Some("leave:approve"),
-        "EXPENSE" | "TRAVEL_REQUEST" => Some("expense:approve"),
+        "EXPENSE" => Some("expense:approve"),
+        "TRAVEL_REQUEST" => Some("travel:approve"),
         "TIMESHEET_WEEK_BATCH" => Some("timesheet:approve"),
         _ => None,
     };
@@ -121,15 +196,15 @@ pub async fn create_workflow_step(
             (!normalized.is_empty()).then_some(normalized)
         })
         .or_else(|| inferred_permission.map(str::to_owned));
-    let approver_type = approver_type.map(|value| {
-        match value.trim().to_ascii_uppercase().as_str() {
-            "ROLE" => "PERMISSION".to_owned(),
-            "REPORTING_MANAGER_OR_ROLE" | "MANAGER_OR_ROLE" => {
-                "REPORTING_MANAGER_OR_PERMISSION".to_owned()
-            }
-            other => other.to_owned(),
-        }
-    });
+    if sequence_order < 1 || sla_hours.is_some_and(|hours| hours < 1) {
+        return Err(KabiPayError::Validation("Step order and response time must be positive.".into()));
+    }
+    if approver_permission.as_deref() != Some(approval_permission(&workflow.entity_type)?) {
+        return Err(KabiPayError::Validation("The approver permission must match this workflow's request type.".into()));
+    }
+    let approver_type = Some(normalize_approver(
+        approver_type.as_deref().unwrap_or("REPORTING_MANAGER"),
+    )?);
     let permission_type = matches!(
         approver_type.as_deref(),
         Some("PERMISSION" | "REPORTING_MANAGER_OR_PERMISSION" | "MANAGER_OR_PERMISSION")
@@ -303,4 +378,38 @@ pub async fn reorder_workflow_steps(
     txn.commit().await.map_err(KabiPayError::from)?;
 
     list_workflow_steps(db, tenant_id, workflow_id).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn supported_request_types_map_to_their_exact_approval_permission() {
+        assert_eq!(approval_permission("LEAVE_REQUEST").unwrap(), "leave:approve");
+        assert_eq!(approval_permission("EXPENSE").unwrap(), "expense:approve");
+        assert_eq!(approval_permission("TRAVEL_REQUEST").unwrap(), "travel:approve");
+        assert_eq!(
+            approval_permission("TIMESHEET_WEEK_BATCH").unwrap(),
+            "timesheet:approve"
+        );
+        assert!(matches!(
+            approval_permission("UNKNOWN"),
+            Err(KabiPayError::Validation(_))
+        ));
+    }
+
+    #[test]
+    fn legacy_approver_names_normalize_to_permission_based_runtime_values() {
+        assert_eq!(normalize_approver("manager").unwrap(), "REPORTING_MANAGER");
+        assert_eq!(normalize_approver("role").unwrap(), "PERMISSION");
+        assert_eq!(
+            normalize_approver("manager_or_role").unwrap(),
+            "REPORTING_MANAGER_OR_PERMISSION"
+        );
+        assert!(matches!(
+            normalize_approver("accountant"),
+            Err(KabiPayError::Validation(_))
+        ));
+    }
 }

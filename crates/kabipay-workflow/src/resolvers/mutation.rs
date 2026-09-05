@@ -49,6 +49,7 @@ impl MutationRoot {
             name,
             entity_type,
             input.is_active,
+            input.initial_approver_type,
         )
         .await
         .map_err(KabiPayError::into_graphql)?;

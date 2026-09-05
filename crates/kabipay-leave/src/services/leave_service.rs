@@ -845,13 +845,20 @@ async fn load_required_leave_workflow_first_step<C: ConnectionTrait + Sync>(
         .one(txn)
         .await
         .map_err(KabiPayError::from)?
-        .ok_or_else(leave_workflow_not_current)?;
+        .ok_or_else(leave_workflow_not_configured)?;
     let step = first_leave_workflow_step_query(tenant_id, wf.id)
         .one(txn)
         .await
         .map_err(KabiPayError::from)?
-        .ok_or_else(leave_workflow_not_current)?;
+        .ok_or_else(leave_workflow_not_configured)?;
     Ok((wf, step.id))
+}
+
+fn leave_workflow_not_configured() -> KabiPayError {
+    KabiPayError::BusinessRule {
+        code: "LEAVE_WORKFLOW_NOT_CONFIGURED",
+        message: "Leave approval is not set up. Ask HR to configure a Leave workflow with an approval step.".into(),
+    }
 }
 
 fn active_leave_workflow_query(tenant_id: Uuid) -> sea_orm::Select<workflow::Entity> {
@@ -2373,7 +2380,7 @@ mod decision_authorization_tests {
         let error = load_required_leave_workflow_first_step(&db, tenant_id)
             .await
             .expect_err("submission cannot proceed without an active leave workflow");
-        assert_eq!(error.code(), "LEAVE_WORKFLOW_NOT_CURRENT");
+        assert_eq!(error.code(), "LEAVE_WORKFLOW_NOT_CONFIGURED");
         assert_eq!(statements.lock().expect("statement recorder").len(), 1);
     }
 

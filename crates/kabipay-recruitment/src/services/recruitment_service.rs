@@ -9,12 +9,15 @@ pub async fn list_jobs(
     db: &DatabaseConnection,
     tenant_id: Uuid,
     limit: u64,
+    offset: u64,
 ) -> KabiPayResult<Vec<job_posting::Model>> {
     let limit = limit.clamp(1, 200);
     job_posting::Entity::find()
         .filter(job_posting::Column::TenantId.eq(tenant_id))
         .order_by_desc(job_posting::Column::CreatedAt)
+        .order_by_asc(job_posting::Column::Id)
         .limit(limit)
+        .offset(offset)
         .all(db)
         .await
         .map_err(KabiPayError::from)

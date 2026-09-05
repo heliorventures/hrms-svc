@@ -27,12 +27,15 @@ pub async fn list_designations(
     db: &DatabaseConnection,
     tenant_id: Uuid,
     limit: u64,
+    offset: u64,
 ) -> KabiPayResult<Vec<designation::Model>> {
     let limit = limit.clamp(1, 200);
     designation::Entity::find()
         .filter(designation::Column::TenantId.eq(tenant_id))
         .filter(designation::Column::IsDeleted.eq(false))
         .order_by_asc(designation::Column::Title)
+        .order_by_asc(designation::Column::Id)
+        .offset(offset)
         .limit(limit)
         .all(db)
         .await

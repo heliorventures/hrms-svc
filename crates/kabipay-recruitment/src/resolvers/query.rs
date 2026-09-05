@@ -21,6 +21,7 @@ impl QueryRoot {
         &self,
         ctx: &Context<'_>,
         #[graphql(default = 50)] limit: u64,
+        #[graphql(default = 0)] offset: u64,
     ) -> Result<Vec<JobPostingDto>> {
         let tenant_id = require_tenant_id(ctx)?;
         let claims = require_client_claims(ctx)?;
@@ -30,7 +31,7 @@ impl QueryRoot {
             );
         }
         let db = tenant_db(ctx, tenant_id).await?;
-        let rows = recruitment_service::list_jobs(&db, tenant_id, limit)
+        let rows = recruitment_service::list_jobs(&db, tenant_id, limit, offset)
             .await
             .map_err(KabiPayError::into_graphql)?;
         Ok(rows.into_iter().map(JobPostingDto::from).collect())

@@ -337,6 +337,10 @@ fn summary_last4(value: &str) -> String {
         .collect()
 }
 
+fn pan_summary_digits(value: &str) -> String {
+    value.chars().skip(5).take(4).collect()
+}
+
 fn validated_payload(
     input: NewProfileChange,
 ) -> KabiPayResult<(String, serde_json::Value, serde_json::Value, Option<Uuid>)> {
@@ -367,7 +371,7 @@ fn validated_payload(
         }
         REQUEST_PAN => {
             let pan_number = normalize_pan(input.pan_number)?;
-            let last4 = summary_last4(&pan_number);
+            let last4 = pan_summary_digits(&pan_number);
             (serde_json::to_value(PanPayload { pan_number })?, serde_json::json!({"last4": last4}))
         }
         REQUEST_AADHAAR => {
@@ -461,7 +465,7 @@ fn masked_summary(request_type: &str, payload: &serde_json::Value) -> serde_json
             ].into_iter().flatten().collect::<Vec<_>>();
             serde_json::json!({"changedFields": changed_fields})
         }
-        REQUEST_PAN => serde_json::json!({"last4": payload.get("pan_number").and_then(serde_json::Value::as_str).map(summary_last4)}),
+        REQUEST_PAN => serde_json::json!({"last4": payload.get("pan_number").and_then(serde_json::Value::as_str).map(pan_summary_digits)}),
         REQUEST_AADHAAR => serde_json::json!({"last4": payload.get("aadhaar_last4").and_then(serde_json::Value::as_str)}),
         REQUEST_BANK => serde_json::json!({"last4": payload.get("account_number").and_then(serde_json::Value::as_str).map(summary_last4)}),
         _ => serde_json::json!({}),

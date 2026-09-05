@@ -98,8 +98,8 @@ const WF_ACTION_REJECT: &str = "REJECT";
 /// Submit a new expense claim in `PENDING` status; validates category belongs to the tenant.
 /// Optional `travel_request_id` links the claim to that employee’s trip.
 ///
-/// When the tenant defines an active **`EXPENSE`** workflow with ≥1 step, inserts
-/// **`workflow_instance`** (**M32**) and sets **`expense.workflow_instance_id`**.
+/// Requires an active **`EXPENSE`** workflow with at least one step, then inserts
+/// **`workflow_instance`** (**M32**) and sets **`expense.workflow_instance_id`** atomically.
 pub async fn submit_expense(
     db: &DatabaseConnection,
     tenant_id: Uuid,
@@ -275,7 +275,10 @@ async fn try_attach_expense_workflow(
     now: chrono::DateTime<Utc>,
 ) -> KabiPayResult<()> {
     let Some((wf, first_step_id)) = load_expense_workflow_first_step(txn, tenant_id).await? else {
-        return Ok(());
+        return Err(KabiPayError::BusinessRule {
+            code: "EXPENSE_WORKFLOW_NOT_CONFIGURED",
+            message: "Expense approval is not set up. Ask HR to configure an Expenses workflow with an approval step.".into(),
+        });
     };
     let inst_id = Uuid::new_v4();
     let inst = workflow_instance::ActiveModel {

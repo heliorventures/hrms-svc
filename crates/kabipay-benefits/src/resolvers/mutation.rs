@@ -19,6 +19,9 @@ fn parse_uuid(id: &ID, field: &'static str) -> Result<Uuid> {
 
 #[Object]
 impl MutationRoot {
+ async fn save_benefit_type(&self, ctx: &Context<'_>, id: Option<ID>, input: super::setup::BenefitTypeInput) -> Result<super::types::BenefitTypeDto> { super::setup::save_type(ctx,id,input).await }
+ async fn save_benefit_plan(&self, ctx: &Context<'_>, id: Option<ID>, input: super::setup::BenefitPlanInput) -> Result<super::types::BenefitPlanDto> { super::setup::save_plan(ctx,id,input).await }
+
     /// Enroll the signed-in employee in an **active** benefit plan (`CONFLICT` if already enrolled).
     async fn enroll_in_benefit_plan(
         &self,

@@ -58,6 +58,13 @@ fn validate_schema_override(schema: &str) -> KabiPayResult<()> {
     Ok(())
 }
 
+fn default_timezone_for_country(country: &str) -> &'static str {
+    match country.trim().to_ascii_uppercase().as_str() {
+        "IN" | "INDIA" => "Asia/Kolkata",
+        _ => "UTC",
+    }
+}
+
 pub struct ProvisionOutcome {
     pub tenant: tenant::Model,
     pub schema_name: String,
@@ -118,7 +125,7 @@ pub async fn provision_tenant(
         status: Set("PROVISIONING".into()),
         plan: Set(None),
         country: Set(Some(country.clone())),
-        timezone: Set(Some("UTC".into())),
+        timezone: Set(Some(default_timezone_for_country(&country).into())),
         currency: Set(Some(currency.clone())),
         gstin: Set(None),
         pan: Set(None),
@@ -213,4 +220,16 @@ pub async fn run_tenant_migrations(
     Err(KabiPayError::Validation(format!(
         "tenant migrations are managed from kabipay-database/scripts; run update-tenant-liquibase.ps1 for tenant {tenant_id}"
     )))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::default_timezone_for_country;
+
+    #[test]
+    fn indian_tenant_country_codes_use_the_canonical_iana_timezone() {
+        assert_eq!(default_timezone_for_country("IN"), "Asia/Kolkata");
+        assert_eq!(default_timezone_for_country(" india "), "Asia/Kolkata");
+        assert_eq!(default_timezone_for_country("US"), "UTC");
+    }
 }

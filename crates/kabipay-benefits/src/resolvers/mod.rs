@@ -4,3 +4,5 @@ pub mod types;
 
 pub use mutation::MutationRoot;
 pub use query::QueryRoot;
+
+pub mod setup;

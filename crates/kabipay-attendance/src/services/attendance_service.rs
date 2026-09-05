@@ -237,19 +237,30 @@ pub async fn punch_today(
     let (today, now_t) = attendance_business_date_time(now_ts, clock);
     let source = if geo.is_some() { "WEB+GPS" } else { "WEB" };
     let txn = db.begin().await?;
-    lock_employee_dates(&txn, tenant_id, employee_id, &[today]).await?;
-    let open = attendance::Entity::find()
+    // Retain missed punch-outs without inventing working time. The database permits
+    // one OPEN row per employee, so retire earlier days before opening today's row.
+    let stale = attendance::Entity::find()
         .filter(attendance::Column::TenantId.eq(tenant_id))
         .filter(attendance::Column::EmployeeId.eq(employee_id))
+        .filter(attendance::Column::WorkDate.lt(today))
         .filter(attendance::Column::Status.eq("OPEN"))
-        .filter(attendance::Column::CheckInTime.is_not_null())
-        .filter(attendance::Column::CheckOutTime.is_null())
-        .order_by_desc(attendance::Column::CreatedAt)
+        .all(&txn).await?;
+    let mut dates: Vec<_> = stale.iter().map(|row| row.work_date).collect();
+    dates.push(today);
+    lock_employee_dates(&txn, tenant_id, employee_id, &dates).await?;
+    attendance::Entity::update_many()
+        .col_expr(attendance::Column::Status, sea_orm::sea_query::Expr::value("INCOMPLETE"))
+        .col_expr(attendance::Column::UpdatedAt, sea_orm::sea_query::Expr::value(now_ts))
+        .filter(attendance::Column::TenantId.eq(tenant_id))
+        .filter(attendance::Column::EmployeeId.eq(employee_id))
+        .filter(attendance::Column::WorkDate.lt(today))
+        .filter(attendance::Column::Status.eq("OPEN"))
+        .exec(&txn).await?;
+    let open = open_punch_on_date(tenant_id, employee_id, today)
         .one(&txn)
         .await?;
 
     if let Some(row) = open {
-        lock_employee_dates(&txn, tenant_id, employee_id, &[row.work_date]).await?;
         let existing = attendance::Entity::find()
             .filter(attendance::Column::TenantId.eq(tenant_id))
             .filter(attendance::Column::EmployeeId.eq(employee_id))
@@ -366,6 +377,17 @@ pub async fn add_manual_attendance_segment(
     .await?;
     txn.commit().await?;
     Ok(created)
+}
+
+fn open_punch_on_date(tenant_id: Uuid, employee_id: Uuid, work_date: NaiveDate) -> sea_orm::Select<attendance::Entity> {
+    attendance::Entity::find()
+        .filter(attendance::Column::TenantId.eq(tenant_id))
+        .filter(attendance::Column::EmployeeId.eq(employee_id))
+        .filter(attendance::Column::WorkDate.eq(work_date))
+        .filter(attendance::Column::Status.eq("OPEN"))
+        .filter(attendance::Column::CheckInTime.is_not_null())
+        .filter(attendance::Column::CheckOutTime.is_null())
+        .order_by_desc(attendance::Column::CreatedAt)
 }
 
 pub async fn update_manual_attendance_segment(
@@ -926,6 +948,18 @@ pub async fn list_holidays_in_calendar(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn live_punch_only_considers_the_current_tenant_day() {
+        use sea_orm::QueryTrait;
+        let clock = TenantBusinessClock::from_name("Asia/Kolkata").unwrap();
+        let before = "2026-09-05T18:29:59Z".parse().unwrap();
+        let after = "2026-09-05T18:30:00Z".parse().unwrap();
+        assert_ne!(clock.business_date(before), clock.business_date(after));
+        let sql = open_punch_on_date(Uuid::nil(), Uuid::nil(), clock.business_date(after))
+            .build(sea_orm::DbBackend::Postgres).to_string();
+        assert!(sql.contains("\"work_date\" = '2026-09-06'"), "{sql}");
+        assert!(sql.contains("\"status\" = 'OPEN'"));
+    }
     use super::*;
 
     #[test]

@@ -113,6 +113,8 @@ pub struct CreateWorkflowInput {
     pub entity_type: String,
     #[graphql(default = true)]
     pub is_active: bool,
+    /// If supplied, save the definition and its first approval step atomically.
+    pub initial_approver_type: Option<String>,
 }
 
 /// Add a **step** to a workflow. `sequence_order` must be unique per workflow.

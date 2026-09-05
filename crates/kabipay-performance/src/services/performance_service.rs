@@ -9,11 +9,14 @@ pub async fn list_cycles(
     db: &DatabaseConnection,
     tenant_id: Uuid,
     limit: u64,
+    offset: u64,
 ) -> KabiPayResult<Vec<review_cycle::Model>> {
     let limit = limit.clamp(1, 40);
     review_cycle::Entity::find()
         .filter(review_cycle::Column::TenantId.eq(tenant_id))
         .order_by_desc(review_cycle::Column::StartDate)
+        .order_by_asc(review_cycle::Column::Id)
+        .offset(offset)
         .limit(limit)
         .all(db)
         .await

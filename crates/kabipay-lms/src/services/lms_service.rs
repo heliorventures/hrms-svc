@@ -9,11 +9,14 @@ pub async fn list_skills(
     db: &DatabaseConnection,
     tenant_id: Uuid,
     limit: u64,
+    offset: u64,
 ) -> KabiPayResult<Vec<skill::Model>> {
     let limit = limit.clamp(1, 200);
     skill::Entity::find()
         .filter(skill::Column::TenantId.eq(tenant_id))
         .order_by_asc(skill::Column::Name)
+        .order_by_asc(skill::Column::Id)
+        .offset(offset)
         .limit(limit)
         .all(db)
         .await
@@ -25,6 +28,7 @@ pub async fn list_courses(
     tenant_id: Uuid,
     active_only: bool,
     limit: u64,
+    offset: u64,
 ) -> KabiPayResult<Vec<course::Model>> {
     let limit = limit.clamp(1, 200);
     let mut q = course::Entity::find().filter(course::Column::TenantId.eq(tenant_id));
@@ -32,6 +36,8 @@ pub async fn list_courses(
         q = q.filter(course::Column::IsActive.eq(true));
     }
     q.order_by_asc(course::Column::Title)
+        .order_by_asc(course::Column::Id)
+        .offset(offset)
         .limit(limit)
         .all(db)
         .await

@@ -382,6 +382,11 @@ impl ClientClaims {
             .any(|p| self.permissions.iter().any(|owned| owned == p))
     }
 
+    fn has_permission_with_scope(&self, permission: &str, scope: ScopeType) -> bool {
+        self.has_any_permission(&[permission])
+            && self.scope_for_permission(permission) == Some(scope)
+    }
+
     /// Create/update other users' **employee** rows (not self-service profile edits).
     pub fn can_manage_employee_directory(&self) -> bool {
         self.has_any_permission(&[PERM_EMPLOYEE_WRITE, PERM_EMPLOYEE_MANAGE])
@@ -438,24 +443,30 @@ impl ClientClaims {
     }
 
     pub fn can_manage_benefits_catalog(&self) -> bool {
-        self.has_any_permission(&[PERM_BENEFITS_MANAGE])
+        self.has_permission_with_scope(PERM_BENEFITS_MANAGE, ScopeType::All)
     }
 
     /// Benefit types/plans list queries for the workplace Benefits UI (HR + enrollment pickers).
     pub fn can_read_benefit_catalog_queries(&self) -> bool {
-        self.has_any_permission(&[PERM_BENEFITS_MANAGE, PERM_BENEFITS_SELF])
+        self.can_manage_benefits_catalog()
+            || self.has_permission_with_scope(PERM_BENEFITS_SELF, ScopeType::Self_)
+    }
+
+    /// Read or change only the signed-in employee's own benefit enrollments.
+    pub fn can_use_benefits_self_service(&self) -> bool {
+        self.can_read_benefit_catalog_queries()
     }
 
     pub fn can_manage_recruitment(&self) -> bool {
-        self.has_any_permission(&[PERM_RECRUITMENT_MANAGE])
+        self.has_permission_with_scope(PERM_RECRUITMENT_MANAGE, ScopeType::All)
     }
 
     pub fn can_manage_performance_programs(&self) -> bool {
-        self.has_any_permission(&[PERM_PERFORMANCE_MANAGE])
+        self.has_permission_with_scope(PERM_PERFORMANCE_MANAGE, ScopeType::All)
     }
 
     pub fn can_manage_learning_catalog(&self) -> bool {
-        self.has_any_permission(&[PERM_LEARNING_MANAGE])
+        self.has_permission_with_scope(PERM_LEARNING_MANAGE, ScopeType::All)
     }
 
     pub fn can_manage_assets_registry(&self) -> bool {
@@ -471,11 +482,11 @@ impl ClientClaims {
     }
 
     pub fn can_manage_succession_planning(&self) -> bool {
-        self.has_any_permission(&[PERM_SUCCESSION_MANAGE])
+        self.has_permission_with_scope(PERM_SUCCESSION_MANAGE, ScopeType::All)
     }
 
     pub fn can_manage_compensation_admin(&self) -> bool {
-        self.has_any_permission(&[PERM_COMPENSATION_MANAGE])
+        self.has_permission_with_scope(PERM_COMPENSATION_MANAGE, ScopeType::All)
     }
 
     pub fn can_manage_grievance_tenant_cases(&self) -> bool {
@@ -729,6 +740,71 @@ mod tests {
         let claims = client_claims(&[], &[PERM_ATTENDANCE_PUNCH_SELF]);
 
         assert!(claims.can_record_own_attendance_punches());
+    }
+
+    #[test]
+    fn workplace_configuration_capabilities_require_the_exact_all_scoped_permission() {
+        let capabilities: [(&str, fn(&ClientClaims) -> bool); 6] = [
+            (PERM_BENEFITS_MANAGE, ClientClaims::can_manage_benefits_catalog),
+            (PERM_RECRUITMENT_MANAGE, ClientClaims::can_manage_recruitment),
+            (
+                PERM_PERFORMANCE_MANAGE,
+                ClientClaims::can_manage_performance_programs,
+            ),
+            (PERM_LEARNING_MANAGE, ClientClaims::can_manage_learning_catalog),
+            (
+                PERM_SUCCESSION_MANAGE,
+                ClientClaims::can_manage_succession_planning,
+            ),
+            (
+                PERM_COMPENSATION_MANAGE,
+                ClientClaims::can_manage_compensation_admin,
+            ),
+        ];
+
+        for (permission, capability) in capabilities {
+            assert!(!capability(&client_claims(&[], &[])), "{permission}");
+
+            let mut missing_scope = client_claims(&[], &[permission]);
+            assert!(!capability(&missing_scope), "{permission} without scope");
+
+            for scope in ["SELF", "TEAM", "DEPARTMENT", "invalid"] {
+                missing_scope
+                    .permission_scopes
+                    .insert(permission.into(), scope.into());
+                assert!(!capability(&missing_scope), "{permission} with {scope}");
+            }
+
+            missing_scope
+                .permission_scopes
+                .insert(permission.into(), "ALL".into());
+            assert!(capability(&missing_scope), "{permission} with ALL");
+        }
+    }
+
+    #[test]
+    fn benefits_self_service_accepts_only_self_scope_or_all_scoped_management() {
+        let mut self_service = client_claims(&[], &[PERM_BENEFITS_SELF]);
+        self_service
+            .permission_scopes
+            .insert(PERM_BENEFITS_SELF.into(), "SELF".into());
+        assert!(self_service.can_read_benefit_catalog_queries());
+        assert!(self_service.can_use_benefits_self_service());
+
+        for scope in ["TEAM", "DEPARTMENT", "ALL", "invalid"] {
+            self_service
+                .permission_scopes
+                .insert(PERM_BENEFITS_SELF.into(), scope.into());
+            assert!(!self_service.can_read_benefit_catalog_queries(), "{scope}");
+            assert!(!self_service.can_use_benefits_self_service(), "{scope}");
+        }
+
+        let mut manager = client_claims(&[], &[PERM_BENEFITS_MANAGE]);
+        manager
+            .permission_scopes
+            .insert(PERM_BENEFITS_MANAGE.into(), "ALL".into());
+        assert!(manager.can_read_benefit_catalog_queries());
+        assert!(manager.can_use_benefits_self_service());
     }
 
     #[test]

@@ -963,11 +963,12 @@ impl QueryRoot {
         &self,
         ctx: &Context<'_>,
         #[graphql(default = 100)] limit: u64,
+        #[graphql(default = 0)] offset: u64,
     ) -> Result<Vec<DesignationDto>> {
         require_employee_reference_access(ctx)?;
         let tenant_id = require_tenant_id(ctx)?;
         let db = tenant_db(ctx, tenant_id).await?;
-        let rows = org_service::list_designations(&db, tenant_id, limit)
+        let rows = org_service::list_designations(&db, tenant_id, limit, offset)
             .await
             .map_err(KabiPayError::into_graphql)?;
         Ok(rows.into_iter().map(DesignationDto::from).collect())
