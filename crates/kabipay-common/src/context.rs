@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use uuid::Uuid;
 
-/// Canonical employee status that permits login and active employment workflows.
+/// Canonical employee status used for ordinary active-employment workflows.
 pub const EMPLOYMENT_STATUS_ACTIVE: &str = "ACTIVE";
 /// Canonical probation status; probationary employees remain actively employed.
 pub const EMPLOYMENT_STATUS_PROBATION: &str = "PROBATION";
@@ -53,6 +53,13 @@ pub fn canonical_employment_status(status: &str) -> KabiPayResult<&'static str> 
 pub fn is_active_employment_status(status: &str) -> bool {
     canonical_employment_status(status)
         .is_ok_and(|status| ACTIVE_EMPLOYMENT_STATUSES.contains(&status))
+}
+
+/// Login access follows employee termination only. Other employment statuses can still be used
+/// by domain workflows to decide whether an employee may perform operational actions.
+pub fn employee_status_allows_login(status: &str) -> bool {
+    canonical_employment_status(status)
+        .is_ok_and(|status| status != EMPLOYMENT_STATUS_TERMINATED)
 }
 
 #[cfg(test)]
@@ -116,6 +123,21 @@ mod active_employment_tests {
             ACTIVE_EMPLOYMENT_STATUSES,
             ["ACTIVE", "PROBATION", "ON_LEAVE"]
         );
+    }
+
+    #[test]
+    fn login_access_is_disabled_only_for_terminated_employment() {
+        for status in [
+            "ACTIVE",
+            "PROBATION",
+            "INACTIVE",
+            "ON_LEAVE",
+            "SUSPENDED",
+        ] {
+            assert!(employee_status_allows_login(status), "status={status}");
+        }
+        assert!(!employee_status_allows_login("TERMINATED"));
+        assert!(!employee_status_allows_login("NOTICE"));
     }
 }
 

@@ -8,7 +8,8 @@ use kabipay_common::client_data_scope::{
     resolve_employee_scope_filter, EmployeeScopeFilter,
 };
 use kabipay_common::context::{
-    canonical_employment_status, is_active_employment_status, ClientViewerEmployee, ScopeType,
+    canonical_employment_status, employee_status_allows_login, ClientViewerEmployee, ScopeType,
+    EMPLOYMENT_STATUS_TERMINATED,
 };
 use kabipay_common::db_constraint::constraint_name;
 use kabipay_common::{KabiPayError, KabiPayResult};
@@ -426,7 +427,13 @@ mod login_role_integrity_tests {
             scripted_connection(vec![Ok(vec![user_row(user_id, tenant_id, true)]), Ok(vec![])])
                 .await;
 
-        let error = sync_linked_user_status(&db, tenant_id, Some(user_id), "ACTIVE")
+        let error = sync_linked_user_status(
+            &db,
+            tenant_id,
+            Some(user_id),
+            Some("ACTIVE"),
+            "ACTIVE",
+        )
             .await
             .expect_err("an active employee-linked login must retain an active role");
 
@@ -434,7 +441,7 @@ mod login_role_integrity_tests {
     }
 
     #[tokio::test]
-    async fn deactivation_without_roles_is_allowed_and_revokes_sessions() {
+    async fn termination_without_roles_is_allowed_and_revokes_sessions() {
         let tenant_id = Uuid::new_v4();
         let user_id = Uuid::new_v4();
         let (db, events) = scripted_connection(vec![
@@ -443,9 +450,15 @@ mod login_role_integrity_tests {
         ])
         .await;
 
-        sync_linked_user_status(&db, tenant_id, Some(user_id), "INACTIVE")
+        sync_linked_user_status(
+            &db,
+            tenant_id,
+            Some(user_id),
+            Some("ACTIVE"),
+            "TERMINATED",
+        )
             .await
-            .expect("canonical deactivation must not require a role assignment");
+            .expect("termination must not require a role assignment");
 
         let events = events.lock().expect("event recorder");
         assert!(
@@ -466,24 +479,101 @@ mod login_role_integrity_tests {
         let user_id = Uuid::new_v4();
         let (db, _events) = scripted_connection(vec![Ok(Vec::new())]).await;
 
-        let error = sync_linked_user_status(&db, tenant_id, Some(user_id), "ACTIVE")
+        let error = sync_linked_user_status(
+            &db,
+            tenant_id,
+            Some(user_id),
+            Some("ACTIVE"),
+            "ACTIVE",
+        )
             .await
             .expect_err("an employee cannot link a user outside the tenant");
 
         assert_eq!(error.code(), "NOT_FOUND");
     }
+
+    #[test]
+    fn linked_login_activity_changes_only_at_the_termination_boundary() {
+        for status in ["ACTIVE", "PROBATION", "INACTIVE", "ON_LEAVE", "SUSPENDED"] {
+            assert_eq!(
+                linked_user_activity_change(Some("ACTIVE"), status).unwrap(),
+                LinkedUserActivityChange::Preserve,
+                "status={status}"
+            );
+        }
+        assert_eq!(
+            linked_user_activity_change(Some("ON_LEAVE"), "TERMINATED").unwrap(),
+            LinkedUserActivityChange::Deactivate
+        );
+        assert_eq!(
+            linked_user_activity_change(Some("TERMINATED"), "ON_LEAVE").unwrap(),
+            LinkedUserActivityChange::Activate
+        );
+    }
+
+    #[tokio::test]
+    async fn ordinary_status_change_preserves_an_explicitly_disabled_login() {
+        let tenant_id = Uuid::new_v4();
+        let user_id = Uuid::new_v4();
+        let (db, events) =
+            scripted_connection(vec![Ok(vec![user_row(user_id, tenant_id, false)])]).await;
+
+        sync_linked_user_status(
+            &db,
+            tenant_id,
+            Some(user_id),
+            Some("ACTIVE"),
+            "ON_LEAVE",
+        )
+        .await
+        .expect("ordinary status changes must preserve explicit account activity");
+
+        let events = events.lock().expect("event recorder");
+        assert!(!events.iter().any(|event| event.contains("UPDATE \"user\"")));
+        assert!(!events
+            .iter()
+            .any(|event| event.contains("DELETE FROM \"user_session\"")));
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LinkedUserActivityChange {
+    Preserve,
+    Activate,
+    Deactivate,
+}
+
+fn linked_user_activity_change(
+    previous_employee_status: Option<&str>,
+    employee_status: &str,
+) -> KabiPayResult<LinkedUserActivityChange> {
+    let employee_status = canonical_employment_status(employee_status)?;
+    if employee_status == EMPLOYMENT_STATUS_TERMINATED {
+        return Ok(LinkedUserActivityChange::Deactivate);
+    }
+    let was_terminated = previous_employee_status
+        .map(canonical_employment_status)
+        .transpose()?
+        .is_some_and(|status| status == EMPLOYMENT_STATUS_TERMINATED);
+    Ok(if was_terminated {
+        LinkedUserActivityChange::Activate
+    } else {
+        LinkedUserActivityChange::Preserve
+    })
 }
 
 async fn sync_linked_user_status<C: ConnectionTrait>(
     db: &C,
     tenant_id: Uuid,
     user_id: Option<Uuid>,
+    previous_employee_status: Option<&str>,
     employee_status: &str,
 ) -> KabiPayResult<()> {
     let Some(user_id) = user_id else {
         return Ok(());
     };
-    let should_be_active = is_active_employment_status(employee_status);
+    let activity_change =
+        linked_user_activity_change(previous_employee_status, employee_status)?;
     let found = user::Entity::find_by_id(user_id)
         .filter(user::Column::TenantId.eq(tenant_id))
         .filter(user::Column::IsDeleted.eq(false))
@@ -494,16 +584,23 @@ async fn sync_linked_user_status<C: ConnectionTrait>(
             entity: "user",
             id: user_id.to_string(),
         })?;
-    if should_be_active {
+    if activity_change == LinkedUserActivityChange::Activate
+        || (activity_change == LinkedUserActivityChange::Preserve && found.is_active)
+    {
         rbac_admin_service::require_user_active_tenant_role(db, tenant_id, user_id).await?;
     }
-    if found.is_active != should_be_active {
+    let next_is_active = match activity_change {
+        LinkedUserActivityChange::Preserve => found.is_active,
+        LinkedUserActivityChange::Activate => true,
+        LinkedUserActivityChange::Deactivate => false,
+    };
+    if found.is_active != next_is_active {
         let mut am: user::ActiveModel = found.into();
-        am.is_active = Set(should_be_active);
+        am.is_active = Set(next_is_active);
         am.updated_at = Set(Utc::now());
         am.update(db).await?;
     }
-    if !should_be_active {
+    if activity_change == LinkedUserActivityChange::Deactivate {
         user_session::Entity::delete_many()
             .filter(user_session::Column::UserId.eq(user_id))
             .exec(db)
@@ -521,7 +618,7 @@ async fn ensure_linked_user_role_integrity<C: ConnectionTrait>(
     let Some(user_id) = user_id else {
         return Ok(());
     };
-    user::Entity::find_by_id(user_id)
+    let found = user::Entity::find_by_id(user_id)
         .filter(user::Column::TenantId.eq(tenant_id))
         .filter(user::Column::IsDeleted.eq(false))
         .one(db)
@@ -531,7 +628,7 @@ async fn ensure_linked_user_role_integrity<C: ConnectionTrait>(
             entity: "user",
             id: user_id.to_string(),
         })?;
-    if is_active_employment_status(employee_status) {
+    if employee_status_allows_login(employee_status) && found.is_active {
         rbac_admin_service::require_user_active_tenant_role(db, tenant_id, user_id).await?;
     }
     Ok(())
@@ -861,7 +958,7 @@ async fn insert_login_user<C: ConnectionTrait>(
         email: Set(email),
         password_hash: Set(password_hash),
         must_change_password: Set(true),
-        is_active: Set(is_active_employment_status(employee_status)),
+        is_active: Set(employee_status_allows_login(employee_status)),
         mfa_enabled: Set(false),
         mfa_secret: Set(None),
         last_login_at: Set(None),
@@ -902,6 +999,8 @@ pub async fn create<C: ConnectionTrait>(
     if let Some(mgr) = data.reporting_manager_id {
         assert_valid_reporting_manager(db, tenant_id, id, mgr).await?;
     }
+    let linked_user_id = data.user_id;
+    let employee_status = data.status.clone();
     let now = Utc::now();
     let am = employee::ActiveModel {
         id: Set(id),
@@ -939,6 +1038,9 @@ pub async fn create<C: ConnectionTrait>(
         updated_at: Set(now),
     };
     am.insert(db).await.map_err(map_employee_db_error)?;
+    if !employee_status_allows_login(&employee_status) {
+        sync_linked_user_status(db, tenant_id, linked_user_id, None, &employee_status).await?;
+    }
     employee::Entity::find_by_id(id)
         .one(db)
         .await?
@@ -1084,6 +1186,7 @@ pub async fn update(
             entity: "employee",
             id: employee_id.to_string(),
         })?;
+    let previous_status = existing.status.clone();
     let mut final_user_id = existing.user_id;
     if let Some(v) = patch.user_id {
         final_user_id = Some(v);
@@ -1128,7 +1231,14 @@ pub async fn update(
     if let Some(email) = linked_user_email {
         update_linked_user_email(&txn, tenant_id, final_user_id, Some(email)).await?;
     }
-    sync_linked_user_status(&txn, tenant_id, final_user_id, &final_status).await?;
+    sync_linked_user_status(
+        &txn,
+        tenant_id,
+        final_user_id,
+        Some(&previous_status),
+        &final_status,
+    )
+    .await?;
     let updated = find_by_id(&txn, tenant_id, employee_id)
         .await?
         .ok_or_else(|| KabiPayError::Internal("updated employee not found".into()))?;
