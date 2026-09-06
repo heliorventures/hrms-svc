@@ -25,10 +25,12 @@ pub const EMPLOYMENT_STATUSES: [&str; 6] = [
     EMPLOYMENT_STATUS_SUSPENDED,
     EMPLOYMENT_STATUS_TERMINATED,
 ];
-/// Canonical statuses treated as active employment across authentication and HRMS domains.
-pub const ACTIVE_EMPLOYMENT_STATUSES: [&str; 2] = [
+/// Canonical statuses treated as current employment across authentication and HRMS domains.
+/// Temporary leave must not disable the employee's linked login user.
+pub const ACTIVE_EMPLOYMENT_STATUSES: [&str; 3] = [
     EMPLOYMENT_STATUS_ACTIVE,
     EMPLOYMENT_STATUS_PROBATION,
+    EMPLOYMENT_STATUS_ON_LEAVE,
 ];
 
 /// Normalize a supported employment status to its canonical persisted representation.
@@ -96,14 +98,24 @@ mod active_employment_tests {
     }
 
     #[test]
-    fn canonical_active_employment_accepts_only_active_and_probation() {
-        for status in ["ACTIVE", "active", " PROBATION ", "probation"] {
+    fn current_employment_includes_temporary_leave() {
+        for status in [
+            "ACTIVE",
+            "active",
+            " PROBATION ",
+            "probation",
+            "ON_LEAVE",
+            " on_leave ",
+        ] {
             assert!(is_active_employment_status(status), "status={status}");
         }
         for status in ["INACTIVE", "TERMINATED", "NOTICE", "", "ACTIVE_EMPLOYEE"] {
             assert!(!is_active_employment_status(status), "status={status}");
         }
-        assert_eq!(ACTIVE_EMPLOYMENT_STATUSES, ["ACTIVE", "PROBATION"]);
+        assert_eq!(
+            ACTIVE_EMPLOYMENT_STATUSES,
+            ["ACTIVE", "PROBATION", "ON_LEAVE"]
+        );
     }
 }
 

@@ -13,7 +13,8 @@ use kabipay_common::{
 };
 use kabipay_db_entities::tenant::d0007_employee_core::employee;
 use kabipay_db_entities::tenant::d0011_leave::leave_request;
-use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect};
+use kabipay_db_entities::tenant::d0029_file_storage::file_storage;
+use sea_orm::{ColumnTrait, EntityTrait, PaginatorTrait, QueryFilter, QueryOrder, QuerySelect};
 use std::collections::HashMap;
 use uuid::Uuid;
 
@@ -75,6 +76,7 @@ impl QueryRoot {
         &self,
         ctx: &Context<'_>,
         #[graphql(default = 50)] limit: u64,
+        #[graphql(default = 0)] offset: u64,
         from_date: Option<NaiveDate>,
         to_date: Option<NaiveDate>,
     ) -> Result<Vec<LeaveRequestDto>> {
@@ -112,10 +114,29 @@ impl QueryRoot {
         }
         let rows = query
             .order_by_desc(leave_request::Column::AppliedAt)
+            .order_by_desc(leave_request::Column::Id)
+            .offset(offset)
             .limit(limit.clamp(1, 200))
             .all(&db)
             .await
             .map_err(|error| KabiPayError::from(error).into_graphql())?;
+        let file_ids: Vec<Uuid> = rows
+            .iter()
+            .filter_map(|row| row.supporting_document_file_storage_id)
+            .collect();
+        let supporting_files: HashMap<Uuid, file_storage::Model> = if file_ids.is_empty() {
+            HashMap::new()
+        } else {
+            file_storage::Entity::find()
+                .filter(file_storage::Column::TenantId.eq(tenant_id))
+                .filter(file_storage::Column::Id.is_in(file_ids))
+                .all(&db)
+                .await
+                .map_err(|error| KabiPayError::from(error).into_graphql())?
+                .into_iter()
+                .map(|file| (file.id, file))
+                .collect()
+        };
         let mut employee_ids: Vec<Uuid> = rows.iter().map(|row| row.employee_id).collect();
         employee_ids.sort_unstable();
         employee_ids.dedup();
@@ -143,13 +164,77 @@ impl QueryRoot {
             .into_iter()
             .map(|row| {
                 let label = employee_labels.get(&row.employee_id).cloned();
-                let dto = LeaveRequestDto::from(row);
+                let supporting_file = row
+                    .supporting_document_file_storage_id
+                    .and_then(|file_id| supporting_files.get(&file_id));
+                let dto = LeaveRequestDto::from(row).with_supporting_document_file(supporting_file);
                 match label {
                     Some((name, code)) => dto.with_employee_label(name, code),
                     None => dto,
                 }
             })
             .collect())
+    }
+
+    /// Total leave requests visible to the caller for the selected date range.
+    /// This uses the same tenant, deletion, date, and employee-scope filters as `leave_requests`.
+    async fn leave_request_count(
+        &self,
+        ctx: &Context<'_>,
+        from_date: Option<NaiveDate>,
+        to_date: Option<NaiveDate>,
+    ) -> Result<i32> {
+        let tenant_id = require_tenant_id(ctx)?;
+        let scope = leave_read_scope(ctx)?;
+        let db = tenant_db(ctx, tenant_id).await?;
+        let viewer = resolve_viewer_employee(ctx, &db, tenant_id).await?;
+        let filter = resolve_employee_scope_filter(&db, tenant_id, scope, viewer)
+            .await
+            .map_err(KabiPayError::into_graphql)?;
+        if let (Some(from), Some(to)) = (from_date, to_date) {
+            if from > to {
+                return Err(KabiPayError::Validation(
+                    "fromDate must be on or before toDate".into(),
+                )
+                .into_graphql());
+            }
+        }
+        let mut query = leave_request::Entity::find()
+            .filter(leave_request::Column::TenantId.eq(tenant_id))
+            .filter(leave_request::Column::IsDeleted.eq(false));
+        if let Some(from) = from_date {
+            query = query.filter(leave_request::Column::ToDate.gte(from));
+        }
+        if let Some(to) = to_date {
+            query = query.filter(leave_request::Column::FromDate.lte(to));
+        }
+        match filter {
+            EmployeeScopeFilter::Unrestricted => {}
+            EmployeeScopeFilter::Empty => return Ok(0),
+            EmployeeScopeFilter::EmployeeIds(ids) if ids.is_empty() => return Ok(0),
+            EmployeeScopeFilter::EmployeeIds(ids) => {
+                query = query.filter(leave_request::Column::EmployeeId.is_in(ids));
+            }
+        }
+        let count = query
+            .count(&db)
+            .await
+            .map_err(|error| KabiPayError::from(error).into_graphql())?;
+        Ok(i32::try_from(count).unwrap_or(i32::MAX))
+    }
+
+    /// Paginated leave requests. Kept separate from the original list field so deployed
+    /// gateways can adopt pagination without breaking existing clients.
+    async fn paged_leave_requests(
+        &self,
+        ctx: &Context<'_>,
+        #[graphql(default = 50)] limit: u64,
+        #[graphql(default = 0)] offset: u64,
+        from_date: Option<NaiveDate>,
+        to_date: Option<NaiveDate>,
+    ) -> Result<Vec<LeaveRequestDto>> {
+        self.leave_requests(ctx, limit, offset, from_date, to_date)
+            .await
     }
 
     /// Leave-balance rows for an employee. Pass `employeeId` to target a

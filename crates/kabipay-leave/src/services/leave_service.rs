@@ -22,6 +22,7 @@ use kabipay_db_entities::tenant::d0025_workflow::{
     workflow, workflow_action, workflow_instance, workflow_step,
 };
 use kabipay_db_entities::tenant::d0027_communication_audit::notification;
+use kabipay_db_entities::tenant::d0029_file_storage::file_storage;
 use kabipay_db_entities::tenant::d0030_outbox_events::outbox_event;
 use rust_decimal::Decimal;
 use sea_orm::{
@@ -335,6 +336,7 @@ pub async fn submit_leave_request(
     half_day_session: Option<String>,
     reason: Option<String>,
     supporting_document_reference: Option<String>,
+    supporting_document_file_storage_id: Option<Uuid>,
 ) -> KabiPayResult<leave_request::Model> {
     if from_date > to_date {
         return Err(KabiPayError::Validation(
@@ -437,10 +439,20 @@ pub async fn submit_leave_request(
     let doc_ref = supporting_document_reference
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
-    if lt.requires_document && doc_ref.is_none() {
+    let supporting_document_file = match supporting_document_file_storage_id {
+        Some(file_id) => Some(
+            supporting_document_file_query(tenant_id, actor_user_id, file_id)
+                .one(&txn)
+                .await?
+                .ok_or_else(|| KabiPayError::Validation(
+                    "supporting document is unavailable; choose the file again".into(),
+                ))?,
+        ),
+        None => None,
+    };
+    if lt.requires_document && supporting_document_file.is_none() {
         return Err(KabiPayError::Validation(
-            "this leave type requires a supporting document reference (link or reference ID)"
-                .into(),
+            "this leave type requires a supporting document upload".into(),
         ));
     }
 
@@ -462,6 +474,7 @@ pub async fn submit_leave_request(
         reason: Set(reason),
         rejection_reason: Set(None),
         supporting_document_reference: Set(doc_ref),
+        supporting_document_file_storage_id: Set(supporting_document_file.map(|file| file.id)),
         approved_by: Set(None),
         workflow_instance_id: Set(None),
         applied_at: Set(now),
@@ -527,6 +540,17 @@ fn pending_request_for_decision_query(
         query = query.filter(leave_request::Column::EmployeeId.is_in(employee_ids));
     }
     query.lock_exclusive()
+}
+
+fn supporting_document_file_query(
+    tenant_id: Uuid,
+    uploader_user_id: Uuid,
+    file_id: Uuid,
+) -> sea_orm::Select<file_storage::Entity> {
+    file_storage::Entity::find_by_id(file_id)
+        .filter(file_storage::Column::TenantId.eq(tenant_id))
+        .filter(file_storage::Column::UploadedBy.eq(uploader_user_id))
+        .lock_exclusive()
 }
 
 fn pending_request_for_decision_candidate_query(
@@ -822,6 +846,28 @@ mod overlap_tests {
             false,
             None,
         ));
+    }
+}
+
+#[cfg(test)]
+mod supporting_document_tests {
+    use super::*;
+    use sea_orm::{DbBackend, QueryTrait};
+
+    #[test]
+    fn supporting_document_lookup_is_bound_to_file_tenant_and_uploader() {
+        let tenant_id = Uuid::parse_str("e6d4fc13-feb8-52a0-93bd-f66c795969b1").unwrap();
+        let user_id = Uuid::parse_str("11111111-1111-4111-8111-111111111111").unwrap();
+        let file_id = Uuid::parse_str("22222222-2222-4222-8222-222222222222").unwrap();
+
+        let sql = supporting_document_file_query(tenant_id, user_id, file_id)
+            .build(DbBackend::Postgres)
+            .to_string();
+
+        assert!(sql.contains("\"id\" = '22222222-2222-4222-8222-222222222222'"));
+        assert!(sql.contains("\"tenant_id\" = 'e6d4fc13-feb8-52a0-93bd-f66c795969b1'"));
+        assert!(sql.contains("\"uploaded_by\" = '11111111-1111-4111-8111-111111111111'"));
+        assert!(sql.ends_with("FOR UPDATE"));
     }
 }
 

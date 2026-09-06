@@ -9,6 +9,7 @@ use kabipay_common::workflow_approval::WorkflowApprovalAuthority;
 use kabipay_common::KabiPayError;
 use kabipay_db_entities::tenant::d0011_leave::{leave_balance, leave_policy, leave_request, leave_type};
 use kabipay_db_entities::tenant::d0025_workflow::workflow_action;
+use kabipay_db_entities::tenant::d0029_file_storage::file_storage;
 
 use crate::resolvers::query::parse_uuid;
 use crate::services::leave_service;
@@ -153,6 +154,8 @@ pub struct LeaveRequestDto {
     pub rejection_reason: Option<String>,
     /// Link or reference ID when the leave type requires documentation.
     pub supporting_document_reference: Option<String>,
+    pub supporting_document_file_storage_id: Option<ID>,
+    pub supporting_document_file_name: Option<String>,
     pub applied_at: DateTime<Utc>,
     /// Set when tenant has an active **LEAVE_REQUEST** workflow with at least one step (M8).
     pub workflow_instance_id: Option<ID>,
@@ -281,6 +284,7 @@ pub struct SubmitLeaveRequestInput {
     pub half_day_session: Option<String>,
     pub reason: Option<String>,
     pub supporting_document_reference: Option<String>,
+    pub supporting_document_file_storage_id: Option<ID>,
 }
 
 #[derive(InputObject, Clone, Debug)]
@@ -345,10 +349,21 @@ impl From<leave_request::Model> for LeaveRequestDto {
             reason: m.reason,
             rejection_reason: m.rejection_reason,
             supporting_document_reference: m.supporting_document_reference,
+            supporting_document_file_storage_id: m
+                .supporting_document_file_storage_id
+                .map(|id| ID(id.to_string())),
+            supporting_document_file_name: None,
             applied_at: m.applied_at,
             workflow_instance_id: m.workflow_instance_id.map(|u| ID(u.to_string())),
             approval_snapshot_cache: LeaveApprovalSnapshotCache::default(),
         }
+    }
+}
+
+impl LeaveRequestDto {
+    pub fn with_supporting_document_file(mut self, file: Option<&file_storage::Model>) -> Self {
+        self.supporting_document_file_name = file.and_then(|row| row.original_filename.clone());
+        self
     }
 }
 
@@ -457,6 +472,8 @@ mod tests {
                 reason: None,
                 rejection_reason: None,
                 supporting_document_reference: None,
+                supporting_document_file_storage_id: None,
+                supporting_document_file_name: None,
                 applied_at: Utc::now(),
                 workflow_instance_id: Some(ID(Uuid::new_v4().to_string())),
                 approval_snapshot_cache: LeaveApprovalSnapshotCache::default(),

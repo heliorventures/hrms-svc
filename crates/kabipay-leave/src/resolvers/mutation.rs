@@ -71,6 +71,11 @@ impl MutationRoot {
         let tenant_id = require_tenant_id(ctx)?;
         let db = tenant_db(ctx, tenant_id).await?;
         let leave_type_id = parse_uuid(&input.leave_type_id, "leaveTypeId")?;
+        let supporting_document_file_storage_id = input
+            .supporting_document_file_storage_id
+            .as_ref()
+            .map(|id| parse_uuid(id, "supportingDocumentFileStorageId"))
+            .transpose()?;
         let m = leave_service::submit_leave_request(
             &db,
             tenant_id,
@@ -83,6 +88,7 @@ impl MutationRoot {
             input.half_day_session,
             input.reason,
             input.supporting_document_reference,
+            supporting_document_file_storage_id,
         )
         .await
         .map_err(KabiPayError::into_graphql)?;

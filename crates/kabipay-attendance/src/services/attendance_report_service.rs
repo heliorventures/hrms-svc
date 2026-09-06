@@ -487,6 +487,69 @@ pub async fn attendance_report(
 mod tests {
     use super::*;
 
+    fn segment(
+        id: u128,
+        source: &str,
+        check_in_at: &str,
+        check_out_at: &str,
+    ) -> attendance::Model {
+        let check_in_at = check_in_at.parse().expect("valid check-in timestamp");
+        let check_out_at = check_out_at.parse().expect("valid check-out timestamp");
+        attendance::Model {
+            id: Uuid::from_u128(id),
+            tenant_id: Uuid::nil(),
+            employee_id: Uuid::from_u128(42),
+            shift_id: None,
+            work_date: "2026-09-04".parse().unwrap(),
+            check_in_time: None,
+            check_out_time: None,
+            check_in_at: Some(check_in_at),
+            check_out_at: Some(check_out_at),
+            check_in_lat: None,
+            check_in_lng: None,
+            check_out_lat: None,
+            check_out_lng: None,
+            source: Some(source.into()),
+            status: Some("COMPLETE".into()),
+            regularization_status: None,
+            biometric_ref: None,
+            overtime_hours: None,
+            late_minutes: None,
+            early_exit_minutes: None,
+            created_at: check_in_at,
+            updated_at: check_out_at,
+        }
+    }
+
+    #[test]
+    fn daily_report_consolidates_live_and_manually_added_segments() {
+        let rows = vec![
+            segment(
+                1,
+                "SELF_SERVICE",
+                "2026-09-04T03:30:00Z",
+                "2026-09-04T07:30:00Z",
+            ),
+            segment(
+                2,
+                "HR_ADJUSTMENT",
+                "2026-09-04T08:30:00Z",
+                "2026-09-04T13:30:00Z",
+            ),
+        ];
+
+        let (minutes, count, has_open, first, last) = aggregate_segments(
+            &rows,
+            TenantBusinessClock::from_name("Asia/Kolkata").unwrap(),
+        );
+
+        assert_eq!(minutes, 9 * 60);
+        assert_eq!(count, 2);
+        assert!(!has_open);
+        assert_eq!(first, Some("2026-09-04T03:30:00Z".parse().unwrap()));
+        assert_eq!(last, Some("2026-09-04T13:30:00Z".parse().unwrap()));
+    }
+
     #[test]
     fn status_thresholds_are_derived_from_expected_minutes() {
         assert_eq!(classify_day(Some(480), 480, false, false, false, false), AttendanceDayStatus::Present);

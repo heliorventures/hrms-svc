@@ -308,8 +308,14 @@ async fn try_attach_expense_workflow(
 
 /// Parse a decimal from string (GraphQL) into `Decimal`.
 pub fn parse_amount(s: &str) -> KabiPayResult<Decimal> {
-    Decimal::from_str(s.trim())
-        .map_err(|_| KabiPayError::Validation("invalid amount; must be a decimal string".into()))
+    let amount = Decimal::from_str(s.trim())
+        .map_err(|_| KabiPayError::Validation("invalid amount; must be a decimal string".into()))?;
+    if amount.normalize().scale() > 2 {
+        return Err(KabiPayError::Validation(
+            "invalid amount; use at most 2 decimal places".into(),
+        ));
+    }
+    Ok(amount)
 }
 
 /// Normalize the ISO-style currency code accepted at the API boundary.
@@ -325,7 +331,7 @@ pub fn normalize_currency_code(raw: &str) -> KabiPayResult<String> {
 
 #[cfg(test)]
 mod currency_tests {
-    use super::normalize_currency_code;
+    use super::{normalize_currency_code, parse_amount};
 
     #[test]
     fn normalizes_lowercase_currency_codes() {
@@ -340,6 +346,19 @@ mod currency_tests {
         assert!(normalize_currency_code("").is_err());
         assert!(normalize_currency_code("IN").is_err());
         assert!(normalize_currency_code("IN1").is_err());
+    }
+
+    #[test]
+    fn monetary_input_accepts_only_insignificant_precision_beyond_two_decimals() {
+        assert_eq!(
+            parse_amount("751.0000").expect("padded database amount").to_string(),
+            "751.0000"
+        );
+        assert_eq!(
+            parse_amount("751.2300").expect("padded two-decimal amount").normalize().to_string(),
+            "751.23"
+        );
+        assert!(parse_amount("751.0010").is_err());
     }
 }
 
