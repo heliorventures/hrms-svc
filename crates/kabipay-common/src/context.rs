@@ -362,6 +362,16 @@ pub const PERM_ONBOARDING_MANAGE: &str = "onboarding:manage";
 pub const PERM_ONBOARDING_SELF: &str = "onboarding:self";
 /// Workplace: performance cycles and goals administration.
 pub const PERM_PERFORMANCE_MANAGE: &str = "performance:manage";
+/// Manager evaluation of direct-report performance records.
+pub const PERM_PERFORMANCE_EVALUATE: &str = "performance:evaluate";
+/// Employee access to their own goals, feedback, and self-appraisal.
+pub const PERM_PERFORMANCE_SELF: &str = "performance:self";
+/// Tenant-wide survey authoring and publication.
+pub const PERM_SURVEY_MANAGE: &str = "survey:manage";
+/// Employee submission of assigned surveys.
+pub const PERM_SURVEY_RESPOND: &str = "survey:respond";
+/// Privacy-protected survey reporting at an explicit organizational scope.
+pub const PERM_SURVEY_RESULTS: &str = "survey:results";
 /// Workplace: LMS skills and courses administration.
 pub const PERM_LEARNING_MANAGE: &str = "learning:manage";
 /// Workplace: asset categories and assignments registry.
@@ -497,6 +507,29 @@ impl ClientClaims {
 
     pub fn can_manage_performance_programs(&self) -> bool {
         self.has_permission_with_scope(PERM_PERFORMANCE_MANAGE, ScopeType::All)
+    }
+
+    pub fn can_evaluate_performance_team(&self) -> bool {
+        self.has_permission_with_scope(PERM_PERFORMANCE_EVALUATE, ScopeType::Team)
+    }
+
+    pub fn can_use_performance_self_service(&self) -> bool {
+        self.has_permission_with_scope(PERM_PERFORMANCE_SELF, ScopeType::Self_)
+    }
+
+    pub fn can_manage_surveys(&self) -> bool {
+        self.has_permission_with_scope(PERM_SURVEY_MANAGE, ScopeType::All)
+    }
+
+    pub fn can_respond_to_surveys(&self) -> bool {
+        self.has_permission_with_scope(PERM_SURVEY_RESPOND, ScopeType::Self_)
+    }
+
+    pub fn survey_results_scope(&self) -> Option<ScopeType> {
+        match self.scope_for_permission(PERM_SURVEY_RESULTS) {
+            Some(scope @ (ScopeType::Team | ScopeType::Department | ScopeType::All)) => Some(scope),
+            _ => None,
+        }
     }
 
     pub fn can_manage_learning_catalog(&self) -> bool {

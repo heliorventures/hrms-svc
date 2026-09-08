@@ -21,7 +21,7 @@ use kabipay_db_entities::tenant::d0011_leave::{
 use kabipay_db_entities::tenant::d0025_workflow::{
     workflow, workflow_action, workflow_instance, workflow_step,
 };
-use kabipay_db_entities::tenant::d0027_communication_audit::notification;
+use kabipay_db_entities::tenant::d0027_communication_audit::{audit_log, notification};
 use kabipay_db_entities::tenant::d0029_file_storage::file_storage;
 use kabipay_db_entities::tenant::d0030_outbox_events::outbox_event;
 use rust_decimal::Decimal;
@@ -327,6 +327,7 @@ async fn move_locked_leave_balance<C: ConnectionTrait + Sync>(
 pub async fn submit_leave_request(
     db: &DatabaseConnection,
     tenant_id: Uuid,
+    business_date: NaiveDate,
     actor_user_id: Uuid,
     claimed_employee_id: Option<Uuid>,
     leave_type_id: Uuid,
@@ -477,6 +478,7 @@ pub async fn submit_leave_request(
         supporting_document_file_storage_id: Set(supporting_document_file.map(|file| file.id)),
         approved_by: Set(None),
         workflow_instance_id: Set(None),
+        uses_comp_off: Set(false),
         applied_at: Set(now),
         is_deleted: Set(false),
         deleted_at: Set(None),
@@ -485,6 +487,15 @@ pub async fn submit_leave_request(
         updated_at: Set(now),
     };
     am_req.insert(&txn).await?;
+
+    let chargeable_dates = requested_date_units(from_date, to_date, is_half_day, lt.sandwich_rule, &holiday_dates)?;
+    let uses_comp_off = crate::services::comp_off::reserve_for_leave(
+        &txn, tenant_id, employee_id, req_id, leave_type_id, business_date, &chargeable_dates,
+    ).await?;
+    if uses_comp_off {
+        let mut request: leave_request::ActiveModel = leave_request::Entity::find_by_id(req_id).one(&txn).await?.ok_or_else(|| KabiPayError::Internal("inserted leave_request not found".into()))?.into();
+        request.uses_comp_off = Set(true); request.updated_at = Set(now); request.update(&txn).await?;
+    }
 
     attach_required_leave_workflow(
         &txn,
@@ -496,7 +507,7 @@ pub async fn submit_leave_request(
     )
     .await?;
 
-    if lt.is_paid {
+    if lt.is_paid && !uses_comp_off {
         move_locked_leave_balance(
             &txn,
             LeaveBalanceKey {
@@ -1119,6 +1130,7 @@ async fn finalize_leave_approval(
 pub async fn approve_leave_request(
     db: &DatabaseConnection,
     tenant_id: Uuid,
+    business_date: NaiveDate,
     request_id: Uuid,
     expected_workflow_step_id: Uuid,
     actor_user_id: Uuid,
@@ -1247,7 +1259,9 @@ pub async fn approve_leave_request(
     am_inst.updated_at = Set(now);
     am_inst.update(&txn).await?;
 
-    if request_uses_leave_balance(&txn, tenant_id, &model).await? {
+    if model.uses_comp_off {
+        crate::services::comp_off::finalize_leave_allocations(&txn, tenant_id, model.id, business_date, true).await?;
+    } else if request_uses_leave_balance(&txn, tenant_id, &model).await? {
         move_locked_leave_balance(
             &txn,
             LeaveBalanceKey {
@@ -1293,6 +1307,7 @@ pub async fn approve_leave_request(
 pub async fn reject_leave_request(
     db: &DatabaseConnection,
     tenant_id: Uuid,
+    business_date: NaiveDate,
     request_id: Uuid,
     expected_workflow_step_id: Uuid,
     actor_user_id: Uuid,
@@ -1397,7 +1412,9 @@ pub async fn reject_leave_request(
     active_instance.updated_at = Set(now);
     active_instance.update(&txn).await?;
 
-    if request_uses_leave_balance(&txn, tenant_id, &model).await? {
+    if model.uses_comp_off {
+        crate::services::comp_off::finalize_leave_allocations(&txn, tenant_id, model.id, business_date, false).await?;
+    } else if request_uses_leave_balance(&txn, tenant_id, &model).await? {
         move_locked_leave_balance(
             &txn,
             LeaveBalanceKey {
@@ -1437,6 +1454,7 @@ pub async fn reject_leave_request(
 pub async fn cancel_leave_request(
     db: &DatabaseConnection,
     tenant_id: Uuid,
+    business_date: NaiveDate,
     request_id: Uuid,
     actor_user_id: Uuid,
     claimed_actor_employee_id: Option<Uuid>,
@@ -1458,8 +1476,7 @@ pub async fn cancel_leave_request(
         claimed_actor_employee_id,
     )
     .await?;
-    let model = pending_request_for_employee_query(tenant_id, request_id, actor.employee_id)
-        .one(&txn)
+    let model = leave_request::Entity::find_by_id(request_id).filter(leave_request::Column::TenantId.eq(tenant_id)).filter(leave_request::Column::EmployeeId.eq(actor.employee_id)).filter(leave_request::Column::IsDeleted.eq(false)).filter(leave_request::Column::Status.eq(STATUS_PENDING)).lock_exclusive().one(&txn)
         .await?
         .ok_or_else(pending_leave_decision_unavailable)?;
     let now = Utc::now();
@@ -1480,7 +1497,9 @@ pub async fn cancel_leave_request(
     active_instance.updated_at = Set(now);
     active_instance.update(&txn).await?;
 
-    if request_uses_leave_balance(&txn, tenant_id, &model).await? {
+    if model.uses_comp_off {
+        crate::services::comp_off::finalize_leave_allocations(&txn, tenant_id, model.id, business_date, false).await?;
+    } else if request_uses_leave_balance(&txn, tenant_id, &model).await? {
         move_locked_leave_balance(
             &txn,
             LeaveBalanceKey {
@@ -1539,6 +1558,64 @@ async fn load_scoped_pending_request_in_txn<C: ConnectionTrait + Sync>(
         .one(txn)
         .await?
         .ok_or_else(pending_leave_decision_unavailable)
+}
+
+/// Cancel an approved future comp-off leave as an HR administrator.
+/// The employee row is the serialization lock shared with approval and ledger operations.
+pub async fn cancel_approved_comp_off_leave(
+    db: &DatabaseConnection,
+    tenant_id: Uuid,
+    business_date: NaiveDate,
+    request_id: Uuid,
+    actor_user_id: Uuid,
+) -> KabiPayResult<leave_request::Model> {
+    let candidate = leave_request::Entity::find_by_id(request_id)
+        .filter(leave_request::Column::TenantId.eq(tenant_id))
+        .filter(leave_request::Column::IsDeleted.eq(false))
+        .one(db).await?
+        .ok_or_else(|| KabiPayError::NotFound { entity: "leave_request", id: request_id.to_string() })?;
+    let txn = db.begin().await?;
+    employee::Entity::find_by_id(candidate.employee_id)
+        .filter(employee::Column::TenantId.eq(tenant_id))
+        .filter(employee::Column::IsDeleted.eq(false))
+        .lock_exclusive().one(&txn).await?
+        .ok_or_else(|| KabiPayError::NotFound { entity: "employee", id: candidate.employee_id.to_string() })?;
+    let model = leave_request::Entity::find_by_id(request_id)
+        .filter(leave_request::Column::TenantId.eq(tenant_id))
+        .filter(leave_request::Column::EmployeeId.eq(candidate.employee_id))
+        .filter(leave_request::Column::IsDeleted.eq(false))
+        .filter(leave_request::Column::Status.eq(STATUS_APPROVED))
+        .filter(leave_request::Column::UsesCompOff.eq(true))
+        .lock_exclusive().one(&txn).await?
+        .ok_or_else(|| KabiPayError::BusinessRule { code: "COMP_OFF_CANCEL_UNAVAILABLE", message: "Only approved comp-off leave can be cancelled by HR.".into() })?;
+    let policy = crate::services::comp_off::resolved_policy(&txn, tenant_id, model.employee_id).await?
+        .ok_or_else(|| KabiPayError::BusinessRule { code: "COMP_OFF_CANCEL_DISABLED", message: "Approved comp-off leave cancellation is not enabled.".into() })?;
+    if !crate::services::comp_off::approved_cancellation_allowed(policy.allow_approved_leave_cancellation, model.from_date, business_date) {
+        return Err(KabiPayError::BusinessRule { code: "COMP_OFF_CANCEL_DISABLED", message: "HR has not enabled cancellation of this approved future comp-off leave.".into() });
+    }
+    crate::services::comp_off::cancel_used_leave_allocations(&txn, tenant_id, model.id, business_date).await?;
+    let now = Utc::now();
+    let mut active: leave_request::ActiveModel = model.into();
+    active.status = Set(STATUS_CANCELLED.into());
+    active.approved_by = Set(None);
+    active.updated_at = Set(now);
+    let out = active.update(&txn).await?;
+    audit_log::ActiveModel {
+        id: Set(Uuid::new_v4()),
+        tenant_id: Set(tenant_id),
+        user_id: Set(Some(actor_user_id)),
+        entity_type: Set("LEAVE_REQUEST".into()),
+        entity_id: Set(Some(request_id)),
+        action: Set("CANCEL_APPROVED_COMP_OFF_LEAVE".into()),
+        before_state: Set(Some(serde_json::json!({"status": "APPROVED", "daysRequested": out.days_requested}))),
+        after_state: Set(Some(serde_json::json!({"status": "CANCELLED", "daysRequested": out.days_requested}))),
+        ip_address: Set(None),
+        user_agent: Set(None),
+        created_at: Set(now),
+    }.insert(&txn).await?;
+    txn.commit().await?;
+    leave_notify_employee(db, tenant_id, out.employee_id, "Approved comp-off leave cancelled", "HR cancelled your approved future comp-off leave.").await;
+    Ok(out)
 }
 
 async fn load_scoped_pending_request_candidate<C: ConnectionTrait + Sync>(
@@ -1968,6 +2045,13 @@ fn compute_requested_days(
     }
 
     Ok(Decimal::from(count))
+}
+
+fn requested_date_units(from_date: NaiveDate, to_date: NaiveDate, is_half_day: bool, sandwich_rule: bool, holidays: &HashSet<NaiveDate>) -> KabiPayResult<Vec<(NaiveDate, Decimal)>> {
+    if is_half_day { return Ok(vec![(from_date, Decimal::new(5, 1))]); }
+    let mut dates = Vec::new(); let mut current = from_date;
+    while current <= to_date { let weekday=current.weekday(); if sandwich_rule || (weekday != Weekday::Sat && weekday != Weekday::Sun && !holidays.contains(&current)) { dates.push((current,Decimal::ONE)); } current += Duration::days(1); }
+    if dates.is_empty() { return Err(KabiPayError::Validation("no chargeable working days in this date range".into())); } Ok(dates)
 }
 
 #[cfg(test)]

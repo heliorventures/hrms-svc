@@ -14,6 +14,7 @@ members = [
     "crates/kabipay-expense",
     "crates/kabipay-recruitment",
     "crates/kabipay-performance",
+    "crates/kabipay-survey",
     "crates/kabipay-lms",
     "crates/kabipay-succession",
     "crates/kabipay-compensation",

@@ -1,8 +1,10 @@
 //! GraphQL DTOs for kabipay-notification.
 
 use async_graphql::{InputObject, SimpleObject, ID};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveTime, Utc};
 use kabipay_db_entities::tenant::d0027_communication_audit::{announcement, notification};
+
+use crate::services::automation_settings::{AutomationSettings, CelebrationPreferences};
 
 #[derive(SimpleObject, Clone, Debug)]
 #[graphql(name = "AnnouncementAttachment")]
@@ -27,6 +29,8 @@ pub struct AnnouncementDto {
     pub post_source: String,
     pub has_image_attachment: bool,
     pub has_document_attachment: bool,
+    pub has_video_attachment: bool,
+    pub video_link: Option<String>,
     pub publish_at: Option<DateTime<Utc>>,
     pub expires_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
@@ -46,6 +50,8 @@ impl From<announcement::Model> for AnnouncementDto {
             post_source: m.post_source,
             has_image_attachment: m.image_file_storage_id.is_some(),
             has_document_attachment: m.document_file_storage_id.is_some(),
+            has_video_attachment: m.video_file_storage_id.is_some(),
+            video_link: m.video_link,
             publish_at: m.publish_at,
             expires_at: m.expires_at,
             created_at: m.created_at,
@@ -74,6 +80,8 @@ mod announcement_tests {
             expires_at: None,
             image_file_storage_id: Some(image_id),
             document_file_storage_id: None,
+            video_file_storage_id: None,
+            video_link: None,
             post_source: "company".into(),
             created_at: Utc::now(),
             updated_at: Utc::now(),
@@ -121,6 +129,8 @@ impl From<notification::Model> for NotificationDto {
 
 #[derive(InputObject, Clone, Debug)]
 pub struct CreateAnnouncementInput {
+    pub video_upload_stage_id: Option<uuid::Uuid>,
+    pub video_link: Option<String>,
     pub title: String,
     pub body: Option<String>,
     pub target_audience: Option<String>,
@@ -145,6 +155,9 @@ pub struct CreateAnnouncementInput {
 
 #[derive(InputObject, Clone, Debug)]
 pub struct UpdateAnnouncementInput {
+    pub video_upload_stage_id: Option<uuid::Uuid>,
+    pub video_link: Option<String>,
+    pub remove_video: Option<bool>,
     pub id: ID,
     pub title: Option<String>,
     pub body: Option<String>,
@@ -224,4 +237,112 @@ pub struct UpdateNotificationPreferencesInput {
     pub announcements_enabled: bool,
     #[graphql(name = "mutedTopics")]
     pub muted_topics: Vec<String>,
+}
+
+#[derive(SimpleObject, Clone, Debug)]
+#[graphql(name = "NotificationAutomationSettings")]
+pub struct NotificationAutomationSettingsGql {
+    #[graphql(name = "birthdayEnabled")]
+    pub birthday_enabled: bool,
+    #[graphql(name = "workAnniversaryEnabled")]
+    pub work_anniversary_enabled: bool,
+    #[graphql(name = "companySharingEnabled")]
+    pub company_sharing_enabled: bool,
+    #[graphql(name = "deliveryLocalTime")]
+    pub delivery_local_time: NaiveTime,
+    #[graphql(name = "birthdayTitleTemplate")]
+    pub birthday_title_template: String,
+    #[graphql(name = "birthdayMessageTemplate")]
+    pub birthday_message_template: String,
+    #[graphql(name = "anniversaryTitleTemplate")]
+    pub anniversary_title_template: String,
+    #[graphql(name = "anniversaryMessageTemplate")]
+    pub anniversary_message_template: String,
+}
+
+impl From<AutomationSettings> for NotificationAutomationSettingsGql {
+    fn from(settings: AutomationSettings) -> Self {
+        Self {
+            birthday_enabled: settings.birthday_enabled,
+            work_anniversary_enabled: settings.work_anniversary_enabled,
+            company_sharing_enabled: settings.company_sharing_enabled,
+            delivery_local_time: settings.delivery_local_time,
+            birthday_title_template: settings.birthday_title_template,
+            birthday_message_template: settings.birthday_message_template,
+            anniversary_title_template: settings.anniversary_title_template,
+            anniversary_message_template: settings.anniversary_message_template,
+        }
+    }
+}
+
+#[derive(InputObject, Clone, Debug)]
+pub struct SaveNotificationAutomationSettingsInput {
+    #[graphql(name = "birthdayEnabled")]
+    pub birthday_enabled: bool,
+    #[graphql(name = "workAnniversaryEnabled")]
+    pub work_anniversary_enabled: bool,
+    #[graphql(name = "companySharingEnabled")]
+    pub company_sharing_enabled: bool,
+    #[graphql(name = "deliveryLocalTime")]
+    pub delivery_local_time: NaiveTime,
+    #[graphql(name = "birthdayTitleTemplate")]
+    pub birthday_title_template: String,
+    #[graphql(name = "birthdayMessageTemplate")]
+    pub birthday_message_template: String,
+    #[graphql(name = "anniversaryTitleTemplate")]
+    pub anniversary_title_template: String,
+    #[graphql(name = "anniversaryMessageTemplate")]
+    pub anniversary_message_template: String,
+}
+
+impl From<SaveNotificationAutomationSettingsInput>
+    for crate::services::automation_settings::SaveAutomationSettings
+{
+    fn from(input: SaveNotificationAutomationSettingsInput) -> Self {
+        Self {
+            birthday_enabled: input.birthday_enabled,
+            work_anniversary_enabled: input.work_anniversary_enabled,
+            company_sharing_enabled: input.company_sharing_enabled,
+            delivery_local_time: input.delivery_local_time,
+            birthday_title_template: input.birthday_title_template,
+            birthday_message_template: input.birthday_message_template,
+            anniversary_title_template: input.anniversary_title_template,
+            anniversary_message_template: input.anniversary_message_template,
+        }
+    }
+}
+
+#[derive(SimpleObject, Clone, Copy, Debug)]
+#[graphql(name = "CelebrationPreferences")]
+pub struct CelebrationPreferencesGql {
+    #[graphql(name = "shareBirthday")]
+    pub share_birthday: bool,
+    #[graphql(name = "shareWorkAnniversary")]
+    pub share_work_anniversary: bool,
+}
+
+impl From<CelebrationPreferences> for CelebrationPreferencesGql {
+    fn from(preferences: CelebrationPreferences) -> Self {
+        Self {
+            share_birthday: preferences.share_birthday,
+            share_work_anniversary: preferences.share_work_anniversary,
+        }
+    }
+}
+
+#[derive(InputObject, Clone, Copy, Debug)]
+pub struct UpdateCelebrationPreferencesInput {
+    #[graphql(name = "shareBirthday")]
+    pub share_birthday: bool,
+    #[graphql(name = "shareWorkAnniversary")]
+    pub share_work_anniversary: bool,
+}
+
+impl From<UpdateCelebrationPreferencesInput> for CelebrationPreferences {
+    fn from(input: UpdateCelebrationPreferencesInput) -> Self {
+        Self {
+            share_birthday: input.share_birthday,
+            share_work_anniversary: input.share_work_anniversary,
+        }
+    }
 }

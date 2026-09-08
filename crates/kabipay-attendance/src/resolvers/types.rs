@@ -23,6 +23,27 @@ use crate::resolvers::query::parse_uuid;
 use crate::services::timesheet_batch_service::{self, TimesheetApprovalSnapshot};
 
 use crate::services::attendance_service::PunchDaySummary;
+use crate::services::attendance_summary_service::AttendancePeriodSummary;
+
+#[derive(SimpleObject, Clone, Debug)]
+#[graphql(name = "AttendancePeriodSummary")]
+pub struct AttendancePeriodSummaryDto {
+    pub completed_minutes: i32,
+    pub worked_days: i32,
+    pub average_minutes: Option<f64>,
+    pub incomplete_segments: i32,
+}
+
+impl From<AttendancePeriodSummary> for AttendancePeriodSummaryDto {
+    fn from(value: AttendancePeriodSummary) -> Self {
+        Self {
+            completed_minutes: value.completed_minutes,
+            worked_days: value.worked_days,
+            average_minutes: value.average_minutes,
+            incomplete_segments: value.incomplete_segments,
+        }
+    }
+}
 use crate::services::attendance_management_service::ManagedAttendanceRow;
 use crate::services::attendance_report_service::{
     AttendanceDailyReportRow, AttendanceReportSummary,

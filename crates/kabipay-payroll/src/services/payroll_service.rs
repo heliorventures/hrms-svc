@@ -26,8 +26,8 @@ use uuid::Uuid;
 use crate::services::arrear_service;
 use crate::services::statutory_india;
 
-pub async fn list_components(
-    db: &DatabaseConnection,
+pub async fn list_components<C: ConnectionTrait + Send + Sync>(
+    db: &C,
     tenant_id: Uuid,
     active_only: bool,
     limit: u64,
@@ -111,6 +111,7 @@ pub async fn upsert_salary_component(
         return Err(KabiPayError::Validation("component name must not be empty".into()));
     }
     let code = normalize_component_code(&code)?;
+    super::unpaid_leave_policy::ensure_manual_component(&code)?;
     let component_type = normalize_component_type(&component_type)?;
     let now = Utc::now();
     if let Some(id) = id {
@@ -124,6 +125,7 @@ pub async fn upsert_salary_component(
                 entity: "salary_component",
                 id: id.to_string(),
             })?;
+        super::unpaid_leave_policy::ensure_manual_component(&existing.code)?;
         let mut active: salary_component::ActiveModel = existing.into();
         active.name = Set(name.to_string());
         active.code = Set(code);
@@ -339,14 +341,15 @@ pub async fn upsert_salary_structure(
 
     for (component_id, basis, value, display_order) in components {
         let basis = normalize_calculation_basis(&basis)?;
-        let component_exists = salary_component::Entity::find()
+        let component = salary_component::Entity::find()
             .filter(salary_component::Column::Id.eq(component_id))
             .filter(salary_component::Column::TenantId.eq(tenant_id))
             .one(&txn)
             .await
-            .map_err(KabiPayError::from)?
-            .is_some();
-        if !component_exists {
+            .map_err(KabiPayError::from)?;
+        if let Some(component) = component {
+            super::unpaid_leave_policy::ensure_manual_component(&component.code)?;
+        } else {
             return Err(KabiPayError::NotFound {
                 entity: "salary_component",
                 id: component_id.to_string(),
@@ -541,8 +544,8 @@ fn trim_opt(s: Option<String>) -> Option<String> {
 }
 
 /// One optional row per tenant — employer TAN and legal name shown on statutory payroll CSV exports.
-pub async fn find_payroll_compliance_setting(
-    db: &DatabaseConnection,
+pub async fn find_payroll_compliance_setting<C: ConnectionTrait + Send + Sync>(
+    db: &C,
     tenant_id: Uuid,
 ) -> KabiPayResult<Option<payroll_compliance_setting::Model>> {
     payroll_compliance_setting::Entity::find()
@@ -2060,8 +2063,8 @@ async fn find_active_salary_component_by_code<C: ConnectionTrait + Send + Sync>(
 }
 
 /// Resolve configured **primary earning** component for gross (tenant setting → `BASIC` → first EARNING).
-async fn resolve_default_earning_component(
-    db: &DatabaseConnection,
+async fn resolve_default_earning_component<C: ConnectionTrait + Send + Sync>(
+    db: &C,
     tenant_id: Uuid,
     configured_base_code: &str,
 ) -> KabiPayResult<salary_component::Model> {
@@ -2170,10 +2173,14 @@ pub async fn run_payroll_for_cycle(
     cycle_id: Uuid,
     processed_by: Uuid,
 ) -> KabiPayResult<payroll_cycle::Model> {
+    let txn = db.begin().await.map_err(KabiPayError::from)?;
+    // Serialize run attempts before inspecting status. The lock is held through
+    // payslip writes and the final cycle transition in this same transaction.
     let cycle_row = payroll_cycle::Entity::find()
         .filter(payroll_cycle::Column::Id.eq(cycle_id))
         .filter(payroll_cycle::Column::TenantId.eq(tenant_id))
-        .one(db)
+        .lock_exclusive()
+        .one(&txn)
         .await
         .map_err(KabiPayError::from)?
         .ok_or_else(|| KabiPayError::NotFound {
@@ -2188,7 +2195,9 @@ pub async fn run_payroll_for_cycle(
         )));
     }
 
-    let comp_cfg = find_payroll_compliance_setting(db, tenant_id).await?;
+    let comp_cfg = find_payroll_compliance_setting(&txn, tenant_id).await?;
+    let unpaid_policy = super::unpaid_leave_policy::find(&txn, tenant_id).await?
+        .filter(|policy| policy.enabled);
     let base_code = comp_cfg
         .as_ref()
         .map(|c| c.base_salary_component_code.as_str())
@@ -2198,9 +2207,7 @@ pub async fn run_payroll_for_cycle(
         .map(|c| c.arrear_salary_component_code.as_str())
         .unwrap_or("ARREAR");
 
-    let basic_comp = resolve_default_earning_component(db, tenant_id, base_code).await?;
-
-    let txn = db.begin().await.map_err(KabiPayError::from)?;
+    let basic_comp = resolve_default_earning_component(&txn, tenant_id, base_code).await?;
 
     let existing_slips = payslip::Entity::find()
         .filter(payslip::Column::TenantId.eq(tenant_id))
@@ -2214,6 +2221,7 @@ pub async fn run_payroll_for_cycle(
         .filter(employee::Column::TenantId.eq(tenant_id))
         .filter(employee::Column::IsDeleted.eq(false))
         .filter(employee::Column::Status.eq("ACTIVE"))
+        .order_by_asc(employee::Column::Id)
         .all(&txn)
         .await
         .map_err(KabiPayError::from)?;
@@ -2252,6 +2260,11 @@ pub async fn run_payroll_for_cycle(
             ),
             None => None,
         };
+        if let Some(breakup) = &structure_breakup {
+            for line in &breakup.lines {
+                super::unpaid_leave_policy::ensure_manual_component(&line.component_code)?;
+            }
+        }
         let pending = arrear_service::list_pending_by_employee(&txn, tenant_id, emp.id).await?;
         let arrear_sum: Decimal = pending.iter().map(|a| a.amount).sum();
         let structure_gross = structure_breakup
@@ -2270,13 +2283,27 @@ pub async fn run_payroll_for_cycle(
         } else {
             base
         };
-        let gross = (recurring_gross + arrear_sum).round_dp(2);
+        let unpaid = if let Some(policy) = &unpaid_policy {
+            let code = policy.basic_component_code.as_deref().unwrap_or_default();
+            let actual_basic = if let Some(breakup) = &structure_breakup {
+                let matches: Vec<_> = breakup.lines.iter()
+                    .filter(|line| line.component_code == code && line.component_type == "EARNING").collect();
+                if matches.len() != 1 {
+                    return Err(KabiPayError::Validation(format!("employee {} must have exactly one {code} basic earning line for unpaid leave calculation", emp.id)));
+                }
+                matches[0].monthly_amount
+            } else {
+                if basic_comp.code != code {
+                    return Err(KabiPayError::Validation(format!("employee {} uses basic component {}, which differs from unpaid leave policy {code}", emp.id, basic_comp.code)));
+                }
+                base
+            };
+            Some(super::unpaid_leave_policy::calculate(&txn, tenant_id, emp.id, payroll_period_start, policy, actual_basic).await?)
+        } else { None };
+        let unpaid_amount = unpaid.as_ref().map(|c| c.amount).unwrap_or_default();
         let tds_m = tds_map.get(&emp.id).map(|d| d.round_dp(2));
-        let (stat, tds) = statutory_india::compute(gross, tds_m);
-        let total_ded = (structure_deductions
-            + statutory_india::employee_deduction_total(&stat, tds))
-            .round_dp(2);
-        let net = (gross - total_ded).round_dp(2);
+        let amounts = super::unpaid_leave_calculation::apply_payroll_treatment(recurring_gross + arrear_sum, structure_deductions, tds_m, unpaid_amount, unpaid_policy.as_ref().and_then(|p| p.treatment.as_deref()))?;
+        let (gross, total_ded, net, stat, tds, earning_reduction, separate_deduction) = (amounts.gross, amounts.total_deductions, amounts.net, amounts.statutory, amounts.tds, amounts.earning_reduction, amounts.separate_deduction);
 
         let pid = Uuid::new_v4();
 
@@ -2307,7 +2334,9 @@ pub async fn run_payroll_for_cycle(
 
         if let Some(breakup) = &structure_breakup {
             for line in &breakup.lines {
-                if line.monthly_amount <= Decimal::ZERO {
+                let reduction = if unpaid_policy.as_ref().and_then(|p| p.basic_component_code.as_deref()) == Some(line.component_code.as_str()) && line.component_type == "EARNING" { earning_reduction } else { Decimal::ZERO };
+                let line_amount = line.monthly_amount - reduction;
+                if line_amount <= Decimal::ZERO {
                     continue;
                 }
                 payslip_component::ActiveModel {
@@ -2315,7 +2344,7 @@ pub async fn run_payroll_for_cycle(
                     tenant_id: Set(tenant_id),
                     payslip_id: Set(pid),
                     salary_component_id: Set(line.salary_component_id),
-                    amount: Set(line.monthly_amount),
+                    amount: Set(line_amount),
                     component_type: Set(Some(line.component_type.clone())),
                     created_at: Set(now),
                     updated_at: Set(now),
@@ -2331,7 +2360,7 @@ pub async fn run_payroll_for_cycle(
                 tenant_id: Set(tenant_id),
                 payslip_id: Set(pid),
                 salary_component_id: Set(basic_comp.id),
-                amount: Set(base),
+                amount: Set(base - earning_reduction),
                 component_type: Set(Some(basic_comp.r#type.clone())),
                 created_at: Set(now),
                 updated_at: Set(now),
@@ -2361,6 +2390,17 @@ pub async fn run_payroll_for_cycle(
             arrear_service::mark_applied(&txn, tenant_id, &a_ids, cycle_id).await?;
         }
 
+        if separate_deduction > Decimal::ZERO {
+            let component = super::unpaid_leave_policy::deduction_component(&txn, tenant_id).await?;
+            payslip_component::ActiveModel {
+                id: Set(Uuid::new_v4()), tenant_id: Set(tenant_id), payslip_id: Set(pid),
+                salary_component_id: Set(component.id), amount: Set(separate_deduction),
+                component_type: Set(Some("DEDUCTION".into())), created_at: Set(now), updated_at: Set(now),
+            }.insert(&txn).await.map_err(KabiPayError::from)?;
+        }
+        if let (Some(policy), Some(calculation)) = (&unpaid_policy, unpaid) {
+            super::unpaid_leave_policy::record(&txn, tenant_id, pid, policy, calculation).await?;
+        }
         have.insert(emp.id);
     }
 

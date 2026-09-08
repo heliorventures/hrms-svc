@@ -1,4 +1,7 @@
-//! Root query resolvers for kabipay-notification.
+use crate::services::announcement_audience::announcement_available_to_reader;
+#[cfg(test)]
+use crate::services::announcement_audience::announcement_is_currently_visible;
+// Root query resolvers for kabipay-notification.
 
 use async_graphql::{Context, Enum, ID, Object, Result};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
@@ -17,8 +20,10 @@ use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
 use uuid::Uuid;
 
 use crate::resolvers::types::{
-    AnnouncementAttachmentDto, AnnouncementDto, NotificationDto, NotificationPreferencesGql,
+    AnnouncementAttachmentDto, AnnouncementDto, CelebrationPreferencesGql, NotificationDto,
+    NotificationAutomationSettingsGql, NotificationPreferencesGql,
 };
+use crate::services::automation_settings;
 use crate::services::notification_service;
 
 pub struct QueryRoot;
@@ -42,14 +47,6 @@ fn attachment_storage_id(
     }
 }
 
-fn announcement_is_currently_visible(
-    publish_at: Option<DateTime<Utc>>,
-    expires_at: Option<DateTime<Utc>>,
-    now: DateTime<Utc>,
-) -> bool {
-    publish_at.is_none_or(|value| value <= now) && expires_at.is_none_or(|value| value > now)
-}
-
 fn require_notification_read(ctx: &Context<'_>) -> Result<()> {
     data_scope_from_context(ctx, PERM_NOTIFICATION_READ).map(|_| ())
 }
@@ -63,25 +60,6 @@ fn require_notification_manage_all(ctx: &Context<'_>) -> Result<()> {
         .into_graphql());
     }
     Ok(())
-}
-
-fn announcement_available_to_reader(
-    row: &announcement::Model,
-    announcements_enabled: bool,
-    now: DateTime<Utc>,
-    viewer_department: Option<Uuid>,
-    viewer_location: Option<Uuid>,
-    viewer_roles: &[String],
-) -> bool {
-    announcements_enabled
-        && announcement_is_currently_visible(row.publish_at, row.expires_at, now)
-        && notification_service::announcement_visible_to_viewer(
-            row,
-            false,
-            viewer_department,
-            viewer_location,
-            viewer_roles,
-        )
 }
 
 fn announcement_attachment_not_found(announcement_id: Uuid) -> async_graphql::Error {
@@ -312,6 +290,8 @@ mod tests {
             expires_at: Some(now + Duration::minutes(1)),
             image_file_storage_id: Some(Uuid::new_v4()),
             document_file_storage_id: None,
+            video_file_storage_id: None,
+            video_link: None,
             post_source: "company".into(),
             created_at: now,
             updated_at: now,
@@ -411,6 +391,8 @@ mod tests {
             expires_at: Some(now + Duration::minutes(1)),
             image_file_storage_id: Some(file_id),
             document_file_storage_id: None,
+            video_file_storage_id: None,
+            video_link: None,
             post_source: "company".into(),
             created_at: now,
             updated_at: now,
@@ -526,6 +508,8 @@ mod tests {
             expires_at: Some(now + Duration::minutes(1)),
             image_file_storage_id: Some(file_id),
             document_file_storage_id: None,
+            video_file_storage_id: None,
+            video_link: None,
             post_source: "company".into(),
             created_at: now,
             updated_at: now,
@@ -605,6 +589,16 @@ mod tests {
             ),
             (
                 "{ myNotificationPreferences { __typename } }".to_string(),
+                PERM_NOTIFICATION_READ,
+                false,
+            ),
+            (
+                "{ notificationAutomationSettings { __typename } }".to_string(),
+                PERM_NOTIFICATION_MANAGE,
+                true,
+            ),
+            (
+                "{ myCelebrationPreferences { __typename } }".to_string(),
                 PERM_NOTIFICATION_READ,
                 false,
             ),
@@ -704,6 +698,14 @@ impl QueryRoot {
 
     /// Load one private announcement attachment after validating the owning announcement's
     /// tenant, publication window, audience and notification preference.
+    async fn announcement_video(&self, ctx: &Context<'_>, announcement_id: Uuid) -> Result<crate::services::announcement_video::AnnouncementVideo> {
+        require_notification_read(ctx)?;
+        let tenant = require_tenant_id(ctx)?;
+        let owner = require_client_claims(ctx)?.sub;
+        let db = crate::services::announcement_video::required_db(ctx,tenant).await?;
+        crate::services::announcement_video::playback(&db,tenant,owner,announcement_id).await.map_err(KabiPayError::into_graphql)
+    }
+
     async fn announcement_attachment(
         &self,
         ctx: &Context<'_>,
@@ -724,13 +726,7 @@ impl QueryRoot {
         )
         .await
         .map_err(KabiPayError::into_graphql)?;
-        let (viewer_department, viewer_location) =
-            match try_client_employee_dept_and_location(&db, tenant_id, claims).await {
-                Ok(Some((department, location))) => (department, location),
-                Ok(None) => (None, None),
-                Err(error) => return Err(error.into_graphql()),
-            };
-
+        let viewer = crate::services::announcement_audience::current_viewer(&db,tenant_id,claims.sub).await.map_err(KabiPayError::into_graphql)?;
         let db_ref = &db;
         resolve_announcement_attachment_with(
             tenant_id,
@@ -738,9 +734,9 @@ impl QueryRoot {
             kind,
             preferences.announcements_enabled,
             Utc::now(),
-            viewer_department,
-            viewer_location,
-            &claims.roles,
+            viewer.department,
+            viewer.location,
+            &viewer.roles,
             || notification_service::get_announcement(db_ref, tenant_id, announcement_id),
             |file_id| async move {
                 file_storage::Entity::find_by_id(file_id)
@@ -826,5 +822,37 @@ impl QueryRoot {
         .await
         .map_err(KabiPayError::into_graphql)?;
         Ok(NotificationPreferencesGql::from_prefs(p))
+    }
+
+    /// Admin / HR configuration for automated employee-event notifications.
+    async fn notification_automation_settings(
+        &self,
+        ctx: &Context<'_>,
+    ) -> Result<NotificationAutomationSettingsGql> {
+        require_notification_manage_all(ctx)?;
+        let tenant_id = require_tenant_id(ctx)?;
+        let db = tenant_db(ctx, tenant_id).await?;
+        automation_settings::load_automation_settings(&db, tenant_id)
+            .await
+            .map(NotificationAutomationSettingsGql::from)
+            .map_err(KabiPayError::into_graphql)
+    }
+
+    /// Current employee's company-sharing consent. Missing consent remains private.
+    async fn my_celebration_preferences(
+        &self,
+        ctx: &Context<'_>,
+    ) -> Result<CelebrationPreferencesGql> {
+        require_notification_read(ctx)?;
+        let claims = require_client_claims(ctx)?;
+        let employee_id = claims.employee_id.ok_or_else(|| {
+            KabiPayError::Forbidden("a linked employee profile is required".into()).into_graphql()
+        })?;
+        let tenant_id = require_tenant_id(ctx)?;
+        let db = tenant_db(ctx, tenant_id).await?;
+        automation_settings::load_celebration_preferences(&db, tenant_id, employee_id)
+            .await
+            .map(CelebrationPreferencesGql::from)
+            .map_err(KabiPayError::into_graphql)
     }
 }

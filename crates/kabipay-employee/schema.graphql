@@ -1,0 +1,1004 @@
+type ClearanceChecklistItem {
+	id: ID!
+	tenantId: ID!
+	separationId: ID!
+	department: String!
+	taskName: String!
+	isCleared: Boolean!
+	clearedBy: ID
+	clearedAt: DateTime
+	createdAt: DateTime!
+	updatedAt: DateTime!
+}
+
+type CompanyDocument {
+	id: ID!
+	tenantId: ID!
+	category: String!
+	title: String!
+	description: String
+	originalFileName: String
+	mimeType: String
+	fileSizeBytes: Int
+	status: String!
+	visibleToEmployees: Boolean!
+	uploadedByUserId: ID
+	createdAt: DateTime!
+	updatedAt: DateTime!
+}
+
+input ConfirmPrejoiningInput {
+	candidateId: ID!
+	revision: Int!
+	employeeCode: String!
+	dateOfJoining: NaiveDate!
+	departmentId: ID
+	designationId: ID
+	reportingManagerId: ID
+	employmentType: String
+	username: String!
+	initialPassword: String!
+	roleIds: [ID!]!
+}
+
+input CreateCompanyDocumentInput {
+	category: String!
+	title: String!
+	description: String
+	stagedUploadId: ID!
+	visibleToEmployees: Boolean! = true
+}
+
+input CreateEmployeeInput {
+	employeeCode: String!
+	firstName: String!
+	lastName: String!
+	dateOfJoining: NaiveDate!
+	departmentId: ID
+	designationId: ID
+	"""
+	Must be another active employee in the tenant; cannot be self (enforced after id is chosen).
+	"""
+	reportingManagerId: ID
+	employmentType: String
+	"""
+	Defaults to `ACTIVE` when omitted.
+	"""
+	status: String
+	userId: ID
+	loginAccount: EmployeeLoginAccountInput
+}
+
+"""
+Implement the DateTime<Utc> scalar
+
+The input/output is a string in RFC3339 format.
+"""
+scalar DateTime
+
+type Department {
+	id: ID!
+	tenantId: ID!
+	name: String!
+	code: String!
+	parentDepartmentId: ID
+}
+
+type Designation {
+	id: ID!
+	tenantId: ID!
+	departmentId: ID!
+	title: String!
+	level: String
+	grade: Int
+}
+
+type DocumentType {
+	id: ID!
+	tenantId: ID!
+	name: String!
+	category: String
+	systemKey: String
+	isRequired: Boolean!
+	expiryAlertDays: Int
+	createdAt: DateTime!
+	updatedAt: DateTime!
+}
+
+"""
+Federated `Employee` type. `id` is the canonical cross-service identifier (Gap A).
+"""
+type Employee {
+	id: ID!
+	tenantId: ID!
+	employeeCode: String!
+	firstName: String!
+	lastName: String!
+	"""
+	Computed convenience field: `first_name` + space + `last_name`.
+	"""
+	fullName: String!
+	status: String!
+	employmentType: String
+	dateOfJoining: NaiveDate!
+	departmentId: ID
+	designationId: ID
+	reportingManagerId: ID
+	userId: ID
+	dateOfBirth: NaiveDate
+	gender: String
+	nationality: String
+	emergencyContactName: String
+	emergencyContactPhone: String
+	emergencyContactRelation: String
+	bloodGroup: String
+	personalPhone: String
+	currentAddress: String
+	permanentAddress: String
+	"""
+	Department display name when `department_id` is set (batch-resolved for directory queries).
+	"""
+	departmentName: String
+	designationTitle: String
+	"""
+	Linked login email when `user_id` is set.
+	"""
+	linkedUserEmail: String
+	"""
+	Linked login username when `user_id` is set. This is the sign-in identifier.
+	"""
+	linkedUserUsername: String
+	reportingManagerName: String
+	createdAt: DateTime!
+	updatedAt: DateTime!
+}
+
+type EmployeeAadhaarRecord {
+	id: ID!
+	maskedAadhaar: String!
+	isVerified: Boolean!
+}
+
+type EmployeeBankAccount {
+	id: ID!
+	bankName: String!
+	accountNumberMasked: String!
+	ifscCode: String!
+	accountType: String
+	isVerified: Boolean!
+}
+
+"""
+Explicitly allow-listed employee information visible in the tenant directory.
+"""
+type EmployeeDirectoryEntry {
+	employeeId: ID!
+	employeeCode: String!
+	fullName: String!
+	departmentName: String
+	designationTitle: String
+	reportingManagerId: ID
+	reportingManagerName: String
+	employmentType: String
+	dateOfJoining: NaiveDate!
+	status: String!
+}
+
+type EmployeeDirectoryPage {
+	rows: [EmployeeDirectoryEntry!]!
+	nextCursor: String
+	hasMore: Boolean!
+}
+
+type EmployeeDocument {
+	id: ID!
+	tenantId: ID!
+	employeeId: ID!
+	documentTypeId: ID!
+	status: String!
+	expiryDate: NaiveDate
+	uploadedAt: DateTime!
+	originalFileName: String
+	mimeType: String
+	uploadedByUserId: ID
+	documentTypeName: String
+	documentTypeCategory: String
+	createdAt: DateTime!
+	updatedAt: DateTime!
+}
+
+type EmployeeDocumentAttachment {
+	fileName: String!
+	mimeType: String!
+	fileSizeBytes: Int
+	"""
+	Standard base64 payload returned only after employee/data-scope authorization.
+	"""
+	contentBase64: String!
+}
+
+type EmployeeEducation {
+	id: ID!
+	employeeId: ID!
+	educationLevel: String!
+	qualification: String!
+	fieldOfStudy: String
+	institution: String!
+	boardUniversity: String
+	startDate: NaiveDate
+	completionYear: Int!
+	gradeScore: String
+	description: String
+	verificationStatus: String!
+	evidenceDocumentIds: [ID!]!
+	reviewedBy: ID
+	reviewedAt: DateTime
+	rejectionReason: String
+	createdAt: DateTime!
+	updatedAt: DateTime!
+}
+
+type EmployeeEvidenceReviewQueueItem {
+	recordId: ID!
+	employeeId: ID!
+	employeeCode: String!
+	employeeName: String!
+	evidenceType: String!
+	summary: String!
+	evidenceDocumentIds: [ID!]!
+	createdAt: DateTime!
+}
+
+type EmployeeIdentityProfile {
+	pan: EmployeePanRecord
+	aadhaar: EmployeeAadhaarRecord
+}
+
+input EmployeeLoginAccountInput {
+	username: String!
+	email: String
+	initialPassword: String!
+	roleIds: [ID!]
+}
+
+type EmployeePanRecord {
+	id: ID!
+	maskedPan: String!
+	isVerified: Boolean!
+}
+
+type EmployeeProfileAccess {
+	directoryEntry: EmployeeDirectoryEntry!
+	isSelf: Boolean!
+	canViewPrivateProfile: Boolean!
+	canViewPayrollSensitive: Boolean!
+	canEditPersonalProfile: Boolean!
+	canManageOrganizationFields: Boolean!
+	canReviewProfileChanges: Boolean!
+}
+
+type EmployeeProfileChangeRequest {
+	id: ID!
+	employeeId: ID!
+	requestType: String!
+	status: String!
+	requestedSummary: String!
+	supportingDocumentId: ID
+	reviewedBy: ID
+	reviewedAt: DateTime
+	rejectionReason: String
+	createdAt: DateTime!
+	updatedAt: DateTime!
+}
+
+type EmployeeProfileChangeReviewDetail {
+	request: EmployeeProfileChangeRequest!
+	employeeCode: String!
+	employeeName: String!
+	currentValues: JSON!
+	requestedValues: JSON!
+}
+
+type EmployeeProfileReviewQueueItem {
+	request: EmployeeProfileChangeRequest!
+	employeeCode: String!
+	employeeName: String!
+	hasSupportingDocument: Boolean!
+}
+
+type EmployeeWorkExperience {
+	id: ID!
+	employeeId: ID!
+	company: String!
+	roleTitle: String!
+	employmentType: String
+	location: String
+	startDate: NaiveDate!
+	endDate: NaiveDate
+	isCurrent: Boolean!
+	description: String
+	verificationStatus: String!
+	evidenceDocumentIds: [ID!]!
+	reviewedBy: ID
+	reviewedAt: DateTime
+	rejectionReason: String
+	createdAt: DateTime!
+	updatedAt: DateTime!
+}
+
+type EmploymentHistoryRecord {
+	id: ID!
+	tenantId: ID!
+	employeeId: ID!
+	"""
+	Monthly amount used as base gross for pay run (maps to `employment_history.salary`).
+	"""
+	monthlySalary: String
+	effectiveFrom: NaiveDate!
+	effectiveTo: NaiveDate
+	changeReason: String
+	changedBy: ID
+	createdAt: DateTime!
+	updatedAt: DateTime!
+}
+
+type FnfSettlement {
+	id: ID!
+	tenantId: ID!
+	separationId: ID!
+	leaveEncashment: String
+	gratuityAmount: String
+	bonusPayable: String
+	recoveryAmount: String
+	netPayable: String
+	status: String!
+	processedAt: DateTime
+	processedBy: ID
+	createdAt: DateTime!
+	updatedAt: DateTime!
+}
+
+"""
+A scalar that can represent any JSON value.
+"""
+scalar JSON
+
+type MutationRoot {
+	savePrejoiningConfig(config: JSON!): JSON!
+	invitePrejoining(email: String!, sendEmail: Boolean!): PrejoiningInvitation!
+	reissuePrejoining(id: ID!, revision: Int!, sendEmail: Boolean!): PrejoiningInvitation!
+	requestPrejoiningChanges(id: ID!, revision: Int!, feedback: String!): PrejoiningCandidate!
+	approvePrejoining(id: ID!, revision: Int!): PrejoiningCandidate!
+	cancelPrejoining(id: ID!, revision: Int!): PrejoiningCandidate!
+	confirmPrejoiningJoined(input: ConfirmPrejoiningInput!): PrejoiningCandidate!
+	createEmployee(input: CreateEmployeeInput!): Employee!
+	provisionEmployeeLogin(input: ProvisionEmployeeLoginInput!): Employee!
+	resetEmployeePassword(input: ResetEmployeePasswordInput!): Boolean!
+	updateEmployee(input: UpdateEmployeeInput!): Employee!
+	"""
+	HR: set or update monthly salary for an employee (`employment_history`), effective from a date.
+	"""
+	setEmployeeCompensation(input: SetEmployeeCompensationInput!): EmploymentHistoryRecord!
+	"""
+	Upload a file to local `KABIPAY_LOCAL_FILE_ROOT` or object storage and attach `employee_document`.
+	**Directory/HR** uploads are **`APPROVED`** immediately; others start **`PENDING`** for HR review.
+	"""
+	uploadEmployeeDocument(input: UploadEmployeeDocumentInput!): EmployeeDocument!
+	"""
+	Upload a tenant-scoped file and return its reusable `file_storage.id`.
+	"""
+	uploadTenantFile(input: UploadTenantFileInput!): UploadedTenantFile!
+	"""
+	Stage a private company-document upload without exposing `file_storage` metadata.
+	"""
+	uploadCompanyDocumentFile(input: UploadCompanyDocumentFileInput!): StagedCompanyDocumentUpload!
+	"""
+	HR/admin: publish a company policy, onboarding, or exit-formality document.
+	"""
+	createCompanyDocument(input: CreateCompanyDocumentInput!): CompanyDocument!
+	"""
+	HR/admin: archive a company document without deleting its private file.
+	"""
+	archiveCompanyDocument(companyDocumentId: ID!): CompanyDocument!
+	"""
+	HR/admin: permanently delete a company document and durably schedule its private file
+	for physical deletion. Use `archiveCompanyDocument` when audit retention is required.
+	"""
+	deleteCompanyDocument(companyDocumentId: ID!): Boolean!
+	"""
+	Demographics + emergency contact. Employee may edit **self**; HR may edit anyone in scope.
+	"""
+	updateEmployeePersonalProfile(input: UpdateEmployeePersonalProfileInput!): Employee!
+	"""
+	Direct self-service fields that do not change legal identity or organization assignment.
+	"""
+	updateEmployeeSelfServiceProfile(input: UpdateEmployeeSelfServiceProfileInput!): Employee!
+	submitEmployeeProfileChange(input: SubmitEmployeeProfileChangeInput!): EmployeeProfileChangeRequest!
+	cancelEmployeeProfileChange(requestId: ID!): EmployeeProfileChangeRequest!
+	resolveEmployeeProfileChange(requestId: ID!, approved: Boolean!, rejectionReason: String): EmployeeProfileChangeRequest!
+	upsertEmployeeEducation(input: UpsertEmployeeEducationInput!): EmployeeEducation!
+	deleteEmployeeEducation(employeeId: ID!, educationId: ID!): Boolean!
+	linkEmployeeEducationEvidence(employeeId: ID!, educationId: ID!, employeeDocumentId: ID!): EmployeeEducation!
+	uploadEmployeeEducationEvidence(educationId: ID!, input: UploadEmployeeDocumentInput!): EmployeeEducation!
+	resolveEmployeeEducation(educationId: ID!, approved: Boolean!, rejectionReason: String): EmployeeEducation!
+	upsertEmployeeWorkExperience(input: UpsertEmployeeWorkExperienceInput!): EmployeeWorkExperience!
+	deleteEmployeeWorkExperience(employeeId: ID!, workExperienceId: ID!): Boolean!
+	linkEmployeeWorkExperienceEvidence(employeeId: ID!, workExperienceId: ID!, employeeDocumentId: ID!): EmployeeWorkExperience!
+	uploadEmployeeWorkExperienceEvidence(workExperienceId: ID!, input: UploadEmployeeDocumentInput!): EmployeeWorkExperience!
+	resolveEmployeeWorkExperience(workExperienceId: ID!, approved: Boolean!, rejectionReason: String): EmployeeWorkExperience!
+	"""
+	Upsert the primary bank row (self or **`employee:write`**).
+	"""
+	upsertEmployeePrimaryBank(input: UpsertEmployeePrimaryBankInput!): EmployeeBankAccount!
+	"""
+	Upsert primary PAN (self or **`employee:write`**). Clears verification until HR re-verifies.
+	"""
+	upsertEmployeePrimaryPan(input: UpsertEmployeePrimaryPanInput!): EmployeePanRecord!
+	"""
+	Upsert primary Aadhaar last‑4 (self or **`employee:write`**). Clears verification.
+	"""
+	upsertEmployeePrimaryAadhaar(input: UpsertEmployeePrimaryAadhaarInput!): EmployeeAadhaarRecord!
+	"""
+	HR: approve or reject a **`PENDING`** employee document.
+	"""
+	resolveEmployeeDocument(employeeDocumentId: ID!, approved: Boolean!): EmployeeDocument!
+	"""
+	Mark an onboarding checklist row complete or incomplete. Employees may update **their own**
+	tasks; HR / directory roles may update tasks for employees in their data scope.
+	"""
+	setOnboardingChecklistItemCompleted(checklistItemId: ID!, isCompleted: Boolean!): OnboardingChecklistItem!
+	"""
+	File a separation / exit request (self-service, or HR on behalf of another employee).
+	"""
+	submitSeparation(input: SubmitSeparationInput!): Separation!
+	"""
+	Approve a pending separation (HR / directory roles — same gate as `createEmployee`).
+	"""
+	approveSeparation(separationId: ID!): Separation!
+	"""
+	Reject a pending separation (HR / directory roles).
+	"""
+	rejectSeparation(separationId: ID!): Separation!
+	"""
+	HR: fill FNF component amounts (while status is DRAFT). Net payable is recalculated.
+	"""
+	upsertFnfSettlement(input: UpsertFnfSettlementInput!): FnfSettlement!
+	"""
+	HR: mark FNF as PROCESSED (no further amount edits).
+	"""
+	finalizeFnfSettlement(separationId: ID!): FnfSettlement!
+	"""
+	HR: create DRAFT FNF + default clearance for an `APPROVED` separation (e.g. legacy row before auto-seed).
+	"""
+	ensureSeparationOffboardingArtifacts(separationId: ID!): Boolean!
+	"""
+	HR: toggle a department clearance line.
+	"""
+	setClearanceItemCleared(clearanceId: ID!, isCleared: Boolean!): ClearanceChecklistItem!
+	"""
+	Replace `role_permission` rows for a role (full matrix row).
+	"""
+	setRolePermissions(roleId: ID!, permissionIds: [ID!]!): Boolean!
+	"""
+	Replace `user_role` rows for a user. Caller must re-login to refresh JWT claims.
+	"""
+	setUserRoles(userId: ID!, roleIds: [ID!]!): Boolean!
+	"""
+	Replace `permission_scope` rows for a role (list-filter scopes).
+	"""
+	setRolePermissionScopes(roleId: ID!, scopes: [PermissionScopeAssignmentInput!]!): Boolean!
+}
+
+"""
+ISO 8601 calendar date without timezone.
+Format: %Y-%m-%d
+
+# Examples
+
+* `1994-11-13`
+* `2000-02-24`
+"""
+scalar NaiveDate
+
+type OnboardingChecklistItem {
+	id: ID!
+	tenantId: ID!
+	employeeId: ID!
+	taskName: String!
+	taskCategory: String
+	assignedTo: ID
+	isCompleted: Boolean!
+	dueDate: NaiveDate
+	completedAt: DateTime
+}
+
+"""
+Flat reporting-line row; clients build a tree from `reporting_manager_id`.
+"""
+type OrgChartRow {
+	employeeId: ID!
+	employeeCode: String!
+	fullName: String!
+	reportingManagerId: ID
+	departmentName: String
+	designationTitle: String
+}
+
+input PermissionScopeAssignmentInput {
+	resource: String!
+	action: String!
+	scopeType: String!
+}
+
+type PrejoiningCandidate {
+	id: ID!
+	email: String!
+	status: String!
+	revision: Int!
+	config: JSON!
+	answers: JSON!
+	feedback: String
+	documents: JSON!
+	expiresAt: DateTime
+	employeeId: ID
+	createdAt: DateTime!
+	updatedAt: DateTime!
+}
+
+type PrejoiningDocumentContent {
+	filename: String!
+	mimeType: String!
+	base64Content: String!
+}
+
+type PrejoiningInvitation {
+	candidate: PrejoiningCandidate!
+	privateUrl: String!
+	emailStatus: String!
+	emailError: String
+}
+
+type PrejoiningPage {
+	nodes: [PrejoiningCandidate!]!
+	total: Int!
+}
+
+input ProvisionEmployeeLoginInput {
+	employeeId: ID!
+	username: String!
+	email: String
+	initialPassword: String!
+	roleIds: [ID!]
+}
+
+type QueryRoot {
+	prejoiningConversionOptions(managerSearch: String, managerOffset: Int): JSON!
+	prejoiningConfig: JSON!
+	prejoiningFieldCatalog: JSON!
+	prejoiningDocumentTypes: JSON!
+	prejoiningCandidates(offset: Int, limit: Int, status: String): PrejoiningPage!
+	prejoiningCandidate(id: ID!): PrejoiningCandidate
+	prejoiningDocument(candidateId: ID!, documentId: ID!): PrejoiningDocumentContent!
+	prejoiningCandidatesCsv(status: String): String!
+	"""
+	Liveness probe for this federated subgraph. Always returns `ok`.
+	"""
+	employeeHealth: String!
+	"""
+	Company directory protected by exact `employee_directory:read=ALL` authority.
+	"""
+	employeeDirectoryPage(limit: Int! = 100, after: String): EmployeeDirectoryPage!
+	"""
+	Reporting hierarchy limited by exact `employee_directory:read=ALL`.
+	"""
+	organizationDirectoryChart: [EmployeeDirectoryEntry!]!
+	"""
+	Public profile projection plus server-derived private/edit capabilities.
+	"""
+	employeeProfileAccess(employeeId: ID!): EmployeeProfileAccess
+	employeeProfileChangeRequests(employeeId: ID!, status: String): [EmployeeProfileChangeRequest!]!
+	"""
+	HR-only masked queue. Sensitive values require the separate detail query.
+	"""
+	employeeProfileReviewQueue(status: String, limit: Int! = 50): [EmployeeProfileReviewQueueItem!]!
+	"""
+	HR-only, scope-checked request detail containing decrypted current and proposed values.
+	"""
+	employeeProfileChangeReviewDetail(requestId: ID!): EmployeeProfileChangeReviewDetail!
+	employeeEvidenceReviewQueue(limit: Int! = 100): [EmployeeEvidenceReviewQueueItem!]!
+	employeeEducationRecords(employeeId: ID!): [EmployeeEducation!]!
+	employeeWorkExperienceRecords(employeeId: ID!): [EmployeeWorkExperience!]!
+	"""
+	Fetch one employee by UUID inside the caller's tenant.
+	
+	Returns `null` if the employee does not exist, is soft-deleted, or
+	belongs to another tenant (never leaks cross-tenant rows).
+	"""
+	employee(id: ID!): Employee
+	"""
+	Authoritative employee profile linked to the authenticated user.
+	
+	This resolves `employee.user_id` on every call instead of trusting the
+	optional denormalized `employee_id` access-token claim, so older tokens
+	and repaired account links still reach the correct profile.
+	"""
+	myEmployee: Employee
+	"""
+	List the first `limit` employees in the caller's tenant (capped at 100).
+	"""
+	employees(limit: Int! = 20): [Employee!]!
+	"""
+	Salary-bearing employment history, newest first.
+	
+	Access is limited to exact `payroll:read=SELF` for the JWT-linked employee or
+	exact `payroll:read=ALL` for tenant payroll/HR/admin users. Employee directory
+	and manager team scope never grant salary access.
+	"""
+	employmentHistoryRecords(employeeId: ID!, limit: Int! = 24): [EmploymentHistoryRecord!]!
+	"""
+	Master list of document / policy types defined for the tenant.
+	"""
+	documentTypes(limit: Int! = 100): [DocumentType!]!
+	"""
+	Company policy, onboarding, and exit-formality documents.
+	"""
+	companyDocuments(category: String, activeOnly: Boolean! = true, limit: Int! = 100): [CompanyDocument!]!
+	"""
+	Uploaded employee documents. Omit `employeeId` to list the caller's own files (JWT).
+	"""
+	employeeDocuments(employeeId: ID, limit: Int! = 50): [EmployeeDocument!]!
+	"""
+	Primary bank account for payroll (masked account number in API).
+	"""
+	employeePrimaryBank(employeeId: ID!): EmployeeBankAccount
+	"""
+	Masked PAN / Aadhaar primary rows for the employee profile.
+	"""
+	employeeIdentityProfile(employeeId: ID!): EmployeeIdentityProfile!
+	departments(limit: Int! = 100): [Department!]!
+	"""
+	Job titles / designations in the tenant. Excludes soft-deleted rows.
+	"""
+	designations(limit: Int! = 100, offset: Int! = 0): [Designation!]!
+	"""
+	Tenant roles for assigning **ROLE**-scoped expense policies (`expense:manage` etc.).
+	Unlike [`Self::tenant_directory_roles`], this does not require **`role:manage`**.
+	"""
+	expenseAssignableRoles(limit: Int! = 100): [TenantDirectoryRole!]!
+	"""
+	Reporting hierarchy as a **flat** list (`reportingManagerId` → parent). Build a tree in the client.
+	Respects the same **`employee`** `resource_scopes` as **`employees`** (SELF / TEAM / DEPARTMENT / ALL).
+	"""
+	orgChart(limit: Int! = 500): [OrgChartRow!]!
+	"""
+	Private employee document bytes. Caller must be able to read the employee who owns the document.
+	"""
+	employeeDocumentAttachment(employeeDocumentId: ID!): EmployeeDocumentAttachment!
+	"""
+	Private company document bytes authorized through the company document record.
+	"""
+	companyDocumentAttachment(companyDocumentId: ID!): TenantFileAttachment!
+	"""
+	Onboarding tasks for an employee. Omit `employeeId` for the JWT subject's checklist.
+	HR / directory managers may pass another employee id (same data-scope rules as documents).
+	"""
+	onboardingChecklist(employeeId: ID, limit: Int! = 100): [OnboardingChecklistItem!]!
+	"""
+	Separation / offboarding requests. `onboarding:manage` sees tenant-wide rows;
+	`onboarding:self` (or manage) sees **their own**; otherwise forbidden.
+	"""
+	separations(limit: Int! = 100): [Separation!]!
+	"""
+	Full & final row for a separation (if HR has run approval, a DRAFT or PROCESSED row exists).
+	"""
+	fnfSettlement(separationId: ID!): FnfSettlement
+	"""
+	Department exit clearance items for a separation.
+	"""
+	clearanceChecklist(separationId: ID!): [ClearanceChecklistItem!]!
+	"""
+	Tenant users for RBAC assignment (`role:manage` / HR admin).
+	"""
+	tenantDirectoryUsers(limit: Int! = 100): [TenantDirectoryUser!]!
+	"""
+	Tenant-defined roles.
+	"""
+	tenantDirectoryRoles(limit: Int! = 100): [TenantDirectoryRole!]!
+	"""
+	Permission catalog rows in the tenant schema (for matrix editing).
+	"""
+	tenantCatalogPermissions(limit: Int! = 300): [TenantCatalogPermission!]!
+	"""
+	Permission UUIDs granted to a role (`role_permission`).
+	"""
+	permissionIdsForRole(roleId: ID!): [ID!]!
+	"""
+	Role UUIDs assigned to a user (`user_role`).
+	"""
+	roleIdsForUser(userId: ID!): [ID!]!
+	"""
+	Data scopes (`permission_scope`) for list filtering (employee / leave / expense / …).
+	"""
+	permissionScopesForRole(roleId: ID!): [TenantPermissionScopeAssignment!]!
+	_service: _Service!
+	_entities(representations: [_Any!]!): [_Entity]!
+}
+
+input ResetEmployeePasswordInput {
+	employeeId: ID!
+	newPassword: String!
+}
+
+type Separation {
+	id: ID!
+	tenantId: ID!
+	employeeId: ID!
+	separationType: String!
+	resignationDate: NaiveDate
+	lastWorkingDate: NaiveDate!
+	reason: String
+	status: String!
+	approvedBy: ID
+	workflowInstanceId: ID
+	createdAt: DateTime!
+	updatedAt: DateTime!
+}
+
+input SetEmployeeCompensationInput {
+	employeeId: ID!
+	"""
+	Monthly gross (BASIC) for payroll — must match Decimal string (e.g. `65000` or `65000.00`).
+	"""
+	monthlySalary: String!
+	effectiveFrom: NaiveDate!
+	changeReason: String
+}
+
+type StagedCompanyDocumentUpload {
+	"""
+	Opaque operation stage ID. This is not a `file_storage.id`.
+	"""
+	id: ID!
+	originalFileName: String
+	mimeType: String
+	fileSizeBytes: Int
+	expiresAt: DateTime!
+}
+
+input SubmitEmployeeProfileChangeInput {
+	employeeId: ID!
+	requestType: String!
+	firstName: String
+	lastName: String
+	dateOfBirth: NaiveDate
+	panNumber: String
+	aadhaarNumber: String
+	bankName: String
+	accountNumber: String
+	ifscCode: String
+	accountType: String
+	supportingDocumentId: ID
+}
+
+input SubmitSeparationInput {
+	"""
+	When omitted, the JWT-linked employee is used (self-service exit request).
+	"""
+	employeeId: ID
+	separationType: String!
+	resignationDate: NaiveDate
+	lastWorkingDate: NaiveDate!
+	reason: String
+}
+
+type TenantCatalogPermission {
+	id: ID!
+	resource: String!
+	action: String!
+	description: String
+}
+
+type TenantDirectoryRole {
+	id: ID!
+	name: String!
+	description: String
+	isSystemRole: Boolean!
+}
+
+type TenantDirectoryUser {
+	id: ID!
+	username: String!
+	email: String
+	isActive: Boolean!
+}
+
+type TenantFileAttachment {
+	fileName: String!
+	mimeType: String!
+	fileSizeBytes: Int
+	"""
+	Standard base64 payload returned only after tenant file authorization.
+	"""
+	contentBase64: String!
+}
+
+type TenantPermissionScopeAssignment {
+	id: ID!
+	resource: String!
+	action: String!
+	scopeType: String!
+}
+
+input UpdateEmployeeInput {
+	id: ID!
+	firstName: String
+	lastName: String
+	departmentId: ID
+	designationId: ID
+	"""
+	Omitted = leave unchanged; `null` = clear manager; id = set manager (cycle-safe).
+	"""
+	reportingManagerId: ID
+	employmentType: String
+	status: String
+	userId: ID
+	"""
+	Optional linked login email. Omit to leave unchanged; pass an empty string to clear it.
+	"""
+	linkedUserEmail: String
+}
+
+input UpdateEmployeePersonalProfileInput {
+	employeeId: ID!
+	firstName: String
+	lastName: String
+	dateOfBirth: NaiveDate
+	gender: String
+	nationality: String
+	bloodGroup: String
+	emergencyContactName: String
+	emergencyContactPhone: String
+	emergencyContactRelation: String
+}
+
+input UpdateEmployeeSelfServiceProfileInput {
+	employeeId: ID!
+	personalPhone: String
+	currentAddress: String
+	permanentAddress: String
+	gender: String
+	nationality: String
+	bloodGroup: String
+	emergencyContactName: String
+	emergencyContactPhone: String
+	emergencyContactRelation: String
+}
+
+input UploadCompanyDocumentFileInput {
+	fileName: String!
+	mimeType: String
+	"""
+	Standard base64 (not data-URL). Max ~6MB decoded.
+	"""
+	contentBase64: String!
+}
+
+input UploadEmployeeDocumentInput {
+	employeeId: ID!
+	documentTypeId: ID!
+	fileName: String!
+	mimeType: String
+	"""
+	Standard base64 (not data-URL). Max ~6MB decoded.
+	"""
+	contentBase64: String!
+}
+
+input UploadTenantFileInput {
+	fileName: String!
+	mimeType: String
+	"""
+	Standard base64 (not data-URL). Max ~6MB decoded.
+	"""
+	contentBase64: String!
+}
+
+type UploadedTenantFile {
+	id: ID!
+	tenantId: ID!
+	originalFileName: String
+	mimeType: String
+	fileSizeBytes: Int
+	createdAt: DateTime!
+}
+
+input UpsertEmployeeEducationInput {
+	id: ID
+	employeeId: ID!
+	educationLevel: String!
+	qualification: String!
+	fieldOfStudy: String
+	institution: String!
+	boardUniversity: String
+	startDate: NaiveDate
+	completionYear: Int!
+	gradeScore: String
+	description: String
+}
+
+input UpsertEmployeePrimaryAadhaarInput {
+	employeeId: ID!
+	"""
+	Last 4 digits, or full 12-digit number (spaces allowed); only last 4 are stored.
+	"""
+	aadhaarNumber: String!
+}
+
+input UpsertEmployeePrimaryBankInput {
+	employeeId: ID!
+	bankName: String!
+	accountNumber: String!
+	ifscCode: String!
+	accountType: String
+}
+
+input UpsertEmployeePrimaryPanInput {
+	employeeId: ID!
+	"""
+	10-character Indian PAN (letters + digits), case-insensitive.
+	"""
+	panNumber: String!
+}
+
+input UpsertEmployeeWorkExperienceInput {
+	id: ID
+	employeeId: ID!
+	company: String!
+	roleTitle: String!
+	employmentType: String
+	location: String
+	startDate: NaiveDate!
+	endDate: NaiveDate
+	isCurrent: Boolean!
+	description: String
+}
+
+input UpsertFnfSettlementInput {
+	separationId: ID!
+	"""
+	Decimal as string, e.g. "12500.50". Omit or empty to clear.
+	"""
+	leaveEncashment: String
+	gratuityAmount: String
+	bonusPayable: String
+	recoveryAmount: String
+}
+
+"""
+The `_Any` scalar is used to pass representations of entities from external
+services into the root `_entities` field for execution.
+"""
+scalar _Any
+
+union _Entity = Employee
+
+type _Service {
+	sdl: String
+}
+
+"""
+Directs the executor to include this field or fragment only when the `if` argument is true.
+"""
+directive @include(if: Boolean!) on FIELD | FRAGMENT_SPREAD | INLINE_FRAGMENT
+"""
+Directs the executor to skip this field or fragment when the `if` argument is true.
+"""
+directive @skip(if: Boolean!) on FIELD | FRAGMENT_SPREAD | INLINE_FRAGMENT
+"""
+Provides a scalar specification URL for specifying the behavior of custom scalar types.
+"""
+directive @specifiedBy(url: String!) on SCALAR
+schema {
+	query: QueryRoot
+	mutation: MutationRoot
+}

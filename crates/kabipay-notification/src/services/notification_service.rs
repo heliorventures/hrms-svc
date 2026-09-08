@@ -278,6 +278,8 @@ pub async fn list_notifications(
 }
 
 pub struct NewAnnouncement {
+    pub video_upload_stage_id: Option<Uuid>,
+    pub video_link: Option<String>,
     pub title: String,
     pub body: Option<String>,
     pub target_audience: Option<String>,
@@ -301,6 +303,9 @@ pub async fn create_announcement(
     let id = Uuid::new_v4();
     let now = Utc::now();
     let publish_at = new.publish_at.unwrap_or(now);
+    let video_link = new.video_link.as_deref().map(super::announcement_video::validate_link).transpose()?;
+    if video_link.is_some() && new.video_upload_stage_id.is_some() { return Err(KabiPayError::Validation("choose a video link or uploaded video".into())); }
+
     let am = announcement::ActiveModel {
         id: Set(id),
         tenant_id: Set(tenant_id),
@@ -314,11 +319,17 @@ pub async fn create_announcement(
         expires_at: Set(new.expires_at),
         image_file_storage_id: Set(new.image_file_storage_id),
         document_file_storage_id: Set(new.document_file_storage_id),
+        video_file_storage_id: Set(None),
+        video_link: Set(video_link),
         post_source: Set(new.post_source),
         created_at: Set(now),
         updated_at: Set(now),
     };
     am.insert(&transaction).await.map_err(KabiPayError::from)?;
+    if let Some(stage_id) = new.video_upload_stage_id {
+        let file_id = super::announcement_video::claim(&transaction,tenant_id,created_by,stage_id,id).await?;
+        announcement::ActiveModel { id: Set(id), video_file_storage_id: Set(Some(file_id)), ..Default::default() }.update(&transaction).await?;
+    }
     let row = announcement::Entity::find_by_id(id)
         .one(&transaction)
         .await?
@@ -343,6 +354,10 @@ pub async fn create_announcement(
 }
 
 pub struct AnnouncementUpdate {
+    pub video_upload_stage_id: Option<Uuid>,
+    pub video_link: Option<String>,
+    pub remove_video: bool,
+    pub video_owner: Uuid,
     pub title: Option<String>,
     pub body: Option<String>,
     /// When true, clears `target_audience` and ignores `target_audience`.
@@ -373,6 +388,7 @@ pub async fn update_announcement(
             entity: "announcement",
             id: announcement_id.to_string(),
         })?;
+    let previous_video_id = row.video_file_storage_id;
     let previous_image_id = row.image_file_storage_id;
     let previous_document_id = row.document_file_storage_id;
     let mut am: announcement::ActiveModel = row.into();
@@ -412,6 +428,15 @@ pub async fn update_announcement(
     if let Some(d) = patch.document_file_storage_id {
         am.document_file_storage_id = Set(d);
     }
+    let video_link = patch.video_link.as_deref().map(super::announcement_video::validate_link).transpose()?;
+    if (video_link.is_some() && patch.video_upload_stage_id.is_some()) || (patch.remove_video && (video_link.is_some() || patch.video_upload_stage_id.is_some())) { return Err(KabiPayError::Validation("choose one video change".into())); }
+    if patch.remove_video || video_link.is_some() || patch.video_upload_stage_id.is_some() {
+        am.video_file_storage_id = Set(None);
+        am.video_link = Set(video_link);
+        if let Some(stage_id) = patch.video_upload_stage_id {
+            am.video_file_storage_id = Set(Some(super::announcement_video::claim(&transaction,tenant_id,patch.video_owner,stage_id,announcement_id).await?));
+        }
+    }
     am.updated_at = Set(now);
     am.update(&transaction).await.map_err(KabiPayError::from)?;
     let updated = announcement::Entity::find_by_id(announcement_id)
@@ -421,12 +446,13 @@ pub async fn update_announcement(
         .map_err(KabiPayError::from)?
         .ok_or_else(|| KabiPayError::Internal("announcement missing after update".into()))?;
 
-    let mut removed_ids = [previous_image_id, previous_document_id]
+    let mut removed_ids = [previous_image_id, previous_document_id, previous_video_id]
         .into_iter()
         .flatten()
         .filter(|file_id| {
             Some(*file_id) != updated.image_file_storage_id
                 && Some(*file_id) != updated.document_file_storage_id
+                && Some(*file_id) != updated.video_file_storage_id
         })
         .collect::<Vec<_>>();
     removed_ids.sort_unstable();
@@ -454,7 +480,7 @@ pub async fn delete_announcement(
             entity: "announcement",
             id: announcement_id.to_string(),
         })?;
-    let mut removed_ids = [row.image_file_storage_id, row.document_file_storage_id]
+    let mut removed_ids = [row.image_file_storage_id, row.document_file_storage_id, row.video_file_storage_id]
         .into_iter()
         .flatten()
         .collect::<Vec<_>>();
@@ -486,7 +512,8 @@ async fn enqueue_attachment_if_unreferenced(
         .filter(
             Condition::any()
                 .add(announcement::Column::ImageFileStorageId.eq(file_id))
-                .add(announcement::Column::DocumentFileStorageId.eq(file_id)),
+                .add(announcement::Column::DocumentFileStorageId.eq(file_id))
+                .add(announcement::Column::VideoFileStorageId.eq(file_id)),
         )
         .one(db)
         .await
@@ -495,6 +522,8 @@ async fn enqueue_attachment_if_unreferenced(
     if still_referenced {
         return Ok(());
     }
+    use kabipay_db_entities::tenant::d0079_announcement_video::announcement_video_stage as video_stage;
+    video_stage::Entity::delete_many().filter(video_stage::Column::TenantId.eq(tenant_id)).filter(video_stage::Column::FileStorageId.eq(file_id)).filter(video_stage::Column::ClaimedAnnouncementId.is_not_null()).exec(db).await?;
     let file = file_storage::Entity::find_by_id(file_id)
         .filter(file_storage::Column::TenantId.eq(tenant_id))
         .lock_exclusive()

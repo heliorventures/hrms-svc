@@ -1065,6 +1065,24 @@ pub struct EmployeePatch {
 pub async fn create_with_login(
     db: &DatabaseConnection,
     tenant_id: Uuid,
+    data: NewEmployee,
+    account: NewLoginAccount,
+) -> KabiPayResult<employee::Model> {
+    if data.user_id.is_some() {
+        return Err(KabiPayError::Validation("userId cannot be supplied when loginAccount is used".into()));
+    }
+    rbac_admin_service::require_nonempty_role_assignment(&account.role_ids)?;
+    canonical_employment_status(&data.status)?;
+    let txn = db.begin().await?;
+    let created = create_with_login_in_transaction(&txn, tenant_id, data, account).await?;
+    txn.commit().await?;
+    Ok(created)
+}
+
+/// Share all account and role validation with atomic candidate conversion.
+pub async fn create_with_login_in_transaction(
+    txn: &sea_orm::DatabaseTransaction,
+    tenant_id: Uuid,
     mut data: NewEmployee,
     account: NewLoginAccount,
 ) -> KabiPayResult<employee::Model> {
@@ -1075,11 +1093,10 @@ pub async fn create_with_login(
     }
     rbac_admin_service::require_nonempty_role_assignment(&account.role_ids)?;
     data.status = canonical_employment_status(&data.status)?.to_owned();
-    let txn = db.begin().await?;
     let validated_role_ids =
-        rbac_admin_service::validated_active_role_ids(&txn, tenant_id, &account.role_ids).await?;
+        rbac_admin_service::validated_active_role_ids(txn, tenant_id, &account.role_ids).await?;
     let user_id = insert_login_user(
-        &txn,
+        txn,
         tenant_id,
         account,
         validated_role_ids,
@@ -1087,8 +1104,7 @@ pub async fn create_with_login(
     )
     .await?;
     data.user_id = Some(user_id);
-    let created = create(&txn, tenant_id, data).await?;
-    txn.commit().await?;
+    let created = create(txn, tenant_id, data).await?;
     Ok(created)
 }
 

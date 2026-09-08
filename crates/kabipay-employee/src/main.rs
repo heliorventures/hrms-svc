@@ -25,6 +25,7 @@ use tower_http::{cors::CorsLayer, trace::TraceLayer};
 mod entities;
 mod resolvers;
 mod services;
+mod http_prejoining;
 
 use resolvers::{MutationRoot, QueryRoot};
 
@@ -79,6 +80,7 @@ async fn main() -> anyhow::Result<()> {
     });
 
     let app = Router::new()
+        .merge(http_prejoining::routes())
         .route("/healthz", get(|| async { "ok" }))
         .route("/graphql", get(graphql_playground).post(employee_graphql))
         .route("/files/employee-document", get(employee_file_download))
@@ -121,7 +123,7 @@ async fn employee_file_download(
             id: "requested".into(),
         })?;
 
-    let body = document_file_service::read_stored_file_bytes(&st.file_root, &row)
+    let body = document_file_service::read_stored_file_bytes(&db, &st.file_root, &row)
         .await?;
 
     let ct = claims

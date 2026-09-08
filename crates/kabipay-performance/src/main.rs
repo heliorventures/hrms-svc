@@ -3,11 +3,7 @@
 
 use async_graphql::{EmptySubscription, Schema};
 use kabipay_common::subgraph::{serve_subgraph, SubgraphConfig};
-
-mod resolvers;
-mod services;
-
-use resolvers::{MutationRoot, QueryRoot};
+use kabipay_performance::resolvers::{MutationRoot, QueryRoot};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {

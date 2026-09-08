@@ -10,6 +10,7 @@ use kabipay_common::KabiPayError;
 use kabipay_db_entities::tenant::d0011_leave::{leave_balance, leave_policy, leave_request, leave_type};
 use kabipay_db_entities::tenant::d0025_workflow::workflow_action;
 use kabipay_db_entities::tenant::d0029_file_storage::file_storage;
+use kabipay_db_entities::tenant::d0078_comp_off::{comp_off_claim, comp_off_policy};
 
 use crate::resolvers::query::parse_uuid;
 use crate::services::leave_service;
@@ -330,6 +331,39 @@ pub struct AdjustLeaveBalanceEntitlementInput {
     pub year: i32,
     pub entitled_delta: String,
 }
+
+#[derive(SimpleObject, Clone, Debug)]
+#[graphql(name = "CompOffPolicy")]
+pub struct CompOffPolicyDto { pub id: ID, pub designation_id: Option<ID>, pub employee_id: Option<ID>, pub leave_type_id: ID, pub enabled: bool, pub validity_days: i32, pub claim_deadline_days: i32, pub monthly_earning_limit: Option<String>, pub yearly_earning_limit: Option<String>, pub max_unused_balance: Option<String>, pub allow_approved_leave_cancellation: bool }
+impl From<comp_off_policy::Model> for CompOffPolicyDto { fn from(m: comp_off_policy::Model) -> Self { Self { id: ID(m.id.to_string()), designation_id: m.designation_id.map(|v| ID(v.to_string())), employee_id: m.employee_id.map(|v| ID(v.to_string())), leave_type_id: ID(m.leave_type_id.to_string()), enabled: m.enabled, validity_days: m.validity_days, claim_deadline_days: m.claim_deadline_days, monthly_earning_limit: m.monthly_earning_limit.map(|v| v.to_string()), yearly_earning_limit: m.yearly_earning_limit.map(|v| v.to_string()), max_unused_balance: m.max_unused_balance.map(|v| v.to_string()), allow_approved_leave_cancellation: m.allow_approved_leave_cancellation } } }
+
+#[derive(SimpleObject, Clone, Debug)]
+#[graphql(name = "CompOffClaim")]
+pub struct CompOffClaimDto { pub id: ID, pub employee_id: ID, pub employee_name: Option<String>, pub employee_code: Option<String>, pub worked_date: NaiveDate, pub units: String, pub status: String, pub reason: Option<String>, pub rejection_reason: Option<String>, pub approved_by: Option<ID>, pub approved_at: Option<DateTime<Utc>>, pub created_at: DateTime<Utc> }
+impl From<comp_off_claim::Model> for CompOffClaimDto { fn from(m: comp_off_claim::Model) -> Self { Self { id: ID(m.id.to_string()), employee_id: ID(m.employee_id.to_string()), employee_name:None, employee_code:None, worked_date: m.worked_date, units: m.units.to_string(), status: m.status, reason: m.reason, rejection_reason: m.rejection_reason, approved_by: m.approved_by.map(|v| ID(v.to_string())), approved_at: m.approved_at, created_at: m.created_at } } }
+impl CompOffClaimDto { pub fn with_employee(mut self,name:String,code:String)->Self{self.employee_name=Some(name);self.employee_code=Some(code);self} }
+
+#[derive(SimpleObject, Clone, Debug)]
+#[graphql(name = "CompOffBalance")]
+pub struct CompOffBalanceDto { pub earned_units: String, pub reserved_units: String, pub used_units: String, pub expired_units: String, pub available_units: String }
+
+#[derive(SimpleObject, Clone, Debug)]
+#[graphql(name = "ApprovedCompOffLeave")]
+pub struct ApprovedCompOffLeaveDto {
+    pub id: ID,
+    pub employee_id: ID,
+    pub employee_name: String,
+    pub employee_code: String,
+    pub from_date: NaiveDate,
+    pub to_date: NaiveDate,
+    pub days_requested: String,
+}
+
+#[derive(InputObject, Clone, Debug)]
+pub struct SubmitCompOffClaimInput { pub worked_date: NaiveDate, pub units: String, pub reason: Option<String> }
+
+#[derive(InputObject, Clone, Debug)]
+pub struct UpsertCompOffPolicyInput { pub id: Option<ID>, pub designation_id: Option<ID>, pub employee_id: Option<ID>, pub enabled: bool, pub validity_days: i32, pub claim_deadline_days: i32, pub monthly_earning_limit: Option<String>, pub yearly_earning_limit: Option<String>, pub max_unused_balance: Option<String>, pub allow_approved_leave_cancellation: bool }
 
 impl From<leave_request::Model> for LeaveRequestDto {
     fn from(m: leave_request::Model) -> Self {

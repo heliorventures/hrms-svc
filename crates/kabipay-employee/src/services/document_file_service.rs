@@ -143,9 +143,19 @@ fn absolute_storage_path(storage_path: &str) -> KabiPayResult<PathBuf> {
 /// Read bytes for `GET /files/employee-document`. Uses row metadata (not only current env) so
 /// old local files still work after switching to R2.
 pub async fn read_stored_file_bytes(
+    db: &DatabaseConnection,
     file_root: &Path,
     row: &file_storage::Model,
 ) -> KabiPayResult<Vec<u8>> {
+    if row.provider == "DATABASE" {
+        use kabipay_db_entities::tenant::d0080_prejoining::prejoining_document;
+        return prejoining_document::Entity::find()
+            .filter(prejoining_document::Column::TenantId.eq(row.tenant_id))
+            .filter(prejoining_document::Column::FileStorageId.eq(row.id))
+            .one(db).await?
+            .map(|document| document.bytes)
+            .ok_or_else(|| KabiPayError::NotFound { entity: "document", id: "requested".into() });
+    }
     if row.provider == PROVIDER_LOCAL {
         if row.storage_path.contains('\\')
             || Path::new(&row.storage_path).components().any(|part| {

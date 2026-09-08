@@ -19,6 +19,7 @@ use uuid::Uuid;
 use crate::resolvers::types::{
     AttendanceAdjustmentPolicyDto, AttendanceConnectionDto, AttendanceDto, AttendanceEdgeDto,
     AttendanceDailyReportConnectionDto, AttendanceDailyReportEdgeDto, AttendancePageInfoDto,
+    AttendancePeriodSummaryDto,
     AttendancePunchPolicyDto, AttendanceReportSummaryDto, HolidayCalendarDto, HolidayDayDto,
     HolidayEntryDto, ManagedAttendanceConnectionDto, ManagedAttendanceDto,
     ManagedAttendanceEdgeDto, PunchDaySummaryDto, ShiftDto, TimesheetEntryDto,
@@ -27,7 +28,8 @@ use crate::resolvers::types::{
 use crate::resolvers::attendance_management_auth;
 use crate::services::{
     attendance_management_service, attendance_report_service, attendance_service,
-    hrms_master_service, punch_policy, timesheet_batch_service, timesheet_project_assignment_service,
+    attendance_summary_service, hrms_master_service, punch_policy, timesheet_batch_service,
+    timesheet_project_assignment_service,
 };
 
 fn self_attendance_date_range(
@@ -136,6 +138,32 @@ impl QueryRoot {
             .await
             .map_err(KabiPayError::into_graphql)?;
         Ok(rows.into_iter().map(AttendanceDto::from).collect())
+    }
+
+    /// Complete-period totals for the JWT-linked employee; cursor pages never affect totals.
+    async fn my_attendance_summary(
+        &self,
+        ctx: &Context<'_>,
+        from_date: NaiveDate,
+        to_date: NaiveDate,
+    ) -> Result<AttendancePeriodSummaryDto> {
+        let tenant_id = require_tenant_id(ctx)?;
+        attendance_read_scope(ctx)?;
+        attendance_management_service::validate_date_range(from_date, to_date)
+            .map_err(KabiPayError::into_graphql)?;
+        let db = tenant_db(ctx, tenant_id).await?;
+        let employee_id = resolve_client_employee_id(ctx, &db, tenant_id)
+            .await
+            .map_err(KabiPayError::into_graphql)?;
+        let clock = TenantBusinessClock::load(ops_db(ctx)?, tenant_id)
+            .await
+            .map_err(KabiPayError::into_graphql)?;
+        let summary = attendance_summary_service::my_attendance_summary(
+            &db, tenant_id, employee_id, from_date, to_date, clock,
+        )
+        .await
+        .map_err(KabiPayError::into_graphql)?;
+        Ok(summary.into())
     }
 
     /// Cursor-paginated attendance for the JWT-linked employee only.
@@ -856,6 +884,7 @@ mod tests {
             ("{ punchDaySummary { __typename } }".to_string(), PERM_ATTENDANCE_READ, PERM_TIMESHEET_READ),
             ("{ upcomingHolidays { __typename } }".to_string(), PERM_ATTENDANCE_READ, PERM_TIMESHEET_READ),
             ("{ timesheetEntries { __typename } }".to_string(), PERM_TIMESHEET_READ, PERM_TIMESHEET_APPROVE),
+            ("{ myAttendanceSummary(fromDate: \"2026-09-01\", toDate: \"2026-09-30\") { completedMinutes workedDays averageMinutes incompleteSegments } }".to_string(), PERM_ATTENDANCE_READ, PERM_TIMESHEET_READ),
             ("{ attendanceAdjustmentPolicy { __typename } }".to_string(), PERM_ATTENDANCE_READ, PERM_TIMESHEET_READ),
             ("{ timesheetLockPolicy { __typename } }".to_string(), PERM_TIMESHEET_READ, PERM_TIMESHEET_APPROVE),
             ("{ timesheetProjects { __typename } }".to_string(), PERM_TIMESHEET_READ, PERM_TIMESHEET_APPROVE),

@@ -1,6 +1,42 @@
 //! GraphQL DTOs for kabipay-payroll.
 
 use async_graphql::{InputObject, SimpleObject, ID};
+
+#[derive(InputObject)]
+pub struct SavePayrollUnpaidLeavePolicyInput {
+    pub enabled: bool,
+    pub basic_component_code: Option<String>,
+    pub day_divisor: Option<String>,
+    pub treatment: Option<String>,
+}
+
+#[derive(SimpleObject)]
+pub struct PayrollUnpaidLeavePolicy {
+    pub enabled: bool,
+    pub basic_component_code: Option<String>,
+    pub day_divisor: Option<String>,
+    pub treatment: Option<String>,
+}
+impl From<kabipay_db_entities::tenant::d0077_unpaid_leave_payroll::payroll_unpaid_leave_policy::Model> for PayrollUnpaidLeavePolicy {
+    fn from(m: kabipay_db_entities::tenant::d0077_unpaid_leave_payroll::payroll_unpaid_leave_policy::Model) -> Self {
+        Self { enabled: m.enabled, basic_component_code: m.basic_component_code, day_divisor: m.day_divisor.map(|v| v.to_string()), treatment: m.treatment }
+    }
+}
+
+#[derive(SimpleObject)]
+pub struct PayslipUnpaidLeave {
+    pub basic_component_code: String,
+    pub basic_amount: String,
+    pub day_divisor: String,
+    pub unpaid_days: String,
+    pub amount: String,
+    pub treatment: String,
+}
+impl From<kabipay_db_entities::tenant::d0077_unpaid_leave_payroll::payslip_unpaid_leave::Model> for PayslipUnpaidLeave {
+    fn from(m: kabipay_db_entities::tenant::d0077_unpaid_leave_payroll::payslip_unpaid_leave::Model) -> Self {
+        Self { basic_component_code: m.basic_component_code, basic_amount: m.basic_amount.to_string(), day_divisor: m.day_divisor.to_string(), unpaid_days: m.unpaid_days.to_string(), amount: m.amount.to_string(), treatment: m.treatment }
+    }
+}
 use kabipay_db_entities::tenant::d0035_payroll_arrear::payroll_arrear;
 use chrono::{DateTime, NaiveDate, Utc};
 use kabipay_db_entities::tenant::d0012_payroll::{

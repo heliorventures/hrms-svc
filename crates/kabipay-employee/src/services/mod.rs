@@ -19,3 +19,6 @@ pub mod profile_payload_crypto;
 pub mod profile_record_service;
 pub mod rbac_admin_service;
 pub mod separation_service;
+pub mod prejoining;
+#[cfg(test)]
+mod prejoining_tests;

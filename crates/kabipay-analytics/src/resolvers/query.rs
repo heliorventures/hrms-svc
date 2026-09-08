@@ -39,6 +39,113 @@ fn require_analytics_insights(ctx: &Context<'_>) -> Result<()> {
 
 #[Object]
 impl QueryRoot {
+    async fn hr_report_rows(
+        &self,
+        ctx: &Context<'_>,
+        kind: super::hr_report_types::HrReportKind,
+        from_date: chrono::NaiveDate,
+        to_date: chrono::NaiveDate,
+        employee_id: Option<Uuid>,
+        employee_search: Option<String>,
+        #[graphql(default = 0)] offset: i32,
+        #[graphql(default = 50)] limit: i32,
+    ) -> Result<super::hr_report_types::HrReportRows> {
+        let claims = require_client_claims(ctx)?;
+        crate::services::hr_reports::authorize(claims, kind)
+            .map_err(KabiPayError::into_graphql)?;
+        let filter = crate::services::hr_reports::ReportFilter {
+            from_date, to_date, employee_id, employee_search,
+        };
+        filter.validate().map_err(KabiPayError::into_graphql)?;
+        if offset < 0 || !(1..=100).contains(&limit) {
+            return Err(KabiPayError::Validation(
+                "offset must be non-negative and limit between 1 and 100".into(),
+            ).into_graphql());
+        }
+        let tenant_id = require_tenant_id(ctx)?;
+        if tenant_id != claims.tenant_id {
+            return Err(KabiPayError::Forbidden(
+                "report tenant does not match authenticated tenant".into(),
+            ).into_graphql());
+        }
+        let clock = kabipay_common::tenant_business_clock::TenantBusinessClock::load(
+            ops_db(ctx)?, tenant_id,
+        ).await.map_err(KabiPayError::into_graphql)?;
+        let db = tenant_db(ctx, tenant_id).await?;
+        crate::services::hr_reports::load(&db, tenant_id, claims, kind, &filter, clock)
+            .await
+            .and_then(|data| data.preview(offset, limit))
+            .map_err(KabiPayError::into_graphql)
+    }
+
+    async fn hr_report_csv(
+        &self,
+        ctx: &Context<'_>,
+        kind: super::hr_report_types::HrReportKind,
+        from_date: chrono::NaiveDate,
+        to_date: chrono::NaiveDate,
+        employee_id: Option<Uuid>,
+        employee_search: Option<String>,
+    ) -> Result<super::hr_report_types::HrReportCsv> {
+        let claims = require_client_claims(ctx)?;
+        crate::services::hr_reports::authorize(claims, kind)
+            .map_err(KabiPayError::into_graphql)?;
+        let filter = crate::services::hr_reports::ReportFilter {
+            from_date, to_date, employee_id, employee_search,
+        };
+        filter.validate().map_err(KabiPayError::into_graphql)?;
+        let tenant_id = require_tenant_id(ctx)?;
+        if tenant_id != claims.tenant_id {
+            return Err(KabiPayError::Forbidden(
+                "report tenant does not match authenticated tenant".into(),
+            ).into_graphql());
+        }
+        let clock = kabipay_common::tenant_business_clock::TenantBusinessClock::load(
+            ops_db(ctx)?, tenant_id,
+        ).await.map_err(KabiPayError::into_graphql)?;
+        let db = tenant_db(ctx, tenant_id).await?;
+        crate::services::hr_reports::load(&db, tenant_id, claims, kind, &filter, clock)
+            .await
+            .and_then(|data| data.csv(kind, &filter))
+            .map_err(KabiPayError::into_graphql)
+    }
+
+    async fn hr_insights(
+        &self,
+        ctx: &Context<'_>,
+        from_date: chrono::NaiveDate,
+        to_date: chrono::NaiveDate,
+    ) -> Result<super::hr_report_types::HrInsights> {
+        let claims = require_client_claims(ctx)?;
+        if !crate::services::hr_reports::has_all(claims, "analytics:read") {
+            return Err(KabiPayError::Forbidden(
+                "analytics:read permission requires ALL scope".into(),
+            ).into_graphql());
+        }
+        let filter = crate::services::hr_reports::ReportFilter {
+            from_date, to_date, employee_id: None, employee_search: None,
+        };
+        filter.validate().map_err(KabiPayError::into_graphql)?;
+        if ![
+            "attendance:read", "employee:read", "payroll:read", "leave:read",
+            "timesheet:read", "expense:read", "travel:read",
+        ].iter().any(|permission| crate::services::hr_reports::has_all(claims, permission)) {
+            return Ok(super::hr_report_types::HrInsights::default());
+        }
+        let tenant_id = require_tenant_id(ctx)?;
+        if tenant_id != claims.tenant_id {
+            return Err(KabiPayError::Forbidden(
+                "report tenant does not match authenticated tenant".into(),
+            ).into_graphql());
+        }
+        let clock = kabipay_common::tenant_business_clock::TenantBusinessClock::load(
+            ops_db(ctx)?, tenant_id,
+        ).await.map_err(KabiPayError::into_graphql)?;
+        let db = tenant_db(ctx, tenant_id).await?;
+        crate::services::hr_insights::load(&db, tenant_id, claims, &filter, clock)
+            .await.map_err(KabiPayError::into_graphql)
+    }
+
     async fn analytics_health(&self) -> &'static str {
         "ok"
     }

@@ -3,7 +3,7 @@
 use std::collections::{HashMap, HashSet};
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-use chrono::{DateTime, Datelike, Days, Duration, NaiveDate, Timelike, Utc, Weekday};
+use chrono::{DateTime, Datelike, Duration, NaiveDate, Timelike, Utc, Weekday};
 use kabipay_common::{
     client_data_scope::EmployeeScopeFilter, tenant_business_clock::TenantBusinessClock,
     KabiPayError, KabiPayResult,
@@ -18,6 +18,7 @@ use kabipay_db_entities::tenant::{
 };
 use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, QueryOrder};
 use uuid::Uuid;
+use super::attendance_duration::canonical_instants;
 
 const DEFAULT_PAGE_SIZE: usize = 50;
 const MAX_PAGE_SIZE: usize = 100;
@@ -188,29 +189,6 @@ fn shift_expected_minutes(row: &shift::Model) -> Option<i32> {
 
 fn is_weekly_off(date: NaiveDate, expected_minutes: Option<i32>) -> bool {
     expected_minutes.is_none() && matches!(date.weekday(), Weekday::Sat | Weekday::Sun)
-}
-
-fn canonical_instants(
-    row: &attendance::Model,
-    clock: TenantBusinessClock,
-) -> (Option<DateTime<Utc>>, Option<DateTime<Utc>>) {
-    let legacy_check_in = row
-        .check_in_time
-        .and_then(|time| clock.to_utc(row.work_date, time).ok());
-    let legacy_check_out = match (row.check_in_time, row.check_out_time) {
-        (Some(check_in), Some(check_out)) if check_out != check_in => {
-            let checkout_date = if check_out > check_in {
-                Some(row.work_date)
-            } else {
-                row.work_date.checked_add_days(Days::new(1))
-            };
-            checkout_date.and_then(|date| clock.to_utc(date, check_out).ok())
-        }
-        _ => None,
-    };
-    let check_in = row.check_in_at.or(legacy_check_in);
-    let check_out = row.check_out_at.or(legacy_check_out);
-    (check_in, check_out)
 }
 
 fn aggregate_segments(

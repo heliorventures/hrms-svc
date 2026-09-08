@@ -163,7 +163,7 @@ fn opt_uuid(id: &Option<ID>, field: &'static str) -> Result<Option<Uuid>> {
 
 const MIN_PASSWORD_LEN: usize = 8;
 
-fn validate_admin_password(raw: String, field: &'static str) -> Result<String> {
+pub(super) fn validate_admin_password(raw: String, field: &'static str) -> Result<String> {
     let trimmed = raw.trim().to_string();
     if trimmed.len() < MIN_PASSWORD_LEN {
         return Err(KabiPayError::Validation(format!(
@@ -182,7 +182,7 @@ fn parse_role_ids(role_ids: Option<Vec<ID>>) -> Result<Vec<Uuid>> {
     Ok(parsed)
 }
 
-async fn hash_password_async(plaintext: String) -> Result<String> {
+pub(super) async fn hash_password_async(plaintext: String) -> Result<String> {
     tokio::task::spawn_blocking(move || password::hash(&plaintext))
         .await
         .map_err(|error| {
@@ -196,7 +196,7 @@ async fn hash_password_async(plaintext: String) -> Result<String> {
 /// - Valid **client JWT** must include `employee:write` or `employee:manage`.
 /// - **Dev only:** set `KABIPAY_EMPLOYEE_MUTATION_HEADER_OK=1` to allow unauthenticated
 ///   `x-tenant-id` (no claims) for local automation — never in production.
-fn require_employee_mutation_rbac(ctx: &Context<'_>) -> Result<()> {
+pub(super) fn require_employee_mutation_rbac(ctx: &Context<'_>) -> Result<()> {
     if ctx.data_opt::<ClientClaims>().is_none() {
         if std::env::var("KABIPAY_EMPLOYEE_MUTATION_HEADER_OK").as_deref() == Ok("1") {
             return Ok(());
@@ -249,6 +249,13 @@ pub struct MutationRoot;
 
 #[Object]
 impl MutationRoot {
+    async fn save_prejoining_config(&self, ctx: &Context<'_>, config: async_graphql::Json<serde_json::Value>) -> Result<async_graphql::Json<serde_json::Value>> { super::prejoining::save_config(ctx, config).await }
+    async fn invite_prejoining(&self, ctx: &Context<'_>, email: String, send_email: bool) -> Result<super::prejoining::PrejoiningInvitation> { super::prejoining::invite(ctx, email, send_email).await }
+    async fn reissue_prejoining(&self, ctx: &Context<'_>, id: ID, revision: i32, send_email: bool) -> Result<super::prejoining::PrejoiningInvitation> { super::prejoining::reissue(ctx, id, revision, send_email).await }
+    async fn request_prejoining_changes(&self, ctx: &Context<'_>, id: ID, revision: i32, feedback: String) -> Result<super::prejoining::PrejoiningCandidate> { super::prejoining::review(ctx, id, revision, "REQUEST_CHANGES", Some(feedback)).await }
+    async fn approve_prejoining(&self, ctx: &Context<'_>, id: ID, revision: i32) -> Result<super::prejoining::PrejoiningCandidate> { super::prejoining::review(ctx, id, revision, "APPROVE", None).await }
+    async fn cancel_prejoining(&self, ctx: &Context<'_>, id: ID, revision: i32) -> Result<super::prejoining::PrejoiningCandidate> { super::prejoining::review(ctx, id, revision, "CANCEL", None).await }
+    async fn confirm_prejoining_joined(&self, ctx: &Context<'_>, input: super::prejoining::ConfirmPrejoiningInput) -> Result<super::prejoining::PrejoiningCandidate> { super::prejoining::confirm(ctx, input).await }
     async fn create_employee(
         &self,
         ctx: &Context<'_>,

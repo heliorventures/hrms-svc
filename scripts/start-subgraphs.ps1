@@ -1,4 +1,4 @@
-# Starts all federated GraphQL subgraphs: unified ops on 4010, tenant modules 4013-4029.
+# Starts all federated GraphQL subgraphs: unified ops on 4010, tenant modules 4013-4030.
 # Requires: cargo build for each crate (use: cargo build -j 1 -p <crate> per crate if full workspace build OOMs on Windows).
 #
 # Connection budget: each process opens its own SeaORM/sqlx pool. A managed Postgres with
@@ -28,7 +28,8 @@ $runs = @(
     @('kabipay-grievance.exe', 'KABIPAY_GRIEVANCE_PORT', '4026'),
     @('kabipay-workflow.exe', 'KABIPAY_WORKFLOW_PORT', '4027'),
     @('kabipay-notification.exe', 'KABIPAY_NOTIFICATION_PORT', '4028'),
-    @('kabipay-analytics.exe', 'KABIPAY_ANALYTICS_PORT', '4029')
+    @('kabipay-analytics.exe', 'KABIPAY_ANALYTICS_PORT', '4029'),
+    @('kabipay-survey.exe', 'KABIPAY_SURVEY_PORT', '4030')
 )
 Get-Process -Name 'kabipay-*' -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
 foreach ($r in $runs) {
@@ -42,4 +43,4 @@ foreach ($r in $runs) {
     # Small delay avoids a simultaneous TLS/auth stampede against small managed DBs.
     Start-Sleep -Milliseconds 250
 }
-Write-Host "Started $($runs.Count) subgraph processes (KABIPAY_DB_POOL_MAX=$($env:KABIPAY_DB_POOL_MAX)). Ops: 4010; tenant modules: 4013-4029."
+Write-Host "Started $($runs.Count) subgraph processes (KABIPAY_DB_POOL_MAX=$($env:KABIPAY_DB_POOL_MAX)). Ops: 4010; tenant modules: 4013-4030."

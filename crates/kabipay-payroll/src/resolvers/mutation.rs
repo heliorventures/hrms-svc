@@ -45,6 +45,15 @@ pub struct MutationRoot;
 
 #[Object]
 impl MutationRoot {
+    async fn save_payroll_unpaid_leave_policy(&self, ctx: &Context<'_>, input: super::types::SavePayrollUnpaidLeavePolicyInput) -> Result<super::types::PayrollUnpaidLeavePolicy> {
+        let actor = require_payroll_manage_all(ctx)?;
+        let tenant = require_tenant_id(ctx)?;
+        let divisor = input.day_divisor.as_deref().map(|v| Decimal::from_str(v.trim())
+            .map_err(|_| KabiPayError::Validation("day divisor must be a decimal number".into()).into_graphql())).transpose()?;
+        let db = tenant_db(ctx, tenant).await?;
+        Ok(crate::services::unpaid_leave_policy::save(&db, tenant, actor, input.enabled, input.basic_component_code, divisor, input.treatment)
+            .await.map_err(KabiPayError::into_graphql)?.into())
+    }
     /// Record a **PENDING** arrear for an employee; amount is added on the next pay run (with an `ARREAR` line).
     async fn create_payroll_arrear(
         &self,
@@ -320,8 +329,9 @@ mod tests {
         );
     }
 
-    fn protected_mutations() -> [&'static str; 7] {
+    fn protected_mutations() -> [&'static str; 8] {
         [
+            r#"mutation { savePayrollUnpaidLeavePolicy(input: { enabled: false }) { enabled } }"#,
             r#"mutation { createPayrollArrear(input: { employeeId: "00000000-0000-0000-0000-000000000001", amount: "1" }) { id } }"#,
             r#"mutation { upsertSalaryComponent(input: { name: "Base", code: "BASIC", componentType: "EARNING", isTaxable: true, isFixed: true, isActive: true }) { id } }"#,
             r#"mutation { upsertSalaryStructure(input: { name: "Default", components: [] }) { id } }"#,

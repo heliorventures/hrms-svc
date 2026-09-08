@@ -8,18 +8,20 @@ use kabipay_common::client_data_scope::{
 };
 use kabipay_common::context::{ClientClaims, ScopeType, PERM_LEAVE_READ};
 use kabipay_common::{
-    subgraph::{require_tenant_id, resolve_client_employee_id, tenant_db},
+    subgraph::{ops_db, require_tenant_id, resolve_client_employee_id, tenant_db},
+    tenant_business_clock::TenantBusinessClock,
     KabiPayError, KabiPayResult,
 };
 use kabipay_db_entities::tenant::d0007_employee_core::employee;
 use kabipay_db_entities::tenant::d0011_leave::leave_request;
 use kabipay_db_entities::tenant::d0029_file_storage::file_storage;
 use sea_orm::{ColumnTrait, EntityTrait, PaginatorTrait, QueryFilter, QueryOrder, QuerySelect};
+use rust_decimal::Decimal;
 use std::collections::HashMap;
 use uuid::Uuid;
 
 use crate::resolvers::types::{
-    LeaveBalanceDto, LeavePolicyDto, LeaveRequestDto, LeaveTypeDto, LeaveWorkflowActionDto,
+    ApprovedCompOffLeaveDto, CompOffBalanceDto, CompOffClaimDto, CompOffPolicyDto, LeaveBalanceDto, LeavePolicyDto, LeaveRequestDto, LeaveTypeDto, LeaveWorkflowActionDto,
 };
 use crate::services::{leave_admin, leave_service};
 
@@ -41,6 +43,9 @@ pub struct QueryRoot;
 
 #[Object]
 impl QueryRoot {
+    async fn comp_off_policy_targets(&self, ctx: &Context<'_>) -> Result<super::comp_off_targets::CompOffPolicyTargets> {
+        super::comp_off_targets::load(ctx).await
+    }
     async fn leave_health(&self) -> &'static str {
         "ok"
     }
@@ -174,6 +179,109 @@ impl QueryRoot {
                 }
             })
             .collect())
+    }
+
+    async fn comp_off_policy(&self, ctx: &Context<'_>) -> Result<Option<CompOffPolicyDto>> {
+        let tenant_id = require_tenant_id(ctx)?; leave_read_scope(ctx)?; let db = tenant_db(ctx, tenant_id).await?; let employee_id = resolve_client_employee_id(ctx, &db, tenant_id).await.map_err(KabiPayError::into_graphql)?;
+        Ok(crate::services::comp_off::resolved_policy(&db, tenant_id, employee_id).await.map_err(KabiPayError::into_graphql)?.map(Into::into))
+    }
+
+    async fn comp_off_policies(&self, ctx: &Context<'_>) -> Result<Vec<CompOffPolicyDto>> {
+        let tenant_id=require_tenant_id(ctx)?; let claims=ctx.data_opt::<ClientClaims>(); let scope=data_scope_from_claims(claims, kabipay_common::context::PERM_LEAVE_MANAGE).map_err(KabiPayError::into_graphql)?; if scope != ScopeType::All { return Err(KabiPayError::Forbidden("leave:manage requires ALL scope".into()).into_graphql()); } let db=tenant_db(ctx,tenant_id).await?; Ok(crate::services::comp_off::list_policies(&db,tenant_id).await.map_err(KabiPayError::into_graphql)?.into_iter().map(Into::into).collect())
+    }
+
+    async fn comp_off_claims(
+        &self, ctx: &Context<'_>, #[graphql(default = 100)] limit: u64,
+        #[graphql(default = 0)] offset: u64, status: Option<String>,
+        #[graphql(default = false)] mine: bool, #[graphql(default = false)] for_approval: bool,
+    ) -> Result<Vec<CompOffClaimDto>> {
+        if mine && for_approval {
+            return Err(KabiPayError::Validation("mine and forApproval cannot both be true".into()).into_graphql());
+        }
+        let scope = if for_approval {
+            let scope = data_scope_from_claims(ctx.data_opt::<ClientClaims>(), kabipay_common::context::PERM_LEAVE_APPROVE)
+                .map_err(KabiPayError::into_graphql)?;
+            if !matches!(scope, ScopeType::Team | ScopeType::All) {
+                return Err(KabiPayError::Forbidden("leave:approve requires TEAM or ALL scope".into()).into_graphql());
+            }
+            scope
+        } else { leave_read_scope(ctx)? };
+        let tenant_id = require_tenant_id(ctx)?;
+        let db = tenant_db(ctx, tenant_id).await?;
+        let viewer = resolve_viewer_employee(ctx, &db, tenant_id).await?;
+        let viewer_id = viewer.map(|value| value.employee_id);
+        let ids = if mine {
+            Some(vec![resolve_client_employee_id(ctx, &db, tenant_id).await.map_err(KabiPayError::into_graphql)?])
+        } else {
+            match resolve_employee_scope_filter(&db, tenant_id, scope, viewer).await.map_err(KabiPayError::into_graphql)? {
+                EmployeeScopeFilter::Unrestricted => None,
+                EmployeeScopeFilter::Empty => Some(vec![]),
+                EmployeeScopeFilter::EmployeeIds(ids) => Some(ids),
+            }
+        };
+        let rows = crate::services::comp_off::list_claims(&db, tenant_id, ids, if for_approval { viewer_id } else { None }, status.as_deref(), limit, offset)
+            .await.map_err(KabiPayError::into_graphql)?;
+        if rows.is_empty() { return Ok(Vec::new()); }
+        let labels: HashMap<Uuid, (String, String)> = employee::Entity::find()
+            .filter(employee::Column::TenantId.eq(tenant_id))
+            .filter(employee::Column::Id.is_in(rows.iter().map(|row| row.employee_id)))
+            .all(&db).await.map_err(|error| KabiPayError::from(error).into_graphql())?
+            .into_iter().map(|employee| (employee.id, (format!("{} {}", employee.first_name, employee.last_name).trim().to_string(), employee.employee_code))).collect();
+        Ok(rows.into_iter().map(|row| {
+            let label = labels.get(&row.employee_id);
+            let dto = CompOffClaimDto::from(row);
+            match label { Some((name, code)) => dto.with_employee(name.clone(), code.clone()), None => dto }
+        }).collect())
+    }
+
+    async fn comp_off_balance(&self, ctx: &Context<'_>) -> Result<CompOffBalanceDto> {
+        let tenant_id=require_tenant_id(ctx)?; leave_read_scope(ctx)?; let today=TenantBusinessClock::load(ops_db(ctx)?,tenant_id).await.map_err(KabiPayError::into_graphql)?.now_date(); let db=tenant_db(ctx,tenant_id).await?; let employee_id=resolve_client_employee_id(ctx,&db,tenant_id).await.map_err(KabiPayError::into_graphql)?; let (earned,reserved,used,expired)=crate::services::comp_off::balance(&db,tenant_id,employee_id,today).await.map_err(KabiPayError::into_graphql)?; Ok(CompOffBalanceDto { earned_units:earned.to_string(), reserved_units:reserved.to_string(), used_units:used.to_string(), expired_units:expired.to_string(), available_units:(earned-reserved-used-expired).max(Decimal::ZERO).to_string() })
+    }
+
+    /// Future approved comp-off leave that HR may cancel under the employee's current policy.
+    async fn approved_comp_off_leaves(
+        &self,
+        ctx: &Context<'_>,
+        #[graphql(default = 50)] limit: u64,
+        #[graphql(default = 0)] offset: u64,
+    ) -> Result<Vec<ApprovedCompOffLeaveDto>> {
+        let scope = data_scope_from_claims(ctx.data_opt::<ClientClaims>(), kabipay_common::context::PERM_LEAVE_MANAGE)
+            .map_err(KabiPayError::into_graphql)?;
+        if scope != ScopeType::All {
+            return Err(KabiPayError::Forbidden("leave:manage requires ALL scope".into()).into_graphql());
+        }
+        let tenant_id = require_tenant_id(ctx)?;
+        let today = TenantBusinessClock::load(ops_db(ctx)?, tenant_id).await.map_err(KabiPayError::into_graphql)?.now_date();
+        let db = tenant_db(ctx, tenant_id).await?;
+        let candidates = leave_request::Entity::find()
+            .filter(leave_request::Column::TenantId.eq(tenant_id))
+            .filter(leave_request::Column::IsDeleted.eq(false))
+            .filter(leave_request::Column::Status.eq("APPROVED"))
+            .filter(leave_request::Column::UsesCompOff.eq(true))
+            .filter(leave_request::Column::FromDate.gt(today))
+            .order_by_asc(leave_request::Column::FromDate)
+            .order_by_asc(leave_request::Column::Id)
+            .all(&db).await.map_err(|error| KabiPayError::from(error).into_graphql())?;
+        let mut eligible = Vec::new();
+        for request in candidates {
+            let policy = crate::services::comp_off::resolved_policy(&db, tenant_id, request.employee_id).await.map_err(KabiPayError::into_graphql)?;
+            if policy.as_ref().is_some_and(|value| value.allow_approved_leave_cancellation) {
+                eligible.push(request);
+            }
+        }
+        let selected: Vec<_> = eligible.into_iter().skip(offset as usize).take(limit.clamp(1, 200) as usize).collect();
+        if selected.is_empty() { return Ok(Vec::new()); }
+        let labels: HashMap<Uuid, employee::Model> = employee::Entity::find()
+            .filter(employee::Column::TenantId.eq(tenant_id))
+            .filter(employee::Column::Id.is_in(selected.iter().map(|row| row.employee_id)))
+            .all(&db).await.map_err(|error| KabiPayError::from(error).into_graphql())?
+            .into_iter().map(|row| (row.id, row)).collect();
+        Ok(selected.into_iter().filter_map(|request| labels.get(&request.employee_id).map(|employee| ApprovedCompOffLeaveDto {
+            id: ID(request.id.to_string()), employee_id: ID(request.employee_id.to_string()),
+            employee_name: format!("{} {}", employee.first_name, employee.last_name).trim().to_owned(),
+            employee_code: employee.employee_code.clone(), from_date: request.from_date, to_date: request.to_date,
+            days_requested: request.days_requested.to_string(),
+        })).collect())
     }
 
     /// Total leave requests visible to the caller for the selected date range.
@@ -457,6 +565,9 @@ mod tests {
     async fn every_protected_leave_query_denies_missing_and_sibling_permissions_before_db_access() {
         let leave_request_id = Uuid::new_v4();
         let fields = vec![
+            "{ compOffPolicy { id } }".to_string(),
+            "{ compOffBalance { availableUnits } }".to_string(),
+            "{ compOffClaims(mine: true) { id } }".to_string(),
             "{ viewerEmployeeId }".to_string(),
             "{ leaveTypes { __typename } }".to_string(),
             "{ leaveRequests { __typename } }".to_string(),
@@ -474,6 +585,23 @@ mod tests {
             let sibling =
                 execute_query(claims(PERM_LEAVE_APPROVE, Some("ALL")), &query).await;
             assert_leave_read_denied_before_db(&sibling);
+        }
+    }
+
+    #[tokio::test]
+    async fn comp_off_admin_and_approval_queries_require_their_exact_scope_before_database_access() {
+        use kabipay_common::context::PERM_LEAVE_MANAGE;
+        for (query, required) in [
+            ("{ compOffPolicyTargets { employees { id } } }", PERM_LEAVE_MANAGE),
+            ("{ compOffPolicies { id } }", PERM_LEAVE_MANAGE),
+            ("{ compOffClaims(forApproval: true) { id } }", PERM_LEAVE_APPROVE),
+        ] {
+            for denied in [claims(PERM_LEAVE_READ, Some("ALL")), claims(required, Some("SELF"))] {
+                let response = execute_query(denied, query).await;
+                assert_eq!(response.errors.len(), 1);
+                assert!(response.errors[0].message.contains(required), "{response:?}");
+                assert!(!response.errors[0].message.contains("TenantDbCache"));
+            }
         }
     }
 

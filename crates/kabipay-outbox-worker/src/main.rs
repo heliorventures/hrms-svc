@@ -17,6 +17,8 @@ use kabipay_common::tenant_business_clock::TenantBusinessClock;
 use kabipay_db_entities::ops::tenant_database;
 use kabipay_db_entities::tenant::d0026_integrations::{webhook_delivery_log, webhook_subscription};
 use kabipay_db_entities::tenant::d0030_outbox_events::outbox_event;
+use kabipay_notification::services::automated_events::process_due_celebrations;
+use kabipay_performance::services::performance_workflow::process_due_performance_cycles;
 use reqwest::header::{HeaderMap, HeaderValue, CONTENT_TYPE};
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseConnection, DbBackend, EntityTrait,
@@ -517,17 +519,67 @@ async fn main() -> anyhow::Result<()> {
                     match resolve_tenant_db(tid, &ops_db, &cache, &fallback).await {
                         Ok(tdb) => {
                             match TenantBusinessClock::load(&ops_db, tid).await {
-                                Ok(clock) => match process_due_separations(&tdb, tid, clock.now_date()).await {
-                                    Ok(result) if result.processed > 0 => {
-                                        tracing::info!(%tid, processed = result.processed, "due employee offboarding completed");
+                                Ok(clock) => {
+                                    let now = Utc::now();
+                                    let business_date = clock.business_date(now);
+                                    let business_time = clock.local_time(now);
+                                    match process_due_separations(&tdb, tid, business_date).await {
+                                        Ok(result) if result.processed > 0 => {
+                                            tracing::info!(%tid, processed = result.processed, "due employee offboarding completed");
+                                        }
+                                        Ok(_) => {}
+                                        Err(error) => tracing::error!(%tid, code = error.code(), "due employee offboarding sweep failed"),
                                     }
-                                    Ok(_) => {}
-                                    Err(error) => tracing::error!(%tid, code = error.code(), "due employee offboarding sweep failed"),
-                                },
-                                Err(error) => tracing::error!(%tid, code = error.code(), "tenant business clock unavailable for offboarding sweep"),
+                                    match process_due_celebrations(
+                                        &tdb,
+                                        tid,
+                                        business_date,
+                                        business_time,
+                                    )
+                                    .await
+                                    {
+                                        Ok(result) if result.notifications_created > 0 => {
+                                            tracing::info!(
+                                                %tid,
+                                                eligible_events = result.eligible_events,
+                                                notifications_created = result.notifications_created,
+                                                duplicates_skipped = result.duplicates_skipped,
+                                                "automated employee notification sweep completed"
+                                            );
+                                        }
+                                        Ok(_) => {}
+                                        Err(error) => tracing::error!(
+                                            %tid,
+                                            code = error.code(),
+                                            "automated employee notification sweep failed"
+                                        ),
+                                    }
+                                    match process_due_performance_cycles(&tdb, tid, business_date).await {
+                                        Ok(result) if result.cycles_created > 0 => tracing::info!(
+                                            %tid,
+                                            cycles_created = result.cycles_created,
+                                            participants_created = result.participants_created,
+                                            "scheduled performance cycle sweep completed"
+                                        ),
+                                        Ok(_) => {}
+                                        Err(error) => tracing::error!(
+                                            %tid,
+                                            code = error.code(),
+                                            "scheduled performance cycle sweep failed"
+                                        ),
+                                    }
+                                }
+                                Err(error) => tracing::error!(
+                                    %tid,
+                                    code = error.code(),
+                                    "tenant business clock unavailable for scheduled tenant sweeps"
+                                ),
                             }
                             if let Err(error) = sweep_expired_company_upload_stages(&tdb, tid, 25).await {
                                 tracing::error!(%tid, code = error.code(), "expired file-upload stage sweep failed");
+                            }
+                            if let Err(error) = kabipay_notification::services::announcement_video::sweep_expired(&tdb, tid, 25).await {
+                                tracing::error!(%tid, code=error.code(), "expired video upload sweep failed");
                             }
                             if let Err(error) = process_private_file_cleanup_tasks(&tdb, tid, 25).await {
                                 tracing::error!(%tid, code = error.code(), "private file cleanup sweep failed");

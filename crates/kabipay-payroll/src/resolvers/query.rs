@@ -124,6 +124,25 @@ pub struct QueryRoot;
 
 #[Object]
 impl QueryRoot {
+    async fn payroll_unpaid_leave_policy(&self, ctx: &Context<'_>) -> Result<Option<super::types::PayrollUnpaidLeavePolicy>> {
+        require_payroll_tenant_all_scope(ctx, PERM_PAYROLL_MANAGE)?;
+        let tenant = require_tenant_id(ctx)?;
+        let db = tenant_db(ctx, tenant).await?;
+        Ok(crate::services::unpaid_leave_policy::find(&db, tenant).await.map_err(KabiPayError::into_graphql)?.map(Into::into))
+    }
+
+    async fn payslip_unpaid_leave(&self, ctx: &Context<'_>, payslip_id: ID) -> Result<Option<super::types::PayslipUnpaidLeave>> {
+        let tenant = require_tenant_id(ctx)?;
+        let scope = payroll_read_scope(ctx)?;
+        let id = parse_uuid(&payslip_id, "payslipId")?;
+        let db = tenant_db(ctx, tenant).await?;
+        let viewer = resolve_viewer_employee(ctx, &db, tenant).await?;
+        let filter = resolve_employee_scope_filter(&db, tenant, scope, viewer).await.map_err(KabiPayError::into_graphql)?;
+        if payroll_service::find_scoped_payslip_detail(&db, tenant, id, &filter).await.map_err(KabiPayError::into_graphql)?.is_none() { return Ok(None); }
+        use kabipay_db_entities::tenant::d0077_unpaid_leave_payroll::payslip_unpaid_leave as snapshot;
+        Ok(snapshot::Entity::find().filter(snapshot::Column::TenantId.eq(tenant)).filter(snapshot::Column::PayslipId.eq(id))
+            .one(&db).await.map_err(KabiPayError::from).map_err(KabiPayError::into_graphql)?.map(Into::into))
+    }
     async fn payroll_health(&self) -> &'static str {
         "ok"
     }
@@ -1118,6 +1137,18 @@ mod tests {
         let employee_id = Uuid::new_v4();
         let record_id = Uuid::new_v4();
         let fields = vec![
+            (
+                "{ payrollUnpaidLeavePolicy { enabled } }".to_string(),
+                PERM_PAYROLL_MANAGE,
+                PERM_PAYROLL_READ,
+                true,
+            ),
+            (
+                format!("{{ payslipUnpaidLeave(payslipId: \"{record_id}\") {{ amount }} }}"),
+                PERM_PAYROLL_READ,
+                PERM_EMPLOYEE_READ,
+                false,
+            ),
             (
                 "{ salaryComponents { __typename } }".to_string(),
                 PERM_PAYROLL_MANAGE,

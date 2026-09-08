@@ -7,6 +7,8 @@ pub mod mutation;
 pub mod query;
 pub mod scope;
 pub mod types;
+pub mod prejoining;
+pub mod prejoining_options;
 
 pub use mutation::MutationRoot;
 pub use query::QueryRoot;
