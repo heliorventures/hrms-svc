@@ -51,7 +51,7 @@ fn source(kind:HrReportKind,domains:&[&str])->Source {
  if unpaid {cols.extend(["Basic component","Stored basic amount","Day divisor","Unpaid days","Unpaid amount","Treatment","Source day snapshot"]);}
  (cols,format!("SELECT {labels},to_char(make_date(c.year,c.month,1),'YYYY-MM'),r.gross_salary,r.total_deductions,r.net_salary,r.status{extra} FROM payslip r {employee_join} JOIN payroll_cycle c ON c.id=r.payroll_cycle_id AND c.tenant_id=r.tenant_id {} WHERE {predicate} AND make_date(c.year,c.month,1)<= $3 AND (make_date(c.year,c.month,1)+interval '1 month')::date>$2 ORDER BY c.year,c.month,e.employee_code,r.id",if unpaid {"JOIN payslip_unpaid_leave u ON u.payslip_id=r.id AND u.tenant_id=r.tenant_id"}else{""}))
  },
- HrReportKind::EmployeeMovements => (vec!["Employee code","Employee","Movement","Effective date","Current department","Current designation"],format!("WITH movements AS (SELECT id employee_id,tenant_id,'Joined' movement,date_of_joining effective_date,id FROM employee WHERE tenant_id=$1 AND NOT is_deleted UNION ALL SELECT employee_id,tenant_id,'Exited',last_working_date,id FROM separation WHERE tenant_id=$1 AND offboarded_at IS NOT NULL AND last_working_date<=$6) SELECT {labels},r.movement,r.effective_date,d.name,g.name FROM movements r {employee_join} LEFT JOIN department d ON d.id=e.department_id AND d.tenant_id=e.tenant_id LEFT JOIN designation g ON g.id=e.designation_id AND g.tenant_id=e.tenant_id WHERE {predicate} AND r.effective_date BETWEEN $2 AND $3 ORDER BY r.effective_date,e.employee_code,r.movement,r.id")),
+ HrReportKind::EmployeeMovements => (vec!["Employee code","Employee","Movement","Effective date","Current department","Current designation"],format!("WITH movements AS (SELECT id employee_id,tenant_id,'Joined' movement,date_of_joining effective_date,id FROM employee WHERE tenant_id=$1 AND NOT is_deleted UNION ALL SELECT employee_id,tenant_id,'Exited',last_working_date,id FROM separation WHERE tenant_id=$1 AND offboarded_at IS NOT NULL AND last_working_date<=$6) SELECT {labels},r.movement,r.effective_date,d.name,g.title FROM movements r {employee_join} LEFT JOIN department d ON d.id=e.department_id AND d.tenant_id=e.tenant_id LEFT JOIN designation g ON g.id=e.designation_id AND g.tenant_id=e.tenant_id WHERE {predicate} AND r.effective_date BETWEEN $2 AND $3 ORDER BY r.effective_date,e.employee_code,r.movement,r.id")),
  HrReportKind::TimesheetHours => (vec!["Employee code","Employee","Work date","Project code","Work description","Hours","Approval status"],format!("SELECT {labels},r.work_date,r.project_code,r.description,r.hours_worked,r.status FROM timesheet_entry r {employee_join} WHERE {predicate} AND NOT r.is_deleted AND r.work_date BETWEEN $2 AND $3 ORDER BY r.work_date,e.employee_code,r.id")),
  HrReportKind::CompOffCredits => (vec!["Employee code","Employee","Approval business date","Credited units","Current reserved","Current used","Current remaining","Current expired","Expiry date"],format!("SELECT {labels},r.approval_business_date,r.earned_units,r.reserved_units,r.used_units,CASE WHEN r.expires_at>$6 THEN greatest(0,r.earned_units-r.reserved_units-r.used_units) ELSE 0 END,CASE WHEN r.expires_at<=$6 THEN greatest(0,r.earned_units-r.reserved_units-r.used_units) ELSE 0 END,r.expires_at FROM comp_off_credit r {employee_join} WHERE {predicate} AND r.approval_business_date BETWEEN $2 AND $3 ORDER BY r.approval_business_date,e.employee_code,r.id")),
  HrReportKind::PendingRequests => {
@@ -92,6 +92,21 @@ async fn load_sql(db:&DatabaseConnection,tenant_id:Uuid,claims:&ClientClaims,kin
 #[cfg(test)]
 mod tests {
  use super::*;
+ #[test]
+ fn employee_movements_selects_designation_title_from_entity_schema() {
+     use kabipay_db_entities::tenant::d0006_org_hierarchy::{department, designation};
+     use sea_orm::IdenStatic;
+
+     let report = source(HrReportKind::EmployeeMovements, &[]);
+     let organization_fields = format!(
+         "d.{},g.{} FROM movements",
+         department::Column::Name.as_str(),
+         designation::Column::Title.as_str(),
+     );
+     assert!(report.sql.contains(&organization_fields),
+         "Employee movements must select the department name and designation title");
+     assert_eq!(report.columns.last(), Some(&"Current designation"));
+ }
  fn filter()->ReportFilter {ReportFilter{from_date:NaiveDate::from_ymd_opt(2026,9,1).unwrap(),to_date:NaiveDate::from_ymd_opt(2026,9,8).unwrap(),employee_id:None,employee_search:None}}
  #[test] fn csv_neutralizes_formulas_and_escapes_multiline_quotes() {
  assert_eq!(csv_cell("=SUM(1,2)"),"\"'=SUM(1,2)\"");
