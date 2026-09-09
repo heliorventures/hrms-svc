@@ -27,11 +27,11 @@ async fn authorized_inverted_range_is_rejected_before_database() {
  assert_eq!(result.errors.len(),1);assert!(result.errors[0].message.contains("fromDate must not exceed"),"{:?}",result.errors);
 }
 #[tokio::test]
-async fn analytics_only_returns_unavailable_metrics_without_domain_database_access() {
+async fn analytics_fails_closed_without_entitlement_context() {
  let schema=Schema::build(resolvers::QueryRoot,resolvers::MutationRoot,EmptySubscription).data(claims("analytics:read",Some("ALL"))).finish();
  let result=schema.execute(r#"{hrInsights(fromDate:"2026-09-01",toDate:"2026-09-08"){onTimeDays netSalaryGenerated pendingRequests monthlyPayroll { month } includedPendingDomains}}"#).await;
- assert!(result.errors.is_empty(),"{:?}",result.errors);
- assert_eq!(result.data.into_json().unwrap(),serde_json::json!({"hrInsights":{"onTimeDays":null,"netSalaryGenerated":null,"pendingRequests":null,"monthlyPayroll":null,"includedPendingDomains":[]}}));
+ assert_eq!(result.errors.len(),1);
+ assert!(result.errors[0].message.contains("Entitlements"),"{:?}",result.errors);
 }
 #[tokio::test]
 async fn employee_search_is_supported_by_both_report_operations() {

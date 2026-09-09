@@ -202,7 +202,7 @@ impl From<leave_balance::Model> for LeaveBalanceDto {
 
 #[ComplexObject]
 impl LeaveRequestDto {
-    async fn actionable_approval_step_id(&self, ctx: &Context<'_>) -> Result<Option<uuid::Uuid>> {
+    pub(crate) async fn actionable_approval_step_id(&self, ctx: &Context<'_>) -> Result<Option<uuid::Uuid>> {
         let claims = require_client_claims(ctx)?;
         let Some(scope) = leave_approval_scope_from_claims(claims) else {
             return Ok(None);

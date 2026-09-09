@@ -83,6 +83,9 @@ mod tests {
     }
 }
 use chrono::{Datelike, Duration, NaiveDate, Utc};
+#[cfg(test)]
+#[path = "comp_off_decision_tests.rs"]
+mod comp_off_decision_tests;
 use kabipay_common::client_data_scope::resolve_employee_scope_filter_with_connection;
 use kabipay_common::context::{ClientViewerEmployee, ScopeType};
 use kabipay_common::{KabiPayError, KabiPayResult};

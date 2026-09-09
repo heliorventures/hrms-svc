@@ -101,9 +101,11 @@ pub async fn list_outbox_events(
     tenant_id: Uuid,
     status: Option<String>,
     limit: u64,
+    allowed_aggregates: Vec<&str>,
 ) -> KabiPayResult<Vec<outbox_event::Model>> {
     let limit = limit.clamp(1, 500);
-    let mut q = outbox_event::Entity::find().filter(outbox_event::Column::TenantId.eq(tenant_id));
+    let mut q = outbox_event::Entity::find().filter(outbox_event::Column::TenantId.eq(tenant_id))
+        .filter(outbox_event::Column::AggregateType.is_in(allowed_aggregates));
     if let Some(s) = status {
         let t = s.trim();
         if !t.is_empty() {

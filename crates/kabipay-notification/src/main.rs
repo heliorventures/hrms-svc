@@ -31,7 +31,7 @@ async fn main()->anyhow::Result<()>{
     let ops=connect_ops_db(&ops_dsn_from_env()).await?;
     let cache=TenantDbCache::new();
     let fallback=tenant_db_config_from_env();
-    let schema=Arc::new(Schema::build(QueryRoot,MutationRoot,EmptySubscription).enable_federation().data(ops.clone()).data(cache.clone()).data(fallback.clone()).finish());
+    let schema=Arc::new(Schema::build(QueryRoot,MutationRoot,EmptySubscription).extension(kabipay_common::entitlement_graphql::ModuleEntitlement("EMPLOYEE")).enable_federation().data(ops.clone()).data(cache.clone()).data(fallback.clone()).finish());
     let media=Arc::new(MediaState{
         ops,cache,fallback
     });

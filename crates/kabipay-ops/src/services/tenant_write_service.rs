@@ -5,7 +5,7 @@ use kabipay_common::{KabiPayError, KabiPayResult};
 use kabipay_db_entities::ops::{feature_flag, module, tenant, tenant_subscription};
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, QueryOrder,
-    QuerySelect, Set,
+    QuerySelect, Set, TransactionTrait,
 };
 use uuid::Uuid;
 
@@ -39,8 +39,14 @@ pub async fn upsert_tenant_subscription(
         ));
     }
 
+    if matches!((activated_at, expires_at), (Some(start), Some(end)) if start >= end) {
+        return Err(KabiPayError::Validation("subscription expiry must be after activation".into()));
+    }
+    let txn = db.begin().await?;
+
     tenant::Entity::find_by_id(tenant_id)
-        .one(db)
+        .lock_exclusive()
+        .one(&txn)
         .await?
         .ok_or_else(|| KabiPayError::NotFound {
             entity: "tenant",
@@ -48,7 +54,7 @@ pub async fn upsert_tenant_subscription(
         })?;
 
     module::Entity::find_by_id(module_id)
-        .one(db)
+        .one(&txn)
         .await?
         .ok_or_else(|| KabiPayError::NotFound {
             entity: "module",
@@ -59,11 +65,15 @@ pub async fn upsert_tenant_subscription(
         .filter(tenant_subscription::Column::TenantId.eq(tenant_id))
         .filter(tenant_subscription::Column::ModuleId.eq(module_id))
         .filter(tenant_subscription::Column::IsDeleted.eq(false))
-        .one(db)
+        .lock_exclusive()
+        .one(&txn)
         .await?;
 
     let now = Utc::now();
-    if let Some(row) = existing {
+    if let Some(mut row) = existing {
+        row.contracted_seats = contracted_seats;
+        row.overage_policy = overage_policy.clone();
+        enforce_seat_cap(&row)?;
         let mut am: tenant_subscription::ActiveModel = row.into();
         am.status = Set(status);
         am.contracted_seats = Set(contracted_seats);
@@ -72,8 +82,8 @@ pub async fn upsert_tenant_subscription(
         am.expires_at = Set(expires_at);
         am.approved_by = Set(Some(operator_user_id));
         am.updated_at = Set(now);
-        let m = am.update(db).await?;
-        enforce_seat_cap(&m)?;
+        let m = am.update(&txn).await?;
+        txn.commit().await?;
         return Ok(m);
     }
 
@@ -94,9 +104,9 @@ pub async fn upsert_tenant_subscription(
         created_at: Set(now),
         updated_at: Set(now),
     }
-    .insert(db)
+    .insert(&txn)
     .await?;
-    enforce_seat_cap(&m)?;
+    txn.commit().await?;
     Ok(m)
 }
 
@@ -109,6 +119,107 @@ fn enforce_seat_cap(m: &tenant_subscription::Model) -> KabiPayResult<()> {
         });
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod subscription_security_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn rejected_seat_reduction_never_emits_an_update() {
+        use sea_orm::entity::prelude::async_trait;
+        use sea_orm::{Database, DbBackend, DbErr, ProxyDatabaseTrait, ProxyExecResult, ProxyRow, Statement};
+        use std::{collections::{BTreeMap, VecDeque}, sync::{Arc, Mutex}};
+        #[derive(Clone, Debug)]
+        struct Proxy {
+            replies: Arc<Mutex<VecDeque<Vec<ProxyRow>>>>,
+            statements: Arc<Mutex<Vec<String>>>,
+        }
+        #[async_trait::async_trait]
+        impl ProxyDatabaseTrait for Proxy {
+            async fn query(&self, statement: Statement) -> Result<Vec<ProxyRow>, DbErr> {
+                self.statements.lock().unwrap().push(statement.to_string());
+                self.replies.lock().unwrap().pop_front().ok_or_else(|| DbErr::Custom("unexpected write/query".into()))
+            }
+            async fn execute(&self, statement: Statement) -> Result<ProxyExecResult, DbErr> {
+                panic!("rejected subscription must not execute writes: {statement}")
+            }
+        }
+        let tid = Uuid::new_v4();
+        let mid = Uuid::new_v4();
+        let now = Utc::now();
+        let mut tenant_fields = BTreeMap::from([
+            ("id".into(), tid.into()), ("name".into(), "test".into()),
+            ("status".into(), "ACTIVE".into()), ("is_deleted".into(), false.into()),
+            ("created_at".into(), now.into()), ("updated_at".into(), now.into()),
+            ("account_manager_id".into(), Option::<Uuid>::None.into()),
+            ("deleted_by".into(), Option::<Uuid>::None.into()),
+            ("deleted_at".into(), Option::<chrono::DateTime<Utc>>::None.into()),
+        ]);
+        for name in ["plan", "country", "timezone", "currency", "gstin", "pan", "registered_address", "logo_url", "primary_color", "subdomain"] {
+            tenant_fields.insert(name.into(), Option::<String>::None.into());
+        }
+        let module_row = ProxyRow::new(BTreeMap::from([
+            ("id".into(), mid.into()), ("code".into(), "LEAVE".into()), ("name".into(), "Leave".into()),
+            ("category".into(), Option::<String>::None.into()), ("description".into(), Option::<String>::None.into()),
+            ("is_active".into(), true.into()), ("is_core".into(), false.into()), ("display_order".into(), 1.into()),
+            ("created_at".into(), now.into()), ("updated_at".into(), now.into()),
+        ]));
+        let subscription = ProxyRow::new(BTreeMap::from([
+            ("id".into(), Uuid::new_v4().into()), ("tenant_id".into(), tid.into()), ("module_id".into(), mid.into()),
+            ("status".into(), "ACTIVE".into()), ("activated_at".into(), Option::<NaiveDate>::None.into()),
+            ("expires_at".into(), Option::<NaiveDate>::None.into()), ("contracted_seats".into(), 10.into()),
+            ("current_seat_usage".into(), 10.into()), ("overage_policy".into(), "BLOCK".into()),
+            ("approved_by".into(), Option::<Uuid>::None.into()), ("is_deleted".into(), false.into()),
+            ("deleted_by".into(), Option::<Uuid>::None.into()),
+            ("deleted_at".into(), Option::<chrono::DateTime<Utc>>::None.into()),
+            ("created_at".into(), now.into()), ("updated_at".into(), now.into()),
+        ]));
+        let proxy = Proxy {
+            replies: Arc::new(Mutex::new(VecDeque::from([vec![ProxyRow::new(tenant_fields)], vec![module_row], vec![subscription]]))),
+            statements: Arc::new(Mutex::new(Vec::new())),
+        };
+        let db = Database::connect_proxy(DbBackend::Postgres, Arc::new(Box::new(proxy.clone()))).await.unwrap();
+        let result = upsert_tenant_subscription(&db, Uuid::new_v4(), tid, mid, "ACTIVE".into(), 9, "BLOCK".into(), None, None).await;
+        assert!(matches!(result, Err(KabiPayError::SeatLimitReached { .. })), "{result:?}");
+        let statements = proxy.statements.lock().unwrap();
+        assert_eq!(statements.len(), 3);
+        assert!(statements.iter().all(|sql| sql.starts_with("SELECT")));
+        assert!(statements[0].ends_with("FOR UPDATE"));
+        assert!(statements[2].ends_with("FOR UPDATE"));
+        assert!(statements[2].contains(&tid.to_string()) && statements[2].contains(&mid.to_string()));
+    }
+
+    #[tokio::test]
+    async fn invalid_date_window_is_rejected_without_database_access() {
+        let start = NaiveDate::from_ymd_opt(2026, 9, 20).unwrap();
+        for end in [start, start.pred_opt().unwrap()] {
+            let result = upsert_tenant_subscription(
+                &DatabaseConnection::Disconnected, Uuid::nil(), Uuid::nil(), Uuid::nil(),
+                "ACTIVE".into(), 10, "BLOCK".into(), Some(start), Some(end),
+            ).await;
+            assert!(matches!(result, Err(KabiPayError::Validation(_))));
+        }
+    }
+
+    #[test]
+    fn prospective_seat_cap_respects_block_allow_notify_and_exact_capacity() {
+        let now = Utc::now();
+        let mut row = tenant_subscription::Model {
+            id: Uuid::nil(), tenant_id: Uuid::nil(), module_id: Uuid::nil(),
+            status: "ACTIVE".into(), activated_at: None, expires_at: None,
+            contracted_seats: 10, current_seat_usage: 10, overage_policy: "BLOCK".into(),
+            approved_by: None, is_deleted: false, deleted_at: None, deleted_by: None,
+            created_at: now, updated_at: now,
+        };
+        assert!(enforce_seat_cap(&row).is_ok());
+        row.contracted_seats = 9;
+        assert!(matches!(enforce_seat_cap(&row), Err(KabiPayError::SeatLimitReached { .. })));
+        for policy in ["ALLOW", "NOTIFY"] {
+            row.overage_policy = policy.into();
+            assert!(enforce_seat_cap(&row).is_ok());
+        }
+    }
 }
 
 pub async fn remove_tenant_subscription(

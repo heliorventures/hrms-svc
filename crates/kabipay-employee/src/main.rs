@@ -12,7 +12,7 @@ use axum::extract::{Query, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::routing::get;
 use axum::Router;
-use kabipay_common::db::{connect_ops_db, resolve_tenant_db, TenantDbCache, TenantDbConfig};
+use kabipay_common::db::{connect_ops_db, resolve_required_tenant_db, TenantDbCache, TenantDbConfig};
 use kabipay_common::error::KabiPayError;
 use kabipay_common::load_dotenv;
 use kabipay_common::subgraph::{graphql_playground, tenant_graphql_post};
@@ -64,6 +64,7 @@ async fn main() -> anyhow::Result<()> {
     let _ = tokio::fs::create_dir_all(&file_root).await;
 
     let schema = Schema::build(QueryRoot, MutationRoot, EmptySubscription)
+        .extension(kabipay_common::entitlement_graphql::ModuleEntitlement("EMPLOYEE"))
         .enable_federation()
         .data(ops.clone())
         .data(cache.clone())
@@ -109,7 +110,9 @@ async fn employee_file_download(
 ) -> Result<axum::response::Response, KabiPayError> {
     let claims = verify_download_token(&q.token).ok_or(KabiPayError::Unauthorised)?;
 
-    let db = resolve_tenant_db(claims.tenant_id, &st.ops, &st.cache, &st.fallback)
+    kabipay_common::entitlements::require_current_module(&st.ops, claims.tenant_id, "EMPLOYEE").await?;
+
+    let db = resolve_required_tenant_db(claims.tenant_id, &st.ops, &st.cache, &st.fallback)
         .await
         .map_err(|error: KabiPayError| error)?;
 

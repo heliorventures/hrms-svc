@@ -38,3 +38,6 @@ hmac.workspace = true
 sha2.workspace = true
 urlencoding.workspace = true
 opendal = { version = "0.55.0", features = ["services-s3"] }
+
+[dev-dependencies]
+sea-orm = { workspace = true, features = ["proxy"] }

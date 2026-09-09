@@ -84,6 +84,7 @@ async fn authorize(state: &EmployeeState, headers: &HeaderMap)
         ApiError> {
     let token = token(headers)?;
     let (tenant, id) = service::verify_token(&token)?;
+    kabipay_common::entitlements::require_current_module(&state.ops, tenant, "EMPLOYEE").await?;
     let db =
         resolve_required_tenant_db(tenant, &state.ops, &state.cache,
                     &state.fallback).await?;

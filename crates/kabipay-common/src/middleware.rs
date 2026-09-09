@@ -1,11 +1,12 @@
 //! Axum middleware for authentication and module gating.
 //!
-//! Three layers:
+//! Authentication layers:
 //!   1. `operator_auth` — validates the `kabipay-ops` JWT and injects `OperatorContext`.
 //!   2. `client_auth`   — validates the `kabipay-client` JWT and injects `ClientContext`.
-//!   3. `module_guard`  — checks `TENANT_SUBSCRIPTION` for the module code; 403 if inactive.
+//! Module enforcement is implemented by `entitlement_graphql::ModuleEntitlement`
+//! and `entitlements::require_current_module` on the actual GraphQL/HTTP paths.
 //!
-//! The gateway should layer these in the order: request-id → tracing → CORS → auth → module.
+//! Service boundaries enforce modules independently of gateway routing.
 
 use crate::context::{ClientClaims, ClientContext, OperatorClaims, OperatorContext, ScopeType};
 use crate::error::KabiPayError;
@@ -86,19 +87,4 @@ fn extract_client_claims(
         .ok_or(KabiPayError::Unauthorised)?;
     let token = extract_bearer(auth)?;
     decode_client_jwt(token, cfg.client_jwt_secret.as_ref())
-}
-
-/// Module-subscription guard factory. Use as:
-///
-/// ```ignore
-/// .layer(axum::middleware::from_fn_with_state(state, module_guard("leave")))
-/// ```
-///
-/// Requires that `client_auth` has already run. Checks `kabipay_ops.tenant_subscription`
-/// for an ACTIVE row for (tenant_id, module_code). Returns `ModuleNotSubscribed` otherwise.
-///
-/// TODO: wire to a shared subscription-lookup helper once `kabipay-tenant` is available.
-pub async fn module_guard_placeholder(req: Request, next: Next) -> Result<Response, KabiPayError> {
-    // Placeholder pass-through — real implementation will query tenant_subscription.
-    Ok(next.run(req).await)
 }

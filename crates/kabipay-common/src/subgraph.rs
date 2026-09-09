@@ -14,7 +14,7 @@
 
 use crate::context::{ClientClaims, ClientRequestHints, OperatorClaims, OperatorContext};
 use crate::db::{
-    apply_postgres_ssl_mode_to_url, connect_ops_db, resolve_tenant_db, TenantDbCache,
+    apply_postgres_ssl_mode_to_url, connect_ops_db, resolve_required_tenant_db, TenantDbCache,
     TenantDbConfig,
 };
 use crate::error::{KabiPayError, KabiPayResult};
@@ -229,7 +229,7 @@ pub async fn tenant_db(
     let fallback = ctx.data::<TenantDbConfig>().map_err(|_| {
         KabiPayError::Internal("TenantDbConfig missing from schema data".into()).into_graphql()
     })?;
-    resolve_tenant_db(tenant_id, ops_db, cache, fallback)
+    resolve_required_tenant_db(tenant_id, ops_db, cache, fallback)
         .await
         .map_err(KabiPayError::into_graphql)
 }
@@ -287,6 +287,11 @@ where
 {
     crate::env_file::load_dotenv();
     init_tracing(cfg.service_name);
+
+    let schema_builder = match crate::entitlements::service_module(cfg.service_name)? {
+        Some(code) => schema_builder.extension(crate::entitlement_graphql::ModuleEntitlement(code)),
+        None => schema_builder,
+    };
 
     let port: u16 = std::env::var(cfg.port_env)
         .ok()
@@ -353,10 +358,16 @@ where
         RequestIdentity::Client { tenant_id, claims } => {
             req = req.data(TenantId(tenant_id));
             if let Some(c) = claims {
+                let ops = schema.data::<DatabaseConnection>().ok_or_else(|| (
+                    StatusCode::INTERNAL_SERVER_ERROR, "control plane unavailable".to_owned()
+                ))?;
+                let entitlements = crate::entitlements::Entitlements::load(ops, tenant_id).await
+                    .map_err(|error| (error.http_status(), error.to_string()))?;
                 ensure_active_client_user(schema.as_ref(), tenant_id, c.sub)
                     .await
                     .map_err(|error| (error.http_status(), error.to_string()))?;
                 req = req.data(c);
+                req = req.data(entitlements);
             }
         }
         RequestIdentity::Operator(claims) => {
@@ -401,7 +412,7 @@ where
         .ok_or_else(|| {
             KabiPayError::Internal("TenantDbConfig missing from schema data".into())
         })?;
-    let db = resolve_tenant_db(tenant_id, ops_db, cache, fallback).await?;
+    let db = resolve_required_tenant_db(tenant_id, ops_db, cache, fallback).await?;
     let row = user::Entity::find_by_id(user_id)
         .filter(user::Column::TenantId.eq(tenant_id))
         .one(&db)

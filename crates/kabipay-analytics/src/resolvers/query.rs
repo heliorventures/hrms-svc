@@ -16,6 +16,12 @@ use crate::services::analytics_service;
 
 pub struct QueryRoot;
 
+fn entitled_report_claims(ctx: &Context<'_>) -> Result<kabipay_common::context::ClientClaims> {
+    let claims = require_client_claims(ctx)?;
+    let state = ctx.data::<kabipay_common::entitlements::Entitlements>()?;
+    state.filter_claims(claims).map_err(KabiPayError::into_graphql)
+}
+
 fn parse_opt_uuid(id: &Option<ID>, field: &'static str) -> Result<Option<Uuid>> {
     match id {
         None => Ok(None),
@@ -57,6 +63,9 @@ impl QueryRoot {
             from_date, to_date, employee_id, employee_search,
         };
         filter.validate().map_err(KabiPayError::into_graphql)?;
+        let entitled = entitled_report_claims(ctx)?;
+        let claims = &entitled;
+        crate::services::hr_reports::authorize(claims, kind).map_err(KabiPayError::into_graphql)?;
         if offset < 0 || !(1..=100).contains(&limit) {
             return Err(KabiPayError::Validation(
                 "offset must be non-negative and limit between 1 and 100".into(),
@@ -94,6 +103,9 @@ impl QueryRoot {
             from_date, to_date, employee_id, employee_search,
         };
         filter.validate().map_err(KabiPayError::into_graphql)?;
+        let entitled = entitled_report_claims(ctx)?;
+        let claims = &entitled;
+        crate::services::hr_reports::authorize(claims, kind).map_err(KabiPayError::into_graphql)?;
         let tenant_id = require_tenant_id(ctx)?;
         if tenant_id != claims.tenant_id {
             return Err(KabiPayError::Forbidden(
@@ -122,6 +134,8 @@ impl QueryRoot {
                 "analytics:read permission requires ALL scope".into(),
             ).into_graphql());
         }
+        let entitled = entitled_report_claims(ctx)?;
+        let claims = &entitled;
         let filter = crate::services::hr_reports::ReportFilter {
             from_date, to_date, employee_id: None, employee_search: None,
         };
@@ -219,7 +233,12 @@ impl QueryRoot {
         let rows = analytics_service::list_workforce_snapshots(&db, tenant_id, limit)
             .await
             .map_err(KabiPayError::into_graphql)?;
-        Ok(rows.into_iter().map(WorkforceSnapshotDto::from).collect())
+        let state = ctx.data::<kabipay_common::entitlements::Entitlements>()?;
+        Ok(rows.into_iter().map(|row| {
+            let mut dto = WorkforceSnapshotDto::from(row);
+            if !state.allows("RECRUITMENT") { dto.open_positions = None; }
+            dto
+        }).collect())
     }
 
     /// **HR / directory admins only** — inspect transactional outbox rows (e.g. after leave approval).
@@ -240,7 +259,9 @@ impl QueryRoot {
         }
         let tenant_id = require_tenant_id(ctx)?;
         let db = tenant_db(ctx, tenant_id).await?;
-        let rows = analytics_service::list_outbox_events(&db, tenant_id, status, limit)
+        let state = ctx.data::<kabipay_common::entitlements::Entitlements>()?;
+        state.require_tenant(tenant_id).map_err(KabiPayError::into_graphql)?;
+        let rows = analytics_service::list_outbox_events(&db, tenant_id, status, limit, state.outbox_aggregates())
             .await
             .map_err(KabiPayError::into_graphql)?;
         Ok(rows.into_iter().map(OutboxEventDto::from).collect())
@@ -335,7 +356,19 @@ impl QueryRoot {
         let rows = analytics_service::list_webhook_delivery_logs(&db, tenant_id, limit)
             .await
             .map_err(KabiPayError::into_graphql)?;
-        Ok(rows.into_iter().map(WebhookDeliveryLogDto::from).collect())
+        let state = ctx.data::<kabipay_common::entitlements::Entitlements>()?;
+        state.require_tenant(tenant_id).map_err(KabiPayError::into_graphql)?;
+        let allowed = state.outbox_aggregates();
+        Ok(rows.into_iter().map(|row| {
+            let mut dto = WebhookDeliveryLogDto::from(row);
+            let entitled = dto.event_name.as_deref().and_then(|name| name.rsplit_once('.'))
+                .is_some_and(|(aggregate, _)| allowed.contains(&aggregate));
+            if !entitled {
+                dto.payload_json = None;
+                dto.response_body = None;
+            }
+            dto
+        }).collect())
     }
 
     /// **HR / directory admins only** — communication/entity audit log (most recent first).

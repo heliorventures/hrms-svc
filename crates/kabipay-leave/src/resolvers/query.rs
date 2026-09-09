@@ -43,6 +43,21 @@ pub struct QueryRoot;
 
 #[Object]
 impl QueryRoot {
+    /// Complete date/read-scope queue. Summary counts are independent of the selected tab.
+    async fn leave_approval_queue(
+        &self,
+        ctx: &Context<'_>,
+        #[graphql(default = 50)] limit: u64,
+        #[graphql(default = 0)] offset: u64,
+        from_date: Option<NaiveDate>,
+        to_date: Option<NaiveDate>,
+        status: Option<String>,
+        #[graphql(default = false)] needs_my_action: bool,
+    ) -> Result<super::approval_queue::LeaveApprovalQueue> {
+        let tenant_id = require_tenant_id(ctx)?;
+        let scope = leave_read_scope(ctx)?;
+        super::approval_queue::load(ctx, tenant_id, scope, limit, offset, from_date, to_date, status.as_deref(), needs_my_action).await
+    }
     async fn comp_off_policy_targets(&self, ctx: &Context<'_>) -> Result<super::comp_off_targets::CompOffPolicyTargets> {
         super::comp_off_targets::load(ctx).await
     }
@@ -562,6 +577,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn approval_queue_invalid_filters_fail_before_database_access() {
+        for query in [
+            "{ leaveApprovalQueue(limit: 0) { totalCount } }",
+            "{ leaveApprovalQueue(limit: 201) { totalCount } }",
+            "{ leaveApprovalQueue(offset: -1) { totalCount } }",
+            "{ leaveApprovalQueue(status: \"UNKNOWN\") { totalCount } }",
+            "{ leaveApprovalQueue(fromDate: \"2026-09-10\", toDate: \"2026-09-01\") { totalCount } }",
+        ] {
+            let response = execute_query(claims(PERM_LEAVE_READ, Some("ALL")), query).await;
+            assert_eq!(response.errors.len(), 1, "{response:?}");
+            assert!(!response.errors[0].message.contains("TenantDbCache"), "{response:?}");
+        }
+    }
+
+    #[tokio::test]
     async fn every_protected_leave_query_denies_missing_and_sibling_permissions_before_db_access() {
         let leave_request_id = Uuid::new_v4();
         let fields = vec![
@@ -571,6 +601,7 @@ mod tests {
             "{ viewerEmployeeId }".to_string(),
             "{ leaveTypes { __typename } }".to_string(),
             "{ leaveRequests { __typename } }".to_string(),
+            "{ leaveApprovalQueue { totalCount pendingCount actionableCount rows { id } } }".to_string(),
             "{ leaveBalances { __typename } }".to_string(),
             "{ leavePolicies { __typename } }".to_string(),
             format!(

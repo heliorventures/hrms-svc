@@ -61,6 +61,7 @@ pub async fn upload(State(state):State<Arc<MediaState>>,Query(query):Query<Token
 }
 async fn upload_inner(state:&MediaState,token:&str,headers:HeaderMap,body:Body)->KabiPayResult<uuid::Uuid>{
     let ticket=video::verify_ticket(token,"announcement-video-upload")?;
+    kabipay_common::entitlements::require_current_module(&state.ops,ticket.tenant,"EMPLOYEE").await?;
     let db=resolve_required_tenant_db(ticket.tenant,&state.ops,&state.cache,&state.fallback).await?;
     announcement_audience::current_viewer(&db,ticket.tenant,ticket.user).await?;
     let tx=db.begin().await?;
@@ -205,6 +206,7 @@ pub async fn play(State(state):State<Arc<MediaState>>,Query(query):Query<TokenQu
 }
 async fn play_inner(state:&MediaState,token:&str,headers:HeaderMap)->KabiPayResult<Response>{
     let ticket=video::verify_ticket(token,"announcement-video-play")?;
+    kabipay_common::entitlements::require_current_module(&state.ops,ticket.tenant,"EMPLOYEE").await?;
     let db=resolve_required_tenant_db(ticket.tenant,&state.ops,&state.cache,&state.fallback).await?;
     let parent=announcement_audience::authorized_parent(&db,ticket.tenant,ticket.user,ticket.resource).await?;
     let file=video::video_file(&db,ticket.tenant,&parent).await?;
