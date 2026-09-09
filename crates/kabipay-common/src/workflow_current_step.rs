@@ -129,3 +129,51 @@ pub async fn ensure_workflow_instance_current_step_repaired(
         .await?
         .ok_or_else(|| KabiPayError::Internal("workflow_instance missing after repair update".into()))
 }
+
+/// Batch equivalent of logical step resolution for queue display. LATERAL bounds the
+/// result to one step per instance even for long workflows and large action histories.
+/// This is display data only; action authority still requires a valid current pointer.
+pub async fn pending_step_titles_batch(
+    conn: &impl ConnectionTrait,
+    tenant_id: Uuid,
+    instance_ids: &[Uuid],
+) -> KabiPayResult<std::collections::HashMap<Uuid, String>> {
+    use sea_orm::{DbBackend, FromQueryResult, Statement};
+    #[derive(FromQueryResult)]
+    struct Title {
+        id: Uuid,
+        status: String,
+        step_name: String,
+    }
+    if instance_ids.is_empty() {
+        return Ok(std::collections::HashMap::new());
+    }
+    let placeholders = (2..=instance_ids.len() + 1)
+        .map(|index| format!("${index}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!(r#"
+        SELECT i.id, i.status, COALESCE(current_step.step_name, fallback.step_name) AS step_name
+        FROM workflow_instance i
+        LEFT JOIN workflow_step current_step ON current_step.id = i.current_step_id AND current_step.tenant_id = $1
+        LEFT JOIN LATERAL (
+            SELECT s.step_name FROM workflow_step s
+            WHERE current_step.id IS NULL AND s.tenant_id = $1 AND s.workflow_id = i.workflow_id
+              AND NOT EXISTS (SELECT 1 FROM workflow_action a WHERE a.instance_id = i.id AND a.workflow_step_id = s.id AND a.action = 'APPROVE')
+            ORDER BY s.sequence_order ASC LIMIT 1
+        ) fallback ON TRUE
+        WHERE i.tenant_id = $1 AND i.id IN ({placeholders})
+          AND COALESCE(current_step.step_name, fallback.step_name) IS NOT NULL
+    "#);
+    let values = std::iter::once(tenant_id.into())
+        .chain(instance_ids.iter().map(|id| (*id).into()));
+    Ok(Title::find_by_statement(Statement::from_sql_and_values(
+        DbBackend::Postgres, sql, values,
+    ))
+    .all(conn)
+    .await?
+    .into_iter()
+    .filter(|row| row.status.trim().eq_ignore_ascii_case("IN_PROGRESS"))
+    .map(|row| (row.id, row.step_name))
+    .collect())
+}

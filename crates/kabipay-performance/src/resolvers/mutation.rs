@@ -698,13 +698,18 @@ impl MutationRoot {
         participant_id: ID,
     ) -> Result<Vec<GoalDto>> {
         let claims = require_client_claims(ctx)?;
+        if !claims.can_manage_performance_programs() {
+            require_employee_id(claims)?;
+        }
         let tenant_id = require_tenant_id(ctx)?;
         let participant_id = parse_id(&participant_id)?;
         let db = tenant_db(ctx, tenant_id).await?;
         let participant = performance_workflow::load_participant(&db, tenant_id, participant_id).await.map_err(KabiPayError::into_graphql)?;
         if !claims.can_manage_performance_programs()
             && (!claims.can_evaluate_performance_team()
-                || claims.employee_id != participant.manager_employee_id)
+                || !claims.employee_id.is_some_and(|actor| {
+                    performance_lifecycle::manager_matches_snapshot(actor, participant.manager_employee_id)
+                }))
         {
             return Err(KabiPayError::Forbidden("Only the review's assigned manager can approve its goals".into()).into_graphql());
         }
@@ -742,6 +747,9 @@ impl MutationRoot {
         input: AddPerformanceFeedbackInput,
     ) -> Result<PerformanceFeedbackDto> {
         let claims = require_client_claims(ctx)?;
+        if !claims.can_manage_performance_programs() {
+            require_employee_id(claims)?;
+        }
         let tenant_id = require_tenant_id(ctx)?;
         let participant_id = parse_id(&input.participant_id)?;
         let comments = validate_text(&input.comments, 4000)?;
@@ -749,7 +757,9 @@ impl MutationRoot {
         let participant = performance_workflow::load_participant(&db, tenant_id, participant_id).await.map_err(KabiPayError::into_graphql)?;
         if !claims.can_manage_performance_programs()
             && (!claims.can_evaluate_performance_team()
-                || claims.employee_id != participant.manager_employee_id)
+                || !claims.employee_id.is_some_and(|actor| {
+                    performance_lifecycle::manager_matches_snapshot(actor, participant.manager_employee_id)
+                }))
         {
             return Err(KabiPayError::Forbidden("Only the review's assigned manager can provide feedback".into()).into_graphql());
         }
@@ -931,6 +941,9 @@ impl MutationRoot {
         performance_band: Option<String>,
     ) -> Result<PerformanceReviewDetailDto> {
         let claims = require_client_claims(ctx)?;
+        if !claims.can_manage_performance_programs() {
+            require_employee_id(claims)?;
+        }
         let tenant_id = require_tenant_id(ctx)?;
         let participant_id = parse_id(&participant_id)?;
         let final_rating = parse_decimal(&final_rating, "Final rating")?;
@@ -943,7 +956,9 @@ impl MutationRoot {
             .one(&txn).await.map_err(KabiPayError::from).map_err(KabiPayError::into_graphql)?
             .ok_or_else(|| KabiPayError::NotFound { entity: "performance review", id: participant_id.to_string() }.into_graphql())?;
         if !claims.can_manage_performance_programs()
-            && (!claims.can_evaluate_performance_team() || claims.employee_id != participant.manager_employee_id)
+            && (!claims.can_evaluate_performance_team() || !claims.employee_id.is_some_and(|actor| {
+                performance_lifecycle::manager_matches_snapshot(actor, participant.manager_employee_id)
+            }))
         {
             return Err(KabiPayError::Forbidden("Only the review's assigned manager can submit this appraisal".into()).into_graphql());
         }
@@ -1163,6 +1178,33 @@ impl AppraisalAnswerInput {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn unlinked_team_evaluator_cannot_access_participant_workflows() {
+        let claims: kabipay_common::context::ClientClaims =
+            serde_json::from_value(serde_json::json!({
+                "sub": Uuid::new_v4(), "tenant_id": Uuid::new_v4(),
+                "iss": "kabipay-client", "iat": 0, "exp": 9999999999i64,
+                "permissions": ["performance:evaluate"],
+                "permission_scopes": {"performance:evaluate": "TEAM"}
+            })).unwrap();
+        let schema = async_graphql::Schema::build(
+            crate::resolvers::QueryRoot, MutationRoot, async_graphql::EmptySubscription,
+        ).data(kabipay_common::subgraph::TenantId(claims.tenant_id)).data(claims).finish();
+        let id = Uuid::new_v4();
+        let operations = [
+            format!(r#"{{ performanceReviewDetail(participantId: "{id}") {{ review {{ id }} }} }}"#),
+            format!(r#"mutation {{ approvePerformanceGoals(participantId: "{id}") {{ id }} }}"#),
+            format!(r#"mutation {{ addPerformanceFeedback(input: {{ participantId: "{id}", comments: "Feedback", observationDate: "2026-09-10" }}) {{ id }} }}"#),
+            format!(r#"mutation {{ submitManagerAppraisal(participantId: "{id}", answers: [], finalRating: "3") {{ review {{ id }} }} }}"#),
+        ];
+        for operation in operations {
+            let response = schema.execute(&operation).await;
+            assert_eq!(response.errors.len(), 1, "{operation}: {:?}", response.errors);
+            assert!(response.errors[0].message.contains("employee-linked"),
+                "{operation}: {:?}", response.errors);
+        }
+    }
 
     #[test]
     fn rejects_blank_and_overlong_names() {

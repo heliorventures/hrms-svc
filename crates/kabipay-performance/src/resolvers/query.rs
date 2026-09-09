@@ -10,7 +10,7 @@ use crate::resolvers::types::{
     AppraisalTemplateDto, GoalDto, PerformanceProgramDto, PerformanceReviewDetailDto,
     PerformanceReviewSummaryDto, ReviewCycleDto,
 };
-use crate::services::{performance_service, performance_workflow};
+use crate::services::{performance_lifecycle, performance_service, performance_workflow};
 
 fn parse_id(id: &ID) -> Result<uuid::Uuid> {
     uuid::Uuid::parse_str(id.as_str())
@@ -168,6 +168,9 @@ impl QueryRoot {
         participant_id: ID,
     ) -> Result<PerformanceReviewDetailDto> {
         let claims = require_client_claims(ctx)?;
+        if !claims.can_manage_performance_programs() {
+            require_employee_id(claims)?;
+        }
         let tenant_id = require_tenant_id(ctx)?;
         let participant_id = parse_id(&participant_id)?;
         let db = tenant_db(ctx, tenant_id).await?;
@@ -179,7 +182,9 @@ impl QueryRoot {
             || (claims.can_use_performance_self_service()
                 && actor_employee_id == Some(participant.employee_id))
             || (claims.can_evaluate_performance_team()
-                && actor_employee_id == participant.manager_employee_id);
+                && actor_employee_id.is_some_and(|actor| {
+                    performance_lifecycle::manager_matches_snapshot(actor, participant.manager_employee_id)
+                }));
         if !allowed {
             return Err(KabiPayError::Forbidden(
                 "This performance review is outside your authorized scope".into(),

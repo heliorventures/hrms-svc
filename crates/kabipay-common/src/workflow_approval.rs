@@ -43,6 +43,43 @@ fn approval_scope_allows(filter: &EmployeeScopeFilter, subject_employee_id: Uuid
     filter.allows_employee(subject_employee_id)
 }
 
+/// Exact resolved membership indexed once for a queue request.
+/// None denotes ALL; an empty set remains fail-closed.
+pub struct WorkflowApprovalScope(Option<std::collections::HashSet<Uuid>>);
+
+impl From<&EmployeeScopeFilter> for WorkflowApprovalScope {
+    fn from(filter: &EmployeeScopeFilter) -> Self {
+        Self(match filter {
+            EmployeeScopeFilter::Unrestricted => None,
+            EmployeeScopeFilter::Empty => Some(std::collections::HashSet::new()),
+            EmployeeScopeFilter::EmployeeIds(ids) => Some(ids.iter().copied().collect()),
+        })
+    }
+}
+
+impl WorkflowApprovalScope {
+    fn allows_employee(&self, employee_id: Uuid) -> bool {
+        self.0.as_ref().is_none_or(|ids| ids.contains(&employee_id))
+    }
+}
+
+/// Evaluate preloaded tenant-filtered records without repeating database reads.
+pub fn batch_workflow_step_actor_allows(
+    subject: &employee::Model,
+    manager: Option<&employee::Model>,
+    filter: &WorkflowApprovalScope,
+    step: &workflow_step::Model,
+    authority: &WorkflowApprovalAuthority,
+) -> bool {
+    if assert_not_self_approval(authority, subject.id).is_err()
+        || !filter.allows_employee(subject.id)
+    {
+        return false;
+    }
+    let manager_result = assert_reporting_manager_record(authority, subject, manager);
+    assert_workflow_step_relationship(step, authority, manager_result).is_ok()
+}
+
 fn normalize_approver_type(raw: &Option<String>) -> String {
     raw.as_deref()
         .map(str::trim)
@@ -136,6 +173,22 @@ async fn assert_is_reporting_manager_user(
         .ok_or_else(|| {
             KabiPayError::Validation("reporting manager employee record not found".into())
         })?;
+    assert_reporting_manager_record(authority, &subject, Some(&manager))
+}
+
+fn assert_reporting_manager_record(
+    authority: &WorkflowApprovalAuthority,
+    subject: &employee::Model,
+    manager: Option<&employee::Model>,
+) -> KabiPayResult<()> {
+    let manager_id = subject.reporting_manager_id.ok_or_else(|| {
+        KabiPayError::Validation(
+            "employee has no reporting manager; assign a manager before this workflow step can be completed".into(),
+        )
+    })?;
+    let manager = manager.filter(|row| row.id == manager_id).ok_or_else(|| {
+        KabiPayError::Validation("reporting manager employee record not found".into())
+    })?;
     match manager.user_id {
         Some(user_id) if user_id == authority.actor_user_id => Ok(()),
         Some(_) => Err(KabiPayError::Forbidden(
@@ -157,29 +210,38 @@ pub async fn assert_workflow_step_actor(
     authority: &WorkflowApprovalAuthority,
 ) -> KabiPayResult<()> {
     assert_subject_in_approval_scope(conn, tenant_id, subject_employee_id, authority).await?;
+    let manager_result = if matches!(
+        normalize_approver_type(&step.approver_type).as_str(),
+        "REPORTING_MANAGER" | "MANAGER" | "LINE_MANAGER"
+            | "REPORTING_MANAGER_OR_PERMISSION" | "MANAGER_OR_PERMISSION"
+    ) {
+        assert_is_reporting_manager_user(conn, tenant_id, authority, subject_employee_id).await
+    } else {
+        Ok(())
+    };
+    assert_workflow_step_relationship(step, authority, manager_result)
+}
+
+/// Shared decision rule for transaction-backed and batch-backed authority inputs.
+/// Callers must first enforce self denial and exact subject scope.
+fn assert_workflow_step_relationship(
+    step: &workflow_step::Model,
+    authority: &WorkflowApprovalAuthority,
+    manager_result: KabiPayResult<()>,
+) -> KabiPayResult<()> {
     match normalize_approver_type(&step.approver_type).as_str() {
-        "REPORTING_MANAGER" | "MANAGER" | "LINE_MANAGER" => {
-            assert_is_reporting_manager_user(conn, tenant_id, authority, subject_employee_id).await
-        }
+        "REPORTING_MANAGER" | "MANAGER" | "LINE_MANAGER" => manager_result,
         "PERMISSION" => step_requires_authority_permission(step, authority),
         "REPORTING_MANAGER_OR_PERMISSION" | "MANAGER_OR_PERMISSION" => {
-            if assert_is_reporting_manager_user(conn, tenant_id, authority, subject_employee_id)
-                .await
-                .is_ok()
-            {
-                return Ok(());
+            if manager_result.is_ok() {
+                Ok(())
+            } else {
+                step_requires_authority_permission(step, authority)
             }
-            step_requires_authority_permission(step, authority)
         }
-        "ROLE" | "REPORTING_MANAGER_OR_ROLE" | "MANAGER_OR_ROLE" => {
-            Err(KabiPayError::Validation(
-                "role-based workflow steps are no longer valid runtime authority; migrate the step to a required permission"
-                    .into(),
-            ))
-        }
-        other => Err(KabiPayError::Validation(format!(
-            "unsupported workflow_step.approver_type: {other}"
-        ))),
+        "ROLE" | "REPORTING_MANAGER_OR_ROLE" | "MANAGER_OR_ROLE" => Err(KabiPayError::Validation(
+            "role-based workflow steps are no longer valid runtime authority; migrate the step to a required permission".into())),
+        other => Err(KabiPayError::Validation(format!("unsupported workflow_step.approver_type: {other}"))),
     }
 }
 
@@ -222,6 +284,41 @@ mod tests {
             sla_hours: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
+        }
+    }
+
+    #[test]
+    fn indexed_batch_scope_preserves_exact_resolved_membership() {
+        let subject = Uuid::new_v4();
+        let outside = Uuid::new_v4();
+        for filter in [
+            EmployeeScopeFilter::Unrestricted,
+            EmployeeScopeFilter::Empty,
+            EmployeeScopeFilter::EmployeeIds(vec![subject, subject]),
+        ] {
+            let indexed = WorkflowApprovalScope::from(&filter);
+            for id in [subject, outside] {
+                assert_eq!(indexed.allows_employee(id), filter.allows_employee(id));
+            }
+        }
+    }
+
+    #[test]
+    fn batch_relationship_rules_fail_closed() {
+        let auth = authority("leave:approve");
+        for (kind, permission, manager, allowed) in [
+            ("PERMISSION", Some(" LEAVE:APPROVE "), false, true),
+            ("PERMISSION", Some("expense:approve"), true, false),
+            ("MANAGER", None, true, true),
+            ("MANAGER", Some("leave:approve"), false, false),
+            ("MANAGER_OR_PERMISSION", Some("leave:approve"), false, true),
+            ("MANAGER_OR_PERMISSION", None, true, true),
+            ("ROLE", Some("leave:approve"), true, false),
+            ("MANAGER_OR_ROLE", Some("leave:approve"), true, false),
+            ("UNKNOWN", Some("leave:approve"), true, false),
+        ] {
+            let result = if manager { Ok(()) } else { Err(KabiPayError::Forbidden("manager denied".into())) };
+            assert_eq!(assert_workflow_step_relationship(&step(kind, permission), &auth, result).is_ok(), allowed, "{kind}");
         }
     }
 

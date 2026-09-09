@@ -33,7 +33,7 @@ impl LeaveApprovalSnapshotCache {
     }
 }
 
-fn leave_approval_scope_from_claims(claims: &ClientClaims) -> Option<ScopeType> {
+pub(crate) fn leave_approval_scope_from_claims(claims: &ClientClaims) -> Option<ScopeType> {
     if !claims.has_any_permission(&[PERM_LEAVE_APPROVE]) {
         return None;
     }
@@ -162,6 +162,8 @@ pub struct LeaveRequestDto {
     pub workflow_instance_id: Option<ID>,
     #[graphql(skip)]
     approval_snapshot_cache: LeaveApprovalSnapshotCache,
+    #[graphql(skip)]
+    pending_stage_snapshot: Option<Option<String>>,
 }
 
 #[derive(SimpleObject, Clone, Debug)]
@@ -240,6 +242,9 @@ impl LeaveRequestDto {
     }
 
     async fn pending_approval_stage(&self, ctx: &Context<'_>) -> Result<Option<String>> {
+        if let Some(stage) = &self.pending_stage_snapshot {
+            return Ok(stage.clone());
+        }
         let tenant_id = require_tenant_id(ctx)?;
         let db = tenant_db(ctx, tenant_id).await?;
         let workflow_instance_id = self
@@ -269,6 +274,18 @@ impl LeaveRequestDto {
 }
 
 impl LeaveRequestDto {
+    pub(crate) fn with_approval_snapshot(mut self, step_id: Option<uuid::Uuid>) -> Self {
+        self.approval_snapshot_cache = LeaveApprovalSnapshotCache {
+            value: Arc::new(OnceCell::new_with(Some(step_id))),
+        };
+        self
+    }
+
+    pub(crate) fn with_pending_stage_snapshot(mut self, stage: Option<String>) -> Self {
+        self.pending_stage_snapshot = Some(stage);
+        self
+    }
+
     pub fn with_employee_label(mut self, name: String, code: String) -> Self {
         self.employee_name = Some(name);
         self.employee_code = Some(code);
@@ -390,6 +407,7 @@ impl From<leave_request::Model> for LeaveRequestDto {
             applied_at: m.applied_at,
             workflow_instance_id: m.workflow_instance_id.map(|u| ID(u.to_string())),
             approval_snapshot_cache: LeaveApprovalSnapshotCache::default(),
+            pending_stage_snapshot: None,
         }
     }
 }
@@ -511,6 +529,7 @@ mod tests {
                 applied_at: Utc::now(),
                 workflow_instance_id: Some(ID(Uuid::new_v4().to_string())),
                 approval_snapshot_cache: LeaveApprovalSnapshotCache::default(),
+            pending_stage_snapshot: None,
             }
         }
     }
