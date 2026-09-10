@@ -141,8 +141,8 @@ pub async fn list_templates(
         .map_err(KabiPayError::from)
 }
 
-pub async fn load_template(
-    db: &DatabaseConnection,
+pub async fn load_template<C: ConnectionTrait>(
+    db: &C,
     tenant_id: Uuid,
     template_id: Uuid,
 ) -> KabiPayResult<AppraisalTemplateDto> {
@@ -392,6 +392,27 @@ where
             entity: "performance program",
             id: cycle_id.to_string(),
         })
+}
+
+/// Serialize goal changes with stage advancement. Acquire before goal reads/writes
+/// and hold the transaction through commit; do not acquire after participant locks.
+pub(crate) async fn locked_cycle_stage(
+    txn: &sea_orm::DatabaseTransaction,
+    tenant_id: Uuid,
+    cycle_id: Uuid,
+) -> KabiPayResult<String> {
+    let row = txn
+        .query_one(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            "SELECT current_stage FROM review_cycle WHERE tenant_id = $1 AND id = $2 FOR UPDATE",
+            [tenant_id.into(), cycle_id.into()],
+        ))
+        .await?
+        .ok_or_else(|| KabiPayError::NotFound {
+            entity: "performance cycle",
+            id: cycle_id.to_string(),
+        })?;
+    row.try_get("", "current_stage").map_err(KabiPayError::from)
 }
 
 pub async fn cycle_stage<C>(

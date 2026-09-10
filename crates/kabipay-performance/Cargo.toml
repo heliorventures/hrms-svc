@@ -30,3 +30,6 @@ tracing-subscriber.workspace = true
 thiserror.workspace = true
 anyhow.workspace = true
 dotenvy.workspace = true
+
+[dev-dependencies]
+sea-orm = { workspace = true, features = ["proxy"] }
