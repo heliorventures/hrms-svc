@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 use async_graphql::{Context, InputObject, Object, Result, ID};
 use kabipay_common::{
@@ -9,8 +9,8 @@ use kabipay_db_entities::tenant::{
     d0006_org_hierarchy::department,
     d0007_employee_core::employee,
     d0076_anonymous_surveys::{
-        survey, survey_answer, survey_assignment, survey_audience_department, survey_question,
-        survey_question_option, survey_response, survey_section,
+        survey, survey_audience_department, survey_question, survey_question_option,
+        survey_section,
     },
 };
 use rust_decimal::Decimal;
@@ -21,7 +21,7 @@ use sea_orm::{
 use uuid::Uuid;
 
 use super::types::SurveyDto;
-use crate::services::{survey_rules, survey_service};
+use crate::services::{survey_rules, survey_service, survey_submission::{self, SubmissionAnswer}};
 
 fn parse_id(id: &ID) -> Result<Uuid> {
     Uuid::parse_str(id.as_str()).map_err(|_| KabiPayError::Validation("Invalid ID".into()).into_graphql())
@@ -248,16 +248,18 @@ impl MutationRoot {
         if !audience_ids.is_empty() { employees = employees.filter(employee::Column::DepartmentId.is_in(audience_ids)); }
         let employees = employees.all(&txn).await.map_err(KabiPayError::from).map_err(KabiPayError::into_graphql)?;
         if employees.is_empty() { return Err(KabiPayError::Validation("No active employee-linked accounts match this survey audience".into()).into_graphql()); }
+        let published_at = chrono::Utc::now();
         for employee in employees {
-            survey_assignment::ActiveModel { id: Set(Uuid::new_v4()), tenant_id: Set(tenant_id), survey_id: Set(survey_id),
-                employee_id: Set(employee.id), completed_at: Set(None), created_at: Set(chrono::Utc::now()) }
+            survey_submission::new_assignment(tenant_id, survey_id, &employee, published_at)
                 .insert(&txn).await.map_err(KabiPayError::from).map_err(KabiPayError::into_graphql)?;
         }
         let mut model = row.into_active_model();
-        model.status = Set("PUBLISHED".into()); model.published_at = Set(Some(chrono::Utc::now())); model.updated_at = Set(chrono::Utc::now());
+        model.status = Set("PUBLISHED".into()); model.published_at = Set(Some(published_at)); model.updated_at = Set(published_at);
         model.update(&txn).await.map_err(KabiPayError::from).map_err(KabiPayError::into_graphql)?;
         txn.commit().await.map_err(KabiPayError::from).map_err(KabiPayError::into_graphql)?;
-        survey_service::load_survey(&db, tenant_id, survey_id, false).await.map_err(KabiPayError::into_graphql)
+        let completed = survey_service::completion_for_viewer(&db, tenant_id, survey_id, claims.employee_id, true)
+            .await.map_err(KabiPayError::into_graphql)?;
+        survey_service::load_survey(&db, tenant_id, survey_id, completed).await.map_err(KabiPayError::into_graphql)
     }
 
     async fn close_survey(&self, ctx: &Context<'_>, survey_id: ID) -> Result<SurveyDto> {
@@ -276,7 +278,9 @@ impl MutationRoot {
         let mut model = row.into_active_model(); model.status = Set("CLOSED".into()); model.closed_at = Set(Some(chrono::Utc::now())); model.updated_at = Set(chrono::Utc::now());
         model.update(&txn).await.map_err(KabiPayError::from).map_err(KabiPayError::into_graphql)?;
         txn.commit().await.map_err(KabiPayError::from).map_err(KabiPayError::into_graphql)?;
-        survey_service::load_survey(&db, tenant_id, survey_id, false).await.map_err(KabiPayError::into_graphql)
+        let completed = survey_service::completion_for_viewer(&db, tenant_id, survey_id, claims.employee_id, true)
+            .await.map_err(KabiPayError::into_graphql)?;
+        survey_service::load_survey(&db, tenant_id, survey_id, completed).await.map_err(KabiPayError::into_graphql)
     }
 
     async fn submit_survey(&self, ctx: &Context<'_>, survey_id: ID, answers: Vec<SurveyAnswerInput>) -> Result<bool> {
@@ -285,80 +289,15 @@ impl MutationRoot {
         let employee_id = claims.employee_id.ok_or_else(|| KabiPayError::Forbidden("An employee-linked account is required".into()).into_graphql())?;
         let tenant_id = require_tenant_id(ctx)?;
         let survey_id = parse_id(&survey_id)?;
+        let parsed = answers.into_iter().map(|answer| Ok(SubmissionAnswer {
+            question_id: parse_id(&answer.question_id)?,
+            selected_option_ids: answer.selected_option_ids.iter().map(parse_id).collect::<Result<_>>()?,
+            numeric_answer: answer.numeric_answer.as_deref().map(|value| decimal(value, "Numeric answer")).transpose()?,
+            text_answer: answer.text_answer,
+        })).collect::<Result<Vec<_>>>()?;
         let db = tenant_db(ctx, tenant_id).await?;
-        let txn = db.begin().await.map_err(KabiPayError::from).map_err(KabiPayError::into_graphql)?;
-        let survey = survey::Entity::find_by_id(survey_id).filter(survey::Column::TenantId.eq(tenant_id)).lock_exclusive().one(&txn).await
-            .map_err(KabiPayError::from).map_err(KabiPayError::into_graphql)?
-            .ok_or_else(|| KabiPayError::NotFound { entity: "survey", id: survey_id.to_string() }.into_graphql())?;
-        let now = chrono::Utc::now();
-        if survey.status != "PUBLISHED" || survey.opens_at.is_some_and(|opens| now < opens) || survey.closes_at.is_some_and(|closes| now >= closes) {
-            return Err(KabiPayError::Validation("This survey is not currently open for responses".into()).into_graphql());
-        }
-        let assignment = survey_assignment::Entity::find().filter(survey_assignment::Column::TenantId.eq(tenant_id))
-            .filter(survey_assignment::Column::SurveyId.eq(survey_id)).filter(survey_assignment::Column::EmployeeId.eq(employee_id))
-            .lock_exclusive().one(&txn).await.map_err(KabiPayError::from).map_err(KabiPayError::into_graphql)?
-            .ok_or_else(|| KabiPayError::Forbidden("This survey is not assigned to the signed-in employee".into()).into_graphql())?;
-        if assignment.completed_at.is_some() { return Err(KabiPayError::Conflict("This survey has already been submitted".into()).into_graphql()); }
-        let sections = survey_section::Entity::find().filter(survey_section::Column::TenantId.eq(tenant_id))
-            .filter(survey_section::Column::SurveyId.eq(survey_id)).all(&txn).await.map_err(KabiPayError::from).map_err(KabiPayError::into_graphql)?;
-        let section_ids: Vec<Uuid> = sections.into_iter().map(|row| row.id).collect();
-        let questions = survey_question::Entity::find().filter(survey_question::Column::TenantId.eq(tenant_id))
-            .filter(survey_question::Column::SectionId.is_in(section_ids)).all(&txn).await.map_err(KabiPayError::from).map_err(KabiPayError::into_graphql)?;
-        let question_map: HashMap<Uuid, survey_question::Model> = questions.into_iter().map(|row| (row.id, row)).collect();
-        let mut answered = HashSet::new();
-        let mut parsed = Vec::new();
-        for answer in answers {
-            let question_id = parse_id(&answer.question_id)?;
-            if !answered.insert(question_id) { return Err(KabiPayError::Validation("Each survey question can be answered only once".into()).into_graphql()); }
-            let question = question_map.get(&question_id).ok_or_else(|| KabiPayError::Validation("An answer references a question outside this survey".into()).into_graphql())?;
-            let option_ids: Vec<Uuid> = answer.selected_option_ids.iter().map(parse_id).collect::<Result<_>>()?;
-            let numeric = answer.numeric_answer.as_deref().map(|value| decimal(value, "Numeric answer")).transpose()?;
-            let text_answer = optional_text(answer.text_answer, 8000, "Text answer")?;
-            let value_count = usize::from(!option_ids.is_empty()) + usize::from(numeric.is_some()) + usize::from(text_answer.is_some());
-            if value_count != 1 { return Err(KabiPayError::Validation("Each answered survey question must provide exactly one compatible value".into()).into_graphql()); }
-            match question.question_type.as_str() {
-                "SINGLE_CHOICE" if option_ids.len() != 1 => return Err(KabiPayError::Validation("Single-choice questions require exactly one option".into()).into_graphql()),
-                "SINGLE_CHOICE" | "MULTIPLE_CHOICE" if numeric.is_some() || text_answer.is_some() => return Err(KabiPayError::Validation("Choice questions require selected options".into()).into_graphql()),
-                "RATING" if numeric.is_none() => return Err(KabiPayError::Validation("Rating questions require a numeric answer".into()).into_graphql()),
-                "SHORT_TEXT" | "LONG_TEXT" if text_answer.is_none() => return Err(KabiPayError::Validation("Text questions require a text answer".into()).into_graphql()),
-                _ => {}
-            }
-            if let Some(value) = numeric {
-                if value < question.rating_min.unwrap_or(value) || value > question.rating_max.unwrap_or(value) {
-                    return Err(KabiPayError::Validation("A rating answer is outside the configured range".into()).into_graphql());
-                }
-            }
-            parsed.push((question_id, option_ids, numeric, text_answer));
-        }
-        for question in question_map.values().filter(|question| question.is_required) {
-            if !answered.contains(&question.id) { return Err(KabiPayError::Validation(format!("Required question '{}' must be answered", question.prompt)).into_graphql()); }
-        }
-        let all_options: Vec<Uuid> = parsed.iter().flat_map(|(_, ids, _, _)| ids.iter().copied()).collect();
-        if !all_options.is_empty() {
-            let valid = survey_question_option::Entity::find().filter(survey_question_option::Column::TenantId.eq(tenant_id))
-                .filter(survey_question_option::Column::Id.is_in(all_options.clone())).all(&txn).await
-                .map_err(KabiPayError::from).map_err(KabiPayError::into_graphql)?;
-            if valid.len() != all_options.len() || valid.iter().any(|option| !parsed.iter().any(|(question_id, ids, _, _)| *question_id == option.question_id && ids.contains(&option.id))) {
-                return Err(KabiPayError::Validation("A selected option does not belong to its survey question".into()).into_graphql());
-            }
-        }
-        let employee = employee::Entity::find_by_id(employee_id).filter(employee::Column::TenantId.eq(tenant_id)).one(&txn).await
-            .map_err(KabiPayError::from).map_err(KabiPayError::into_graphql)?
-            .ok_or_else(|| KabiPayError::Forbidden("Employee profile is unavailable".into()).into_graphql())?;
-        let response_id = Uuid::new_v4();
-        survey_response::ActiveModel { id: Set(response_id), tenant_id: Set(tenant_id), survey_id: Set(survey_id),
-            department_id: Set(employee.department_id), manager_employee_id: Set(employee.reporting_manager_id), submitted_at: Set(now) }
-            .insert(&txn).await.map_err(KabiPayError::from).map_err(KabiPayError::into_graphql)?;
-        for (question_id, option_ids, numeric, text_answer) in parsed {
-            survey_answer::ActiveModel { id: Set(Uuid::new_v4()), tenant_id: Set(tenant_id), survey_response_id: Set(response_id),
-                question_id: Set(question_id), selected_option_ids: Set((!option_ids.is_empty()).then(|| serde_json::Value::Array(option_ids.into_iter().map(|id| serde_json::Value::String(id.to_string())).collect()))),
-                numeric_answer: Set(numeric), text_answer: Set(text_answer) }.insert(&txn).await
-                .map_err(KabiPayError::from).map_err(KabiPayError::into_graphql)?;
-        }
-        let mut assignment = assignment.into_active_model(); assignment.completed_at = Set(Some(now));
-        assignment.update(&txn).await.map_err(KabiPayError::from).map_err(KabiPayError::into_graphql)?;
-        txn.commit().await.map_err(KabiPayError::from).map_err(KabiPayError::into_graphql)?;
-        Ok(true)
+        survey_submission::submit_survey(&db, tenant_id, survey_id, employee_id, parsed)
+            .await.map_err(KabiPayError::into_graphql)
     }
 }
 

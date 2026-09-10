@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<databaseChangeLog xmlns="http://www.liquibase.org/xml/ns/dbchangelog">
+    <changeSet id="fixture-forward-amendments" author="test">
+        <addColumn tableName="survey_assignment" schemaName="${schema}">
+            <column name="completed" type="BOOLEAN" defaultValueBoolean="false"><constraints nullable="false"/></column>
+            <column name="publication_department_id" type="UUID"/>
+            <column name="publication_manager_employee_id" type="UUID"/>
+        </addColumn>
+        <dropColumn tableName="survey_assignment" schemaName="${schema}" columnName="completed_at"/>
+        <dropColumn tableName="survey_response" schemaName="${schema}" columnName="submitted_at"/>
+        <dropColumn tableName="survey_assignment" schemaName="${schema}" columnName="master_order_marker"/>
+        <rollback>
+            <dropColumn tableName="survey_assignment" schemaName="${schema}" columnName="completed"/>
+            <addColumn tableName="survey_assignment" schemaName="${schema}">
+                <column name="completed_at" type="TIMESTAMPTZ"/>
+            </addColumn>
+            <addColumn tableName="survey_response" schemaName="${schema}">
+                <column name="submitted_at" type="TIMESTAMPTZ"/>
+            </addColumn>
+        </rollback>
+    </changeSet>
+</databaseChangeLog>

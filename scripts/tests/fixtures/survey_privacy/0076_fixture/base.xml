@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<databaseChangeLog xmlns="http://www.liquibase.org/xml/ns/dbchangelog">
+    <changeSet id="fixture-create" author="test">
+        <createTable tableName="survey_assignment" schemaName="${schema}">
+            <column name="id" type="UUID"><constraints primaryKey="true" nullable="false"/></column>
+            <column name="tenant_id" type="UUID"><constraints nullable="false"/></column>
+            <column name="survey_id" type="UUID"><constraints nullable="false"/></column>
+            <column name="employee_id" type="UUID"><constraints nullable="false"/></column>
+            <column name="completed_at" type="TIMESTAMPTZ"/>
+            <column name="created_at" type="TIMESTAMPTZ"><constraints nullable="false"/></column>
+        </createTable>
+        <createTable tableName="survey_response" schemaName="${schema}">
+            <column name="id" type="UUID"><constraints primaryKey="true" nullable="false"/></column>
+            <column name="tenant_id" type="UUID"><constraints nullable="false"/></column>
+            <column name="survey_id" type="UUID"><constraints nullable="false"/></column>
+            <column name="department_id" type="UUID"/>
+            <column name="manager_employee_id" type="UUID"/>
+            <column name="submitted_at" type="TIMESTAMPTZ"><constraints nullable="false"/></column>
+        </createTable>
+        <createTable tableName="unrelated_record" schemaName="${schema}">
+            <column name="tenant_id" type="UUID"><constraints nullable="false"/></column>
+            <column name="record_id" type="UUID"><constraints nullable="false"/></column>
+            <column name="label" type="VARCHAR(100)"><constraints nullable="false"/></column>
+        </createTable>
+        <addPrimaryKey
+            tableName="unrelated_record"
+            schemaName="${schema}"
+            columnNames="tenant_id,record_id"
+            constraintName="pk_unrelated_record"/>
+    </changeSet>
+</databaseChangeLog>

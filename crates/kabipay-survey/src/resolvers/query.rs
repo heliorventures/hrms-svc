@@ -64,12 +64,15 @@ impl QueryRoot {
         let tenant_id = require_tenant_id(ctx)?;
         let survey_id = parse_id(&survey_id)?;
         let db = tenant_db(ctx, tenant_id).await?;
-        let completed = if claims.can_manage_surveys() {
-            false
-        } else {
-            survey_service::load_assignment(&db, tenant_id, survey_id, employee_id(claims)?)
-                .await.map_err(KabiPayError::into_graphql)?.completed_at.is_some()
-        };
+        let completed = survey_service::completion_for_viewer(
+            &db,
+            tenant_id,
+            survey_id,
+            claims.employee_id,
+            claims.can_manage_surveys(),
+        )
+        .await
+        .map_err(KabiPayError::into_graphql)?;
         survey_service::load_survey(&db, tenant_id, survey_id, completed).await.map_err(KabiPayError::into_graphql)
     }
 

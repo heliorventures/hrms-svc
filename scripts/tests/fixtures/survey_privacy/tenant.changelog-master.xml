@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<databaseChangeLog xmlns="http://www.liquibase.org/xml/ns/dbchangelog">
+    <include file="0076_fixture/base.xml" relativeToChangelogFile="true"/>
+    <include file="0090_order_marker/add.xml" relativeToChangelogFile="true"/>
+    <include file="0082_fixture/amend.xml" relativeToChangelogFile="true"/>
+</databaseChangeLog>

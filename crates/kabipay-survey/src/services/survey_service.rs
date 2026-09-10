@@ -75,7 +75,7 @@ pub async fn list_available_surveys(
         .await?;
     let completion: HashMap<Uuid, bool> = assignments
         .into_iter()
-        .map(|row| (row.survey_id, row.completed_at.is_some()))
+        .map(|row| (row.survey_id, row.completed))
         .collect();
     Ok(surveys
         .into_iter()
@@ -161,6 +161,44 @@ pub async fn load_assignment(
         .filter(survey_assignment::Column::EmployeeId.eq(employee_id))
         .one(db).await?
         .ok_or_else(|| KabiPayError::Forbidden("This survey is not assigned to the signed-in employee".into()))
+}
+
+/// Loads an assignment when it exists, preserving database failures.
+pub async fn load_optional_assignment(
+    db: &DatabaseConnection,
+    tenant_id: Uuid,
+    survey_id: Uuid,
+    employee_id: Uuid,
+) -> KabiPayResult<Option<survey_assignment::Model>> {
+    survey_assignment::Entity::find()
+        .filter(survey_assignment::Column::TenantId.eq(tenant_id))
+        .filter(survey_assignment::Column::SurveyId.eq(survey_id))
+        .filter(survey_assignment::Column::EmployeeId.eq(employee_id))
+        .one(db)
+        .await
+        .map_err(KabiPayError::from)
+}
+
+/// Resolves the completion state visible to a survey detail consumer.
+pub async fn completion_for_viewer(
+    db: &DatabaseConnection,
+    tenant_id: Uuid,
+    survey_id: Uuid,
+    employee_id: Option<Uuid>,
+    is_administrator: bool,
+) -> KabiPayResult<bool> {
+    let Some(employee_id) = employee_id else {
+        return is_administrator.then_some(false).ok_or_else(|| {
+            KabiPayError::Forbidden("An employee-linked account is required".into())
+        });
+    };
+    match load_optional_assignment(db, tenant_id, survey_id, employee_id).await? {
+        Some(assignment) => Ok(assignment.completed),
+        None if is_administrator => Ok(false),
+        None => Err(KabiPayError::Forbidden(
+            "This survey is not assigned to the signed-in employee".into(),
+        )),
+    }
 }
 
 fn selected_ids(value: &Option<serde_json::Value>) -> Vec<Uuid> {

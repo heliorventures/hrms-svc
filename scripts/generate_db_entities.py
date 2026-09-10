@@ -13,6 +13,9 @@ from pathlib import Path
 NS = {"db": "http://www.liquibase.org/xml/ns/dbchangelog"}
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 MIGRATIONS = REPOSITORY_ROOT / "hrms-database/changelog/migrations"
+TENANT_CHANGELOG_MASTER = (
+    REPOSITORY_ROOT / "hrms-database/changelog/tenant.changelog-master.xml"
+)
 OUT = REPOSITORY_ROOT / "hrms-svc/crates/kabipay-db-entities/src/tenant"
 
 COMPOSITE_PK: dict[str, list[str]] = {
@@ -82,9 +85,13 @@ def rust_field_name(col: str) -> str:
     return col
 
 
-def emit_entity(table: str, cols: list[tuple[str, str, bool]]) -> str:
+def emit_entity(
+    table: str,
+    cols: list[tuple[str, str, bool]],
+    primary_key_columns: list[str] | None = None,
+) -> str:
     mod = sanitize_mod_name(table)
-    composite = COMPOSITE_PK.get(table)
+    composite = primary_key_columns or COMPOSITE_PK.get(table)
     lines = [
         f"pub mod {mod} {{",
         "    use crate::tenant::prelude::*;",
@@ -95,10 +102,11 @@ def emit_entity(table: str, cols: list[tuple[str, str, bool]]) -> str:
     ]
     for name, ctype, nullable in cols:
         if composite and name in composite:
+            rs_t = sql_type_to_rust(ctype, nullable)
             lines.append(
                 "        #[sea_orm(primary_key, auto_increment = false)]"
             )
-            lines.append(f"        pub {rust_field_name(name)}: Uuid,")
+            lines.append(f"        pub {rust_field_name(name)}: {rs_t},")
             continue
         if composite:
             rs_t = sql_type_to_rust(ctype, nullable)
@@ -123,11 +131,23 @@ def emit_entity(table: str, cols: list[tuple[str, str, bool]]) -> str:
     return "\n".join(lines)
 
 
-def process_file(path: Path) -> list[str]:
+def forward_changes(path: Path) -> list[ET.Element]:
+    """Return changeset children in file order without rollback descendants."""
     tree = ET.parse(path)
     root = tree.getroot()
+    return [
+        change
+        for changeset in root.findall(".//db:changeSet", NS)
+        for change in list(changeset)
+        if change.tag != f"{{{NS['db']}}}rollback"
+    ]
+
+
+def process_file(path: Path) -> list[str]:
     chunks: list[str] = []
-    for ct in root.findall(".//db:createTable", NS):
+    for ct in forward_changes(path):
+        if ct.tag != f"{{{NS['db']}}}createTable":
+            continue
         schema = ct.attrib.get("schemaName", "")
         if schema != "${schema}":
             continue
@@ -137,6 +157,105 @@ def process_file(path: Path) -> list[str]:
             continue
         chunks.append(emit_entity(table, cols))
     return chunks
+
+
+def tenant_migration_files() -> list[Path]:
+    """Return tenant migration XML files in authoritative master-include order."""
+    tree = ET.parse(TENANT_CHANGELOG_MASTER)
+    master_directory = TENANT_CHANGELOG_MASTER.parent
+    migrations_root = MIGRATIONS.resolve()
+    files: list[Path] = []
+    for include in tree.getroot().findall("db:include", NS):
+        include_path = include.attrib.get("file")
+        if not include_path:
+            continue
+        path = (master_directory / include_path).resolve()
+        try:
+            path.relative_to(migrations_root)
+        except ValueError as error:
+            raise ValueError(
+                f"Tenant migration include is outside {MIGRATIONS}: {include_path}"
+            ) from error
+        files.append(path)
+    return files
+
+
+def migration_directories() -> list[Path]:
+    """Return included migration directories in first-include order."""
+    return list(dict.fromkeys(path.parent for path in tenant_migration_files()))
+
+
+def collect_domain_tables(
+    directory: Path,
+) -> tuple[
+    dict[str, list[tuple[str, str, bool]]],
+    dict[str, list[str]],
+    list[str],
+]:
+    """Collect one domain's tables after all later forward amendments."""
+    selected = directory.resolve()
+    tables: dict[str, list[tuple[str, str, bool]]] = {}
+    primary_keys: dict[str, list[str]] = {}
+    sources: list[str] = []
+    selected_reached = False
+
+    for xml in tenant_migration_files():
+        migration_directory = xml.parent
+        if migration_directory.resolve() == selected:
+            selected_reached = True
+        if not selected_reached:
+            continue
+
+        source_used = False
+        for change in forward_changes(xml):
+            schema = change.attrib.get("schemaName", "")
+            table = change.attrib.get("tableName")
+            if schema != "${schema}" or table is None:
+                continue
+
+            if (
+                migration_directory.resolve() == selected
+                and change.tag == f"{{{NS['db']}}}createTable"
+            ):
+                columns = parse_columns(change)
+                if columns:
+                    tables[table] = columns
+                    source_used = True
+                continue
+
+            if table not in tables:
+                continue
+
+            if change.tag == f"{{{NS['db']}}}addPrimaryKey":
+                primary_keys[table] = [
+                    column.strip()
+                    for column in change.attrib.get("columnNames", "").split(",")
+                    if column.strip()
+                ]
+                source_used = True
+            elif change.tag == f"{{{NS['db']}}}addColumn":
+                existing_names = {name for name, _, _ in tables[table]}
+                for column in parse_columns(change):
+                    if column[0] not in existing_names:
+                        tables[table].append(column)
+                        existing_names.add(column[0])
+                source_used = True
+            elif change.tag == f"{{{NS['db']}}}dropColumn":
+                dropped_names = {
+                    column.attrib["name"]
+                    for column in change.findall("db:column", NS)
+                }
+                if column_name := change.attrib.get("columnName"):
+                    dropped_names.add(column_name)
+                tables[table] = [
+                    column for column in tables[table] if column[0] not in dropped_names
+                ]
+                source_used = True
+
+        if source_used:
+            sources.append(xml.relative_to(REPOSITORY_ROOT).as_posix())
+
+    return tables, primary_keys, sources
 
 
 def domain_rust_mod(folder_name: str) -> str:
@@ -149,19 +268,16 @@ def generate_domain(directory: Path) -> str:
     if "integration_connector" in directory.name and "0005_integration" in directory.name:
         return ""
 
-    chunks: list[str] = []
-    sources: list[str] = []
-    for xml in sorted(directory.glob("*.xml")):
-        part = process_file(xml)
-        if part:
-            chunks.extend(part)
-            sources.append(xml.relative_to(REPOSITORY_ROOT).as_posix())
-    if not chunks:
+    tables, primary_keys, sources = collect_domain_tables(directory)
+    if not tables:
         return ""
 
     module_name = domain_rust_mod(directory.name)
     src_comment = ", ".join(sources)
-    body = "\n".join(chunks)
+    body = "\n".join(
+        emit_entity(table, columns, primary_keys.get(table))
+        for table, columns in tables.items()
+    )
     (OUT / f"{module_name}.rs").write_text(
         f"//! Auto-generated from `{src_comment}`.\n\n{body}",
         encoding="utf-8",
@@ -221,10 +337,7 @@ def main() -> None:
         merge_module_export(generate_domain(selected))
         return
 
-    dirs = sorted(
-        [p for p in MIGRATIONS.iterdir() if p.is_dir() and re.match(r"^\d{4}_", p.name)],
-        key=lambda p: p.name,
-    )
+    dirs = migration_directories()
     mod_lines: list[str] = []
 
     for directory in dirs:

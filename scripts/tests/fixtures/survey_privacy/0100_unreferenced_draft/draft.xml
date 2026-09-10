@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<databaseChangeLog xmlns="http://www.liquibase.org/xml/ns/dbchangelog">
+    <changeSet id="fixture-unreferenced-draft" author="test">
+        <addColumn tableName="survey_assignment" schemaName="${schema}">
+            <column name="unreferenced_draft_column" type="TEXT"/>
+        </addColumn>
+        <dropColumn tableName="unrelated_record" schemaName="${schema}" columnName="label"/>
+    </changeSet>
+</databaseChangeLog>
