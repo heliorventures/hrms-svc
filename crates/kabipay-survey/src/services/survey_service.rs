@@ -211,8 +211,20 @@ pub async fn aggregate_results(
     tenant_id: Uuid,
     survey_id: Uuid,
     scope: ResultScope,
+    can_review_submissions: bool,
 ) -> KabiPayResult<SurveyResultsDto> {
     let survey = load_survey_model(db, tenant_id, survey_id).await?;
+    let review_mode = survey.response_review_mode == "ANONYMOUS_SUBMISSIONS";
+    if review_mode && (survey.status != "CLOSED" || scope != ResultScope::All) {
+        return Ok(SurveyResultsDto {
+            survey_id: survey_id.to_string().into(), suppressed: true,
+            suppression_reason: Some(if scope != ResultScope::All {
+                "This survey permits only organization-wide results to protect unnamed submissions".into()
+            } else { "Results become available after this survey is closed".into() }),
+            respondent_count: None, minimum_report_group_size: survey.minimum_report_group_size,
+            dimensions: vec![], questions: vec![],
+        });
+    }
     let mut query = survey_response::Entity::find()
         .filter(survey_response::Column::TenantId.eq(tenant_id))
         .filter(survey_response::Column::SurveyId.eq(survey_id));
@@ -222,10 +234,13 @@ pub async fn aggregate_results(
         ResultScope::Team(manager_id) => query.filter(survey_response::Column::ManagerEmployeeId.eq(manager_id)),
     };
     let responses = query.all(db).await?;
-    let threshold = survey.minimum_report_group_size.max(3) as usize;
-    if !report_group_is_visible(responses.len(), threshold) {
+    let threshold = if can_review_submissions && scope == ResultScope::All
+        && super::survey_review::review_available(&survey.response_review_mode, &survey.status) { 1 }
+        else { survey.minimum_report_group_size.max(3) as usize };
+    if threshold != 1 && !result_group_is_visible(responses.len(), threshold) {
         return Ok(SurveyResultsDto {
             survey_id: survey_id.to_string().into(), suppressed: true, respondent_count: None,
+            suppression_reason: Some("Results are hidden until the minimum response group is reached".into()),
             minimum_report_group_size: threshold as i32, dimensions: Vec::new(), questions: Vec::new(),
         });
     }
@@ -269,8 +284,10 @@ fn aggregate_answers(
     let mut aggregates = Vec::new();
     for question in questions {
         let question_answers: Vec<&survey_answer::Model> = answers.iter().filter(|answer| answer.question_id == question.id).collect();
-        if !report_group_is_visible(question_answers.len(), threshold) {
-            aggregates.push(SurveyQuestionAggregateDto { question_id: question.id.to_string().into(), prompt: question.prompt,
+        if threshold != 1 && !result_group_is_visible(question_answers.len(), threshold) {
+            aggregates.push(SurveyQuestionAggregateDto { suppressed: true, question_id: question.id.to_string().into(), prompt: question.prompt,
+                question_type: question.question_type, rating_min: question.rating_min.map(|v| v.to_string()), rating_max: question.rating_max.map(|v| v.to_string()),
+                skipped_count: None, rating_distribution: Vec::new(),
                 dimension: question.dimension, response_count: 0, average_score: None, options: Vec::new(), comments: Vec::new() });
             continue;
         }
@@ -280,6 +297,7 @@ fn aggregate_answers(
         for answer in &question_answers {
             if let Some(value) = answer.numeric_answer { scores.push((answer.survey_response_id, value)); }
             if let Some(text) = answer.text_answer.as_ref() { comments.push(text.clone()); }
+            if let Some(text) = answer.comment.as_ref() { comments.push(text.clone()); }
             let ids = selected_ids(&answer.selected_option_ids);
             let selected_scores: Vec<Decimal> = ids.iter().filter_map(|id| {
                 *option_counts.entry(*id).or_insert(0) += 1;
@@ -296,6 +314,16 @@ fn aggregate_answers(
         if !options_visible { scores.clear(); }
         dimension_scores.entry(question.dimension.clone()).or_default().extend(scores.iter().copied());
         let average = visible_score_average(&scores, threshold);
+        let mut rating_counts = std::collections::BTreeMap::<Decimal, i32>::new();
+        if question.question_type == "RATING" {
+            for answer in &question_answers {
+                if let Some(score) = answer.numeric_answer { *rating_counts.entry(score).or_default() += 1; }
+            }
+        }
+        let rating_distribution = if rating_counts.values().any(|count| (*count as usize) < threshold) { Vec::new() }
+        else { rating_counts.into_iter().map(|(score, response_count)| crate::resolvers::types::SurveyRatingBucket { score: score.to_string(), response_count }).collect() };
+        let skipped = respondent_count.saturating_sub(question_answers.len());
+        let skipped_count = (skipped == 0 || skipped >= threshold).then_some(skipped as i32);
         let mut option_aggregates: Vec<SurveyOptionAggregateDto> = options.iter().filter(|option| option.question_id == question.id)
             .map(|option| SurveyOptionAggregateDto { option_id: option.id.to_string().into(), label: option.label.clone(), response_count: option_counts.get(&option.id).copied().unwrap_or(0) }).collect();
         option_aggregates.sort_by_key(|option| option.label.clone());
@@ -304,7 +332,9 @@ fn aggregate_answers(
         // Fresh independent keys for every question/report: never align comments
         // using answer row order, response identity, timestamps, or a stable seed.
         order_comments(&mut comments, Uuid::new_v4);
-        aggregates.push(SurveyQuestionAggregateDto { question_id: question.id.to_string().into(), prompt: question.prompt,
+        aggregates.push(SurveyQuestionAggregateDto { suppressed: false, question_id: question.id.to_string().into(), prompt: question.prompt,
+            question_type: question.question_type, rating_min: question.rating_min.map(|v| v.to_string()), rating_max: question.rating_max.map(|v| v.to_string()),
+            skipped_count, rating_distribution,
             dimension: question.dimension, response_count: question_answers.len() as i32, average_score: average,
             options: option_aggregates, comments });
     }
@@ -315,6 +345,7 @@ fn aggregate_answers(
     }).collect();
     dimensions.sort_by(|left, right| left.dimension.cmp(&right.dimension));
     SurveyResultsDto { survey_id: survey_id.to_string().into(), suppressed: false,
+        suppression_reason: None,
         respondent_count: Some(respondent_count as i32), minimum_report_group_size: threshold as i32,
         dimensions, questions: aggregates }
 }
@@ -323,9 +354,13 @@ fn order_comments(comments: &mut [String], mut fresh_key: impl FnMut() -> Uuid) 
     comments.sort_by_cached_key(|_| fresh_key());
 }
 
+fn result_group_is_visible(count: usize, threshold: usize) -> bool {
+    (threshold == 1 && count >= 1) || report_group_is_visible(count, threshold)
+}
+
 fn visible_score_average(scores: &[(Uuid, Decimal)], threshold: usize) -> Option<String> {
     let contributors: HashSet<Uuid> = scores.iter().map(|(response_id, _)| *response_id).collect();
-    report_group_is_visible(contributors.len(), threshold).then(|| {
+    result_group_is_visible(contributors.len(), threshold).then(|| {
         (scores.iter().map(|(_, score)| *score).sum::<Decimal>() / Decimal::from(scores.len() as u64))
             .round_dp(2).to_string()
     })
@@ -342,6 +377,46 @@ mod tests {
         order_comments(&mut comments, || Uuid::from_u128(keys.next().unwrap()));
         assert_eq!(comments, ["other", "same", "same"]);
         assert!(keys.next().is_none());
+    }
+
+    #[test]
+    fn rating_histograms_preserve_legacy_small_bucket_suppression() {
+        let mut question = question();
+        question.question_type = "RATING".into();
+        let answers: Vec<_> = [1, 5, 5, 5].into_iter().map(|score| {
+            let mut answer = answer(question.id, Uuid::new_v4(), Uuid::nil());
+            answer.selected_option_ids = None;
+            answer.numeric_answer = Some(Decimal::from(score));
+            answer
+        }).collect();
+        let legacy = aggregate_answers(Uuid::new_v4(), 4, 3, vec![question.clone()], vec![], answers.clone());
+        assert!(legacy.questions[0].rating_distribution.is_empty());
+        let reviewed = aggregate_answers(Uuid::new_v4(), 4, 1, vec![question], vec![], answers);
+        assert_eq!(reviewed.questions[0].rating_distribution.iter().map(|bucket| (bucket.score.as_str(), bucket.response_count)).collect::<Vec<_>>(), [("1", 1), ("5", 3)]);
+        assert_eq!(reviewed.questions[0].average_score.as_deref(), Some("4"));
+    }
+
+    #[test]
+    fn reviewed_one_response_keeps_comment_and_skipped_counts() {
+        let question = question();
+        let mut answer = answer(question.id, Uuid::new_v4(), Uuid::nil());
+        answer.comment = Some("Feedback".into());
+        let reviewed = aggregate_answers(Uuid::new_v4(), 2, 1, vec![question], vec![], vec![answer]);
+        assert_eq!(reviewed.questions[0].skipped_count, Some(1));
+        assert_eq!(reviewed.questions[0].comments, ["Feedback"]);
+    }
+
+    #[test]
+    fn reviewed_unanswered_question_is_zero_not_suppressed() {
+        let result = aggregate_answers(Uuid::new_v4(), 2, 1, vec![question()], vec![], vec![]);
+        assert!(!result.questions[0].suppressed);
+        assert_eq!(result.questions[0].response_count, 0);
+        assert_eq!(result.questions[0].skipped_count, Some(2));
+        assert!(result.questions[0].rating_distribution.is_empty());
+        assert_eq!(result.questions[0].average_score, None);
+        let legacy = aggregate_answers(Uuid::new_v4(), 3, 3, vec![question()], vec![], vec![]);
+        assert!(legacy.questions[0].suppressed);
+        assert_eq!(legacy.questions[0].skipped_count, None);
     }
 
     #[test]
@@ -388,7 +463,7 @@ mod tests {
         survey_question::Model {
             id: Uuid::new_v4(), tenant_id: Uuid::nil(), section_id: Uuid::nil(),
             dimension: "Wellbeing".into(), question_type: "SINGLE_CHOICE".into(),
-            prompt: "How was your week?".into(), is_required: false,
+            prompt: "How was your week?".into(), description: None, comment_enabled: false, is_required: false,
             rating_min: None, rating_max: None, display_order: 0,
         }
     }
@@ -404,7 +479,7 @@ mod tests {
         survey_answer::Model {
             id: Uuid::new_v4(), tenant_id: Uuid::nil(), survey_response_id: response_id,
             question_id, selected_option_ids: Some(serde_json::json!([option_id])),
-            numeric_answer: None, text_answer: None,
+            numeric_answer: None, text_answer: None, comment: None,
         }
     }
 

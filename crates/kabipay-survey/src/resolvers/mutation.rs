@@ -53,6 +53,9 @@ pub struct SurveyQuestionInput {
     pub dimension: String,
     pub question_type: String,
     pub prompt: String,
+    pub description: Option<String>,
+    #[graphql(default = false)]
+    pub comment_enabled: bool,
     #[graphql(default = false)]
     pub is_required: bool,
     pub rating_min: Option<String>,
@@ -75,6 +78,7 @@ pub struct SaveSurveyInput {
     pub opens_at: Option<chrono::DateTime<chrono::Utc>>,
     pub closes_at: Option<chrono::DateTime<chrono::Utc>>,
     pub minimum_report_group_size: i32,
+    pub response_review_mode: Option<String>,
     #[graphql(default)]
     pub audience_department_ids: Vec<ID>,
     #[graphql(default)]
@@ -92,6 +96,7 @@ pub struct SurveyAnswerInput {
     pub selected_option_ids: Vec<ID>,
     pub numeric_answer: Option<String>,
     pub text_answer: Option<String>,
+    pub comment: Option<String>,
 }
 
 pub struct MutationRoot;
@@ -106,6 +111,10 @@ impl MutationRoot {
         let tenant_id = require_tenant_id(ctx)?;
         let title = text(&input.title, 255, "Survey title")?;
         let description = optional_text(input.description, 4000, "Survey description")?;
+        let response_review_mode = input.response_review_mode.as_deref().unwrap_or("AGGREGATE_ONLY");
+        if !matches!(response_review_mode, "AGGREGATE_ONLY" | "ANONYMOUS_SUBMISSIONS") {
+            return Err(KabiPayError::Validation("Unsupported response review mode".into()).into_graphql());
+        }
         if input.minimum_report_group_size < 3 {
             return Err(KabiPayError::Validation("Minimum report group size must be at least 3".into()).into_graphql());
         }
@@ -124,6 +133,10 @@ impl MutationRoot {
             for question in &section.questions {
                 text(&question.dimension, 100, "Question dimension")?;
                 text(&question.prompt, 4000, "Question prompt")?;
+                optional_text(question.description.clone(), 2000, "Question guidance")?;
+                if question.comment_enabled && !matches!(question.question_type.trim().to_ascii_uppercase().as_str(), "RATING" | "SINGLE_CHOICE" | "MULTIPLE_CHOICE") {
+                    return Err(KabiPayError::Validation("Additional comments are supported only for rating and choice questions".into()).into_graphql());
+                }
                 let question_type = match question.question_type.trim().to_ascii_uppercase().as_str() {
                     "SINGLE_CHOICE" => survey_rules::QuestionType::SingleChoice,
                     "MULTIPLE_CHOICE" => survey_rules::QuestionType::MultipleChoice,
@@ -194,6 +207,7 @@ impl MutationRoot {
             model.title = Set(title.clone()); model.description = Set(description.clone());
             model.opens_at = Set(input.opens_at); model.closes_at = Set(input.closes_at);
             model.minimum_report_group_size = Set(input.minimum_report_group_size);
+            if input.response_review_mode.is_some() { model.response_review_mode = Set(response_review_mode.to_owned()); }
             model.updated_at = Set(chrono::Utc::now());
             model.update(&txn).await.map_err(KabiPayError::from).map_err(KabiPayError::into_graphql)?;
             survey_section::Entity::delete_many().filter(survey_section::Column::TenantId.eq(tenant_id))
@@ -204,6 +218,7 @@ impl MutationRoot {
         } else {
             survey::ActiveModel { id: Set(survey_id), tenant_id: Set(tenant_id), title: Set(title), description: Set(description),
                 status: Set("DRAFT".into()), opens_at: Set(input.opens_at), closes_at: Set(input.closes_at),
+                response_review_mode: Set(response_review_mode.to_owned()),
                 minimum_report_group_size: Set(input.minimum_report_group_size), created_by: Set(claims.sub),
                 published_at: Set(None), closed_at: Set(None), created_at: Set(chrono::Utc::now()), updated_at: Set(chrono::Utc::now()) }
                 .insert(&txn).await.map_err(KabiPayError::from).map_err(KabiPayError::into_graphql)?;
@@ -232,6 +247,7 @@ impl MutationRoot {
                 validated_index += 1;
                 survey_question::ActiveModel { id: Set(question_id), tenant_id: Set(tenant_id), section_id: Set(section_id),
                     dimension: Set(question.dimension.trim().to_owned()), question_type: Set(question.question_type.trim().to_ascii_uppercase()),
+                    description: Set(optional_text(question.description.clone(), 2000, "Question guidance")?), comment_enabled: Set(question.comment_enabled),
                     prompt: Set(question.prompt.trim().to_owned()), is_required: Set(question.is_required), rating_min: Set(rating_min),
                     rating_max: Set(rating_max), display_order: Set(question_index as i32) }
                     .insert(&txn).await.map_err(KabiPayError::from).map_err(KabiPayError::into_graphql)?;
@@ -248,7 +264,9 @@ impl MutationRoot {
             crate::services::survey_lifecycle::ManagementAction::Saved, chrono::Utc::now())
             .await.map_err(KabiPayError::into_graphql)?;
         txn.commit().await.map_err(KabiPayError::from).map_err(KabiPayError::into_graphql)?;
-        survey_service::load_survey(&db, tenant_id, survey_id, false).await.map_err(KabiPayError::into_graphql)
+        let mut survey = survey_service::load_survey(&db, tenant_id, survey_id, false).await.map_err(KabiPayError::into_graphql)?;
+        crate::services::survey_review::populate_counts(&db, tenant_id, &mut survey.summary).await.map_err(KabiPayError::into_graphql)?;
+        Ok(survey)
     }
 
     async fn publish_survey(&self, ctx: &Context<'_>, survey_id: ID) -> Result<SurveyDto> {
@@ -288,7 +306,9 @@ impl MutationRoot {
         txn.commit().await.map_err(KabiPayError::from).map_err(KabiPayError::into_graphql)?;
         let completed = survey_service::completion_for_viewer(&db, tenant_id, survey_id, claims.employee_id, true)
             .await.map_err(KabiPayError::into_graphql)?;
-        survey_service::load_survey(&db, tenant_id, survey_id, completed).await.map_err(KabiPayError::into_graphql)
+        let mut survey = survey_service::load_survey(&db, tenant_id, survey_id, completed).await.map_err(KabiPayError::into_graphql)?;
+        crate::services::survey_review::populate_counts(&db, tenant_id, &mut survey.summary).await.map_err(KabiPayError::into_graphql)?;
+        Ok(survey)
     }
 
     async fn open_survey(&self, ctx: &Context<'_>, survey_id: ID) -> Result<SurveyDto> {
@@ -303,7 +323,9 @@ impl MutationRoot {
             .await.map_err(KabiPayError::into_graphql)?;
         let completed = survey_service::completion_for_viewer(&db, tenant_id, survey_id, claims.employee_id, true)
             .await.map_err(KabiPayError::into_graphql)?;
-        survey_service::load_survey(&db, tenant_id, survey_id, completed).await.map_err(KabiPayError::into_graphql)
+        let mut survey = survey_service::load_survey(&db, tenant_id, survey_id, completed).await.map_err(KabiPayError::into_graphql)?;
+        crate::services::survey_review::populate_counts(&db, tenant_id, &mut survey.summary).await.map_err(KabiPayError::into_graphql)?;
+        Ok(survey)
     }
 
     async fn close_survey(&self, ctx: &Context<'_>, survey_id: ID) -> Result<SurveyDto> {
@@ -328,7 +350,9 @@ impl MutationRoot {
         txn.commit().await.map_err(KabiPayError::from).map_err(KabiPayError::into_graphql)?;
         let completed = survey_service::completion_for_viewer(&db, tenant_id, survey_id, claims.employee_id, true)
             .await.map_err(KabiPayError::into_graphql)?;
-        survey_service::load_survey(&db, tenant_id, survey_id, completed).await.map_err(KabiPayError::into_graphql)
+        let mut survey = survey_service::load_survey(&db, tenant_id, survey_id, completed).await.map_err(KabiPayError::into_graphql)?;
+        crate::services::survey_review::populate_counts(&db, tenant_id, &mut survey.summary).await.map_err(KabiPayError::into_graphql)?;
+        Ok(survey)
     }
 
     async fn submit_survey(&self, ctx: &Context<'_>, survey_id: ID, answers: Vec<SurveyAnswerInput>) -> Result<bool> {
@@ -342,6 +366,7 @@ impl MutationRoot {
             selected_option_ids: answer.selected_option_ids.iter().map(parse_id).collect::<Result<_>>()?,
             numeric_answer: answer.numeric_answer.as_deref().map(|value| decimal(value, "Numeric answer")).transpose()?,
             text_answer: answer.text_answer,
+            comment: answer.comment,
         })).collect::<Result<Vec<_>>>()?;
         let db = tenant_db(ctx, tenant_id).await?;
         survey_submission::submit_survey(&db, tenant_id, survey_id, employee_id, parsed)

@@ -1,4 +1,4 @@
-//! Auto-generated from `hrms-database/changelog/migrations/0076_anonymous_surveys/anonymous_surveys.xml, hrms-database/changelog/migrations/0082_survey_privacy_snapshots/survey_privacy_snapshots.xml, hrms-database/changelog/migrations/0084_survey_targeting_corrections/survey_targeting_corrections.xml`.
+//! Auto-generated from `hrms-database/changelog/migrations/0076_anonymous_surveys/anonymous_surveys.xml, hrms-database/changelog/migrations/0082_survey_privacy_snapshots/survey_privacy_snapshots.xml, hrms-database/changelog/migrations/0084_survey_targeting_corrections/survey_targeting_corrections.xml, hrms-database/changelog/migrations/0086_survey_response_review/survey_response_review.xml`.
 
 pub mod survey {
     use crate::tenant::prelude::*;
@@ -15,6 +15,7 @@ pub mod survey {
         pub opens_at: Option<DateTimeUtc>,
         pub closes_at: Option<DateTimeUtc>,
         pub minimum_report_group_size: i32,
+        pub response_review_mode: String,
         pub created_by: Uuid,
         pub published_at: Option<DateTimeUtc>,
         pub closed_at: Option<DateTimeUtc>,
@@ -80,6 +81,8 @@ pub mod survey_question {
         pub dimension: String,
         pub question_type: String,
         pub prompt: String,
+        pub description: Option<String>,
+        pub comment_enabled: bool,
         pub is_required: bool,
         pub rating_min: Option<Decimal>,
         pub rating_max: Option<Decimal>,
@@ -172,6 +175,7 @@ pub mod survey_answer {
         pub selected_option_ids: Option<Json>,
         pub numeric_answer: Option<Decimal>,
         pub text_answer: Option<String>,
+        pub comment: Option<String>,
     }
 
     impl ActiveModelBehavior for ActiveModel {}

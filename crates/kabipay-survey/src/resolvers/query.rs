@@ -23,6 +23,17 @@ pub struct QueryRoot;
 
 #[Object]
 impl QueryRoot {
+    async fn survey_submissions(&self, ctx: &Context<'_>, survey_id: ID, #[graphql(default = 0)] offset: i32, #[graphql(default = 20)] limit: i32) -> Result<super::types::SurveySubmissions> {
+        let claims = require_client_claims(ctx)?;
+        if !claims.can_manage_surveys() || claims.survey_results_scope() != Some(ScopeType::All) {
+            return Err(KabiPayError::Forbidden("survey:manage and survey:results with ALL scope required".into()).into_graphql());
+        }
+        let tenant_id = require_tenant_id(ctx)?;
+        let survey_id = parse_id(&survey_id)?;
+        let db = tenant_db(ctx, tenant_id).await?;
+        crate::services::survey_review::submissions(&db, tenant_id, survey_id, offset, limit).await.map_err(KabiPayError::into_graphql)
+    }
+
     async fn survey_audience(&self, ctx: &Context<'_>, survey_id: ID) -> Result<crate::services::survey_management::SurveyAudience> {
         let claims = require_client_claims(ctx)?;
         if !claims.can_manage_surveys() { return Err(KabiPayError::Forbidden("survey:manage with ALL scope required".into()).into_graphql()); }
@@ -62,7 +73,9 @@ impl QueryRoot {
         }
         let tenant_id = require_tenant_id(ctx)?;
         let db = tenant_db(ctx, tenant_id).await?;
-        survey_service::list_surveys(&db, tenant_id).await.map_err(KabiPayError::into_graphql)
+        let mut summaries = survey_service::list_surveys(&db, tenant_id).await.map_err(KabiPayError::into_graphql)?;
+        crate::services::survey_review::populate_list_counts(&db, tenant_id, &mut summaries).await.map_err(KabiPayError::into_graphql)?;
+        Ok(summaries)
     }
 
     async fn available_surveys(&self, ctx: &Context<'_>) -> Result<Vec<SurveySummaryDto>> {
@@ -73,7 +86,11 @@ impl QueryRoot {
         let employee_id = employee_id(claims)?;
         let tenant_id = require_tenant_id(ctx)?;
         let db = tenant_db(ctx, tenant_id).await?;
-        survey_service::list_available_surveys(&db, tenant_id, employee_id).await.map_err(KabiPayError::into_graphql)
+        let mut summaries = survey_service::list_available_surveys(&db, tenant_id, employee_id).await.map_err(KabiPayError::into_graphql)?;
+        if claims.can_manage_surveys() {
+            crate::services::survey_review::populate_list_counts(&db, tenant_id, &mut summaries).await.map_err(KabiPayError::into_graphql)?;
+        }
+        Ok(summaries)
     }
 
     async fn survey_results_catalog(&self, ctx: &Context<'_>) -> Result<Vec<SurveySummaryDto>> {
@@ -83,7 +100,11 @@ impl QueryRoot {
         }
         let tenant_id = require_tenant_id(ctx)?;
         let db = tenant_db(ctx, tenant_id).await?;
-        survey_service::list_results_surveys(&db, tenant_id).await.map_err(KabiPayError::into_graphql)
+        let mut summaries = survey_service::list_results_surveys(&db, tenant_id).await.map_err(KabiPayError::into_graphql)?;
+        if claims.can_manage_surveys() {
+            crate::services::survey_review::populate_list_counts(&db, tenant_id, &mut summaries).await.map_err(KabiPayError::into_graphql)?;
+        }
+        Ok(summaries)
     }
 
     async fn survey(&self, ctx: &Context<'_>, survey_id: ID) -> Result<SurveyDto> {
@@ -103,7 +124,11 @@ impl QueryRoot {
         )
         .await
         .map_err(KabiPayError::into_graphql)?;
-        survey_service::load_survey(&db, tenant_id, survey_id, completed).await.map_err(KabiPayError::into_graphql)
+        let mut survey = survey_service::load_survey(&db, tenant_id, survey_id, completed).await.map_err(KabiPayError::into_graphql)?;
+        if claims.can_manage_surveys() {
+            crate::services::survey_review::populate_counts(&db, tenant_id, &mut survey.summary).await.map_err(KabiPayError::into_graphql)?;
+        }
+        Ok(survey)
     }
 
     async fn survey_results(&self, ctx: &Context<'_>, survey_id: ID) -> Result<SurveyResultsDto> {
@@ -128,6 +153,6 @@ impl QueryRoot {
             }
             ScopeType::Self_ => return Err(KabiPayError::Forbidden("SELF scope cannot access aggregate survey results".into()).into_graphql()),
         };
-        survey_service::aggregate_results(&db, tenant_id, survey_id, scope).await.map_err(KabiPayError::into_graphql)
+        survey_service::aggregate_results(&db, tenant_id, survey_id, scope, claims.can_manage_surveys() && result_scope == ScopeType::All).await.map_err(KabiPayError::into_graphql)
     }
 }

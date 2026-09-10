@@ -10,3 +10,4 @@ mod survey_submission_tests;
 
 #[cfg(test)]
 mod survey_lifecycle_tests;
+pub mod survey_review;

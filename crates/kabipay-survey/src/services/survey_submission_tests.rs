@@ -28,6 +28,7 @@ struct SurveyFixture {
     manager_id: Option<Uuid>,
     location_id: Option<Uuid>,
     question_type: String,
+    comment_enabled: bool,
     closes_at: Option<DateTime<Utc>>,
     completed: bool,
     fail_assignment_lookup: bool,
@@ -46,6 +47,7 @@ impl SurveyFixture {
             manager_id: Some(Uuid::new_v4()),
             location_id: Some(Uuid::new_v4()),
             question_type: "RATING".into(),
+            comment_enabled: false,
             closes_at: None,
             completed: false,
             fail_assignment_lookup: false,
@@ -78,6 +80,7 @@ impl SurveyFixture {
             ("status".into(), "PUBLISHED".into()),
             ("opens_at".into(), Option::<DateTime<Utc>>::None.into()),
             ("closes_at".into(), self.closes_at.into()),
+            ("response_review_mode".into(), "AGGREGATE_ONLY".into()),
             ("minimum_report_group_size".into(), 3i32.into()),
             ("created_by".into(), Uuid::new_v4().into()),
             ("published_at".into(), Some(now).into()),
@@ -118,6 +121,8 @@ impl SurveyFixture {
             ("section_id".into(), Uuid::nil().into()),
             ("dimension".into(), "Wellbeing".into()),
             ("question_type".into(), self.question_type.clone().into()),
+            ("description".into(), Option::<String>::None.into()),
+            ("comment_enabled".into(), self.comment_enabled.into()),
             ("prompt".into(), "Score".into()),
             ("is_required".into(), true.into()),
             ("rating_min".into(), Some(Decimal::ONE).into()),
@@ -157,6 +162,7 @@ impl SurveyFixture {
             ("selected_option_ids".into(), Option::<serde_json::Value>::None.into()),
             ("numeric_answer".into(), Some(Decimal::new(4, 0)).into()),
             ("text_answer".into(), Option::<String>::None.into()),
+            ("comment".into(), Option::<String>::None.into()),
         ]))
     }
 }
@@ -278,7 +284,7 @@ fn rating_answer() -> SubmissionAnswer {
         question_id: Uuid::nil(),
         selected_option_ids: Vec::new(),
         numeric_answer: Some(Decimal::new(4, 0)),
-        text_answer: None,
+        text_answer: None, comment: None,
     }
 }
 
@@ -436,7 +442,7 @@ async fn choice_answer_normalizes_whitespace_text_to_null_before_persistence() {
             question_id: Uuid::nil(),
             selected_option_ids: vec![fixture.option_id],
             numeric_answer: None,
-            text_answer: Some("   ".into()),
+            text_answer: Some("   ".into()), comment: None,
         }],
     )
     .await
@@ -463,7 +469,7 @@ async fn text_answer_persists_trimmed_validated_text() {
             question_id: Uuid::nil(),
             selected_option_ids: Vec::new(),
             numeric_answer: None,
-            text_answer: Some("  clear feedback  ".into()),
+            text_answer: Some("  clear feedback  ".into()), comment: None,
         }],
     )
     .await
@@ -676,4 +682,16 @@ async fn optional_assignment_preserves_missing_and_database_failure() {
     .await
     .expect_err("database failure must not look like missing assignment");
     assert!(matches!(error, KabiPayError::Database(_)));
+}
+
+#[tokio::test]
+async fn additional_comments_are_optional_bounded_and_require_question_opt_in() {
+    for (enabled, comment, valid) in [(false, "feedback".to_owned(), false), (true, "x".repeat(4001), false), (true, " feedback ".to_owned(), true)] {
+        let mut fixture = SurveyFixture::new();
+        fixture.comment_enabled = enabled;
+        let answer = SubmissionAnswer { question_id: Uuid::nil(), selected_option_ids: vec![], numeric_answer: Some(Decimal::ONE), text_answer: None, comment: Some(comment) };
+        let result = submit_survey(&fixture.connection().await, fixture.tenant_id, fixture.survey_id, fixture.employee_id, vec![answer]).await;
+        assert_eq!(result.is_ok(), valid, "{result:?}");
+        if !valid { assert!(!fixture.events().iter().any(|sql| sql.starts_with("INSERT INTO"))); }
+    }
 }

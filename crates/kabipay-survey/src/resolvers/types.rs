@@ -26,6 +26,10 @@ pub struct SurveySummaryDto {
     pub closes_at: Option<DateTime<Utc>>,
     pub minimum_report_group_size: i32,
     pub completed: bool,
+    pub response_review_mode: String,
+    pub assigned_count: Option<i32>,
+    pub completed_count: Option<i32>,
+    pub pending_count: Option<i32>,
 }
 
 impl SurveySummaryDto {
@@ -39,6 +43,8 @@ impl SurveySummaryDto {
             closes_at: model.closes_at,
             minimum_report_group_size: model.minimum_report_group_size,
             completed,
+            response_review_mode: model.response_review_mode,
+            assigned_count: None, completed_count: None, pending_count: None,
         }
     }
 }
@@ -70,6 +76,8 @@ pub struct SurveyQuestionDto {
     pub dimension: String,
     pub question_type: String,
     pub prompt: String,
+    pub description: Option<String>,
+    pub comment_enabled: bool,
     pub is_required: bool,
     pub rating_min: Option<String>,
     pub rating_max: Option<String>,
@@ -87,6 +95,8 @@ impl SurveyQuestionDto {
             dimension: model.dimension,
             question_type: model.question_type,
             prompt: model.prompt,
+            description: model.description,
+            comment_enabled: model.comment_enabled,
             is_required: model.is_required,
             rating_min: model.rating_min.map(|value| value.to_string()),
             rating_max: model.rating_max.map(|value| value.to_string()),
@@ -135,11 +145,17 @@ pub struct SurveyOptionAggregateDto {
 #[derive(SimpleObject, Clone, Debug)]
 #[graphql(name = "SurveyQuestionAggregate")]
 pub struct SurveyQuestionAggregateDto {
+    pub suppressed: bool,
     pub question_id: ID,
     pub prompt: String,
     pub dimension: String,
     pub response_count: i32,
     pub average_score: Option<String>,
+    pub question_type: String,
+    pub rating_min: Option<String>,
+    pub rating_max: Option<String>,
+    pub skipped_count: Option<i32>,
+    pub rating_distribution: Vec<SurveyRatingBucket>,
     pub options: Vec<SurveyOptionAggregateDto>,
     pub comments: Vec<String>,
 }
@@ -157,8 +173,29 @@ pub struct SurveyDimensionAggregateDto {
 pub struct SurveyResultsDto {
     pub survey_id: ID,
     pub suppressed: bool,
+    pub suppression_reason: Option<String>,
     pub respondent_count: Option<i32>,
     pub minimum_report_group_size: i32,
     pub dimensions: Vec<SurveyDimensionAggregateDto>,
     pub questions: Vec<SurveyQuestionAggregateDto>,
+}
+
+#[derive(SimpleObject, Clone, Debug)]
+pub struct SurveyRatingBucket { pub score: String, pub response_count: i32 }
+
+#[derive(SimpleObject)]
+pub struct SurveySubmissionAnswer {
+    pub question_id: ID,
+    pub prompt: String,
+    pub numeric_answer: Option<String>,
+    pub text_answer: Option<String>,
+    pub comment: Option<String>,
+    pub selected_options: Vec<String>,
+}
+#[derive(SimpleObject)]
+pub struct SurveyAnonymousSubmission { pub number: i32, pub answers: Vec<SurveySubmissionAnswer> }
+#[derive(SimpleObject)]
+pub struct SurveySubmissions {
+    pub available: bool, pub reason: Option<String>, pub total_count: Option<i32>,
+    pub nodes: Vec<SurveyAnonymousSubmission>, pub has_more: bool,
 }

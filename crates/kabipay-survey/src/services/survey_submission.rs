@@ -25,6 +25,7 @@ pub struct SubmissionAnswer {
     pub selected_option_ids: Vec<Uuid>,
     pub numeric_answer: Option<Decimal>,
     pub text_answer: Option<String>,
+    pub comment: Option<String>,
 }
 
 /// Builds an assignment with the cohort values visible at publication time.
@@ -149,6 +150,7 @@ where
             })),
             numeric_answer: Set(answer.numeric_answer),
             text_answer: Set(answer.text_answer),
+            comment: Set(answer.comment),
         }
         .insert(&txn)
         .await?;
@@ -164,6 +166,7 @@ fn normalize_answers(answers: Vec<SubmissionAnswer>) -> Vec<SubmissionAnswer> {
     answers
         .into_iter()
         .map(|mut answer| {
+            answer.comment = answer.comment.as_deref().map(str::trim).filter(|text| !text.is_empty()).map(str::to_owned);
             answer.text_answer = answer
                 .text_answer
                 .as_deref()
@@ -191,6 +194,9 @@ async fn validate_answers(
         let question = question_map.get(&answer.question_id).ok_or_else(|| {
             KabiPayError::Validation("An answer references a question outside this survey".into())
         })?;
+        if answer.comment.as_ref().is_some_and(|comment| !question.comment_enabled || comment.chars().count() > 4000) {
+            return Err(KabiPayError::Validation("Additional comment is disabled or exceeds 4000 characters".into()));
+        }
         let text_answer = answer.text_answer.as_deref().map(str::trim).filter(|text| !text.is_empty());
         if text_answer.is_some_and(|text| text.chars().count() > 8_000) {
             return Err(KabiPayError::Validation(
