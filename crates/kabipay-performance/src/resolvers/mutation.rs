@@ -1101,8 +1101,13 @@ where
         if rating.is_some() && !rating_enabled {
             return Err(KabiPayError::Validation("Rating is not enabled for this question and reviewer".into()).into_graphql());
         }
-        let meaningful = text.is_some() || !option_ids.is_empty() || rating.is_some();
-        if question.is_required && !meaningful {
+        let has_primary_answer = match question.question_type.as_str() {
+            "SHORT_TEXT" | "LONG_TEXT" => text.is_some(),
+            "SINGLE_CHOICE" | "MULTIPLE_CHOICE" => !option_ids.is_empty(),
+            "RATING" => rating.is_some(),
+            _ => false,
+        };
+        if question.is_required && !has_primary_answer {
             return Err(KabiPayError::Validation(format!("Required question '{}' must be answered", question.prompt)).into_graphql());
         }
         parsed.push((question_id, text, option_ids, rating));
@@ -1172,6 +1177,10 @@ impl AppraisalAnswerInput {
     fn employee_option_ids_alias(&self) -> &[ID] { &self.selected_option_ids }
     fn employee_rating_alias(&self) -> Option<String> { self.rating.clone() }
 }
+
+#[cfg(test)]
+#[path = "answer_validation_tests.rs"]
+mod answer_validation_tests;
 
 #[cfg(test)]
 mod tests {
