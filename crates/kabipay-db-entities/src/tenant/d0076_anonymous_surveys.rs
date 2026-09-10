@@ -1,4 +1,4 @@
-//! Auto-generated from `hrms-database/changelog/migrations/0076_anonymous_surveys/anonymous_surveys.xml, hrms-database/changelog/migrations/0082_survey_privacy_snapshots/survey_privacy_snapshots.xml`.
+//! Auto-generated from `hrms-database/changelog/migrations/0076_anonymous_surveys/anonymous_surveys.xml, hrms-database/changelog/migrations/0082_survey_privacy_snapshots/survey_privacy_snapshots.xml, hrms-database/changelog/migrations/0084_survey_targeting_corrections/survey_targeting_corrections.xml`.
 
 pub mod survey {
     use crate::tenant::prelude::*;
@@ -128,6 +128,7 @@ pub mod survey_assignment {
         pub completed: bool,
         pub publication_department_id: Option<Uuid>,
         pub publication_manager_employee_id: Option<Uuid>,
+        pub publication_location_id: Option<Uuid>,
     }
 
     impl ActiveModelBehavior for ActiveModel {}
@@ -148,6 +149,7 @@ pub mod survey_response {
         pub survey_id: Uuid,
         pub department_id: Option<Uuid>,
         pub manager_employee_id: Option<Uuid>,
+        pub location_id: Option<Uuid>,
     }
 
     impl ActiveModelBehavior for ActiveModel {}

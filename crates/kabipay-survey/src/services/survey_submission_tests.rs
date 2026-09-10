@@ -26,6 +26,7 @@ struct SurveyFixture {
     option_id: Uuid,
     department_id: Option<Uuid>,
     manager_id: Option<Uuid>,
+    location_id: Option<Uuid>,
     question_type: String,
     closes_at: Option<DateTime<Utc>>,
     completed: bool,
@@ -43,6 +44,7 @@ impl SurveyFixture {
             option_id: Uuid::new_v4(),
             department_id: Some(Uuid::new_v4()),
             manager_id: Some(Uuid::new_v4()),
+            location_id: Some(Uuid::new_v4()),
             question_type: "RATING".into(),
             closes_at: None,
             completed: false,
@@ -94,6 +96,7 @@ impl SurveyFixture {
             ("completed".into(), completed.into()),
             ("publication_department_id".into(), self.department_id.into()),
             ("publication_manager_employee_id".into(), self.manager_id.into()),
+            ("publication_location_id".into(), self.location_id.into()),
             ("created_at".into(), Utc::now().into()),
         ]))
     }
@@ -130,6 +133,7 @@ impl SurveyFixture {
             ("survey_id".into(), self.survey_id.into()),
             ("department_id".into(), self.department_id.into()),
             ("manager_employee_id".into(), self.manager_id.into()),
+            ("location_id".into(), self.location_id.into()),
         ]))
     }
 
@@ -299,7 +303,11 @@ fn publication_assignment_freezes_department_and_manager_with_nulls_preserved() 
         Some(manager_at_publication),
     );
 
+    let location_at_publication = Uuid::new_v4();
+    employee.location_id = Some(location_at_publication);
     let assignment = new_assignment(tenant_id, survey_id, &employee, Utc::now());
+    employee.location_id = Some(Uuid::new_v4());
+    assert_eq!(assignment.publication_location_id, ActiveValue::Set(Some(location_at_publication)));
     employee.department_id = Some(Uuid::new_v4());
     employee.reporting_manager_id = Some(Uuid::new_v4());
 
@@ -316,6 +324,7 @@ fn publication_assignment_freezes_department_and_manager_with_nulls_preserved() 
     let null_employee = employee_model(tenant_id, employee_id, None, None);
     let null_assignment = new_assignment(tenant_id, survey_id, &null_employee, Utc::now());
     assert_eq!(null_assignment.publication_department_id, ActiveValue::Set(None));
+    assert_eq!(null_assignment.publication_location_id, ActiveValue::Set(None));
     assert_eq!(
         null_assignment.publication_manager_employee_id,
         ActiveValue::Set(None)
@@ -355,6 +364,7 @@ async fn submission_uses_publication_snapshots_and_completes_after_answers() {
     assert!(response < answer && answer < completion && completion < commit, "{events:#?}");
     assert!(events[response].contains(&fixture.department_id.expect("department").to_string()));
     assert!(events[response].contains(&fixture.manager_id.expect("manager").to_string()));
+    assert!(events[response].contains(&fixture.location_id.expect("location").to_string()));
     assert!(events.iter().all(|event| !event.contains("FROM \"employee\"")));
     for select in events.iter().filter(|event| event.starts_with("SELECT")) {
         assert!(select.contains(&fixture.tenant_id.to_string()), "{select}");
@@ -366,6 +376,7 @@ async fn null_publication_snapshots_do_not_fall_back_to_current_employee() {
     let mut fixture = SurveyFixture::new();
     fixture.department_id = None;
     fixture.manager_id = None;
+    fixture.location_id = None;
     let db = fixture.connection().await;
 
     submit_survey(

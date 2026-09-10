@@ -23,7 +23,37 @@ pub struct QueryRoot;
 
 #[Object]
 impl QueryRoot {
+    async fn survey_audience(&self, ctx: &Context<'_>, survey_id: ID) -> Result<crate::services::survey_management::SurveyAudience> {
+        let claims = require_client_claims(ctx)?;
+        if !claims.can_manage_surveys() { return Err(KabiPayError::Forbidden("survey:manage with ALL scope required".into()).into_graphql()); }
+        let tenant_id = require_tenant_id(ctx)?;
+        let survey_id = parse_id(&survey_id)?;
+        let db = tenant_db(ctx, tenant_id).await?;
+        crate::services::survey_management::audience(&db, tenant_id, survey_id).await.map_err(KabiPayError::into_graphql)
+    }
+
+    async fn survey_audience_options(&self, ctx: &Context<'_>, kind: String, search: Option<String>, after: Option<ID>, #[graphql(default = 50)] limit: i32) -> Result<crate::services::survey_management::SurveyAudienceOptions> {
+        let claims = require_client_claims(ctx)?;
+        if !claims.can_manage_surveys() { return Err(KabiPayError::Forbidden("survey:manage with ALL scope required".into()).into_graphql()); }
+        let tenant_id = require_tenant_id(ctx)?;
+        let after = after.as_ref().map(parse_id).transpose()?;
+        let db = tenant_db(ctx, tenant_id).await?;
+        crate::services::survey_management::options(&db, tenant_id, &kind, search, after, limit).await.map_err(KabiPayError::into_graphql)
+    }
+
     async fn survey_health(&self) -> &'static str { "ok" }
+
+    async fn survey_management_events(&self, ctx: &Context<'_>, survey_id: ID) -> Result<Vec<super::types::SurveyManagementEventDto>> {
+        let claims = require_client_claims(ctx)?;
+        if !claims.can_manage_surveys() {
+            return Err(KabiPayError::Forbidden("survey:manage with ALL scope required".into()).into_graphql());
+        }
+        let tenant_id = require_tenant_id(ctx)?;
+        let survey_id = parse_id(&survey_id)?;
+        let db = tenant_db(ctx, tenant_id).await?;
+        crate::services::survey_lifecycle::load_management_events(&db, tenant_id, survey_id)
+            .await.map_err(KabiPayError::into_graphql)
+    }
 
     async fn surveys(&self, ctx: &Context<'_>) -> Result<Vec<SurveySummaryDto>> {
         let claims = require_client_claims(ctx)?;

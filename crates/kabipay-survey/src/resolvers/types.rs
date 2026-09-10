@@ -6,6 +6,15 @@ use kabipay_db_entities::tenant::d0076_anonymous_surveys::{
     survey, survey_question, survey_question_option, survey_section,
 };
 
+/// Static management history; deliberately excludes respondent and actor identities.
+#[derive(SimpleObject, Clone, Debug)]
+#[graphql(name = "SurveyManagementEvent")]
+pub struct SurveyManagementEventDto {
+    pub action: String,
+    pub occurred_at: DateTime<Utc>,
+    pub message: String,
+}
+
 #[derive(SimpleObject, Clone, Debug)]
 #[graphql(name = "SurveySummary")]
 pub struct SurveySummaryDto {

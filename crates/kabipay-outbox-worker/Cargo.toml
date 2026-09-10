@@ -15,6 +15,7 @@ kabipay-common.workspace = true
 kabipay-db-entities.workspace = true
 kabipay-notification = { path = "../kabipay-notification" }
 kabipay-performance = { path = "../kabipay-performance" }
+kabipay-survey = { path = "../kabipay-survey" }
 tokio.workspace = true
 sea-orm.workspace = true
 serde.workspace = true

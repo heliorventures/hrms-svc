@@ -20,6 +20,7 @@ use kabipay_db_entities::tenant::d0026_integrations::{webhook_delivery_log, webh
 use kabipay_db_entities::tenant::d0030_outbox_events::outbox_event;
 use kabipay_notification::services::automated_events::process_due_celebrations;
 use kabipay_performance::services::performance_workflow::process_due_performance_cycles;
+use kabipay_survey::services::survey_lifecycle::process_due_surveys;
 use reqwest::header::{HeaderMap, HeaderValue, CONTENT_TYPE};
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseConnection, DbBackend, EntityTrait,
@@ -562,6 +563,14 @@ async fn main() -> anyhow::Result<()> {
                                         }
                                     };
                                     if employee_enabled {
+                                    match process_due_surveys(&tdb, tid).await {
+                                        Ok(result) if result.opened > 0 || result.closed > 0 || result.failed > 0 => tracing::info!(
+                                            %tid, opened = result.opened, closed = result.closed, failed = result.failed,
+                                            "scheduled survey sweep completed"
+                                        ),
+                                        Ok(_) => {},
+                                        Err(error) => tracing::error!(%tid, code = error.code(), "scheduled survey sweep failed"),
+                                    }
                                     match process_due_celebrations(
                                         &tdb,
                                         tid,

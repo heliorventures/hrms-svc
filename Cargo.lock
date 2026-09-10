@@ -2106,6 +2106,7 @@ dependencies = [
  "kabipay-db-entities",
  "kabipay-notification",
  "kabipay-performance",
+ "kabipay-survey",
  "reqwest",
  "sea-orm",
  "serde",

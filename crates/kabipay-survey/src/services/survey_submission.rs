@@ -43,6 +43,7 @@ pub fn new_assignment(
         completed: Set(false),
         publication_department_id: Set(employee.department_id),
         publication_manager_employee_id: Set(employee.reporting_manager_id),
+        publication_location_id: Set(employee.location_id),
     }
 }
 
@@ -127,6 +128,7 @@ where
         survey_id: Set(survey_id),
         department_id: Set(assignment.publication_department_id),
         manager_employee_id: Set(assignment.publication_manager_employee_id),
+        location_id: Set(assignment.publication_location_id),
     }
     .insert(&txn)
     .await?;

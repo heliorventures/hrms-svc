@@ -7,7 +7,6 @@ use kabipay_common::{
 };
 use kabipay_db_entities::tenant::{
     d0006_org_hierarchy::department,
-    d0007_employee_core::employee,
     d0076_anonymous_surveys::{
         survey, survey_audience_department, survey_question, survey_question_option,
         survey_section,
@@ -78,6 +77,11 @@ pub struct SaveSurveyInput {
     pub minimum_report_group_size: i32,
     #[graphql(default)]
     pub audience_department_ids: Vec<ID>,
+    #[graphql(default)]
+    pub audience_location_ids: Vec<ID>,
+    #[graphql(default)]
+    pub audience_employee_ids: Vec<ID>,
+    pub source_survey_id: Option<ID>,
     pub sections: Vec<SurveySectionInput>,
 }
 
@@ -141,11 +145,21 @@ impl MutationRoot {
             }
         }
         let audience_ids: Vec<Uuid> = input.audience_department_ids.iter().map(parse_id).collect::<Result<_>>()?;
+        let audience_extensions = crate::services::survey_targeting::AudienceExtensions {
+            location_ids: input.audience_location_ids.iter().map(parse_id).collect::<Result<_>>()?,
+            employee_ids: input.audience_employee_ids.iter().map(parse_id).collect::<Result<_>>()?,
+        };
+        let source_survey_id = input.source_survey_id.as_ref().map(parse_id).transpose()?;
+        if input.id.is_some() && source_survey_id.is_some() {
+            return Err(KabiPayError::Validation("A correction source is set only when creating a new draft".into()).into_graphql());
+        }
         if audience_ids.iter().copied().collect::<HashSet<_>>().len() != audience_ids.len() {
             return Err(KabiPayError::Validation("Audience departments must be unique".into()).into_graphql());
         }
         let db = tenant_db(ctx, tenant_id).await?;
         let txn = db.begin().await.map_err(KabiPayError::from).map_err(KabiPayError::into_graphql)?;
+        crate::services::survey_targeting::validate_audience(&txn, tenant_id, &audience_ids, &audience_extensions)
+            .await.map_err(KabiPayError::into_graphql)?;
         if !audience_ids.is_empty() {
             let tenant_departments = department::Entity::find()
                 .filter(department::Column::TenantId.eq(tenant_id))
@@ -194,6 +208,14 @@ impl MutationRoot {
                 published_at: Set(None), closed_at: Set(None), created_at: Set(chrono::Utc::now()), updated_at: Set(chrono::Utc::now()) }
                 .insert(&txn).await.map_err(KabiPayError::from).map_err(KabiPayError::into_graphql)?;
         }
+        crate::services::survey_targeting::save_scope(&txn, tenant_id, survey_id, &audience_ids, &audience_extensions)
+            .await.map_err(KabiPayError::into_graphql)?;
+        crate::services::survey_targeting::save_extensions(&txn, tenant_id, survey_id, &audience_extensions)
+            .await.map_err(KabiPayError::into_graphql)?;
+        if let Some(source_id) = source_survey_id {
+            crate::services::survey_targeting::save_revision(&txn, tenant_id, survey_id, source_id)
+                .await.map_err(KabiPayError::into_graphql)?;
+        }
         for department_id in audience_ids {
             survey_audience_department::ActiveModel { tenant_id: Set(tenant_id), survey_id: Set(survey_id), department_id: Set(department_id) }
                 .insert(&txn).await.map_err(KabiPayError::from).map_err(KabiPayError::into_graphql)?;
@@ -222,6 +244,9 @@ impl MutationRoot {
                 }
             }
         }
+        crate::services::survey_lifecycle::record_management_event(&txn, tenant_id, survey_id, Some(claims.sub),
+            crate::services::survey_lifecycle::ManagementAction::Saved, chrono::Utc::now())
+            .await.map_err(KabiPayError::into_graphql)?;
         txn.commit().await.map_err(KabiPayError::from).map_err(KabiPayError::into_graphql)?;
         survey_service::load_survey(&db, tenant_id, survey_id, false).await.map_err(KabiPayError::into_graphql)
     }
@@ -239,16 +264,17 @@ impl MutationRoot {
             .one(&txn).await.map_err(KabiPayError::from).map_err(KabiPayError::into_graphql)?
             .ok_or_else(|| KabiPayError::NotFound { entity: "survey", id: survey_id.to_string() }.into_graphql())?;
         if row.status != "DRAFT" { return Err(KabiPayError::Validation("Only draft surveys can be published".into()).into_graphql()); }
+        crate::services::survey_lifecycle::validate_publication(row.closes_at, chrono::Utc::now())
+            .map_err(KabiPayError::into_graphql)?;
         let audience = survey_audience_department::Entity::find().filter(survey_audience_department::Column::TenantId.eq(tenant_id)).filter(survey_audience_department::Column::SurveyId.eq(survey_id))
             .all(&txn).await.map_err(KabiPayError::from).map_err(KabiPayError::into_graphql)?;
         let audience_ids: Vec<Uuid> = audience.into_iter().map(|row| row.department_id).collect();
-        let mut employees = employee::Entity::find().filter(employee::Column::TenantId.eq(tenant_id))
-            .filter(employee::Column::IsDeleted.eq(false)).filter(employee::Column::UserId.is_not_null())
-            .filter(employee::Column::Status.is_in(["ACTIVE", "PROBATION", "ON_LEAVE"]));
-        if !audience_ids.is_empty() { employees = employees.filter(employee::Column::DepartmentId.is_in(audience_ids)); }
-        let employees = employees.all(&txn).await.map_err(KabiPayError::from).map_err(KabiPayError::into_graphql)?;
+        let employees = crate::services::survey_targeting::publication_employees(&txn, tenant_id, survey_id, &audience_ids)
+            .await.map_err(KabiPayError::into_graphql)?;
         if employees.is_empty() { return Err(KabiPayError::Validation("No active employee-linked accounts match this survey audience".into()).into_graphql()); }
         let published_at = chrono::Utc::now();
+        crate::services::survey_lifecycle::validate_publication(row.closes_at, published_at)
+            .map_err(KabiPayError::into_graphql)?;
         for employee in employees {
             survey_submission::new_assignment(tenant_id, survey_id, &employee, published_at)
                 .insert(&txn).await.map_err(KabiPayError::from).map_err(KabiPayError::into_graphql)?;
@@ -256,7 +282,25 @@ impl MutationRoot {
         let mut model = row.into_active_model();
         model.status = Set("PUBLISHED".into()); model.published_at = Set(Some(published_at)); model.updated_at = Set(published_at);
         model.update(&txn).await.map_err(KabiPayError::from).map_err(KabiPayError::into_graphql)?;
+        crate::services::survey_lifecycle::record_management_event(&txn, tenant_id, survey_id, Some(claims.sub),
+            crate::services::survey_lifecycle::ManagementAction::Published, published_at)
+            .await.map_err(KabiPayError::into_graphql)?;
         txn.commit().await.map_err(KabiPayError::from).map_err(KabiPayError::into_graphql)?;
+        let completed = survey_service::completion_for_viewer(&db, tenant_id, survey_id, claims.employee_id, true)
+            .await.map_err(KabiPayError::into_graphql)?;
+        survey_service::load_survey(&db, tenant_id, survey_id, completed).await.map_err(KabiPayError::into_graphql)
+    }
+
+    async fn open_survey(&self, ctx: &Context<'_>, survey_id: ID) -> Result<SurveyDto> {
+        let claims = require_client_claims(ctx)?;
+        if !claims.can_manage_surveys() {
+            return Err(KabiPayError::Forbidden("survey:manage with ALL scope required".into()).into_graphql());
+        }
+        let tenant_id = require_tenant_id(ctx)?;
+        let survey_id = parse_id(&survey_id)?;
+        let db = tenant_db(ctx, tenant_id).await?;
+        crate::services::survey_lifecycle::open_survey(&db, tenant_id, survey_id, claims.sub)
+            .await.map_err(KabiPayError::into_graphql)?;
         let completed = survey_service::completion_for_viewer(&db, tenant_id, survey_id, claims.employee_id, true)
             .await.map_err(KabiPayError::into_graphql)?;
         survey_service::load_survey(&db, tenant_id, survey_id, completed).await.map_err(KabiPayError::into_graphql)
@@ -275,8 +319,12 @@ impl MutationRoot {
             .one(&txn).await.map_err(KabiPayError::from).map_err(KabiPayError::into_graphql)?
             .ok_or_else(|| KabiPayError::NotFound { entity: "survey", id: survey_id.to_string() }.into_graphql())?;
         if row.status != "PUBLISHED" { return Err(KabiPayError::Validation("Only a published survey can be closed".into()).into_graphql()); }
-        let mut model = row.into_active_model(); model.status = Set("CLOSED".into()); model.closed_at = Set(Some(chrono::Utc::now())); model.updated_at = Set(chrono::Utc::now());
+        let closed_at = chrono::Utc::now();
+        let mut model = row.into_active_model(); model.status = Set("CLOSED".into()); model.closed_at = Set(Some(closed_at)); model.updated_at = Set(closed_at);
         model.update(&txn).await.map_err(KabiPayError::from).map_err(KabiPayError::into_graphql)?;
+        crate::services::survey_lifecycle::record_management_event(&txn, tenant_id, survey_id, Some(claims.sub),
+            crate::services::survey_lifecycle::ManagementAction::ManuallyClosed, closed_at)
+            .await.map_err(KabiPayError::into_graphql)?;
         txn.commit().await.map_err(KabiPayError::from).map_err(KabiPayError::into_graphql)?;
         let completed = survey_service::completion_for_viewer(&db, tenant_id, survey_id, claims.employee_id, true)
             .await.map_err(KabiPayError::into_graphql)?;

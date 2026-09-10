@@ -47,3 +47,4 @@ pub mod d0077_unpaid_leave_payroll;
 pub mod d0078_comp_off;
 pub mod d0079_announcement_video;
 pub mod d0080_prejoining;
+pub mod d0084_survey_targeting_corrections;

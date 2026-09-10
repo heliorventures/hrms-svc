@@ -301,6 +301,9 @@ fn aggregate_answers(
         option_aggregates.sort_by_key(|option| option.label.clone());
         if !options_visible { option_aggregates.clear(); }
         if comments.len() < threshold { comments.clear(); }
+        // Fresh independent keys for every question/report: never align comments
+        // using answer row order, response identity, timestamps, or a stable seed.
+        order_comments(&mut comments, Uuid::new_v4);
         aggregates.push(SurveyQuestionAggregateDto { question_id: question.id.to_string().into(), prompt: question.prompt,
             dimension: question.dimension, response_count: question_answers.len() as i32, average_score: average,
             options: option_aggregates, comments });
@@ -316,6 +319,10 @@ fn aggregate_answers(
         dimensions, questions: aggregates }
 }
 
+fn order_comments(comments: &mut [String], mut fresh_key: impl FnMut() -> Uuid) {
+    comments.sort_by_cached_key(|_| fresh_key());
+}
+
 fn visible_score_average(scores: &[(Uuid, Decimal)], threshold: usize) -> Option<String> {
     let contributors: HashSet<Uuid> = scores.iter().map(|(response_id, _)| *response_id).collect();
     report_group_is_visible(contributors.len(), threshold).then(|| {
@@ -327,6 +334,55 @@ fn visible_score_average(scores: &[(Uuid, Decimal)], threshold: usize) -> Option
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn comment_order_uses_fresh_keys_and_preserves_duplicates() {
+        let mut comments = vec!["same".to_owned(), "other".to_owned(), "same".to_owned()];
+        let mut keys = [3_u128, 1, 2].into_iter();
+        order_comments(&mut comments, || Uuid::from_u128(keys.next().unwrap()));
+        assert_eq!(comments, ["other", "same", "same"]);
+        assert!(keys.next().is_none());
+    }
+
+    #[test]
+    fn unscored_choices_never_become_positional_scores() {
+        let question = question();
+        let choice = option(question.id, None);
+        let answers = (0..3).map(|_| answer(question.id, Uuid::new_v4(), choice.id)).collect();
+        let result = aggregate_answers(Uuid::new_v4(), 3, 3, vec![question], vec![choice], answers);
+        assert_eq!(result.questions[0].options[0].response_count, 3);
+        assert_eq!(result.questions[0].average_score, None);
+        assert_eq!(result.dimensions[0].scored_answer_count, 0);
+    }
+
+    #[test]
+    fn scored_and_unscored_choices_count_only_scored_contributors() {
+        let question = question();
+        let scored = option(question.id, Some(Decimal::new(4, 0)));
+        let unscored = option(question.id, None);
+        let answers = [scored.id, scored.id, scored.id, unscored.id, unscored.id, unscored.id]
+            .into_iter().map(|id| answer(question.id, Uuid::new_v4(), id)).collect();
+        let result = aggregate_answers(Uuid::new_v4(), 6, 3, vec![question], vec![scored, unscored], answers);
+        assert_eq!(result.questions[0].average_score, Some("4".into()));
+        assert_eq!(result.questions[0].response_count, 6);
+        assert_eq!(result.dimensions[0].scored_answer_count, 3);
+    }
+
+    #[test]
+    fn comments_preserve_duplicates_only_above_the_comment_threshold() {
+        let mut question = question();
+        question.question_type = "LONG_TEXT".into();
+        let make_answers = |count: usize| (0..3).map(|index| {
+            let mut response = answer(question.id, Uuid::new_v4(), Uuid::nil());
+            response.selected_option_ids = None;
+            response.text_answer = (index < count).then(|| "Same comment".into());
+            response
+        }).collect();
+        let hidden = aggregate_answers(Uuid::new_v4(), 3, 3, vec![question.clone()], vec![], make_answers(2));
+        assert!(hidden.questions[0].comments.is_empty());
+        let visible = aggregate_answers(Uuid::new_v4(), 3, 3, vec![question.clone()], vec![], make_answers(3));
+        assert_eq!(visible.questions[0].comments, vec!["Same comment"; 3]);
+    }
 
     fn question() -> survey_question::Model {
         survey_question::Model {
