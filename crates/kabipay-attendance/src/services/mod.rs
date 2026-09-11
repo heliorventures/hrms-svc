@@ -11,3 +11,5 @@ pub mod timesheet_dates;
 pub mod timesheet_notification_service;
 pub mod timesheet_policy;
 pub mod timesheet_project_assignment_service;
+pub mod attendance_day;
+pub mod attendance_day_runtime;

@@ -2102,6 +2102,7 @@ dependencies = [
  "chrono",
  "hex",
  "hmac",
+ "kabipay-attendance",
  "kabipay-common",
  "kabipay-db-entities",
  "kabipay-notification",

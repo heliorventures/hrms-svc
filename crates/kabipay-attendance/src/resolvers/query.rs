@@ -86,6 +86,44 @@ pub struct QueryRoot;
 
 #[Object]
 impl QueryRoot {
+    /// Tenant configuration metadata; only explicit ALL configuration authority.
+    async fn attendance_day_policy(&self, ctx: &Context<'_>) -> Result<crate::resolvers::types::AttendanceDayPolicyDto> {
+        let tenant_id = require_tenant_id(ctx)?;
+        super::mutation::require_all_authority(ctx, kabipay_common::context::PERM_ATTENDANCE_PUNCH_POLICY)?;
+        let db = tenant_db(ctx, tenant_id).await?;
+        let clock = TenantBusinessClock::load(ops_db(ctx)?, tenant_id).await.map_err(KabiPayError::into_graphql)?;
+        let now = chrono::Utc::now();
+        let state = crate::services::attendance_day::policy(&db, tenant_id, clock, now).await.map_err(KabiPayError::into_graphql)?;
+        crate::resolvers::types::AttendanceDayPolicyDto::from_state(state, now).map_err(KabiPayError::into_graphql)
+    }
+
+    /// Read-only metadata for current or historical corrections; no employee data.
+    async fn attendance_day_window(&self, ctx: &Context<'_>, work_date: Option<NaiveDate>) -> Result<crate::resolvers::types::AttendanceDayWindowDto> {
+        let tenant_id = require_tenant_id(ctx)?;
+        attendance_read_scope(ctx)?;
+        let db = tenant_db(ctx, tenant_id).await?;
+        let clock = TenantBusinessClock::load(ops_db(ctx)?, tenant_id).await.map_err(KabiPayError::into_graphql)?;
+        let now = chrono::Utc::now();
+        let window = match work_date {
+            Some(date) => crate::services::attendance_day::window_for_date(&db, tenant_id, clock, date, now).await,
+            None => crate::services::attendance_day::current_window(&db, tenant_id, clock, now).await,
+        }.map_err(KabiPayError::into_graphql)?;
+        Ok(window.into())
+    }
+
+    async fn preview_attendance_day_policy(&self, ctx: &Context<'_>, input: crate::resolvers::types::ScheduleAttendanceDayPolicyInput) -> Result<crate::resolvers::types::AttendanceDayPolicyPreviewDto> {
+        let tenant_id = require_tenant_id(ctx)?;
+        super::mutation::require_all_authority(ctx, kabipay_common::context::PERM_ATTENDANCE_PUNCH_POLICY)?;
+        let command = input.command().map_err(KabiPayError::into_graphql)?;
+        let claims = kabipay_common::subgraph::require_client_claims(ctx)?;
+        let db = tenant_db(ctx, tenant_id).await?;
+        let clock = TenantBusinessClock::load(ops_db(ctx)?, tenant_id).await.map_err(KabiPayError::into_graphql)?;
+        let preview = crate::services::attendance_day::preview_policy(&db, tenant_id, clock, claims, command, chrono::Utc::now())
+            .await.map_err(KabiPayError::into_graphql)?;
+        Ok(crate::resolvers::types::AttendanceDayPolicyPreviewDto {
+            revision: preview.revision, transition: preview.transition.into(), following: preview.following.into(),
+        })
+    }
     async fn attendance_health(&self) -> &'static str {
         "ok"
     }
@@ -134,9 +172,12 @@ impl QueryRoot {
         let filt = resolve_employee_scope_filter(&db, tenant_id, scope, viewer)
             .await
             .map_err(KabiPayError::into_graphql)?;
-        let rows = attendance_service::list_attendance(&db, tenant_id, limit, &filt, from_date, to_date)
+        let mut rows = attendance_service::list_attendance(&db, tenant_id, limit, &filt, from_date, to_date)
             .await
             .map_err(KabiPayError::into_graphql)?;
+        let clock = TenantBusinessClock::load(ops_db(ctx)?, tenant_id).await.map_err(KabiPayError::into_graphql)?;
+        crate::services::attendance_day_runtime::project_rows(&db, tenant_id, clock, &mut rows, chrono::Utc::now())
+            .await.map_err(KabiPayError::into_graphql)?;
         Ok(rows.into_iter().map(AttendanceDto::from).collect())
     }
 
@@ -184,9 +225,11 @@ impl QueryRoot {
         let clock = TenantBusinessClock::load(ops_db(ctx)?, tenant_id)
             .await
             .map_err(KabiPayError::into_graphql)?;
+        let current = crate::services::attendance_day::current_window(&db, tenant_id, clock, chrono::Utc::now())
+            .await.map_err(KabiPayError::into_graphql)?;
         let (from_date, to_date) =
-            self_attendance_date_range(from_date, to_date, clock.now_date())?;
-        let page = attendance_management_service::list_my_attendance(
+            self_attendance_date_range(from_date, to_date, current.work_date)?;
+        let mut page = attendance_management_service::list_my_attendance(
             &db,
             tenant_id,
             employee_id,
@@ -197,6 +240,8 @@ impl QueryRoot {
         )
         .await
         .map_err(KabiPayError::into_graphql)?;
+        crate::services::attendance_day_runtime::project_rows(&db, tenant_id, clock, &mut page.rows, chrono::Utc::now())
+            .await.map_err(KabiPayError::into_graphql)?;
         Ok(AttendanceConnectionDto {
             edges: page
                 .rows
@@ -249,7 +294,7 @@ impl QueryRoot {
             )
             .await?;
         }
-        let page = attendance_management_service::list_managed_attendance(
+        let mut page = attendance_management_service::list_managed_attendance(
             &db,
             tenant_id,
             &scope,
@@ -262,6 +307,12 @@ impl QueryRoot {
         )
         .await
         .map_err(KabiPayError::into_graphql)?;
+        let clock = TenantBusinessClock::load(ops_db(ctx)?, tenant_id).await.map_err(KabiPayError::into_graphql)?;
+        let now = chrono::Utc::now();
+        let mut projected: Vec<_> = page.rows.iter().map(|row| row.attendance.clone()).collect();
+        crate::services::attendance_day_runtime::project_rows(&db, tenant_id, clock, &mut projected, now)
+            .await.map_err(KabiPayError::into_graphql)?;
+        for (row, attendance) in page.rows.iter_mut().zip(projected) { row.attendance = attendance; }
         Ok(ManagedAttendanceConnectionDto {
             edges: page
                 .rows
@@ -400,8 +451,12 @@ impl QueryRoot {
         let clock = TenantBusinessClock::load(ops_db(ctx)?, tenant_id)
             .await
             .map_err(KabiPayError::into_graphql)?;
-        let date = work_date.unwrap_or_else(|| clock.now_date());
-        let s = attendance_service::punch_day_summary(&db, tenant_id, employee_id, date)
+        let date = match work_date {
+            Some(date) => date,
+            None => crate::services::attendance_day::current_window(&db, tenant_id, clock, chrono::Utc::now())
+                .await.map_err(KabiPayError::into_graphql)?.work_date,
+        };
+        let s = attendance_service::punch_day_summary(&db, tenant_id, employee_id, date, clock)
             .await
             .map_err(KabiPayError::into_graphql)?;
         Ok(s.into())
@@ -707,6 +762,24 @@ mod tests {
             .finish()
             .execute(Request::new(query))
             .await
+    }
+
+    #[tokio::test]
+    async fn attendance_day_settings_and_preview_require_all_but_window_accepts_scoped_read() {
+        let permission = kabipay_common::context::PERM_ATTENDANCE_PUNCH_POLICY;
+        for query in [
+            "{ attendanceDayPolicy { revision } }",
+            "{ previewAttendanceDayPolicy(input: { boundaryTime: \"06:00\", effectiveWorkDate: \"2026-09-15\", expectedRevision: 1 }) { revision transition { startsAt endsAt } } }",
+        ] {
+            for scope in [None, Some("SELF"), Some("TEAM"), Some("ALL")] {
+                let result = execute_query(claims(permission, scope), query).await;
+                assert_eq!(result.errors.len(), 1);
+                let code = result.errors[0].extensions.as_ref().and_then(|e| e.get("code")).cloned();
+                assert_eq!(code, Some(async_graphql::Value::from(if scope == Some("ALL") { "INTERNAL_ERROR" } else { "FORBIDDEN" })), "{result:?}");
+            }
+        }
+        let result = execute_query(claims(PERM_ATTENDANCE_READ, Some("SELF")), "{ attendanceDayWindow { workDate startsAt endsAt timezone boundaryMinutes } }").await;
+        assert_eq!(result.errors[0].extensions.as_ref().and_then(|e| e.get("code")).cloned(), Some(async_graphql::Value::from("INTERNAL_ERROR")));
     }
 
     fn assert_permission_denied_before_db(

@@ -26,6 +26,79 @@ use crate::services::attendance_service::PunchDaySummary;
 use crate::services::attendance_summary_service::AttendancePeriodSummary;
 
 #[derive(SimpleObject, Clone, Debug)]
+#[graphql(name = "AttendanceDayWindow")]
+pub struct AttendanceDayWindowDto {
+    pub work_date: NaiveDate,
+    pub starts_at: DateTime<Utc>,
+    pub ends_at: DateTime<Utc>,
+    pub timezone: String,
+    pub boundary_minutes: i32,
+}
+impl From<crate::services::attendance_day::AttendanceDayWindow> for AttendanceDayWindowDto {
+    fn from(w: crate::services::attendance_day::AttendanceDayWindow) -> Self {
+        Self { work_date: w.work_date, starts_at: w.starts_at, ends_at: w.ends_at,
+            timezone: w.timezone, boundary_minutes: w.boundary_minutes }
+    }
+}
+#[derive(SimpleObject, Clone, Debug)]
+#[graphql(name = "AttendanceDayPolicyVersion")]
+pub struct AttendanceDayPolicyVersionDto {
+    pub effective_work_date: NaiveDate,
+    pub boundary_minutes: i32,
+    pub timezone: String,
+}
+impl From<crate::services::attendance_day::PolicyVersion> for AttendanceDayPolicyVersionDto {
+    fn from(v: crate::services::attendance_day::PolicyVersion) -> Self {
+        Self { effective_work_date: v.effective_work_date, boundary_minutes: v.boundary_minutes, timezone: v.timezone }
+    }
+}
+#[derive(SimpleObject, Clone, Debug)]
+#[graphql(name = "AttendanceDayPolicy")]
+pub struct AttendanceDayPolicyDto {
+    pub revision: i64,
+    pub initialized: bool,
+    pub legacy_activation_pending: bool,
+    pub legacy_activation_date: Option<NaiveDate>,
+    pub current_policy: AttendanceDayPolicyVersionDto,
+    pub pending_policy: Option<AttendanceDayPolicyVersionDto>,
+    pub current_window: AttendanceDayWindowDto,
+}
+impl AttendanceDayPolicyDto {
+    pub fn from_state(state: crate::services::attendance_day::AttendanceDayPolicy, now: DateTime<Utc>) -> kabipay_common::KabiPayResult<Self> {
+        let current = crate::services::attendance_day::resolve_current_window(&state.versions, now)?;
+        let current_policy = state.versions.iter().find(|v| v.id == current.policy_version_id).cloned()
+            .ok_or_else(|| KabiPayError::Internal("attendance active policy missing".into()))?;
+        let pending_policy = state.versions.iter().find(|v| v.effective_work_date > current.work_date).cloned();
+        Ok(Self { revision: state.revision, initialized: state.initialized,
+            legacy_activation_pending: state.legacy_activation_pending,
+            legacy_activation_date: state.legacy_activation_date,
+            current_policy: current_policy.into(), pending_policy: pending_policy.map(Into::into), current_window: current.into() })
+    }
+}
+#[derive(InputObject, Clone, Debug)]
+pub struct ScheduleAttendanceDayPolicyInput {
+    /// Tenant-local time in strict HH:mm format.
+    pub boundary_time: String,
+    pub effective_work_date: NaiveDate,
+    pub expected_revision: i64,
+}
+impl ScheduleAttendanceDayPolicyInput {
+    pub fn command(&self) -> kabipay_common::KabiPayResult<crate::services::attendance_day::SchedulePolicyCommand> {
+        Ok(crate::services::attendance_day::SchedulePolicyCommand {
+            expected_revision: self.expected_revision, effective_work_date: self.effective_work_date,
+            boundary_minutes: crate::services::attendance_day::parse_boundary_minutes(&self.boundary_time)?,
+        })
+    }
+}
+#[derive(SimpleObject, Clone, Debug)]
+#[graphql(name = "AttendanceDayPolicyPreview")]
+pub struct AttendanceDayPolicyPreviewDto {
+    pub revision: i64,
+    pub transition: AttendanceDayWindowDto,
+    pub following: AttendanceDayWindowDto,
+}
+
+#[derive(SimpleObject, Clone, Debug)]
 #[graphql(name = "AttendancePeriodSummary")]
 pub struct AttendancePeriodSummaryDto {
     pub completed_minutes: i32,
@@ -277,18 +350,22 @@ pub struct PunchTodayInput {
     pub longitude: Option<f64>,
 }
 
-/// Log a **completed** check-in and check-out for a **past or today** `workDate` when both
-/// live punches were missed. Same calendar day only: check-in time must be before check-out.
+/// Log a completed interval inside a historical/current attendance window.
+/// Supply both actual dates for after-midnight or otherwise ambiguous wall times.
 #[derive(InputObject, Clone, Debug)]
 pub struct AddManualAttendanceSegmentInput {
+    pub check_in_date: Option<NaiveDate>,
+    pub check_out_date: Option<NaiveDate>,
     pub work_date: NaiveDate,
     pub check_in_time: NaiveTime,
     pub check_out_time: NaiveTime,
 }
 
-/// Update an existing completed attendance segment after client-side review.
+/// Correct the original completed or incomplete segment after client-side review.
 #[derive(InputObject, Clone, Debug)]
 pub struct UpdateManualAttendanceSegmentInput {
+    pub check_in_date: Option<NaiveDate>,
+    pub check_out_date: Option<NaiveDate>,
     pub id: ID,
     pub work_date: NaiveDate,
     pub check_in_time: NaiveTime,
@@ -297,6 +374,8 @@ pub struct UpdateManualAttendanceSegmentInput {
 
 #[derive(InputObject, Clone, Debug)]
 pub struct AddManagedAttendanceSegmentInput {
+    pub check_in_date: Option<NaiveDate>,
+    pub check_out_date: Option<NaiveDate>,
     pub employee_id: ID,
     pub work_date: NaiveDate,
     pub check_in_time: NaiveTime,
@@ -306,6 +385,8 @@ pub struct AddManagedAttendanceSegmentInput {
 
 #[derive(InputObject, Clone, Debug)]
 pub struct UpdateManagedAttendanceSegmentInput {
+    pub check_in_date: Option<NaiveDate>,
+    pub check_out_date: Option<NaiveDate>,
     pub id: ID,
     pub work_date: NaiveDate,
     pub check_in_time: NaiveTime,
@@ -319,6 +400,10 @@ pub struct UpdateManagedAttendanceSegmentInput {
 #[graphql(name = "PunchDaySummary")]
 pub struct PunchDaySummaryDto {
     pub work_date: NaiveDate,
+    pub starts_at: DateTime<Utc>,
+    pub ends_at: DateTime<Utc>,
+    pub timezone: String,
+    pub boundary_minutes: i32,
     /// Sum of (check out − check in) for every **completed** segment that day.
     pub total_worked_minutes: i32,
     /// Current in-progress row (punched in, not out), if any.
@@ -798,6 +883,10 @@ impl From<PunchDaySummary> for PunchDaySummaryDto {
     fn from(s: PunchDaySummary) -> Self {
         Self {
             work_date: s.work_date,
+            starts_at: s.window.starts_at,
+            ends_at: s.window.ends_at,
+            timezone: s.window.timezone,
+            boundary_minutes: s.window.boundary_minutes,
             total_worked_minutes: s.total_worked_minutes,
             open_segment: s.open_segment.map(AttendanceDto::from),
             segments: s.segments.into_iter().map(AttendanceDto::from).collect(),

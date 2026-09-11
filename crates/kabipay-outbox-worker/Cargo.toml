@@ -12,6 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 kabipay-common.workspace = true
+kabipay-attendance = { path = "../kabipay-attendance" }
 kabipay-db-entities.workspace = true
 kabipay-notification = { path = "../kabipay-notification" }
 kabipay-performance = { path = "../kabipay-performance" }

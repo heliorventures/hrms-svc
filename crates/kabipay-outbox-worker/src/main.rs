@@ -555,13 +555,22 @@ async fn main() -> anyhow::Result<()> {
                                         Ok(_) => {}
                                         Err(error) => tracing::error!(%tid, code = error.code(), "due employee offboarding sweep failed"),
                                     }
-                                    let employee_enabled = match Entitlements::load(&ops_db, tid).await {
-                                        Ok(state) => state.allows("EMPLOYEE"),
+                                    let (employee_enabled, attendance_enabled) = match Entitlements::load(&ops_db, tid).await {
+                                        Ok(state) => (state.allows("EMPLOYEE"), state.allows("ATTENDANCE")),
                                         Err(error) => {
                                             tracing::error!(%tid, code = error.code(), "scheduled domain work held: entitlements unavailable");
-                                            false
+                                            (false, false)
                                         }
                                     };
+                                    if attendance_enabled {
+                                        match kabipay_attendance::sweep_expired_attendance(&tdb, tid, clock, 50).await {
+                                            Ok(result) if result.expired > 0 || result.failed > 0 => tracing::info!(
+                                                %tid, expired = result.expired, failed = result.failed, "attendance expiry sweep completed"
+                                            ),
+                                            Ok(_) => {},
+                                            Err(error) => tracing::error!(%tid, code = error.code(), "attendance expiry sweep failed"),
+                                        }
+                                    }
                                     if employee_enabled {
                                     match process_due_surveys(&tdb, tid).await {
                                         Ok(result) if result.opened > 0 || result.closed > 0 || result.failed > 0 => tracing::info!(

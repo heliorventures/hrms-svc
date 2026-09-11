@@ -31,13 +31,6 @@ use crate::services::{
     },
     timesheet_dates, timesheet_policy,
 };
-fn attendance_business_date_time(
-    now_utc: DateTime<Utc>,
-    clock: TenantBusinessClock,
-) -> (NaiveDate, NaiveTime) {
-    (clock.business_date(now_utc), clock.local_time(now_utc))
-}
-
 pub async fn list_shifts(
     db: &DatabaseConnection,
     tenant_id: Uuid,
@@ -179,6 +172,7 @@ pub async fn list_employee_attendance_on_date(
 /// segment, plus the current open segment (checked in, not out) if any.
 pub struct PunchDaySummary {
     pub work_date: NaiveDate,
+    pub window: super::attendance_day::AttendanceDayWindow,
     pub total_worked_minutes: i32,
     pub open_segment: Option<attendance::Model>,
     pub segments: Vec<attendance::Model>,
@@ -189,8 +183,12 @@ pub async fn punch_day_summary(
     tenant_id: Uuid,
     employee_id: Uuid,
     work_date: NaiveDate,
+    clock: TenantBusinessClock,
 ) -> KabiPayResult<PunchDaySummary> {
-    let segments = list_employee_attendance_on_date(db, tenant_id, employee_id, work_date).await?;
+    let now = Utc::now();
+    let window = super::attendance_day::window_for_date(db, tenant_id, clock, work_date, now).await?;
+    let mut segments = list_employee_attendance_on_date(db, tenant_id, employee_id, work_date).await?;
+    for row in &mut segments { super::attendance_day_runtime::derive_expiry(row, &window, now); }
     let total = segments.iter().map(attendance_segment_minutes).sum();
     let open_segment = segments
         .iter()
@@ -204,6 +202,7 @@ pub async fn punch_day_summary(
         .cloned();
     Ok(PunchDaySummary {
         work_date,
+        window,
         total_worked_minutes: total,
         open_segment,
         segments,
@@ -225,6 +224,14 @@ pub async fn punch_today(
     geo: Option<PunchGeo>,
     client_ip: Option<&str>,
 ) -> KabiPayResult<attendance::Model> {
+    punch_today_with_clock(db, tenant_id, employee_id, clock, geo, client_ip, Utc::now).await
+}
+
+pub(crate) async fn punch_today_with_clock(
+    db: &DatabaseConnection, tenant_id: Uuid, employee_id: Uuid,
+    clock: TenantBusinessClock, geo: Option<PunchGeo>, client_ip: Option<&str>,
+    mut now: impl FnMut() -> DateTime<Utc>,
+) -> KabiPayResult<attendance::Model> {
     let policy = crate::services::punch_policy::find_punch_policy(db, tenant_id).await?;
     let lat_lng = geo.as_ref().map(|g| (g.lat, g.lng));
     crate::services::punch_policy::validate_live_punch_for_policy(
@@ -233,29 +240,15 @@ pub async fn punch_today(
         client_ip,
     )?;
 
-    let now_ts = Utc::now();
-    let (today, now_t) = attendance_business_date_time(now_ts, clock);
     let source = if geo.is_some() { "WEB+GPS" } else { "WEB" };
     let txn = db.begin().await?;
-    // Retain missed punch-outs without inventing working time. The database permits
-    // one OPEN row per employee, so retire earlier days before opening today's row.
-    let stale = attendance::Entity::find()
-        .filter(attendance::Column::TenantId.eq(tenant_id))
-        .filter(attendance::Column::EmployeeId.eq(employee_id))
-        .filter(attendance::Column::WorkDate.lt(today))
-        .filter(attendance::Column::Status.eq("OPEN"))
-        .all(&txn).await?;
-    let mut dates: Vec<_> = stale.iter().map(|row| row.work_date).collect();
-    dates.push(today);
-    lock_employee_dates(&txn, tenant_id, employee_id, &dates).await?;
-    attendance::Entity::update_many()
-        .col_expr(attendance::Column::Status, sea_orm::sea_query::Expr::value("INCOMPLETE"))
-        .col_expr(attendance::Column::UpdatedAt, sea_orm::sea_query::Expr::value(now_ts))
-        .filter(attendance::Column::TenantId.eq(tenant_id))
-        .filter(attendance::Column::EmployeeId.eq(employee_id))
-        .filter(attendance::Column::WorkDate.lt(today))
-        .filter(attendance::Column::Status.eq("OPEN"))
-        .exec(&txn).await?;
+    let (window, now_ts) = super::attendance_day_runtime::lock_current_window(
+        &txn, tenant_id, employee_id, clock, &mut now,
+    ).await?;
+    let today = window.work_date;
+    let window_clock = TenantBusinessClock::from_name(&window.timezone)?;
+    let now_t = window_clock.local_time(now_ts);
+    super::attendance_day_runtime::expire_employee(&txn, tenant_id, employee_id, clock, now_ts).await?;
     let open = open_punch_on_date(tenant_id, employee_id, today)
         .one(&txn)
         .await?;
@@ -337,9 +330,9 @@ pub async fn punch_today(
         .ok_or_else(|| KabiPayError::Internal("attendance row missing after insert".into()))
 }
 
-/// One completed in→out **segment** for a chosen `work_date` when the user missed live punches
-/// (e.g. forgot to open the app). **Same calendar day** only — night shifts that span midnight
-/// are not represented as a single row here. Stored with `source` `WEB+MANUAL` and
+/// One completed interval inside the retained attendance window for `work_date`.
+/// Paired actual dates support intervals across midnight; omitted dates must
+/// identify an unambiguous interval. Stored with `source` `WEB+MANUAL` and
 /// `regularization_status` `SELF_REPORTED` for audit.
 pub async fn add_manual_attendance_segment(
     db: &DatabaseConnection,
@@ -349,20 +342,20 @@ pub async fn add_manual_attendance_segment(
     work_date: NaiveDate,
     check_in_time: NaiveTime,
     check_out_time: NaiveTime,
+    actual_dates: Option<(NaiveDate, NaiveDate)>,
 ) -> KabiPayResult<attendance::Model> {
     let segment = SegmentTimes::for_manual_input(work_date, check_in_time, check_out_time);
-    let instants = segment.to_instants(clock)?;
-    let today = clock.now_date();
     let txn = db.begin().await?;
     lock_employee_dates(&txn, tenant_id, employee_id, &[work_date]).await?;
-    validate_segment_with_connection(
+    let now = Utc::now();
+    let instants = validate_segment_with_connection(
         &txn,
         tenant_id,
         employee_id,
         segment,
         None,
         false,
-        today,
+        clock, actual_dates, now,
     )
     .await?;
     let created = insert_manual_segment(
@@ -372,7 +365,7 @@ pub async fn add_manual_attendance_segment(
         segment,
         instants,
         MANUAL_SELF_REPORTED,
-        Utc::now(),
+        now,
     )
     .await?;
     txn.commit().await?;
@@ -399,8 +392,10 @@ pub async fn update_manual_attendance_segment(
     work_date: NaiveDate,
     check_in_time: NaiveTime,
     check_out_time: NaiveTime,
+    actual_dates: Option<(NaiveDate, NaiveDate)>,
 ) -> KabiPayResult<attendance::Model> {
     let txn = db.begin().await?;
+    super::attendance_day::lock_policy(&txn, tenant_id).await?;
     let row = attendance::Entity::find_by_id(attendance_id)
         .filter(attendance::Column::TenantId.eq(tenant_id))
         .one(&txn)
@@ -417,8 +412,6 @@ pub async fn update_manual_attendance_segment(
     }
 
     let segment = SegmentTimes::for_manual_input(work_date, check_in_time, check_out_time);
-    let instants = segment.to_instants(clock)?;
-    let today = clock.now_date();
     let locked_employee_id = row.employee_id;
     let locked_work_date = row.work_date;
     lock_employee_dates(
@@ -442,14 +435,15 @@ pub async fn update_manual_attendance_segment(
         row.employee_id,
         row.work_date,
     )?;
-    validate_segment_with_connection(
+    let now = Utc::now();
+    let instants = validate_segment_with_connection(
         &txn,
         tenant_id,
         row.employee_id,
         segment,
         Some(attendance_id),
         false,
-        today,
+        clock, actual_dates, now,
     )
     .await?;
     let updated = update_manual_segment(
@@ -458,7 +452,7 @@ pub async fn update_manual_attendance_segment(
         segment,
         instants,
         MANUAL_SELF_REPORTED,
-        Utc::now(),
+        now,
     )
     .await?;
     txn.commit().await?;
@@ -969,26 +963,7 @@ mod tests {
         assert!(parse_hours("1.23").is_ok());
         assert!(parse_hours("1.234").is_err());
     }
-    use chrono::{NaiveDate, NaiveTime};
 
-    #[test]
-    fn live_punch_clock_uses_configured_business_timezone_not_utc_wall_time() {
-        let now_utc = "2026-08-22T20:00:00Z"
-            .parse::<DateTime<Utc>>()
-            .expect("valid UTC timestamp");
-
-        let clock = TenantBusinessClock::from_name("Asia/Kolkata").expect("valid timezone");
-        let (work_date, punch_time) = attendance_business_date_time(now_utc, clock);
-
-        assert_eq!(
-            work_date,
-            NaiveDate::from_ymd_opt(2026, 8, 23).expect("valid date")
-        );
-        assert_eq!(
-            punch_time,
-            NaiveTime::from_hms_opt(1, 30, 0).expect("valid time")
-        );
-    }
 
     #[test]
     fn attendance_daily_total_must_remain_below_twenty_four_hours() {

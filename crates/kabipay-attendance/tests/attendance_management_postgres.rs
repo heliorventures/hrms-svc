@@ -109,6 +109,26 @@ impl Fixture {
                 request_id VARCHAR(128),
                 created_at TIMESTAMPTZ NOT NULL
             )"#,
+            // Required by the real transaction-owned attendance window resolver.
+            // These fixtures do not substitute for migration/trigger acceptance.
+            r#"CREATE TABLE attendance_day_profile (
+                tenant_id UUID PRIMARY KEY, revision BIGINT NOT NULL,
+                legacy_activation_date DATE, initialized_at TIMESTAMPTZ NOT NULL
+            )"#,
+            r#"CREATE TABLE attendance_day_policy_version (
+                id UUID PRIMARY KEY, tenant_id UUID NOT NULL,
+                effective_work_date DATE NOT NULL, boundary_minutes INTEGER NOT NULL,
+                timezone TEXT NOT NULL, created_at TIMESTAMPTZ NOT NULL,
+                superseded_at TIMESTAMPTZ, UNIQUE (tenant_id, id)
+            )"#,
+            r#"CREATE TABLE attendance_day_window (
+                id UUID PRIMARY KEY, tenant_id UUID NOT NULL, work_date DATE NOT NULL,
+                starts_at TIMESTAMPTZ NOT NULL, ends_at TIMESTAMPTZ NOT NULL,
+                timezone TEXT NOT NULL, boundary_minutes INTEGER NOT NULL,
+                policy_version_id UUID NOT NULL, created_at TIMESTAMPTZ NOT NULL,
+                UNIQUE (tenant_id, work_date), CHECK (ends_at > starts_at),
+                FOREIGN KEY (tenant_id, policy_version_id) REFERENCES attendance_day_policy_version(tenant_id, id)
+            )"#,
         ] {
             db.execute(Statement::from_string(DbBackend::Postgres, ddl))
                 .await?;
@@ -157,11 +177,8 @@ impl Fixture {
             target_employee_id: self.employee_id,
             actor_user_id,
             segment,
-            instants: segment
-                .to_instants(TenantBusinessClock::from_name("UTC").expect("valid timezone"))
-                .expect("valid segment instants"),
-            today: NaiveDate::from_ymd_opt(2026, 8, 24)
-                .expect("fixed harness date is valid"),
+            clock: TenantBusinessClock::from_name("UTC").expect("valid timezone"),
+            actual_dates: None,
             reason: "approved external harness adjustment".into(),
             request_id: Some(Uuid::new_v4().to_string()),
         }

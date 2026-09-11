@@ -50,6 +50,14 @@ fn parse_uuid(id: &ID, field: &'static str) -> Result<Uuid> {
         .map_err(|e| KabiPayError::Validation(format!("invalid {field}: {e}")).into_graphql())
 }
 
+fn actual_attendance_dates(check_in: Option<chrono::NaiveDate>, check_out: Option<chrono::NaiveDate>) -> Result<Option<(chrono::NaiveDate, chrono::NaiveDate)>> {
+    match (check_in, check_out) {
+        (None, None) => Ok(None),
+        (Some(start), Some(end)) => Ok(Some((start, end))),
+        _ => Err(KabiPayError::Validation("provide both checkInDate and checkOutDate, or neither".into()).into_graphql()),
+    }
+}
+
 async fn managed_attendance_dto<C>(
     db: &C,
     row: attendance::Model,
@@ -117,7 +125,7 @@ fn require_team_or_all_authority(
     require_mutation_authority(ctx, permission, &[ScopeType::Team, ScopeType::All], false)
 }
 
-fn require_all_authority(ctx: &Context<'_>, permission: &'static str) -> Result<()> {
+pub(crate) fn require_all_authority(ctx: &Context<'_>, permission: &'static str) -> Result<()> {
     require_mutation_authority(ctx, permission, &[ScopeType::All], false).map(|_| ())
 }
 
@@ -125,6 +133,24 @@ pub struct MutationRoot;
 
 #[Object]
 impl MutationRoot {
+    async fn schedule_attendance_day_policy(
+        &self, ctx: &Context<'_>, input: crate::resolvers::types::ScheduleAttendanceDayPolicyInput,
+    ) -> Result<crate::resolvers::types::AttendanceDayPolicyDto> {
+        let tenant_id = require_tenant_id(ctx)?;
+        require_all_authority(ctx, PERM_ATTENDANCE_PUNCH_POLICY)?;
+        let command = input.command().map_err(KabiPayError::into_graphql)?;
+        let claims = require_client_claims(ctx)?;
+        let db = tenant_db(ctx, tenant_id).await?;
+        let clock = TenantBusinessClock::load(ops_db(ctx)?, tenant_id).await.map_err(KabiPayError::into_graphql)?;
+        let txn = db.begin().await.map_err(KabiPayError::from).map_err(KabiPayError::into_graphql)?;
+        crate::services::attendance_day::lock_policy(&txn, tenant_id).await.map_err(KabiPayError::into_graphql)?;
+        let now = chrono::Utc::now();
+        let state = crate::services::attendance_day::schedule_policy(&txn, tenant_id, clock, claims, command, now)
+            .await.map_err(KabiPayError::into_graphql)?;
+        let dto = crate::resolvers::types::AttendanceDayPolicyDto::from_state(state, now).map_err(KabiPayError::into_graphql)?;
+        txn.commit().await.map_err(KabiPayError::from).map_err(KabiPayError::into_graphql)?;
+        Ok(dto)
+    }
     /// Record a punch: closes the **open** segment (punch in without out) if any, otherwise
     /// starts a **new** segment (new `attendance` row). Multiple in/out pairs per `work_date`
     /// are allowed; there is no “third punch” error.
@@ -213,6 +239,7 @@ impl MutationRoot {
             input.work_date,
             input.check_in_time,
             input.check_out_time,
+            actual_attendance_dates(input.check_in_date, input.check_out_date)?,
         )
         .await
         .map_err(KabiPayError::into_graphql)?;
@@ -244,6 +271,7 @@ impl MutationRoot {
             input.work_date,
             input.check_in_time,
             input.check_out_time,
+            actual_attendance_dates(input.check_in_date, input.check_out_date)?,
         )
         .await
         .map_err(KabiPayError::into_graphql)?;
@@ -269,7 +297,7 @@ impl MutationRoot {
             input.check_in_time,
             input.check_out_time,
         );
-        let instants = segment.to_instants(clock).map_err(KabiPayError::into_graphql)?;
+        let actual_dates = actual_attendance_dates(input.check_in_date, input.check_out_date)?;
         let mut txn = db
             .begin()
             .await
@@ -289,8 +317,7 @@ impl MutationRoot {
                 target_employee_id,
                 actor_user_id,
                 segment,
-                instants,
-                today: clock.now_date(),
+                clock, actual_dates,
                 reason: input.reason,
                 request_id,
             },
@@ -324,7 +351,7 @@ impl MutationRoot {
             input.check_in_time,
             input.check_out_time,
         );
-        let instants = segment.to_instants(clock).map_err(KabiPayError::into_graphql)?;
+        let actual_dates = actual_attendance_dates(input.check_in_date, input.check_out_date)?;
         let mut txn = db
             .begin()
             .await
@@ -346,8 +373,7 @@ impl MutationRoot {
                 actor_user_id,
                 initial_work_date: initial.work_date,
                 segment,
-                instants,
-                today: clock.now_date(),
+                clock, actual_dates,
                 reason: input.reason,
                 request_id,
                 expected_updated_at: input.expected_updated_at,
@@ -786,6 +812,8 @@ mod authorization_tests {
         let id = Uuid::new_v4();
         let step_id = Uuid::new_v4();
         vec![
+            (PERM_ATTENDANCE_PUNCH_POLICY,
+                "mutation { scheduleAttendanceDayPolicy(input: { boundaryTime: \"05:00\", effectiveWorkDate: \"2026-09-15\", expectedRevision: 1 }) { revision } }".into()),
             (PERM_ATTENDANCE_PUNCH_SELF, "mutation { punchToday { id } }".into()),
             (
                 PERM_ATTENDANCE_PUNCH_POLICY,
@@ -950,7 +978,7 @@ mod authorization_tests {
 
     #[tokio::test]
     async fn suitable_exact_scopes_allow_every_mutation_to_reach_its_database_boundary() {
-        assert_eq!(mutation_inventory().len(), 21);
+        assert_eq!(mutation_inventory().len(), 22);
         for (required_permission, mutation) in mutation_inventory() {
             for scope in allowed_scopes(required_permission) {
                 let response = execute_mutation(
