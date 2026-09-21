@@ -5,7 +5,7 @@ use kabipay_common::{
     KabiPayError,
 };
 use kabipay_db_entities::tenant::{
-    d0018_performance::{goal, review_cycle},
+    d0018_performance::{goal, kpi, review_cycle},
     d0075_performance_appraisal_lifecycle::{
         appraisal_answer, appraisal_question, appraisal_question_option, appraisal_template,
         appraisal_template_section, continuous_feedback, performance_participant,
@@ -16,8 +16,9 @@ use rust_decimal::Decimal;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseBackend, EntityTrait,
     IntoActiveModel, PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Set,
-    Statement, TransactionTrait,
+    Statement, TransactionTrait, ModelTrait, DatabaseTransaction,
 };
+use sea_orm::prelude::Expr;
 use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
 
@@ -75,6 +76,95 @@ fn require_employee_id(claims: &kabipay_common::context::ClientClaims) -> Result
     claims.employee_id.ok_or_else(|| {
         KabiPayError::Forbidden("An employee-linked account is required".into()).into_graphql()
     })
+}
+
+fn goal_actor_can_manage(
+    claims: &kabipay_common::context::ClientClaims,
+    participant: &performance_participant::Model,
+    own_proposal_only: bool,
+    goal_status: Option<&str>,
+) -> Result<()> {
+    if claims.can_manage_performance_programs() {
+        return Ok(());
+    }
+    let actor = require_employee_id(claims)?;
+    if claims.can_evaluate_performance_team()
+        && performance_lifecycle::manager_matches_snapshot(actor, participant.manager_employee_id)
+    {
+        return Ok(());
+    }
+    if claims.can_use_performance_self_service() && actor == participant.employee_id {
+        if own_proposal_only && goal_status != Some("PROPOSED") {
+            return Err(KabiPayError::Forbidden(
+                "Employees can only change proposed goals".into(),
+            ).into_graphql());
+        }
+        return Ok(());
+    }
+    Err(KabiPayError::Forbidden("You are not authorized to change this goal".into()).into_graphql())
+}
+
+fn require_goal_mutation_authority(claims: &kabipay_common::context::ClientClaims) -> Result<()> {
+    if claims.can_manage_performance_programs() {
+        return Ok(());
+    }
+    if (claims.can_use_performance_self_service() || claims.can_evaluate_performance_team())
+        && claims.employee_id.is_some()
+    {
+        return Ok(());
+    }
+    Err(KabiPayError::Forbidden("A concrete employee-linked performance authority is required".into()).into_graphql())
+}
+
+async fn locked_goal_participant<C: ConnectionTrait>(
+    txn: &C,
+    tenant_id: Uuid,
+    participant_id: Uuid,
+) -> Result<performance_participant::Model> {
+    performance_participant::Entity::find_by_id(participant_id)
+        .filter(performance_participant::Column::TenantId.eq(tenant_id))
+        .lock_exclusive()
+        .one(txn)
+        .await
+        .map_err(KabiPayError::from)
+        .map_err(KabiPayError::into_graphql)?
+        .ok_or_else(|| KabiPayError::NotFound {
+            entity: "performance review",
+            id: participant_id.to_string(),
+        }.into_graphql())
+}
+
+async fn locked_goal_context(
+    txn: &DatabaseTransaction,
+    tenant_id: Uuid,
+    participant_id: Uuid,
+) -> Result<(performance_participant::Model, String)> {
+    let cycle_id = performance_participant::Entity::find_by_id(participant_id)
+        .filter(performance_participant::Column::TenantId.eq(tenant_id))
+        .one(txn).await
+        .map_err(KabiPayError::from).map_err(KabiPayError::into_graphql)?
+        .map(|row| row.review_cycle_id)
+        .ok_or_else(|| KabiPayError::NotFound { entity: "performance review", id: participant_id.to_string() }.into_graphql())?;
+    let stage = performance_workflow::locked_cycle_stage(txn, tenant_id, cycle_id).await
+        .map_err(KabiPayError::into_graphql)?;
+    let participant = locked_goal_participant(txn, tenant_id, participant_id).await?;
+    if participant.review_cycle_id != cycle_id {
+        return Err(KabiPayError::Conflict(
+            "Performance review changed while acquiring its cycle lock; retry the request".into(),
+        )
+        .into_graphql());
+    }
+    Ok((participant, stage))
+}
+
+fn require_goal_setting(participant: &performance_participant::Model, stage: &str) -> Result<()> {
+    if participant.is_excluded {
+        return Err(KabiPayError::Validation("Excluded participants cannot have goals".into()).into_graphql());
+    }
+    if stage != "GOAL_SETTING" {
+        return Err(KabiPayError::Validation("Goals can only be changed during goal setting".into()).into_graphql());
+    }
+    Ok(())
 }
 
 #[derive(InputObject)]
@@ -671,10 +761,7 @@ impl MutationRoot {
         input: SavePerformanceGoalInput,
     ) -> Result<GoalDto> {
         let claims = require_client_claims(ctx)?;
-        let employee_id = require_employee_id(claims)?;
-        if !claims.can_use_performance_self_service() && !claims.can_manage_performance_programs() {
-            return Err(KabiPayError::Forbidden("performance:self with SELF scope required".into()).into_graphql());
-        }
+        require_goal_mutation_authority(claims)?;
         let tenant_id = require_tenant_id(ctx)?;
         let participant_id = parse_id(&input.participant_id)?;
         let title = validate_text(&input.title, 255)?;
@@ -684,14 +771,10 @@ impl MutationRoot {
             return Err(KabiPayError::Validation("Goal weight must be greater than 0 and at most 100".into()).into_graphql());
         }
         let db = tenant_db(ctx, tenant_id).await?;
-        let participant = performance_workflow::load_participant(&db, tenant_id, participant_id).await.map_err(KabiPayError::into_graphql)?;
-        if participant.employee_id != employee_id && !claims.can_manage_performance_programs() {
-            return Err(KabiPayError::Forbidden("Goals can only be proposed for your own review".into()).into_graphql());
-        }
         let txn = db.begin().await.map_err(KabiPayError::from).map_err(KabiPayError::into_graphql)?;
-        if performance_workflow::locked_cycle_stage(&txn, tenant_id, participant.review_cycle_id).await.map_err(KabiPayError::into_graphql)? != "GOAL_SETTING" {
-            return Err(KabiPayError::Validation("Goals can only be changed during goal setting".into()).into_graphql());
-        }
+        let (participant, stage) = locked_goal_context(&txn, tenant_id, participant_id).await?;
+        require_goal_setting(&participant, &stage)?;
+        goal_actor_can_manage(claims, &participant, false, None)?;
         let now = chrono::Utc::now();
         let saved = goal::ActiveModel {
             id: Set(Uuid::new_v4()), tenant_id: Set(tenant_id), employee_id: Set(participant.employee_id),
@@ -701,6 +784,72 @@ impl MutationRoot {
         }.insert(&txn).await.map_err(KabiPayError::from).map_err(KabiPayError::into_graphql)?;
         txn.commit().await.map_err(KabiPayError::from).map_err(KabiPayError::into_graphql)?;
         Ok(saved.into())
+    }
+
+    async fn update_performance_goal(
+        &self,
+        ctx: &Context<'_>,
+        goal_id: ID,
+        input: SavePerformanceGoalInput,
+    ) -> Result<GoalDto> {
+        let claims = require_client_claims(ctx)?;
+        require_goal_mutation_authority(claims)?;
+        let tenant_id = require_tenant_id(ctx)?;
+        let participant_id = parse_id(&input.participant_id)?;
+        let goal_id = parse_id(&goal_id)?;
+        let title = validate_text(&input.title, 255)?;
+        let description = optional_text(input.description, 4000)?;
+        let weight = parse_decimal(&input.weightage, "Goal weight")?;
+        if weight <= Decimal::ZERO || weight > Decimal::ONE_HUNDRED {
+            return Err(KabiPayError::Validation("Goal weight must be greater than 0 and at most 100".into()).into_graphql());
+        }
+        let db = tenant_db(ctx, tenant_id).await?;
+        let txn = db.begin().await.map_err(KabiPayError::from).map_err(KabiPayError::into_graphql)?;
+        let (participant, stage) = locked_goal_context(&txn, tenant_id, participant_id).await?;
+        require_goal_setting(&participant, &stage)?;
+        let existing = goal::Entity::find_by_id(goal_id)
+            .filter(goal::Column::TenantId.eq(tenant_id))
+            .filter(goal::Column::ReviewCycleId.eq(participant.review_cycle_id))
+            .filter(goal::Column::EmployeeId.eq(participant.employee_id))
+            .lock_exclusive().one(&txn).await.map_err(KabiPayError::from).map_err(KabiPayError::into_graphql)?
+            .ok_or_else(|| KabiPayError::NotFound { entity: "performance goal", id: goal_id.to_string() }.into_graphql())?;
+        goal_actor_can_manage(claims, &participant, true, Some(existing.status.as_str()))?;
+        let mut model = existing.into_active_model();
+        model.title = Set(title); model.description = Set(description); model.weightage = Set(Some(weight));
+        model.status = Set("PROPOSED".into()); model.updated_at = Set(chrono::Utc::now());
+        let saved = model.update(&txn).await.map_err(KabiPayError::from).map_err(KabiPayError::into_graphql)?;
+        txn.commit().await.map_err(KabiPayError::from).map_err(KabiPayError::into_graphql)?;
+        Ok(saved.into())
+    }
+
+    async fn delete_performance_goal(&self, ctx: &Context<'_>, participant_id: ID, goal_id: ID) -> Result<bool> {
+        let claims = require_client_claims(ctx)?;
+        require_goal_mutation_authority(claims)?;
+        let tenant_id = require_tenant_id(ctx)?;
+        let participant_id = parse_id(&participant_id)?;
+        let goal_id = parse_id(&goal_id)?;
+        let db = tenant_db(ctx, tenant_id).await?;
+        let txn = db.begin().await.map_err(KabiPayError::from).map_err(KabiPayError::into_graphql)?;
+        let (participant, stage) = locked_goal_context(&txn, tenant_id, participant_id).await?;
+        require_goal_setting(&participant, &stage)?;
+        let existing = goal::Entity::find_by_id(goal_id).filter(goal::Column::TenantId.eq(tenant_id))
+            .filter(goal::Column::ReviewCycleId.eq(participant.review_cycle_id)).filter(goal::Column::EmployeeId.eq(participant.employee_id))
+            .lock_exclusive().one(&txn).await.map_err(KabiPayError::from).map_err(KabiPayError::into_graphql)?
+            .ok_or_else(|| KabiPayError::NotFound { entity: "performance goal", id: goal_id.to_string() }.into_graphql())?;
+        goal_actor_can_manage(claims, &participant, true, Some(existing.status.as_str()))?;
+        let kpis = kpi::Entity::find().filter(kpi::Column::TenantId.eq(tenant_id)).filter(kpi::Column::GoalId.eq(goal_id)).count(&txn).await.map_err(KabiPayError::from).map_err(KabiPayError::into_graphql)?;
+        let children = goal::Entity::find().filter(goal::Column::TenantId.eq(tenant_id)).filter(goal::Column::ParentGoalId.eq(goal_id)).count(&txn).await.map_err(KabiPayError::from).map_err(KabiPayError::into_graphql)?;
+        let feedback = continuous_feedback::Entity::find().filter(continuous_feedback::Column::TenantId.eq(tenant_id)).filter(continuous_feedback::Column::GoalId.eq(goal_id)).count(&txn).await.map_err(KabiPayError::from).map_err(KabiPayError::into_graphql)?;
+        if kpis > 0 || children > 0 || feedback > 0 {
+            return Err(KabiPayError::Conflict("This goal has dependent KPI, child goal, or feedback records".into()).into_graphql());
+        }
+        existing.delete(&txn).await.map_err(KabiPayError::from).map_err(KabiPayError::into_graphql)?;
+        goal::Entity::update_many().col_expr(goal::Column::Status, Expr::value("PROPOSED"))
+            .col_expr(goal::Column::UpdatedAt, Expr::value(chrono::Utc::now()))
+            .filter(goal::Column::TenantId.eq(tenant_id)).filter(goal::Column::ReviewCycleId.eq(participant.review_cycle_id))
+            .filter(goal::Column::EmployeeId.eq(participant.employee_id)).exec(&txn).await.map_err(KabiPayError::from).map_err(KabiPayError::into_graphql)?;
+        txn.commit().await.map_err(KabiPayError::from).map_err(KabiPayError::into_graphql)?;
+        Ok(true)
     }
 
     async fn approve_performance_goals(
@@ -715,24 +864,21 @@ impl MutationRoot {
         let tenant_id = require_tenant_id(ctx)?;
         let participant_id = parse_id(&participant_id)?;
         let db = tenant_db(ctx, tenant_id).await?;
-        let participant = performance_workflow::load_participant(&db, tenant_id, participant_id).await.map_err(KabiPayError::into_graphql)?;
-        if !claims.can_manage_performance_programs()
-            && (!claims.can_evaluate_performance_team()
-                || !claims.employee_id.is_some_and(|actor| {
-                    performance_lifecycle::manager_matches_snapshot(actor, participant.manager_employee_id)
-                }))
-        {
-            return Err(KabiPayError::Forbidden("Only the review's assigned manager can approve its goals".into()).into_graphql());
-        }
         let txn = db.begin().await.map_err(KabiPayError::from).map_err(KabiPayError::into_graphql)?;
-        if performance_workflow::locked_cycle_stage(&txn, tenant_id, participant.review_cycle_id).await.map_err(KabiPayError::into_graphql)? != "GOAL_SETTING" {
-            return Err(KabiPayError::Validation("Goals can only be approved during goal setting".into()).into_graphql());
+        let (participant, stage) = locked_goal_context(&txn, tenant_id, participant_id).await?;
+        require_goal_setting(&participant, &stage)?;
+        if !claims.can_manage_performance_programs()
+            && (!claims.can_evaluate_performance_team() || !claims.employee_id.is_some_and(|actor| performance_lifecycle::manager_matches_snapshot(actor, participant.manager_employee_id))) {
+            return Err(KabiPayError::Forbidden("Only the review's assigned manager can approve its goals".into()).into_graphql());
         }
         let goals = goal::Entity::find()
             .filter(goal::Column::TenantId.eq(tenant_id))
             .filter(goal::Column::ReviewCycleId.eq(participant.review_cycle_id))
             .filter(goal::Column::EmployeeId.eq(participant.employee_id))
             .all(&txn).await.map_err(KabiPayError::from).map_err(KabiPayError::into_graphql)?;
+        if goals.iter().any(|goal| goal.weightage.is_none()) {
+            return Err(KabiPayError::Validation("Every goal must have a weight before approval".into()).into_graphql());
+        }
         let weights: Vec<Decimal> = goals.iter().filter_map(|goal| goal.weightage).collect();
         performance_lifecycle::validate_goal_weight_total(&weights)
             .map_err(|message| KabiPayError::Validation(message).into_graphql())?;
@@ -877,6 +1023,17 @@ impl MutationRoot {
                 return Err(KabiPayError::Validation(format!("{missing} manager review(s) are still pending")).into_graphql());
             }
         }
+        if stage == performance_lifecycle::CycleStage::EmployeeAcknowledgement {
+            let missing = performance_participant::Entity::find()
+                .filter(performance_participant::Column::TenantId.eq(tenant_id))
+                .filter(performance_participant::Column::ReviewCycleId.eq(cycle_id))
+                .filter(performance_participant::Column::IsExcluded.eq(false))
+                .filter(performance_participant::Column::AcknowledgedAt.is_null())
+                .count(&txn).await.map_err(KabiPayError::from).map_err(KabiPayError::into_graphql)?;
+            if missing > 0 {
+                return Err(KabiPayError::Validation(format!("{missing} employee acknowledgement(s) are still pending")).into_graphql());
+            }
+        }
         let next = performance_lifecycle::next_stage(stage, program.include_calibration, program.include_acknowledgement)
             .ok_or_else(|| KabiPayError::Validation("A closed performance cycle cannot be advanced".into()).into_graphql())?;
         let next_wire = cycle_stage_wire(next);
@@ -995,18 +1152,28 @@ impl MutationRoot {
         let participant_id = parse_id(&participant_id)?;
         let comment = optional_text(comment, 2000)?;
         let db = tenant_db(ctx, tenant_id).await?;
-        let participant = performance_workflow::load_participant(&db, tenant_id, participant_id).await.map_err(KabiPayError::into_graphql)?;
+        let txn = db.begin().await.map_err(KabiPayError::from).map_err(KabiPayError::into_graphql)?;
+        let (participant, stage) = locked_goal_context(&txn, tenant_id, participant_id).await?;
         if participant.employee_id != employee_id {
             return Err(KabiPayError::Forbidden("This review belongs to another employee".into()).into_graphql());
         }
-        if performance_workflow::cycle_stage(&db, tenant_id, participant.review_cycle_id).await.map_err(KabiPayError::into_graphql)? != "EMPLOYEE_ACKNOWLEDGEMENT" {
+        if participant.is_excluded {
+            return Err(KabiPayError::Validation("Excluded participants cannot acknowledge a review".into()).into_graphql());
+        }
+        if stage != "EMPLOYEE_ACKNOWLEDGEMENT" {
             return Err(KabiPayError::Validation("This review is not awaiting employee acknowledgement".into()).into_graphql());
+        }
+        if participant.acknowledged_at.is_some() {
+            txn.commit().await.map_err(KabiPayError::from).map_err(KabiPayError::into_graphql)?;
+            return performance_workflow::load_review_detail(&db, tenant_id, participant).await.map_err(KabiPayError::into_graphql);
         }
         let mut model = participant.into_active_model();
         model.acknowledged_at = Set(Some(chrono::Utc::now()));
         model.acknowledgement_comment = Set(comment);
         model.status = Set("ACKNOWLEDGED".into());
-        let participant = model.update(&db).await.map_err(KabiPayError::from).map_err(KabiPayError::into_graphql)?;
+        model.updated_at = Set(chrono::Utc::now());
+        let participant = model.update(&txn).await.map_err(KabiPayError::from).map_err(KabiPayError::into_graphql)?;
+        txn.commit().await.map_err(KabiPayError::from).map_err(KabiPayError::into_graphql)?;
         performance_workflow::load_review_detail(&db, tenant_id, participant).await.map_err(KabiPayError::into_graphql)
     }
 
@@ -1218,6 +1385,40 @@ mod tests {
         assert!(validate_text("  ", 255).is_err());
         assert!(validate_text(&"a".repeat(256), 255).is_err());
         assert_eq!(validate_text(" Skills ", 255).unwrap(), "Skills");
+    }
+
+    #[test]
+    fn goal_mutation_authority_requires_a_concrete_identity_unless_manage_all() {
+        let mut claims: kabipay_common::context::ClientClaims = serde_json::from_value(serde_json::json!({
+            "sub": Uuid::new_v4(), "tenant_id": Uuid::new_v4(), "iss": "kabipay-client",
+            "iat": 0, "exp": 9999999999i64, "permissions": ["performance:evaluate"],
+            "permission_scopes": {"performance:evaluate": "TEAM"}
+        })).unwrap();
+        assert!(require_goal_mutation_authority(&claims).is_err());
+        claims.employee_id = Some(Uuid::new_v4());
+        assert!(require_goal_mutation_authority(&claims).is_ok());
+        claims.employee_id = None;
+        claims.permissions = vec!["performance:manage".into()];
+        claims.permission_scopes = std::collections::HashMap::from([("performance:manage".into(), "ALL".into())]);
+        assert!(require_goal_mutation_authority(&claims).is_ok());
+    }
+
+    #[test]
+    fn excluded_or_stale_goal_participants_are_rejected_before_writes() {
+        let participant = performance_participant::Model {
+            id: Uuid::new_v4(), tenant_id: Uuid::new_v4(), review_cycle_id: Uuid::new_v4(),
+            employee_id: Uuid::new_v4(), manager_employee_id: None, department_id: None,
+            designation_id: None, work_location_id: None, appraisal_template_id: Uuid::new_v4(),
+            status: "GOAL_SETTING".into(), is_excluded: true, exclusion_reason: Some("leave".into()),
+            response_revision: 1, self_submitted_at: None, manager_submitted_at: None,
+            acknowledged_at: None, acknowledgement_comment: None, final_rating: None,
+            performance_band: None, created_at: chrono::Utc::now(), updated_at: chrono::Utc::now(),
+        };
+        assert!(require_goal_setting(&participant, "GOAL_SETTING").is_err());
+        let mut active = participant;
+        active.is_excluded = false;
+        assert!(require_goal_setting(&active, "SELF_REVIEW").is_err());
+        assert!(require_goal_setting(&active, "GOAL_SETTING").is_ok());
     }
 
     #[tokio::test]
