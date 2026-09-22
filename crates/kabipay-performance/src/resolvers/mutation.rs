@@ -16,7 +16,7 @@ use rust_decimal::Decimal;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseBackend, EntityTrait,
     IntoActiveModel, PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Set,
-    Statement, TransactionTrait, ModelTrait, DatabaseTransaction,
+    Statement, TransactionTrait, ModelTrait, DatabaseTransaction, TryGetable,
 };
 use sea_orm::prelude::Expr;
 use std::collections::{HashMap, HashSet};
@@ -26,14 +26,16 @@ use super::types::{
     AppraisalTemplateDto, GoalDto, PerformanceFeedbackDto, PerformanceProgramDto,
     PerformanceReviewDetailDto, ReviewCycleDto,
 };
-use crate::services::{performance_lifecycle, performance_workflow};
+use crate::services::{
+    performance_administration, performance_lifecycle, performance_policy, performance_workflow,
+};
 
 #[cfg(not(test))]
 use kabipay_common::subgraph::tenant_db;
 #[cfg(test)]
 use super::concurrency_tests::tenant_db;
 
-fn validate_text(value: &str, maximum: usize) -> Result<String> {
+pub(crate) fn validate_text(value: &str, maximum: usize) -> Result<String> {
     let value = value.trim();
     if value.is_empty() || value.chars().count() > maximum {
         return Err(KabiPayError::Validation(format!(
@@ -43,25 +45,52 @@ fn validate_text(value: &str, maximum: usize) -> Result<String> {
     Ok(value.to_owned())
 }
 
-fn optional_text(value: Option<String>, maximum: usize) -> Result<Option<String>> {
+pub(crate) fn optional_text(value: Option<String>, maximum: usize) -> Result<Option<String>> {
     value
         .filter(|value| !value.trim().is_empty())
         .map(|value| validate_text(&value, maximum))
         .transpose()
 }
 
-fn parse_id(id: &ID) -> Result<Uuid> {
+pub(crate) fn parse_id(id: &ID) -> Result<Uuid> {
     Uuid::parse_str(id.as_str())
         .map_err(|_| KabiPayError::Validation("Invalid ID".into()).into_graphql())
 }
 
-fn parse_decimal(value: &str, field: &str) -> Result<Decimal> {
+pub(crate) fn parse_decimal(value: &str, field: &str) -> Result<Decimal> {
     value.trim().parse::<Decimal>().map_err(|_| {
         KabiPayError::Validation(format!("{field} must be a valid number")).into_graphql()
     })
 }
 
-fn require_manage(claims: &kabipay_common::context::ClientClaims) -> Result<()> {
+fn require_expected_revision(actual: i32, expected: Option<i32>) -> Result<()> {
+    if expected == Some(actual) || (expected.is_none() && actual == 1) {
+        Ok(())
+    } else {
+        Err(KabiPayError::Conflict(
+            "Performance review changed; refresh before submitting this revision".into(),
+        ).into_graphql())
+    }
+}
+
+fn require_appraisal_submission_state(
+    participant: &performance_participant::Model,
+    locked_cycle_id: Uuid,
+    manager_submission: bool,
+) -> Result<()> {
+    if participant.review_cycle_id != locked_cycle_id {
+        return Err(KabiPayError::Conflict("Performance review changed while acquiring its cycle lock; retry the request".into()).into_graphql());
+    }
+    if participant.is_excluded {
+        return Err(KabiPayError::Validation("Excluded participants cannot submit an appraisal".into()).into_graphql());
+    }
+    if manager_submission && participant.self_submitted_at.is_none() {
+        return Err(KabiPayError::Validation("A self-appraisal is required before manager appraisal".into()).into_graphql());
+    }
+    Ok(())
+}
+
+pub(crate) fn require_manage(claims: &kabipay_common::context::ClientClaims) -> Result<()> {
     if claims.can_manage_performance_programs() {
         Ok(())
     } else {
@@ -78,7 +107,7 @@ fn require_employee_id(claims: &kabipay_common::context::ClientClaims) -> Result
     })
 }
 
-fn goal_actor_can_manage(
+pub(crate) fn goal_actor_can_manage(
     claims: &kabipay_common::context::ClientClaims,
     participant: &performance_participant::Model,
     own_proposal_only: bool,
@@ -134,7 +163,7 @@ async fn locked_goal_participant<C: ConnectionTrait>(
         }.into_graphql())
 }
 
-async fn locked_goal_context(
+pub(crate) async fn locked_goal_context(
     txn: &DatabaseTransaction,
     tenant_id: Uuid,
     participant_id: Uuid,
@@ -266,7 +295,7 @@ pub struct AppraisalAnswerInput {
 
 pub struct MutationRoot;
 
-#[Object]
+#[Object(name = "PerformanceMutationOperations")]
 impl MutationRoot {
     async fn save_review_cycle(
         &self,
@@ -713,17 +742,34 @@ impl MutationRoot {
         let cycle_id = Uuid::new_v4();
         let now = chrono::Utc::now();
         let txn = db.begin().await.map_err(KabiPayError::from).map_err(KabiPayError::into_graphql)?;
+        let policy = performance_policy::lock_launch_policy(&txn, tenant_id, program_id)
+            .await
+            .map_err(KabiPayError::into_graphql)?;
+        if policy.program_status != "ACTIVE" {
+            return Err(KabiPayError::Validation("Archived performance programs cannot launch cycles".into()).into_graphql());
+        }
+        let deadlines = performance_policy::snapshot_cycle_deadlines(
+            &policy,
+            period.start_date,
+            performance_policy::ManualDeadlineOverrides {
+                self_review_due_date: input.self_review_due_date,
+                manager_review_due_date: input.manager_review_due_date,
+            },
+        )
+        .map_err(KabiPayError::into_graphql)?;
         let insert = txn.execute(Statement::from_sql_and_values(
             DatabaseBackend::Postgres,
             r#"INSERT INTO review_cycle
                (id, tenant_id, name, start_date, end_date, status, review_type, created_at, updated_at,
                 performance_program_id, period_key, appraisal_template_id, current_stage,
-                self_review_due_date, manager_review_due_date, launched_at)
-               VALUES ($1,$2,$3,$4,$5,'ACTIVE',$6,$7,$7,$8,$9,$10,'GOAL_SETTING',$11,$12,$7)"#,
+                goal_setting_due_date, self_review_due_date, manager_review_due_date, calibration_due_date,
+                acknowledgement_due_date, launched_at)
+               VALUES ($1,$2,$3,$4,$5,'ACTIVE',$6,$7,$7,$8,$9,$10,'GOAL_SETTING',$11,$12,$13,$14,$15,$7)"#,
             vec![cycle_id.into(), tenant_id.into(), format!("{} {}", program.name, period.key).into(),
                 period.start_date.into(), period.end_date.into(), program.cadence.clone().into(), now.into(),
-                program_id.into(), period.key.into(), template_id.into(), input.self_review_due_date.into(),
-                input.manager_review_due_date.into()],
+                program_id.into(), period.key.into(), template_id.into(), deadlines.goal_setting_due_date.into(),
+                deadlines.self_review_due_date.into(), deadlines.manager_review_due_date.into(),
+                deadlines.calibration_due_date.into(), deadlines.acknowledgement_due_date.into()],
         )).await;
         if let Err(error) = insert {
             let message = error.to_string();
@@ -732,22 +778,13 @@ impl MutationRoot {
             }
             return Err(KabiPayError::from(error).into_graphql());
         }
-        let participants = txn.execute(Statement::from_sql_and_values(
-            DatabaseBackend::Postgres,
-            r#"INSERT INTO performance_participant
-               (id, tenant_id, review_cycle_id, employee_id, manager_employee_id, department_id,
-                designation_id, work_location_id, appraisal_template_id, status, is_excluded,
-                response_revision, created_at, updated_at)
-               SELECT gen_random_uuid(), e.tenant_id, $1, e.id, e.reporting_manager_id, e.department_id,
-                      e.designation_id, e.location_id, $2, 'GOAL_SETTING', FALSE, 1, $3, $3
-               FROM employee e
-               WHERE e.tenant_id = $4 AND e.is_deleted = FALSE
-                 AND UPPER(TRIM(e.status)) IN ('ACTIVE','PROBATION','ON_LEAVE')
-                 AND e.user_id IS NOT NULL"#,
-            [cycle_id.into(), template_id.into(), now.into(), tenant_id.into()],
-        )).await.map_err(KabiPayError::from).map_err(KabiPayError::into_graphql)?;
-        if participants.rows_affected() == 0 {
-            return Err(KabiPayError::Validation("No active employee-linked accounts are eligible for this cycle".into()).into_graphql());
+        let participants = performance_policy::insert_eligible_participants(
+            &txn, tenant_id, program_id, cycle_id, template_id, now, &policy,
+        )
+        .await
+        .map_err(KabiPayError::into_graphql)?;
+        if participants == 0 {
+            return Err(KabiPayError::Validation("No active employee-linked accounts matched this cycle's launch policy".into()).into_graphql());
         }
         txn.commit().await.map_err(KabiPayError::from).map_err(KabiPayError::into_graphql)?;
         review_cycle::Entity::find_by_id(cycle_id).filter(review_cycle::Column::TenantId.eq(tenant_id))
@@ -951,102 +988,12 @@ impl MutationRoot {
         let cycle_id = parse_id(&review_cycle_id)?;
         let db = tenant_db(ctx, tenant_id).await?;
         let txn = db.begin().await.map_err(KabiPayError::from).map_err(KabiPayError::into_graphql)?;
-        let current = performance_workflow::locked_cycle_stage(&txn, tenant_id, cycle_id)
-            .await
-            .map_err(KabiPayError::into_graphql)?;
-        let program = performance_workflow::program_for_cycle(&txn, tenant_id, cycle_id).await.map_err(KabiPayError::into_graphql)?;
-        let stage = parse_cycle_stage(&current)?;
-        if stage == performance_lifecycle::CycleStage::GoalSetting {
-            let participants = performance_participant::Entity::find()
-                .filter(performance_participant::Column::TenantId.eq(tenant_id))
-                .filter(performance_participant::Column::ReviewCycleId.eq(cycle_id))
-                .filter(performance_participant::Column::IsExcluded.eq(false))
-                .all(&txn)
-                .await
-                .map_err(KabiPayError::from)
-                .map_err(KabiPayError::into_graphql)?;
-            let goals = goal::Entity::find()
-                .filter(goal::Column::TenantId.eq(tenant_id))
-                .filter(goal::Column::ReviewCycleId.eq(cycle_id))
-                .all(&txn)
-                .await
-                .map_err(KabiPayError::from)
-                .map_err(KabiPayError::into_graphql)?;
-            let mut goals_by_employee: HashMap<Uuid, Vec<&goal::Model>> = HashMap::new();
-            for goal in &goals {
-                goals_by_employee.entry(goal.employee_id).or_default().push(goal);
-            }
-            let incomplete = participants
-                .iter()
-                .filter(|participant| {
-                    let participant_goals = goals_by_employee
-                        .get(&participant.employee_id)
-                        .map(Vec::as_slice)
-                        .unwrap_or(&[]);
-                    let weights: Vec<Decimal> = participant_goals
-                        .iter()
-                        .filter_map(|goal| goal.weightage)
-                        .collect();
-                    let statuses: Vec<&str> = participant_goals
-                        .iter()
-                        .map(|goal| goal.status.as_str())
-                        .collect();
-                    performance_lifecycle::validate_approved_goal_set(&weights, &statuses).is_err()
-                })
-                .count();
-            if incomplete > 0 {
-                return Err(KabiPayError::Validation(format!(
-                    "{incomplete} employee goal plan(s) still require approved goals totaling 100"
-                ))
-                .into_graphql());
-            }
-        }
-        if stage == performance_lifecycle::CycleStage::SelfReview {
-            let missing = performance_participant::Entity::find()
-                .filter(performance_participant::Column::TenantId.eq(tenant_id))
-                .filter(performance_participant::Column::ReviewCycleId.eq(cycle_id))
-                .filter(performance_participant::Column::IsExcluded.eq(false))
-                .filter(performance_participant::Column::SelfSubmittedAt.is_null())
-                .count(&txn).await.map_err(KabiPayError::from).map_err(KabiPayError::into_graphql)?;
-            if missing > 0 {
-                return Err(KabiPayError::Validation(format!("{missing} employee self-review(s) are still pending")).into_graphql());
-            }
-        }
-        if stage == performance_lifecycle::CycleStage::ManagerReview {
-            let missing = performance_participant::Entity::find()
-                .filter(performance_participant::Column::TenantId.eq(tenant_id))
-                .filter(performance_participant::Column::ReviewCycleId.eq(cycle_id))
-                .filter(performance_participant::Column::IsExcluded.eq(false))
-                .filter(performance_participant::Column::ManagerSubmittedAt.is_null())
-                .count(&txn).await.map_err(KabiPayError::from).map_err(KabiPayError::into_graphql)?;
-            if missing > 0 {
-                return Err(KabiPayError::Validation(format!("{missing} manager review(s) are still pending")).into_graphql());
-            }
-        }
-        if stage == performance_lifecycle::CycleStage::EmployeeAcknowledgement {
-            let missing = performance_participant::Entity::find()
-                .filter(performance_participant::Column::TenantId.eq(tenant_id))
-                .filter(performance_participant::Column::ReviewCycleId.eq(cycle_id))
-                .filter(performance_participant::Column::IsExcluded.eq(false))
-                .filter(performance_participant::Column::AcknowledgedAt.is_null())
-                .count(&txn).await.map_err(KabiPayError::from).map_err(KabiPayError::into_graphql)?;
-            if missing > 0 {
-                return Err(KabiPayError::Validation(format!("{missing} employee acknowledgement(s) are still pending")).into_graphql());
-            }
-        }
-        let next = performance_lifecycle::next_stage(stage, program.include_calibration, program.include_acknowledgement)
-            .ok_or_else(|| KabiPayError::Validation("A closed performance cycle cannot be advanced".into()).into_graphql())?;
-        let next_wire = cycle_stage_wire(next);
-        txn.execute(Statement::from_sql_and_values(DatabaseBackend::Postgres,
-            "UPDATE review_cycle SET current_stage = $1, status = CASE WHEN $1 = 'CLOSED' THEN 'COMPLETED' ELSE status END, updated_at = NOW() WHERE tenant_id = $2 AND id = $3",
-            [next_wire.into(), tenant_id.into(), cycle_id.into()]
-        )).await.map_err(KabiPayError::from).map_err(KabiPayError::into_graphql)?;
-        txn.execute(Statement::from_sql_and_values(DatabaseBackend::Postgres,
-            "UPDATE performance_participant SET status = $1, updated_at = NOW() WHERE tenant_id = $2 AND review_cycle_id = $3 AND is_excluded = FALSE",
-            [next_wire.into(), tenant_id.into(), cycle_id.into()]
-        )).await.map_err(KabiPayError::from).map_err(KabiPayError::into_graphql)?;
+        let next = performance_administration::advance_cycle_with_context(&txn, tenant_id, cycle_id, "", Some(claims.sub), "MANUAL").await.map_err(KabiPayError::into_graphql)?;
         txn.commit().await.map_err(KabiPayError::from).map_err(KabiPayError::into_graphql)?;
-        Ok(next_wire.to_owned())
+        if next == "BLOCKED" {
+            return Err(KabiPayError::Validation("Performance cycle has unresolved prerequisites; review actionable exceptions".into()).into_graphql());
+        }
+        Ok(next)
     }
 
     async fn submit_self_appraisal(
@@ -1054,6 +1001,7 @@ impl MutationRoot {
         ctx: &Context<'_>,
         participant_id: ID,
         answers: Vec<AppraisalAnswerInput>,
+        expected_revision: Option<i32>,
     ) -> Result<PerformanceReviewDetailDto> {
         let claims = require_client_claims(ctx)?;
         if !claims.can_use_performance_self_service() {
@@ -1064,18 +1012,22 @@ impl MutationRoot {
         let participant_id = parse_id(&participant_id)?;
         let db = tenant_db(ctx, tenant_id).await?;
         let txn = db.begin().await.map_err(KabiPayError::from).map_err(KabiPayError::into_graphql)?;
+        let cycle_id = performance_participant::Entity::find_by_id(participant_id).filter(performance_participant::Column::TenantId.eq(tenant_id)).one(&txn).await.map_err(KabiPayError::from).map_err(KabiPayError::into_graphql)?.ok_or_else(|| KabiPayError::NotFound { entity: "performance review", id: participant_id.to_string() }.into_graphql())?.review_cycle_id;
+        let stage = performance_workflow::locked_cycle_stage(&txn, tenant_id, cycle_id).await.map_err(KabiPayError::into_graphql)?;
         let participant = performance_participant::Entity::find_by_id(participant_id)
             .filter(performance_participant::Column::TenantId.eq(tenant_id))
             .lock_exclusive()
             .one(&txn).await.map_err(KabiPayError::from).map_err(KabiPayError::into_graphql)?
             .ok_or_else(|| KabiPayError::NotFound { entity: "performance review", id: participant_id.to_string() }.into_graphql())?;
+        require_appraisal_submission_state(&participant, cycle_id, false)?;
+        require_expected_revision(participant.response_revision, expected_revision)?;
         if participant.employee_id != employee_id {
             return Err(KabiPayError::Forbidden("This self-appraisal belongs to another employee".into()).into_graphql());
         }
         if participant.self_submitted_at.is_some() {
             return Err(KabiPayError::Conflict("This self-appraisal has already been submitted".into()).into_graphql());
         }
-        if performance_workflow::cycle_stage(&txn, tenant_id, participant.review_cycle_id).await.map_err(KabiPayError::into_graphql)? != "SELF_REVIEW" {
+        if stage != "SELF_REVIEW" {
             return Err(KabiPayError::Validation("Self-appraisal is only available during the self-review stage".into()).into_graphql());
         }
         save_appraisal_answers(&txn, tenant_id, &participant, answers, AnswerRole::Employee).await?;
@@ -1083,6 +1035,7 @@ impl MutationRoot {
         model.self_submitted_at = Set(Some(chrono::Utc::now()));
         model.status = Set("SELF_SUBMITTED".into());
         let participant = model.update(&txn).await.map_err(KabiPayError::from).map_err(KabiPayError::into_graphql)?;
+        performance_administration::snapshot_revision(&txn, tenant_id, participant.id).await.map_err(KabiPayError::into_graphql)?;
         txn.commit().await.map_err(KabiPayError::from).map_err(KabiPayError::into_graphql)?;
         performance_workflow::load_review_detail(&db, tenant_id, participant).await.map_err(KabiPayError::into_graphql)
     }
@@ -1094,6 +1047,7 @@ impl MutationRoot {
         answers: Vec<AppraisalAnswerInput>,
         final_rating: String,
         performance_band: Option<String>,
+        expected_revision: Option<i32>,
     ) -> Result<PerformanceReviewDetailDto> {
         let claims = require_client_claims(ctx)?;
         if !claims.can_manage_performance_programs() {
@@ -1105,11 +1059,15 @@ impl MutationRoot {
         let performance_band = optional_text(performance_band, 50)?;
         let db = tenant_db(ctx, tenant_id).await?;
         let txn = db.begin().await.map_err(KabiPayError::from).map_err(KabiPayError::into_graphql)?;
+        let cycle_id = performance_participant::Entity::find_by_id(participant_id).filter(performance_participant::Column::TenantId.eq(tenant_id)).one(&txn).await.map_err(KabiPayError::from).map_err(KabiPayError::into_graphql)?.ok_or_else(|| KabiPayError::NotFound { entity: "performance review", id: participant_id.to_string() }.into_graphql())?.review_cycle_id;
+        let stage = performance_workflow::locked_cycle_stage(&txn, tenant_id, cycle_id).await.map_err(KabiPayError::into_graphql)?;
         let participant = performance_participant::Entity::find_by_id(participant_id)
             .filter(performance_participant::Column::TenantId.eq(tenant_id))
             .lock_exclusive()
             .one(&txn).await.map_err(KabiPayError::from).map_err(KabiPayError::into_graphql)?
             .ok_or_else(|| KabiPayError::NotFound { entity: "performance review", id: participant_id.to_string() }.into_graphql())?;
+        require_appraisal_submission_state(&participant, cycle_id, true)?;
+        require_expected_revision(participant.response_revision, expected_revision)?;
         if !claims.can_manage_performance_programs()
             && (!claims.can_evaluate_performance_team() || !claims.employee_id.is_some_and(|actor| {
                 performance_lifecycle::manager_matches_snapshot(actor, participant.manager_employee_id)
@@ -1120,7 +1078,7 @@ impl MutationRoot {
         if participant.manager_submitted_at.is_some() {
             return Err(KabiPayError::Conflict("This manager appraisal has already been submitted".into()).into_graphql());
         }
-        if performance_workflow::cycle_stage(&txn, tenant_id, participant.review_cycle_id).await.map_err(KabiPayError::into_graphql)? != "MANAGER_REVIEW" {
+        if stage != "MANAGER_REVIEW" {
             return Err(KabiPayError::Validation("Manager appraisal is only available during the manager-review stage".into()).into_graphql());
         }
         let program = performance_workflow::program_for_cycle(&txn, tenant_id, participant.review_cycle_id).await.map_err(KabiPayError::into_graphql)?;
@@ -1129,10 +1087,13 @@ impl MutationRoot {
         save_appraisal_answers(&txn, tenant_id, &participant, answers, AnswerRole::Manager).await?;
         let mut model = participant.into_active_model();
         model.manager_submitted_at = Set(Some(chrono::Utc::now()));
-        model.final_rating = Set(Some(final_rating));
-        model.performance_band = Set(performance_band);
+        model.manager_rating = Set(Some(final_rating));
+        model.manager_performance_band = Set(performance_band.clone());
+        model.final_rating = Set((!program.include_calibration).then_some(final_rating));
+        model.performance_band = Set((!program.include_calibration).then_some(performance_band).flatten());
         model.status = Set("MANAGER_SUBMITTED".into());
         let participant = model.update(&txn).await.map_err(KabiPayError::from).map_err(KabiPayError::into_graphql)?;
+        performance_administration::snapshot_revision(&txn, tenant_id, participant.id).await.map_err(KabiPayError::into_graphql)?;
         txn.commit().await.map_err(KabiPayError::from).map_err(KabiPayError::into_graphql)?;
         performance_workflow::load_review_detail(&db, tenant_id, participant).await.map_err(KabiPayError::into_graphql)
     }
@@ -1142,6 +1103,7 @@ impl MutationRoot {
         ctx: &Context<'_>,
         participant_id: ID,
         comment: Option<String>,
+        expected_revision: Option<i32>,
     ) -> Result<PerformanceReviewDetailDto> {
         let claims = require_client_claims(ctx)?;
         if !claims.can_use_performance_self_service() {
@@ -1154,6 +1116,7 @@ impl MutationRoot {
         let db = tenant_db(ctx, tenant_id).await?;
         let txn = db.begin().await.map_err(KabiPayError::from).map_err(KabiPayError::into_graphql)?;
         let (participant, stage) = locked_goal_context(&txn, tenant_id, participant_id).await?;
+        require_expected_revision(participant.response_revision, expected_revision)?;
         if participant.employee_id != employee_id {
             return Err(KabiPayError::Forbidden("This review belongs to another employee".into()).into_graphql());
         }
@@ -1173,6 +1136,7 @@ impl MutationRoot {
         model.status = Set("ACKNOWLEDGED".into());
         model.updated_at = Set(chrono::Utc::now());
         let participant = model.update(&txn).await.map_err(KabiPayError::from).map_err(KabiPayError::into_graphql)?;
+        performance_administration::snapshot_revision(&txn, tenant_id, participant.id).await.map_err(KabiPayError::into_graphql)?;
         txn.commit().await.map_err(KabiPayError::from).map_err(KabiPayError::into_graphql)?;
         performance_workflow::load_review_detail(&db, tenant_id, participant).await.map_err(KabiPayError::into_graphql)
     }
@@ -1183,29 +1147,6 @@ impl MutationRoot {
 enum AnswerRole {
     Employee,
     Manager,
-}
-
-fn parse_cycle_stage(value: &str) -> Result<performance_lifecycle::CycleStage> {
-    match value {
-        "GOAL_SETTING" => Ok(performance_lifecycle::CycleStage::GoalSetting),
-        "SELF_REVIEW" => Ok(performance_lifecycle::CycleStage::SelfReview),
-        "MANAGER_REVIEW" => Ok(performance_lifecycle::CycleStage::ManagerReview),
-        "HR_CALIBRATION" => Ok(performance_lifecycle::CycleStage::HrCalibration),
-        "EMPLOYEE_ACKNOWLEDGEMENT" => Ok(performance_lifecycle::CycleStage::EmployeeAcknowledgement),
-        "CLOSED" => Ok(performance_lifecycle::CycleStage::Closed),
-        _ => Err(KabiPayError::Validation("Performance cycle stage is invalid".into()).into_graphql()),
-    }
-}
-
-fn cycle_stage_wire(stage: performance_lifecycle::CycleStage) -> &'static str {
-    match stage {
-        performance_lifecycle::CycleStage::GoalSetting => "GOAL_SETTING",
-        performance_lifecycle::CycleStage::SelfReview => "SELF_REVIEW",
-        performance_lifecycle::CycleStage::ManagerReview => "MANAGER_REVIEW",
-        performance_lifecycle::CycleStage::HrCalibration => "HR_CALIBRATION",
-        performance_lifecycle::CycleStage::EmployeeAcknowledgement => "EMPLOYEE_ACKNOWLEDGEMENT",
-        performance_lifecycle::CycleStage::Closed => "CLOSED",
-    }
 }
 
 async fn save_appraisal_answers<C>(
@@ -1363,7 +1304,7 @@ mod tests {
                 "permission_scopes": {"performance:evaluate": "TEAM"}
             })).unwrap();
         let schema = async_graphql::Schema::build(
-            crate::resolvers::QueryRoot, MutationRoot, async_graphql::EmptySubscription,
+            crate::resolvers::QueryRoot::default(), crate::resolvers::MutationRoot::default(), async_graphql::EmptySubscription,
         ).data(kabipay_common::subgraph::TenantId(claims.tenant_id)).data(claims).finish();
         let id = Uuid::new_v4();
         let operations = [
@@ -1412,13 +1353,26 @@ mod tests {
             status: "GOAL_SETTING".into(), is_excluded: true, exclusion_reason: Some("leave".into()),
             response_revision: 1, self_submitted_at: None, manager_submitted_at: None,
             acknowledged_at: None, acknowledgement_comment: None, final_rating: None,
-            performance_band: None, created_at: chrono::Utc::now(), updated_at: chrono::Utc::now(),
+            performance_band: None, manager_rating: None, manager_performance_band: None, calibration_provenance: None, created_at: chrono::Utc::now(), updated_at: chrono::Utc::now(),
         };
         assert!(require_goal_setting(&participant, "GOAL_SETTING").is_err());
         let mut active = participant;
         active.is_excluded = false;
         assert!(require_goal_setting(&active, "SELF_REVIEW").is_err());
         assert!(require_goal_setting(&active, "GOAL_SETTING").is_ok());
+        active.is_excluded = true;
+        assert!(require_appraisal_submission_state(&active, active.review_cycle_id, false).is_err());
+        active.is_excluded = false;
+        assert!(require_appraisal_submission_state(&active, Uuid::new_v4(), false).is_err());
+        assert!(require_appraisal_submission_state(&active, active.review_cycle_id, true).is_err());
+    }
+
+    #[test]
+    fn revision_compatibility_accepts_only_initial_omission_or_matching_revision() {
+        assert!(require_expected_revision(1, None).is_ok());
+        assert!(require_expected_revision(2, None).is_err());
+        assert!(require_expected_revision(2, Some(2)).is_ok());
+        assert!(require_expected_revision(2, Some(1)).is_err());
     }
 
     #[tokio::test]
@@ -1435,8 +1389,8 @@ mod tests {
                     "permission_scopes": {"performance:manage": scope}
                 })).unwrap();
             let schema = async_graphql::Schema::build(
-                crate::resolvers::QueryRoot,
-                MutationRoot,
+                crate::resolvers::QueryRoot::default(),
+                crate::resolvers::MutationRoot::default(),
                 async_graphql::EmptySubscription,
             ).data(claims).finish();
             let response = schema.execute(

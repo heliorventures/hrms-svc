@@ -11,7 +11,7 @@ use kabipay_db_entities::tenant::{
 use rust_decimal::Decimal;
 use sea_orm::{
     ColumnTrait, ConnectionTrait, DatabaseBackend, DatabaseConnection, EntityTrait,
-    FromQueryResult, QueryFilter, QueryOrder, Statement, TransactionTrait,
+    FromQueryResult, QueryFilter, QueryOrder, Statement, TransactionTrait, TryGetable,
 };
 use uuid::Uuid;
 
@@ -20,12 +20,26 @@ use crate::resolvers::types::{
     GoalDto, PerformanceFeedbackDto, PerformanceReviewDetailDto, PerformanceReviewSummaryDto,
 };
 use crate::services::performance_lifecycle::{self, Cadence};
+use crate::services::performance_administration;
+use crate::services::performance_policy;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PerformanceCycleSweepResult {
     pub programs_checked: usize,
     pub cycles_created: usize,
     pub participants_created: u64,
+    pub stages_advanced: usize,
+    pub stages_blocked: usize,
+}
+
+pub async fn process_due_performance_stage_deadlines(
+    db: &DatabaseConnection, tenant_id: Uuid, business_date: NaiveDate,
+) -> KabiPayResult<PerformanceCycleSweepResult> {
+    let rows = db.query_all(Statement::from_sql_and_values(DatabaseBackend::Postgres,
+        "SELECT id FROM review_cycle WHERE tenant_id=$1 AND status='ACTIVE' AND performance_program_id IS NOT NULL AND CASE current_stage WHEN 'GOAL_SETTING' THEN goal_setting_due_date WHEN 'SELF_REVIEW' THEN self_review_due_date WHEN 'MANAGER_REVIEW' THEN manager_review_due_date WHEN 'HR_CALIBRATION' THEN calibration_due_date WHEN 'EMPLOYEE_ACKNOWLEDGEMENT' THEN acknowledgement_due_date ELSE NULL END <= $2 ORDER BY id", [tenant_id.into(),business_date.into()])).await?;
+    let mut result=PerformanceCycleSweepResult::default();
+    for row in rows { let cycle_id:Uuid=row.try_get("","id")?; let txn=db.begin().await?; match performance_administration::advance_due_cycle(&txn,tenant_id,cycle_id,business_date).await { Ok(outcome) => { txn.commit().await?; if outcome == "BLOCKED" { result.stages_blocked += 1; } else if outcome != "NOT_DUE" { result.stages_advanced += 1; } }, Err(_) => { txn.rollback().await?; result.stages_blocked += 1; } } }
+    Ok(result)
 }
 
 fn cadence(value: &str) -> Option<Cadence> {
@@ -68,49 +82,49 @@ pub async fn process_due_performance_cycles(
         let cycle_id = Uuid::new_v4();
         let now = Utc::now();
         let txn = db.begin().await?;
+        let policy = performance_policy::lock_launch_policy(&txn, tenant_id, program.id).await?;
+        if policy.program_status != "ACTIVE" { txn.rollback().await?; continue; }
+        let deadlines = performance_policy::snapshot_cycle_deadlines(
+            &policy,
+            period.start_date,
+            performance_policy::ManualDeadlineOverrides::default(),
+        )?;
         let created = txn
             .query_one(Statement::from_sql_and_values(
                 DatabaseBackend::Postgres,
                 r#"INSERT INTO review_cycle
                    (id, tenant_id, name, start_date, end_date, status, review_type, created_at,
                     updated_at, performance_program_id, period_key, appraisal_template_id,
-                    current_stage, launched_at)
-                   VALUES ($1,$2,$3,$4,$5,'ACTIVE',$6,$7,$7,$8,$9,$10,'GOAL_SETTING',$7)
+                    current_stage, goal_setting_due_date, self_review_due_date, manager_review_due_date,
+                    calibration_due_date, acknowledgement_due_date, launched_at)
+                   VALUES ($1,$2,$3,$4,$5,'ACTIVE',$6,$7,$7,$8,$9,$10,'GOAL_SETTING',$11,$12,$13,$14,$15,$7)
                    ON CONFLICT (performance_program_id, period_key) DO NOTHING
                    RETURNING id"#,
                 vec![cycle_id.into(), tenant_id.into(), format!("{} {}", program.name, period.key).into(),
                     period.start_date.into(), period.end_date.into(), program.cadence.clone().into(), now.into(),
-                    program.id.into(), period.key.into(), template.id.into()],
+                    program.id.into(), period.key.into(), template.id.into(), deadlines.goal_setting_due_date.into(),
+                    deadlines.self_review_due_date.into(), deadlines.manager_review_due_date.into(),
+                    deadlines.calibration_due_date.into(), deadlines.acknowledgement_due_date.into()],
             ))
             .await?;
         if created.is_none() {
             txn.rollback().await?;
             continue;
         }
-        let inserted = txn.execute(Statement::from_sql_and_values(
-            DatabaseBackend::Postgres,
-            r#"INSERT INTO performance_participant
-               (id, tenant_id, review_cycle_id, employee_id, manager_employee_id, department_id,
-                designation_id, work_location_id, appraisal_template_id, status, is_excluded,
-                response_revision, created_at, updated_at)
-               SELECT gen_random_uuid(), e.tenant_id, $1, e.id, e.reporting_manager_id, e.department_id,
-                      e.designation_id, e.location_id, $2, 'GOAL_SETTING', FALSE, 1, $3, $3
-               FROM employee e
-               WHERE e.tenant_id = $4 AND e.is_deleted = FALSE
-                 AND UPPER(TRIM(e.status)) IN ('ACTIVE','PROBATION','ON_LEAVE')
-                 AND e.user_id IS NOT NULL"#,
-            [cycle_id.into(), template.id.into(), now.into(), tenant_id.into()],
-        )).await?;
-        if inserted.rows_affected() == 0 {
+        let participants_created = performance_policy::insert_eligible_participants(
+            &txn, tenant_id, program.id, cycle_id, template.id, now, &policy,
+        )
+        .await?;
+        if participants_created == 0 {
             txn.execute(Statement::from_sql_and_values(
                 DatabaseBackend::Postgres,
-                "INSERT INTO performance_admin_exception (id, tenant_id, performance_program_id, review_cycle_id, exception_code, details, created_at) VALUES ($1,$2,$3,$4,'NO_ELIGIBLE_PARTICIPANTS','No active employee-linked accounts were eligible when the automated cycle was created',$5)",
+                "INSERT INTO performance_admin_exception (id, tenant_id, performance_program_id, review_cycle_id, exception_code, details, created_at) VALUES ($1,$2,$3,$4,'NO_ELIGIBLE_PARTICIPANTS','No active employee-linked accounts matched the policy when the automated cycle was created',$5)",
                 [Uuid::new_v4().into(), tenant_id.into(), program.id.into(), cycle_id.into(), now.into()],
             )).await?;
         }
         txn.commit().await?;
         result.cycles_created += 1;
-        result.participants_created += inserted.rows_affected();
+        result.participants_created += participants_created;
     }
     Ok(result)
 }
@@ -218,6 +232,7 @@ struct ReviewSummaryRow {
     cycle_end_date: NaiveDate,
     cycle_stage: String,
     status: String,
+    response_revision: i32,
     self_submitted_at: Option<DateTime<Utc>>,
     manager_submitted_at: Option<DateTime<Utc>>,
     acknowledged_at: Option<DateTime<Utc>>,
@@ -240,6 +255,7 @@ impl From<ReviewSummaryRow> for PerformanceReviewSummaryDto {
             cycle_end_date: row.cycle_end_date,
             cycle_stage: row.cycle_stage,
             status: row.status,
+            response_revision: row.response_revision,
             self_submitted_at: row.self_submitted_at,
             manager_submitted_at: row.manager_submitted_at,
             acknowledged_at: row.acknowledged_at,
@@ -256,7 +272,7 @@ SELECT p.id, p.review_cycle_id, p.employee_id,
        CASE WHEN m.id IS NULL THEN NULL ELSE BTRIM(CONCAT(m.first_name, ' ', m.last_name)) END AS manager_name,
        p.appraisal_template_id, c.name AS cycle_name,
        c.start_date AS cycle_start_date, c.end_date AS cycle_end_date,
-       c.current_stage AS cycle_stage, p.status, p.self_submitted_at,
+       c.current_stage AS cycle_stage, p.status, p.response_revision, p.self_submitted_at,
        p.manager_submitted_at, p.acknowledged_at, p.final_rating, p.performance_band
 FROM performance_participant p
 JOIN review_cycle c ON c.id = p.review_cycle_id AND c.tenant_id = p.tenant_id

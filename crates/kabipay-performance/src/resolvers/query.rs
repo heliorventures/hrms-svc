@@ -25,7 +25,7 @@ fn require_employee_id(claims: &kabipay_common::context::ClientClaims) -> Result
 
 pub struct QueryRoot;
 
-#[Object]
+#[Object(name = "PerformanceQueryOperations")]
 impl QueryRoot {
     async fn performance_health(&self) -> &'static str {
         "ok"

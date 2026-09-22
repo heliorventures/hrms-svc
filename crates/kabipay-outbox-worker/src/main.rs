@@ -19,7 +19,7 @@ use kabipay_db_entities::ops::tenant_database;
 use kabipay_db_entities::tenant::d0026_integrations::{webhook_delivery_log, webhook_subscription};
 use kabipay_db_entities::tenant::d0030_outbox_events::outbox_event;
 use kabipay_notification::services::automated_events::process_due_celebrations;
-use kabipay_performance::services::performance_workflow::process_due_performance_cycles;
+use kabipay_performance::services::performance_workflow::{process_due_performance_cycles, process_due_performance_stage_deadlines};
 use kabipay_survey::services::survey_lifecycle::process_due_surveys;
 use reqwest::header::{HeaderMap, HeaderValue, CONTENT_TYPE};
 use sea_orm::{
@@ -617,6 +617,11 @@ async fn main() -> anyhow::Result<()> {
                                             code = error.code(),
                                             "scheduled performance cycle sweep failed"
                                         ),
+                                    }
+                                    match process_due_performance_stage_deadlines(&tdb, tid, business_date).await {
+                                        Ok(result) if result.stages_advanced > 0 || result.stages_blocked > 0 => tracing::info!(%tid, stages_advanced = result.stages_advanced, stages_blocked = result.stages_blocked, "scheduled performance stage sweep completed"),
+                                        Ok(_) => {}
+                                        Err(error) => tracing::error!(%tid, code = error.code(), "scheduled performance stage sweep failed"),
                                     }
                                     }
                                 }

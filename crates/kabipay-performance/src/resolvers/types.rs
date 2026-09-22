@@ -222,6 +222,7 @@ pub struct PerformanceReviewSummaryDto {
     pub cycle_end_date: NaiveDate,
     pub cycle_stage: String,
     pub status: String,
+    pub response_revision: i32,
     pub self_submitted_at: Option<DateTime<Utc>>,
     pub manager_submitted_at: Option<DateTime<Utc>>,
     pub acknowledged_at: Option<DateTime<Utc>>,

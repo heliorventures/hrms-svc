@@ -152,6 +152,9 @@ pub mod performance_participant {
         pub acknowledgement_comment: Option<String>,
         pub final_rating: Option<Decimal>,
         pub performance_band: Option<String>,
+        pub manager_rating: Option<Decimal>,
+        pub manager_performance_band: Option<String>,
+        pub calibration_provenance: Option<String>,
         pub created_at: DateTimeUtc,
         pub updated_at: DateTimeUtc,
     }

@@ -115,7 +115,7 @@ impl Fixture {
             roles: vec![], permissions: self.permissions.clone(),
             permission_scopes: self.permission_scopes.clone(), resource_scopes: HashMap::new(),
         };
-        Schema::build(QueryRoot, MutationRoot, EmptySubscription)
+        Schema::build(QueryRoot::default(), MutationRoot::default(), EmptySubscription)
             .data(TestTenantDb(self.tenant, db)).data(TenantId(self.tenant)).data(claims)
             .finish().execute(operation
                 .replace("$PARTICIPANT", &self.participant_id.to_string())
@@ -136,7 +136,7 @@ impl Fixture {
             work_location_id: None, appraisal_template_id: self.template_id, status: "GOAL_SETTING".into(),
             is_excluded: self.is_excluded, exclusion_reason: self.is_excluded.then(|| "excluded".into()), response_revision: 1, self_submitted_at: None,
             manager_submitted_at: None, acknowledged_at: acknowledgement.as_ref().map(|(at, _)| *at), acknowledgement_comment: acknowledgement.and_then(|(_, comment)| comment),
-            final_rating: None, performance_band: None, created_at: Utc::now(), updated_at: Utc::now(),
+            final_rating: None, performance_band: None, manager_rating: None, manager_performance_band: None, calibration_provenance: None, created_at: Utc::now(), updated_at: Utc::now(),
         })
     }
 

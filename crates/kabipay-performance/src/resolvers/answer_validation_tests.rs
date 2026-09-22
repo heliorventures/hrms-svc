@@ -36,7 +36,7 @@ impl Fixture {
             status: "SELF_REVIEW".into(), is_excluded: false, exclusion_reason: None,
             response_revision: 1, self_submitted_at: None, manager_submitted_at: None,
             acknowledged_at: None, acknowledgement_comment: None, final_rating: None,
-            performance_band: None, created_at: chrono::Utc::now(), updated_at: chrono::Utc::now(),
+            performance_band: None, manager_rating: None, manager_performance_band: None, calibration_provenance: None, created_at: chrono::Utc::now(), updated_at: chrono::Utc::now(),
         }
     }
 
