@@ -12,6 +12,7 @@ use kabipay_db_entities::tenant::{
     d0075_performance_appraisal_lifecycle::performance_participant,
 };
 use sea_orm::{
+    sea_query::{Alias, Expr},
     ColumnTrait, Condition, ConnectionTrait, DatabaseBackend, EntityTrait, QueryFilter,
     QueryOrder, QuerySelect, Statement, TryGetable,
 };
@@ -44,7 +45,11 @@ pub(super) async fn admin_cycles(
         cycles = cycles.filter(review_cycle::Column::Status.eq(status.trim().to_ascii_uppercase()));
     }
     if let Some(program_id) = input.performance_program_id.as_ref().map(parse_id).transpose()? {
-        cycles = cycles.filter(review_cycle::Column::PerformanceProgramId.eq(program_id));
+        // Migration 0075 adds this column beyond the original generated cycle entity.
+        cycles = cycles.filter(
+            Expr::col((review_cycle::Entity, Alias::new("performance_program_id")))
+                .eq(program_id),
+        );
     }
     if let Some((start_date, id)) = cycle_cursor(input.cursor.as_deref())? {
         cycles = cycles.filter(

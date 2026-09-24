@@ -9,6 +9,7 @@ use sea_orm::{ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait, Databas
 use uuid::Uuid;
 
 use super::mutation::{goal_actor_can_manage, locked_goal_context, optional_text, parse_decimal, parse_id, require_manage, validate_text};
+use super::administration_history::load_admin_participant;
 use super::administration_types::*;
 use super::administration_pagination::{feedback_cursor as parse_feedback_cursor, page_limit};
 use super::types::{PerformanceFeedbackDto, PerformanceProgramDto};

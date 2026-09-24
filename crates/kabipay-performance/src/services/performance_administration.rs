@@ -138,7 +138,7 @@ pub async fn set_calibration(
     audit_event(txn, tenant_id, Some(cycle_id), Some(participant_id), "CALIBRATION_SAVED", Some(reason), Some(actor_id)).await?;
     txn.execute(Statement::from_sql_and_values(DatabaseBackend::Postgres,
         "UPDATE performance_participant_revision SET final_rating=$3,performance_band=$4,calibration_reason=$5,calibrated_by_user_id=$6,calibrated_at=$7,calibration_provenance='HR_CALIBRATED' WHERE tenant_id=$1 AND performance_participant_id=$2 AND revision=$8",
-        [tenant_id.into(), participant_id.into(), final_rating.into(), performance_band.into(), reason.into(), actor_id.into(), now.into(), revision.into()],
+        [tenant_id.into(), participant_id.into(), final_rating.into(), performance_band.clone().into(), reason.into(), actor_id.into(), now.into(), revision.into()],
     )).await?;
     txn.execute(Statement::from_sql_and_values(DatabaseBackend::Postgres,
         "INSERT INTO performance_calibration_decision (id,tenant_id,performance_participant_id,revision,final_rating,performance_band,reason,decided_by_user_id,decided_at) VALUES (gen_random_uuid(),$1,$2,$3,$4,$5,$6,$7,$8)",

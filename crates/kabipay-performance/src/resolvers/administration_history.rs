@@ -302,7 +302,8 @@ async fn revision_snapshot_kpis(
     .map(|row| row.try_get::<Option<Value>>("", "kpi_snapshot"))
     .transpose()
     .map_err(KabiPayError::from)
-    .map_err(KabiPayError::into_graphql)?;
+    .map_err(KabiPayError::into_graphql)?
+    .flatten();
 
     snapshot
         .as_ref()
