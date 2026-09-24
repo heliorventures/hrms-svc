@@ -74,10 +74,10 @@ fn require_kpi_actual_authority(
                 && actor_employee_id == participant.employee_id => Ok(()),
         "MANAGER_REVIEW"
             if claims.can_evaluate_performance_team()
-                    && performance_lifecycle::manager_matches_snapshot(
-                        actor_employee_id,
-                        participant.manager_employee_id,
-                    )) => Ok(()),
+                && performance_lifecycle::manager_matches_snapshot(
+                    actor_employee_id,
+                    participant.manager_employee_id,
+                ) => Ok(()),
         "SELF_REVIEW" | "MANAGER_REVIEW" => Err(KabiPayError::Forbidden(
             "You are not authorized to submit KPI actuals for this review stage".into(),
         ).into_graphql()),
