@@ -14,7 +14,7 @@ use kabipay_db_entities::tenant::{
 use sea_orm::{
     sea_query::{Alias, Expr},
     ColumnTrait, Condition, ConnectionTrait, DatabaseBackend, EntityTrait, QueryFilter,
-    QueryOrder, QuerySelect, Statement, TryGetable,
+    QueryOrder, QuerySelect, Statement,
 };
 use uuid::Uuid;
 

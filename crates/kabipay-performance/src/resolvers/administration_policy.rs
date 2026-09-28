@@ -10,7 +10,7 @@ use super::concurrency_tests::tenant_db;
 use kabipay_db_entities::tenant::d0075_performance_appraisal_lifecycle::performance_program;
 use sea_orm::{
     ColumnTrait, ConnectionTrait, DatabaseBackend, EntityTrait, QueryFilter, Statement,
-    QuerySelect, TransactionTrait, TryGetable,
+    QuerySelect, TransactionTrait,
 };
 use uuid::Uuid;
 

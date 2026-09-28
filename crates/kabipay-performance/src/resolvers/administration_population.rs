@@ -7,7 +7,7 @@ use kabipay_common::{
 use kabipay_common::subgraph::tenant_db;
 #[cfg(test)]
 use super::concurrency_tests::tenant_db;
-use sea_orm::{ConnectionTrait, DatabaseBackend, Statement, TryGetable};
+use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
 use uuid::Uuid;
 
 use super::{

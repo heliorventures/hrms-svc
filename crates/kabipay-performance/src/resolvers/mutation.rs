@@ -16,7 +16,7 @@ use rust_decimal::Decimal;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseBackend, EntityTrait,
     IntoActiveModel, PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Set,
-    Statement, TransactionTrait, ModelTrait, DatabaseTransaction, TryGetable,
+    Statement, TransactionTrait, ModelTrait, DatabaseTransaction,
 };
 use sea_orm::prelude::Expr;
 use std::collections::{HashMap, HashSet};

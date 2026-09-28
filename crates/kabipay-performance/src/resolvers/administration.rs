@@ -5,7 +5,7 @@ use kabipay_common::subgraph::tenant_db;
 #[cfg(test)]
 use super::concurrency_tests::tenant_db;
 use kabipay_db_entities::tenant::{d0018_performance::{goal, kpi}, d0075_performance_appraisal_lifecycle::{continuous_feedback, performance_participant, performance_program}};
-use sea_orm::{ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait, DatabaseBackend, EntityTrait, IntoActiveModel, QueryFilter, QueryOrder, QuerySelect, Set, Statement, TransactionTrait, TryGetable};
+use sea_orm::{ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait, DatabaseBackend, EntityTrait, IntoActiveModel, QueryFilter, QueryOrder, QuerySelect, Set, Statement, TransactionTrait};
 use uuid::Uuid;
 
 use super::mutation::{goal_actor_can_manage, locked_goal_context, optional_text, parse_decimal, parse_id, require_manage, validate_text};

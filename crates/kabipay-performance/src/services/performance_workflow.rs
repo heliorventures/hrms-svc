@@ -11,7 +11,7 @@ use kabipay_db_entities::tenant::{
 use rust_decimal::Decimal;
 use sea_orm::{
     ColumnTrait, ConnectionTrait, DatabaseBackend, DatabaseConnection, EntityTrait,
-    FromQueryResult, QueryFilter, QueryOrder, Statement, TransactionTrait, TryGetable,
+    FromQueryResult, QueryFilter, QueryOrder, Statement, TransactionTrait,
 };
 use uuid::Uuid;
 

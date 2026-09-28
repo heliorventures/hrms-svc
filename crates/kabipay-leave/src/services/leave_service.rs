@@ -581,6 +581,7 @@ fn pending_request_for_decision_candidate_query(
     query
 }
 
+#[cfg(test)]
 fn pending_request_for_employee_query(
     tenant_id: Uuid,
     request_id: Uuid,

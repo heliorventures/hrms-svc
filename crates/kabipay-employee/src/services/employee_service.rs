@@ -773,24 +773,13 @@ pub async fn map_full_names(
         .collect())
 }
 
+#[cfg(test)]
 fn employee_ids_from_scope_filter(filter: EmployeeScopeFilter) -> Option<Vec<Uuid>> {
     match filter {
         EmployeeScopeFilter::Unrestricted => None,
         EmployeeScopeFilter::Empty => Some(Vec::new()),
         EmployeeScopeFilter::EmployeeIds(ids) => Some(ids),
     }
-}
-
-/// Resolve all employee IDs visible to a caller for cross-record approval queues.
-/// `None` means unrestricted tenant scope; `Some([])` means no visible employees.
-pub async fn employee_ids_in_scope(
-    db: &DatabaseConnection,
-    tenant_id: Uuid,
-    scope: ScopeType,
-    viewer: Option<ClientViewerEmployee>,
-) -> KabiPayResult<Option<Vec<Uuid>>> {
-    let filter = resolve_employee_scope_filter(db, tenant_id, scope, viewer).await?;
-    Ok(employee_ids_from_scope_filter(filter))
 }
 
 /// List the first `limit` non-deleted employees, filtered by the caller’s data scope

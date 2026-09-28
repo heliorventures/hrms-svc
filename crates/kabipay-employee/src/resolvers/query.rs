@@ -41,6 +41,7 @@ use sea_orm::{
 };
 
 use crate::entities::d0007_employee_core::employee;
+#[cfg(test)]
 use crate::entities::d0008_document_system::employee_document;
 use crate::entities::d0029_file_storage::file_storage;
 use crate::resolvers::scope::{

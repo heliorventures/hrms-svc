@@ -3,7 +3,7 @@
 
 use chrono::{DateTime, NaiveDate, Utc};
 use kabipay_common::{KabiPayError, KabiPayResult};
-use sea_orm::{ConnectionTrait, DatabaseBackend, DatabaseTransaction, Statement, TryGetable};
+use sea_orm::{ConnectionTrait, DatabaseBackend, DatabaseTransaction, Statement};
 use uuid::Uuid;
 
 use crate::services::performance_lifecycle;

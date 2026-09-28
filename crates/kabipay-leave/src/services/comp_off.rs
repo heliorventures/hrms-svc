@@ -118,6 +118,7 @@ pub fn validate_earning_limits(units: Decimal, month: Decimal, year: Decimal, un
 }
 
 pub fn approved_cancellation_allowed(configured: bool, first_leave_date: NaiveDate, today: NaiveDate) -> bool { configured && first_leave_date > today }
+#[cfg(test)]
 pub fn unused_units(earned: Decimal, _reserved: Decimal, used: Decimal) -> Decimal { earned - used }
 pub fn unused_with_future_approved(earned: Decimal, used: Decimal, future_used: Decimal) -> Decimal { earned - used + future_used }
 pub fn same_earning_month(approval_date: NaiveDate, today: NaiveDate) -> bool { approval_date.year() == today.year() && approval_date.month() == today.month() }

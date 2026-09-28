@@ -6,7 +6,7 @@
 
 use chrono::{Days, NaiveDate, Utc};
 use kabipay_common::{KabiPayError, KabiPayResult};
-use sea_orm::{ConnectionTrait, DatabaseBackend, DatabaseTransaction, Statement, TryGetable};
+use sea_orm::{ConnectionTrait, DatabaseBackend, DatabaseTransaction, Statement};
 use uuid::Uuid;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

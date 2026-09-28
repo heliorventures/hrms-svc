@@ -14,7 +14,6 @@ use kabipay_db_entities::tenant::{
 };
 use sea_orm::{
     ColumnTrait, ConnectionTrait, DatabaseBackend, EntityTrait, QueryFilter, Statement,
-    TryGetable,
 };
 use serde_json::Value;
 use uuid::Uuid;
