@@ -8,6 +8,7 @@ pub mod document_service;
 pub mod directory_service;
 pub mod employee_service;
 pub mod employment_history_service;
+pub mod guidance_service;
 /// Pluggable file backends: `LOCAL` disk, S3/R2/MinIO (`s3_compat`), future Azure
 pub mod object_store;
 pub mod offboarding_fnf_service;

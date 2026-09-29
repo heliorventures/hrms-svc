@@ -19,8 +19,7 @@ use crate::resolvers::types::{
     EmployeeAadhaarRecordDto,
     EmployeeBankAccountDto, EmployeeDocumentDto, EmployeeDto, EmployeePanRecordDto,
     EmployeeEducationDto, EmployeeProfileChangeRequestDto, EmployeeWorkExperienceDto,
-    EmploymentHistoryRecordDto, FnfSettlementDto,
-    OnboardingChecklistItemDto,
+    EmploymentHistoryRecordDto, FnfSettlementDto, MyGuidanceStateDto, OnboardingChecklistItemDto,
     PermissionScopeAssignmentInput, ProvisionEmployeeLoginInput, ResetEmployeePasswordInput,
     SeparationDto, SetEmployeeCompensationInput, SubmitEmployeeProfileChangeInput,
     SubmitSeparationInput, UpdateEmployeeInput, UpdateEmployeePersonalProfileInput,
@@ -249,6 +248,22 @@ pub struct MutationRoot;
 
 #[Object]
 impl MutationRoot {
+    /// Idempotently dismiss the overview for the authenticated user.
+    async fn dismiss_my_application_overview(
+        &self,
+        ctx: &Context<'_>,
+    ) -> Result<MyGuidanceStateDto> {
+        let (tenant_id, user_id) = super::query::authenticated_guidance_identity(ctx)?;
+        let db = tenant_db(ctx, tenant_id).await?;
+        let overview_dismissed_at =
+            crate::services::guidance_service::dismiss_overview(&db, tenant_id, user_id)
+                .await
+                .map_err(KabiPayError::into_graphql)?;
+        Ok(MyGuidanceStateDto {
+            overview_dismissed_at: Some(overview_dismissed_at),
+        })
+    }
+
     async fn save_prejoining_config(&self, ctx: &Context<'_>, config: async_graphql::Json<serde_json::Value>) -> Result<async_graphql::Json<serde_json::Value>> { super::prejoining::save_config(ctx, config).await }
     async fn invite_prejoining(&self, ctx: &Context<'_>, email: String, send_email: bool) -> Result<super::prejoining::PrejoiningInvitation> { super::prejoining::invite(ctx, email, send_email).await }
     async fn reissue_prejoining(&self, ctx: &Context<'_>, id: ID, revision: i32, send_email: bool) -> Result<super::prejoining::PrejoiningInvitation> { super::prejoining::reissue(ctx, id, revision, send_email).await }

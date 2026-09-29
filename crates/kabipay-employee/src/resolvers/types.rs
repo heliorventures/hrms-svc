@@ -1244,6 +1244,13 @@ pub struct TenantPermissionScopeDto {
     pub scope_type: String,
 }
 
+/// Dismissal state for the authenticated user's application overview.
+#[derive(SimpleObject, Clone, Debug)]
+#[graphql(name = "MyGuidanceState")]
+pub struct MyGuidanceStateDto {
+    pub overview_dismissed_at: Option<DateTime<Utc>>,
+}
+
 impl From<permission_scope::Model> for TenantPermissionScopeDto {
     fn from(m: permission_scope::Model) -> Self {
         Self {

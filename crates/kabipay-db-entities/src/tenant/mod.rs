@@ -49,3 +49,4 @@ pub mod d0079_announcement_video;
 pub mod d0080_prejoining;
 pub mod d0084_survey_targeting_corrections;
 pub mod d0087_attendance_day_boundary;
+pub mod d0089_user_guidance_state;

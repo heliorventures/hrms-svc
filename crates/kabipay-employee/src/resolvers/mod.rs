@@ -9,6 +9,8 @@ pub mod scope;
 pub mod types;
 pub mod prejoining;
 pub mod prejoining_options;
+#[cfg(test)]
+mod guidance_tests;
 
 pub use mutation::MutationRoot;
 pub use query::QueryRoot;

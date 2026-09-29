@@ -31,7 +31,8 @@ use crate::resolvers::types::{
     EmployeePanRecordDto, EmployeeProfileAccessDto, EmployeeProfileChangeRequestDto,
     EmployeeProfileChangeReviewDetailDto, EmployeeProfileReviewQueueItemDto,
     EmployeeWorkExperienceDto, EmploymentHistoryRecordDto, FnfSettlementDto,
-    OnboardingChecklistItemDto, OrgChartRowDto, SeparationDto, TenantCatalogPermissionDto,
+    MyGuidanceStateDto, OnboardingChecklistItemDto, OrgChartRowDto, SeparationDto,
+    TenantCatalogPermissionDto,
     TenantDirectoryRoleDto, TenantDirectoryUserDto, TenantFileAttachmentDto,
     TenantPermissionScopeDto,
 };
@@ -53,11 +54,31 @@ use crate::resolvers::scope::{
 use crate::services::{company_document_service, document_file_service};
 use crate::services::{
     directory_service, document_service, employee_service, employment_history_service,
-    offboarding_fnf_service, onboarding_service, org_service, profile_change_service,
+    guidance_service, offboarding_fnf_service, onboarding_service, org_service,
+    profile_change_service,
     profile_extras_service, profile_record_service, rbac_admin_service, separation_service,
 };
 
 pub struct QueryRoot;
+
+pub(super) fn authenticated_guidance_identity(ctx: &Context<'_>) -> Result<(Uuid, Uuid)> {
+    let claims = require_client_claims(ctx)?;
+    let tenant_id = require_tenant_id(ctx)?;
+    Ok((tenant_id, claims.sub))
+}
+
+pub(super) async fn load_guidance_state(
+    db: &DatabaseConnection,
+    tenant_id: Uuid,
+    user_id: Uuid,
+) -> Result<MyGuidanceStateDto> {
+    let overview_dismissed_at = guidance_service::load_state(db, tenant_id, user_id)
+        .await
+        .map_err(KabiPayError::into_graphql)?;
+    Ok(MyGuidanceStateDto {
+        overview_dismissed_at,
+    })
+}
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 enum EmployeeTargetAccess {
@@ -464,6 +485,14 @@ impl QueryRoot {
     async fn prejoining_candidate(&self, ctx: &Context<'_>, id: ID) -> Result<Option<super::prejoining::PrejoiningCandidate>> { super::prejoining::detail(ctx, id).await }
     async fn prejoining_document(&self, ctx: &Context<'_>, candidate_id: ID, document_id: ID) -> Result<super::prejoining::PrejoiningDocumentContent> { super::prejoining::download(ctx, candidate_id, document_id).await }
     async fn prejoining_candidates_csv(&self, ctx: &Context<'_>, status: Option<String>) -> Result<String> { super::prejoining::csv(ctx, status).await }
+
+    /// Dismissal state for the authenticated user's application overview.
+    async fn my_guidance_state(&self, ctx: &Context<'_>) -> Result<MyGuidanceStateDto> {
+        let (tenant_id, user_id) = authenticated_guidance_identity(ctx)?;
+        let db = tenant_db(ctx, tenant_id).await?;
+        load_guidance_state(&db, tenant_id, user_id).await
+    }
+
     /// Liveness probe for this federated subgraph. Always returns `ok`.
     async fn employee_health(&self) -> &'static str {
         "ok"
