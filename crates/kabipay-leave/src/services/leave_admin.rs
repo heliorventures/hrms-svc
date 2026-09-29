@@ -1,8 +1,6 @@
 //! Tenant admin configuration: leave types and policies.
 
-use chrono::{Datelike, NaiveDate};
-#[cfg(test)]
-use chrono::Utc;
+use chrono::{Datelike, NaiveDate, Utc};
 use kabipay_common::{KabiPayError, KabiPayResult};
 use kabipay_db_entities::tenant::d0011_leave::{leave_policy, leave_type};
 use rust_decimal::Decimal;
