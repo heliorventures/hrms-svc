@@ -65,9 +65,8 @@ where
     ResolveJwtEmployee: FnOnce() -> ResolveJwtEmployeeFuture,
     ResolveJwtEmployeeFuture: std::future::Future<Output = Result<Uuid>>,
     ResolveViewer: FnOnce() -> ResolveViewerFuture,
-    ResolveViewerFuture: std::future::Future<
-        Output = Result<Option<kabipay_common::context::ClientViewerEmployee>>,
-    >,
+    ResolveViewerFuture:
+        std::future::Future<Output = Result<Option<kabipay_common::context::ClientViewerEmployee>>>,
     ResolveScope: FnOnce(
         ScopeType,
         Option<kabipay_common::context::ClientViewerEmployee>,
@@ -94,6 +93,74 @@ pub struct QueryRoot;
 
 #[Object]
 impl QueryRoot {
+    async fn employee_tax_projection(
+        &self,
+        ctx: &Context<'_>,
+        employee_id: Option<ID>,
+        fiscal_year: i32,
+        month: u32,
+    ) -> Result<async_graphql::Json<crate::domain::TaxProjection>> {
+        tax_read_scope(ctx)?;
+        let tenant = require_tenant_id(ctx)?;
+        let db = tenant_db(ctx, tenant).await?;
+        let employee = super::settings::target(ctx, &db, tenant, employee_id).await?;
+        let input = crate::services::tax_projection::load_projection_input(
+            &db,
+            tenant,
+            employee,
+            fiscal_year,
+            month,
+        )
+        .await
+        .map_err(KabiPayError::into_graphql)?;
+        crate::domain::calculate_projection(&input)
+            .map(async_graphql::Json)
+            .map_err(KabiPayError::into_graphql)
+    }
+    async fn employee_tax_settings(
+        &self,
+        ctx: &Context<'_>,
+        employee_id: Option<ID>,
+    ) -> Result<async_graphql::Json<Vec<crate::domain::TaxSettings>>> {
+        tax_read_scope(ctx)?;
+        let tenant = require_tenant_id(ctx)?;
+        let db = tenant_db(ctx, tenant).await?;
+        let employee = super::settings::target(ctx, &db, tenant, employee_id).await?;
+        crate::services::tax_settings::list_tax_settings(&db, tenant, employee)
+            .await
+            .map(async_graphql::Json)
+            .map_err(KabiPayError::into_graphql)
+    }
+    async fn employee_tax_history(
+        &self,
+        ctx: &Context<'_>,
+        employee_id: Option<ID>,
+        fiscal_year: i32,
+    ) -> Result<async_graphql::Json<Vec<crate::services::tax_history::HistoryVersion>>> {
+        tax_read_scope(ctx)?;
+        let tenant = require_tenant_id(ctx)?;
+        let db = tenant_db(ctx, tenant).await?;
+        let employee = super::settings::target(ctx, &db, tenant, employee_id).await?;
+        crate::services::tax_history::list_tax_history(&db, tenant, employee, fiscal_year)
+            .await
+            .map(async_graphql::Json)
+            .map_err(KabiPayError::into_graphql)
+    }
+    async fn employee_tax_declaration(
+        &self,
+        ctx: &Context<'_>,
+        employee_id: Option<ID>,
+        fiscal_year: i32,
+    ) -> Result<Option<async_graphql::Json<serde_json::Value>>> {
+        tax_read_scope(ctx)?;
+        let tenant = require_tenant_id(ctx)?;
+        let db = tenant_db(ctx, tenant).await?;
+        let employee = super::settings::target(ctx, &db, tenant, employee_id).await?;
+        crate::services::tax_declarations::load_declaration(&db, tenant, employee, fiscal_year)
+            .await
+            .map(|v| v.map(async_graphql::Json))
+            .map_err(KabiPayError::into_graphql)
+    }
     async fn tax_health(&self) -> &'static str {
         "ok"
     }
@@ -311,7 +378,11 @@ mod tests {
         response: &async_graphql::Response,
         expected_message: &str,
     ) {
-        assert_eq!(response.errors.len(), 1, "unexpected response: {response:?}");
+        assert_eq!(
+            response.errors.len(),
+            1,
+            "unexpected response: {response:?}"
+        );
         let message = &response.errors[0].message;
         assert!(
             message.contains(expected_message),
@@ -405,9 +476,12 @@ mod tests {
             scope: ScopeType,
             viewer: Option<kabipay_common::context::ClientViewerEmployee>,
         ) -> Result<EmployeeScopeFilter> {
-            self.operations.borrow_mut().push(
-                TargetBoundaryOperation::ResolveScope(scope, viewer.map(|v| v.employee_id)),
-            );
+            self.operations
+                .borrow_mut()
+                .push(TargetBoundaryOperation::ResolveScope(
+                    scope,
+                    viewer.map(|v| v.employee_id),
+                ));
             resolve_employee_scope_filter_with_connection(
                 &self.scope_db,
                 self.tenant_id,
@@ -499,8 +573,7 @@ mod tests {
     #[tokio::test]
     async fn tax_boundary_omitted_target_uses_jwt_employee_then_loads() {
         let jwt_employee_id = Uuid::new_v4();
-        let fixture =
-            TargetBoundaryFixture::new(Some(jwt_employee_id), None, Vec::new()).await;
+        let fixture = TargetBoundaryFixture::new(Some(jwt_employee_id), None, Vec::new()).await;
 
         assert_eq!(
             fixture
@@ -530,7 +603,9 @@ mod tests {
                 .await
                 .expect_err("viewer-bound scope must deny without a viewer");
 
-            assert!(error.message.contains("scope does not include target employee"));
+            assert!(error
+                .message
+                .contains("scope does not include target employee"));
             assert_eq!(
                 fixture.operations(),
                 vec![
@@ -580,7 +655,11 @@ mod tests {
         assert!(statement.sql.contains("root.tenant_id = $1"));
         assert!(statement.sql.contains("child.tenant_id = $1"));
         assert_eq!(
-            statement.values.as_ref().expect("bound TEAM query values").0,
+            statement
+                .values
+                .as_ref()
+                .expect("bound TEAM query values")
+                .0,
             vec![
                 tenant_id.into(),
                 manager_id.into(),
@@ -728,6 +807,10 @@ mod tests {
             "{ taxSlabs { __typename } }".to_string(),
             format!("{{ taxComputations(employeeId: \"{employee_id}\") {{ __typename }} }}"),
             format!("{{ taxProofLines(employeeId: \"{employee_id}\") {{ __typename }} }}"),
+            format!("{{ employeeTaxSettings(employeeId: \"{employee_id}\") }}"),
+            format!("{{ employeeTaxHistory(employeeId: \"{employee_id}\", fiscalYear: 2026) }}"),
+            format!("{{ employeeTaxDeclaration(employeeId: \"{employee_id}\", fiscalYear: 2026) }}"),
+            format!("{{ employeeTaxProjection(employeeId: \"{employee_id}\", fiscalYear: 2026, month: 10) }}"),
         ];
 
         for query in fields {
@@ -746,9 +829,7 @@ mod tests {
                 let response = execute_query(claims(PERM_TAX_READ, scope), &query).await;
                 assert_permission_denied_before_db(
                     &response,
-                    &format!(
-                        "{PERM_TAX_READ} permission requires an explicit valid scope"
-                    ),
+                    &format!("{PERM_TAX_READ} permission requires an explicit valid scope"),
                 );
             }
         }

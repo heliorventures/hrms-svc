@@ -12,15 +12,15 @@ use rust_decimal::Decimal;
 use std::str::FromStr;
 use uuid::Uuid;
 
+use crate::resolvers::query::parse_uuid;
 use crate::resolvers::types::{
-    AssignEmployeeSalaryStructureInput, EmployeeSalaryStructureDto,
-    CreatePayrollArrearInput, CreatePayrollCycleInput, PayrollArrearDto, PayrollComplianceSettingDto,
-    PayrollCycleDto, SalaryComponentDto, SalaryStructureComponentDto, SalaryStructureDto,
+    AssignEmployeeSalaryStructureInput, CreatePayrollArrearInput, CreatePayrollCycleInput,
+    EmployeeSalaryStructureDto, PayrollArrearDto, PayrollComplianceSettingDto, PayrollCycleDto,
+    SalaryComponentDto, SalaryStructureComponentDto, SalaryStructureDto,
     UpsertPayrollComplianceSettingInput, UpsertSalaryComponentInput, UpsertSalaryStructureInput,
 };
 use crate::services::arrear_service;
 use crate::services::payroll_service;
-use crate::resolvers::query::parse_uuid;
 
 fn payroll_manage_all_from_claims(claims: Option<&ClientClaims>) -> KabiPayResult<()> {
     let scope = data_scope_from_claims(claims, PERM_PAYROLL_MANAGE)?;
@@ -45,37 +45,193 @@ pub struct MutationRoot;
 
 #[Object]
 impl MutationRoot {
-    async fn save_payroll_period_input(&self,ctx:&Context<'_>,employee_id:ID,input:async_graphql::Json<serde_json::Value>,expected_revision:Option<i32>)->Result<async_graphql::Json<serde_json::Value>> {
-        use sea_orm::TransactionTrait;
-        let actor=require_payroll_manage_all(ctx)?;let tenant=require_tenant_id(ctx)?;let db=tenant_db(ctx,tenant).await?;
-        let employee=parse_uuid(&employee_id,"employeeId")?;
-        let input:crate::services::payroll_rules::PeriodInput=serde_json::from_value(input.0).map_err(|_|KabiPayError::Validation("invalid payroll period input".into()).into_graphql())?;
-        let transaction=db.begin().await.map_err(KabiPayError::from).map_err(KabiPayError::into_graphql)?;
-        let saved=crate::services::payroll_period_input::save(&transaction,tenant,actor,employee,input,None,expected_revision).await.map_err(KabiPayError::into_graphql)?;
-        let stored:crate::services::payroll_rules::PeriodInput=serde_json::from_value(saved.input.clone()).map_err(|_|KabiPayError::Validation("stored payroll input is invalid".into()).into_graphql())?;
-        let financial_error=crate::services::payroll_rules::calculate_period(&stored).err();
-        let validation_error=if let Some(error)=financial_error {Some(error.to_string())} else {
-            crate::services::imported_lwp::validate(&transaction,tenant,employee,&stored,false).await.err().map(|error|error.to_string())
-        };
-        transaction.commit().await.map_err(KabiPayError::from).map_err(KabiPayError::into_graphql)?;
-        Ok(async_graphql::Json(serde_json::json!({"id":saved.id,"input":saved.input,"revision":saved.revision,"ready":saved.ready,"validationError":validation_error})))
-    }
-    async fn set_salary_component_payslip_visibility(&self,ctx: &Context<'_>,component_id: ID,visible: bool) -> Result<bool> {
-        require_payroll_manage_all(ctx)?;
-        let tenant=require_tenant_id(ctx)?;
-        let db=tenant_db(ctx,tenant).await?;
-        crate::services::component_display::save(&db,tenant,parse_uuid(&component_id,"componentId")?,visible)
-            .await.map_err(KabiPayError::into_graphql)?;
-        Ok(true)
-    }
-    async fn save_payroll_unpaid_leave_policy(&self, ctx: &Context<'_>, input: super::types::SavePayrollUnpaidLeavePolicyInput) -> Result<super::types::PayrollUnpaidLeavePolicy> {
+    async fn calculate_payroll_cycle(
+        &self,
+        ctx: &Context<'_>,
+        cycle_id: ID,
+        expected_revision: Option<i32>,
+    ) -> Result<async_graphql::Json<crate::services::payroll_draft::PayrollDraft>> {
         let actor = require_payroll_manage_all(ctx)?;
         let tenant = require_tenant_id(ctx)?;
-        let divisor = input.day_divisor.as_deref().map(|v| Decimal::from_str(v.trim())
-            .map_err(|_| KabiPayError::Validation("day divisor must be a decimal number".into()).into_graphql())).transpose()?;
         let db = tenant_db(ctx, tenant).await?;
-        Ok(crate::services::unpaid_leave_policy::save(&db, tenant, actor, input.enabled, input.basic_component_code, divisor, input.treatment)
-            .await.map_err(KabiPayError::into_graphql)?.into())
+        crate::services::payroll_draft::calculate_payroll_cycle(
+            &db,
+            tenant,
+            actor,
+            parse_uuid(&cycle_id, "cycleId")?,
+            expected_revision,
+        )
+        .await
+        .map(async_graphql::Json)
+        .map_err(KabiPayError::into_graphql)
+    }
+    async fn finalize_payroll_cycle(
+        &self,
+        ctx: &Context<'_>,
+        cycle_id: ID,
+        draft_revision: i32,
+        fingerprint: String,
+        acknowledgement: async_graphql::Json<
+            crate::services::payroll_draft::FinalizeAcknowledgement,
+        >,
+    ) -> Result<async_graphql::Json<crate::services::payroll_finalize::PayrollFinalization>> {
+        let actor = require_payroll_manage_all(ctx)?;
+        let tenant = require_tenant_id(ctx)?;
+        let db = tenant_db(ctx, tenant).await?;
+        crate::services::payroll_finalize::finalize_payroll_cycle(
+            &db,
+            tenant,
+            actor,
+            parse_uuid(&cycle_id, "cycleId")?,
+            draft_revision,
+            &fingerprint,
+            acknowledgement.0,
+        )
+        .await
+        .map(async_graphql::Json)
+        .map_err(KabiPayError::into_graphql)
+    }
+    async fn save_company_payroll_policy(
+        &self,
+        ctx: &Context<'_>,
+        input: async_graphql::Json<crate::services::contribution_rules::ContributionPolicy>,
+        expected_revision: Option<i32>,
+    ) -> Result<async_graphql::Json<crate::services::contribution_policy_store::PolicyVersion>>
+    {
+        use sea_orm::TransactionTrait;
+        let actor = require_payroll_manage_all(ctx)?;
+        let tenant = require_tenant_id(ctx)?;
+        let db = tenant_db(ctx, tenant).await?;
+        let txn = db
+            .begin()
+            .await
+            .map_err(KabiPayError::from)
+            .map_err(KabiPayError::into_graphql)?;
+        let result = crate::services::contribution_policy_store::save(
+            &txn,
+            tenant,
+            actor,
+            input.0,
+            expected_revision,
+        )
+        .await
+        .map_err(KabiPayError::into_graphql)?;
+        txn.commit()
+            .await
+            .map_err(KabiPayError::from)
+            .map_err(KabiPayError::into_graphql)?;
+        Ok(async_graphql::Json(result))
+    }
+    async fn save_payroll_period_input(
+        &self,
+        ctx: &Context<'_>,
+        employee_id: ID,
+        input: async_graphql::Json<serde_json::Value>,
+        expected_revision: Option<i32>,
+    ) -> Result<async_graphql::Json<serde_json::Value>> {
+        use sea_orm::TransactionTrait;
+        let actor = require_payroll_manage_all(ctx)?;
+        let tenant = require_tenant_id(ctx)?;
+        let db = tenant_db(ctx, tenant).await?;
+        let employee = parse_uuid(&employee_id, "employeeId")?;
+        let input: crate::services::payroll_rules::PeriodInput = serde_json::from_value(input.0)
+            .map_err(|_| {
+                KabiPayError::Validation("invalid payroll period input".into()).into_graphql()
+            })?;
+        let transaction = db
+            .begin()
+            .await
+            .map_err(KabiPayError::from)
+            .map_err(KabiPayError::into_graphql)?;
+        let saved = crate::services::payroll_period_input::save(
+            &transaction,
+            tenant,
+            actor,
+            employee,
+            input,
+            None,
+            expected_revision,
+        )
+        .await
+        .map_err(KabiPayError::into_graphql)?;
+        let stored: crate::services::payroll_rules::PeriodInput =
+            serde_json::from_value(saved.input.clone()).map_err(|_| {
+                KabiPayError::Validation("stored payroll input is invalid".into()).into_graphql()
+            })?;
+        let prepared =
+            crate::services::prepare_payroll::prepare(&transaction, tenant, employee, &stored)
+                .await;
+        let validation_error = match &prepared {
+            Err(error) => Some(error.to_string()),
+            Ok(value) => crate::services::imported_lwp::validate(
+                &transaction,
+                tenant,
+                employee,
+                &value.input,
+                false,
+            )
+            .await
+            .err()
+            .map(|error| error.to_string()),
+        };
+        transaction
+            .commit()
+            .await
+            .map_err(KabiPayError::from)
+            .map_err(KabiPayError::into_graphql)?;
+        Ok(async_graphql::Json(
+            serde_json::json!({"id":saved.id,"input":saved.input,"revision":saved.revision,"ready":saved.ready,"validationError":validation_error,"calculation":prepared.ok()}),
+        ))
+    }
+    async fn set_salary_component_payslip_visibility(
+        &self,
+        ctx: &Context<'_>,
+        component_id: ID,
+        visible: bool,
+    ) -> Result<bool> {
+        require_payroll_manage_all(ctx)?;
+        let tenant = require_tenant_id(ctx)?;
+        let db = tenant_db(ctx, tenant).await?;
+        crate::services::component_display::save(
+            &db,
+            tenant,
+            parse_uuid(&component_id, "componentId")?,
+            visible,
+        )
+        .await
+        .map_err(KabiPayError::into_graphql)?;
+        Ok(true)
+    }
+    async fn save_payroll_unpaid_leave_policy(
+        &self,
+        ctx: &Context<'_>,
+        input: super::types::SavePayrollUnpaidLeavePolicyInput,
+    ) -> Result<super::types::PayrollUnpaidLeavePolicy> {
+        let actor = require_payroll_manage_all(ctx)?;
+        let tenant = require_tenant_id(ctx)?;
+        let divisor = input
+            .day_divisor
+            .as_deref()
+            .map(|v| {
+                Decimal::from_str(v.trim()).map_err(|_| {
+                    KabiPayError::Validation("day divisor must be a decimal number".into())
+                        .into_graphql()
+                })
+            })
+            .transpose()?;
+        let db = tenant_db(ctx, tenant).await?;
+        Ok(crate::services::unpaid_leave_policy::save(
+            &db,
+            tenant,
+            actor,
+            input.enabled,
+            input.basic_component_code,
+            divisor,
+            input.treatment,
+        )
+        .await
+        .map_err(KabiPayError::into_graphql)?
+        .into())
     }
     /// Record a **PENDING** arrear for an employee; amount is added on the next pay run (with an `ARREAR` line).
     async fn create_payroll_arrear(
@@ -122,12 +278,21 @@ impl MutationRoot {
         )
         .await
         .map_err(KabiPayError::into_graphql)?;
-        if id.is_none() && m.r#type=="EMPLOYER_CONTRIBUTION" {
-            crate::services::component_display::save(&db,tenant_id,m.id,false).await.map_err(KabiPayError::into_graphql)?;
+        if id.is_none() && m.r#type == "EMPLOYER_CONTRIBUTION" {
+            crate::services::component_display::save(&db, tenant_id, m.id, false)
+                .await
+                .map_err(KabiPayError::into_graphql)?;
         }
-        let visibility=crate::services::component_display::catalog(&db,tenant_id).await.map_err(KabiPayError::into_graphql)?;
-        let visible=visibility.get(&m.id).copied().unwrap_or(m.r#type!="EMPLOYER_CONTRIBUTION");
-        let mut dto=SalaryComponentDto::from(m);dto.show_on_payslip=visible;Ok(dto)
+        let visibility = crate::services::component_display::catalog(&db, tenant_id)
+            .await
+            .map_err(KabiPayError::into_graphql)?;
+        let visible = visibility
+            .get(&m.id)
+            .copied()
+            .unwrap_or(m.r#type != "EMPLOYER_CONTRIBUTION");
+        let mut dto = SalaryComponentDto::from(m);
+        dto.show_on_payslip = visible;
+        Ok(dto)
     }
 
     async fn upsert_salary_structure(
@@ -148,8 +313,11 @@ impl MutationRoot {
             components.push((
                 parse_uuid(&component.salary_component_id, "salaryComponentId")?,
                 component.calculation_basis,
-                payroll_service::parse_money_decimal(&component.calculation_value, "calculationValue")
-                    .map_err(KabiPayError::into_graphql)?,
+                payroll_service::parse_money_decimal(
+                    &component.calculation_value,
+                    "calculationValue",
+                )
+                .map_err(KabiPayError::into_graphql)?,
                 component.display_order,
             ));
         }
@@ -189,8 +357,11 @@ impl MutationRoot {
             overrides.push((
                 parse_uuid(&override_input.salary_component_id, "salaryComponentId")?,
                 override_input.calculation_basis,
-                payroll_service::parse_money_decimal(&override_input.calculation_value, "calculationValue")
-                    .map_err(KabiPayError::into_graphql)?,
+                payroll_service::parse_money_decimal(
+                    &override_input.calculation_value,
+                    "calculationValue",
+                )
+                .map_err(KabiPayError::into_graphql)?,
                 override_input.notes,
                 override_input.is_active,
             ));
@@ -275,14 +446,9 @@ impl MutationRoot {
         let tenant_id = require_tenant_id(ctx)?;
         let db = tenant_db(ctx, tenant_id).await?;
         let cid = parse_uuid(&payroll_cycle_id, "payrollCycleId")?;
-        let m = payroll_service::run_payroll_for_cycle(
-            &db,
-            tenant_id,
-            cid,
-            actor_user_id,
-        )
-        .await
-        .map_err(KabiPayError::into_graphql)?;
+        let m = payroll_service::run_payroll_for_cycle(&db, tenant_id, cid, actor_user_id)
+            .await
+            .map_err(KabiPayError::into_graphql)?;
         Ok(PayrollCycleDto::from(m))
     }
 }
@@ -290,6 +456,7 @@ impl MutationRoot {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::resolvers::query::QueryRoot;
     use async_graphql::{EmptySubscription, Request, Schema};
     use kabipay_common::context::{
         ClientClaims, CLIENT_JWT_ISSUER, PERM_COMPENSATION_MANAGE, PERM_PAYROLL_MANAGE,
@@ -297,7 +464,6 @@ mod tests {
     };
     use kabipay_common::subgraph::TenantId;
     use std::collections::HashMap;
-    use crate::resolvers::query::QueryRoot;
 
     fn claims(permission: &str, scope: Option<&str>) -> ClientClaims {
         let permission_scopes = scope
@@ -333,7 +499,11 @@ mod tests {
         response: &async_graphql::Response,
         expected_message: &str,
     ) {
-        assert_eq!(response.errors.len(), 1, "unexpected response: {response:?}");
+        assert_eq!(
+            response.errors.len(),
+            1,
+            "unexpected response: {response:?}"
+        );
         let message = &response.errors[0].message;
         assert!(
             message.contains(expected_message),
@@ -344,7 +514,11 @@ mod tests {
     }
 
     fn assert_authorization_reached_db(response: &async_graphql::Response) {
-        assert_eq!(response.errors.len(), 1, "unexpected response: {response:?}");
+        assert_eq!(
+            response.errors.len(),
+            1,
+            "unexpected response: {response:?}"
+        );
         let code = response.errors[0]
             .extensions
             .as_ref()
@@ -357,7 +531,7 @@ mod tests {
         );
     }
 
-    fn protected_mutations() -> [&'static str; 8] {
+    fn protected_mutations() -> [&'static str; 11] {
         [
             r#"mutation { savePayrollUnpaidLeavePolicy(input: { enabled: false }) { enabled } }"#,
             r#"mutation { createPayrollArrear(input: { employeeId: "00000000-0000-0000-0000-000000000001", amount: "1" }) { id } }"#,
@@ -367,16 +541,17 @@ mod tests {
             r#"mutation { createPayrollCycle(input: { name: "January", month: 1, year: 2026 }) { id } }"#,
             r#"mutation { upsertPayrollComplianceSetting(input: {}) { employerTan } }"#,
             r#"mutation { runPayrollForCycle(payrollCycleId: "00000000-0000-0000-0000-000000000003") { id } }"#,
+            r#"mutation { calculatePayrollCycle(cycleId: "00000000-0000-0000-0000-000000000003") }"#,
+            r#"mutation { finalizePayrollCycle(cycleId: "00000000-0000-0000-0000-000000000003", draftRevision: 1, fingerprint: "reviewed", acknowledgement: {provisional_tax_employees: []}) }"#,
+            r#"mutation { saveCompanyPayrollPolicy(input: {effective_from:"2026-10-01", lwp_divisor:31, origin:"HR_CONFIGURATION", reason:"Reviewed rules", pf_employee:{weights:{BASIC:"1"},rate:"0.12",rounding:"HALF_UP_2DP"},pf_employer:{weights:{BASIC:"1"},rate:"0.12",rounding:"HALF_UP_2DP"},esi_basis:{weights:{BASIC:"1"},rate:"0.0075",rounding:"CEIL_RUPEE"},esi_employer_rate:"0.0325",company_esi_covered:false,esi_mode:"CUSTOM_COMPONENTS",classifications:{},professional_tax:"200"}) }"#,
         ]
     }
 
     #[test]
     fn payroll_manage_requires_exact_all_scope() {
-        assert!(payroll_manage_all_from_claims(Some(&claims(
-            PERM_PAYROLL_MANAGE,
-            Some("ALL")
-        )))
-        .is_ok());
+        assert!(
+            payroll_manage_all_from_claims(Some(&claims(PERM_PAYROLL_MANAGE, Some("ALL")))).is_ok()
+        );
 
         for denied in [
             claims(PERM_PAYROLL_MANAGE, None),

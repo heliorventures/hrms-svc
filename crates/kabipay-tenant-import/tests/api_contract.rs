@@ -12,8 +12,54 @@ fn variables() -> Variables {
     Variables::from_json(
         serde_json::json!({"employeeId":"10000000-0000-0000-0000-000000000003",
         "componentId":"10000000-0000-0000-0000-000000000004","payslipId":"10000000-0000-0000-0000-000000000005",
-        "year":2026,"month":9,"asOf":null,"visible":false,"expectedRevision":null,"input":{}}),
+        "year":2026,"fiscalYear":2026,"month":9,"asOf":null,"visible":false,"expectedRevision":null,"input":{},
+        "cycleId":"10000000-0000-0000-0000-000000000006","draftRevision":1,"fingerprint":"reviewed","acknowledgement":{"provisional_tax_employees":[]}}),
     )
+}
+
+#[tokio::test]
+async fn projection_and_draft_ui_documents_match_the_actual_schemas() {
+    let payroll = Schema::build(
+        kabipay_payroll::resolvers::QueryRoot,
+        kabipay_payroll::resolvers::MutationRoot,
+        EmptySubscription,
+    )
+    .finish();
+    let tax = Schema::build(
+        kabipay_tax::resolvers::QueryRoot,
+        kabipay_tax::resolvers::MutationRoot,
+        EmptySubscription,
+    )
+    .finish();
+    let sources = [
+        include_str!("../../../../hrms-ui/src/modules/payroll/taxProjectionTypes.ts"),
+        include_str!("../../../../hrms-ui/src/modules/payroll/projectionViewTypes.ts"),
+    ];
+    let mut count = 0;
+    for source in sources {
+        for document in documents(source) {
+            count += 1;
+            let request = Request::new(document).variables(variables());
+            let response = if document.contains("EmployeeTax") {
+                tax.execute(request).await
+            } else {
+                payroll.execute(request).await
+            };
+            assert!(
+                !response.errors.is_empty(),
+                "private data requires authority"
+            );
+            assert!(
+                response.errors.iter().all(|error| !error.path.is_empty()),
+                "UI document is not supported: {:?}",
+                response.errors
+            );
+        }
+    }
+    assert_eq!(
+        count, 8,
+        "all settings/history/projection/draft documents must be exercised"
+    );
 }
 
 #[tokio::test]

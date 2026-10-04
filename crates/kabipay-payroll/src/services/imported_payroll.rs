@@ -1,11 +1,11 @@
 //! Reviewed month inputs use the ordinary locked pay run, never the statutory stub.
-use super::payroll_rules::{amount, calculate_period, PeriodInput};
+use super::payroll_rules::amount;
 use chrono::{Datelike, NaiveDate, Utc};
 use kabipay_common::{KabiPayError, KabiPayResult};
 use kabipay_db_entities::tenant::{
     d0007_employee_core::employee,
     d0012_payroll::{payslip, payslip_component, salary_component},
-    d0090_payroll_period_configuration::{employee_payroll_rule, payslip_statement},
+    d0090_payroll_period_configuration::payslip_statement,
 };
 use sea_orm::{ActiveModelTrait, ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, Set};
 use uuid::Uuid;
@@ -19,13 +19,14 @@ pub fn rule_cutoff(date: NaiveDate) -> KabiPayResult<NaiveDate> {
         })
 }
 
-pub async fn run<C: ConnectionTrait + Sync>(
+pub(crate) async fn persist_reviewed<C: ConnectionTrait + Send + Sync>(
     db: &C,
     tenant: Uuid,
     cycle: Uuid,
     employee: &employee::Model,
     date: NaiveDate,
-) -> KabiPayResult<bool> {
+    prepared: super::automatic_payroll::PreparedEmployeePayroll,
+) -> KabiPayResult<()> {
     let period = super::payroll_period_input::find(
         db,
         tenant,
@@ -33,43 +34,18 @@ pub async fn run<C: ConnectionTrait + Sync>(
         date.year(),
         date.month() as i32,
     )
-    .await?;
-    let rule = employee_payroll_rule::Entity::find()
-        .filter(employee_payroll_rule::Column::TenantId.eq(tenant))
-        .filter(employee_payroll_rule::Column::EmployeeId.eq(employee.id))
-        .filter(employee_payroll_rule::Column::EffectiveFrom.lte(rule_cutoff(date)?))
-        .one(db)
-        .await?;
-    let Some(period) = period else {
-        if rule.is_some() {
-            return Err(KabiPayError::Validation(
-                "imported salary needs reviewed monthly inputs before payroll generation".into(),
-            ));
-        }
-        return Ok(false);
-    };
-    if !period.ready {
-        return Err(KabiPayError::Validation(
-            "imported payroll period has unresolved inputs or deduction reasons".into(),
-        ));
-    }
-    let input: PeriodInput = serde_json::from_value(period.input.clone())
-        .map_err(|_| KabiPayError::Validation("stored period input is invalid".into()))?;
-    let calculation = calculate_period(&input)?;
+    .await?
+    .ok_or_else(|| KabiPayError::Validation("reviewed monthly input no longer exists".into()))?;
+    let calculation = &prepared.calculation;
+    let input = prepared.input;
     if calculation.components.is_empty() {
         return Err(KabiPayError::Validation(
             "earned salary components are required for a payslip".into(),
         ));
     }
     let dated_lwp = super::imported_lwp::validate(db, tenant, employee.id, &input, true).await?;
-    if !super::arrear_service::list_pending_by_employee(db, tenant, employee.id)
-        .await?
-        .is_empty()
-    {
-        return Err(KabiPayError::Validation(
-            "pending arrears require reconciliation with the imported month".into(),
-        ));
-    }
+    super::reviewed_arrears::verify(db, tenant, employee.id, &prepared.arrears).await?;
+    super::earned_catalog::validate(db, tenant, calculation).await?;
     let now = Utc::now();
     let id = Uuid::new_v4();
     let stat = |key: &str| amount(calculation.statutory.get(key).map(String::as_str), key);
@@ -136,6 +112,17 @@ pub async fn run<C: ConnectionTrait + Sync>(
     let mut statement = serde_json::to_value(&calculation)
         .map_err(|_| KabiPayError::Internal("statement serialization failed".into()))?;
     statement["dated_lwp"] = dated_lwp;
+    statement["arrears"] = serde_json::to_value(&prepared.arrears)
+        .map_err(|_| KabiPayError::Internal("arrear statement serialization failed".into()))?;
+    statement["tax_projection"] = serde_json::to_value(&prepared.tax_projection)
+        .map_err(|_| KabiPayError::Internal("tax statement serialization failed".into()))?;
+    statement["contribution_evidence"] = serde_json::to_value(&prepared.contribution_evidence)
+        .map_err(|_| {
+            KabiPayError::Internal("contribution statement serialization failed".into())
+        })?;
+    statement["contribution_policy"] = serde_json::to_value(&prepared.contribution_policy)
+        .map_err(|_| KabiPayError::Internal("contribution policy serialization failed".into()))?;
+    statement["payroll_engine_version"] = serde_json::json!("effective-payroll-v2");
     payslip_statement::ActiveModel {
         payslip_id: Set(id),
         tenant_id: Set(tenant),
@@ -146,5 +133,12 @@ pub async fn run<C: ConnectionTrait + Sync>(
     }
     .insert(db)
     .await?;
-    Ok(true)
+    super::arrear_service::mark_applied(
+        db,
+        tenant,
+        &prepared.arrears.iter().map(|r| r.id).collect::<Vec<_>>(),
+        cycle,
+    )
+    .await?;
+    Ok(())
 }

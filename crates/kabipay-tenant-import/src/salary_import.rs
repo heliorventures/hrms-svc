@@ -40,7 +40,7 @@ pub async fn ensure_component<C: ConnectionTrait>(
         name: Set(code.replace('_', " ")),
         code: Set(code.into()),
         r#type: Set(kind.into()),
-        is_taxable: Set(false),
+        is_taxable: Set(kind == "EARNING"),
         is_fixed: Set(false),
         is_active: Set(true),
         formula_expression: Set(None),
@@ -145,6 +145,8 @@ pub async fn salary<C: ConnectionTrait>(
         ("PF_EMPLOYER", "EMPLOYER_CONTRIBUTION"),
         ("ESI_EMPLOYER", "EMPLOYER_CONTRIBUTION"),
         ("INCENTIVE", "EARNING"),
+        ("OVERTIME", "EARNING"),
+        ("ARREAR", "EARNING"),
     ] {
         ensure_component(db, tenant, code, kind).await?;
     }

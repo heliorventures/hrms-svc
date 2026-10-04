@@ -8,8 +8,7 @@ use crate::{
 use anyhow::{bail, Result};
 use kabipay_db_entities::tenant::d0092_tenant_import_tracking::tenant_import_run;
 use sea_orm::{
-    ColumnTrait, ConnectionTrait, DbBackend, EntityTrait, QueryFilter,
-    Statement, TransactionTrait,
+    ColumnTrait, ConnectionTrait, DbBackend, EntityTrait, QueryFilter, Statement, TransactionTrait,
 };
 use std::path::Path;
 use uuid::Uuid;
@@ -122,6 +121,18 @@ pub async fn apply(
             bail!("IMPORT_ACTOR_UNAUTHORIZED");
         }
     }
+    let has_tax = package
+        .employees
+        .iter()
+        .any(|row| row.tax_settings.is_some() || !row.tax_history.is_empty());
+    if (has_tax || execution.replace)
+        && permissions
+            .permission_scopes
+            .get(kabipay_common::context::PERM_TAX_MANAGE)
+            .is_none_or(|scope| scope != "ALL")
+    {
+        bail!("IMPORT_ACTOR_TAX_MANAGE_REQUIRED");
+    }
     if execution.replace {
         let manifest = current
             .reset
@@ -177,6 +188,59 @@ pub async fn apply(
             .collect(),
     };
     let mut credentials = Vec::new();
+    if let (Some(value), Some(first)) = (&package.company_payroll_policy, package.employees.first())
+    {
+        let point = transaction.begin().await?;
+        let result = async {
+            let policy: kabipay_payroll::services::contribution_rules::ContributionPolicy =
+                serde_json::from_value(value.clone())?;
+            let existing = kabipay_payroll::services::contribution_policy_store::list(
+                &point,
+                options.tenant_id,
+            )
+            .await?;
+            if existing
+                .first()
+                .is_some_and(|r| serde_json::to_value(&r.policy).ok().as_ref() != Some(value))
+            {
+                anyhow::bail!("COMPANY_PAYROLL_POLICY_EXISTING_REVIEW_REQUIRED");
+            }
+            kabipay_payroll::services::contribution_policy_store::save(
+                &point,
+                options.tenant_id,
+                options.actor_id,
+                policy,
+                existing.first().map(|r| r.revision),
+            )
+            .await?;
+            Ok::<_, anyhow::Error>(if existing.is_empty() {
+                "CREATED"
+            } else {
+                "UNCHANGED"
+            })
+        }
+        .await;
+        match result {
+            Ok(outcome) => {
+                point.commit().await?;
+                report.record(
+                    &first.source_ref,
+                    "company_payroll_policy",
+                    outcome,
+                    "COMPANY_POLICY_IMPORTED",
+                );
+            }
+            Err(_) => {
+                point.rollback().await?;
+                report.record(
+                    &first.source_ref,
+                    "company_payroll_policy",
+                    "DEFERRED",
+                    "COMPANY_POLICY_REVIEW_REQUIRED",
+                );
+            }
+        }
+    }
     for row in &package.employees {
         let blocked = package.issues.iter().any(|issue| {
             issue.severity == "BLOCK_EMPLOYEE"
@@ -195,6 +259,8 @@ pub async fn apply(
                 "recurring_salary",
                 "leave_opening",
                 "period_input",
+                "tax_settings",
+                "tax_history",
             ] {
                 report.record(
                     &row.source_ref,
@@ -227,6 +293,8 @@ pub async fn apply(
                     "recurring_salary",
                     "leave_opening",
                     "period_input",
+                    "tax_settings",
+                    "tax_history",
                 ] {
                     report.record(&row.source_ref, section, "DEFERRED", "CORE_IMPORT_FAILED");
                 }
@@ -259,6 +327,8 @@ pub async fn apply(
             "bank",
             "recurring_salary",
             "leave_opening",
+            "tax_settings",
+            "tax_history",
             "period_input",
         ] {
             let savepoint = transaction.begin().await?;

@@ -9,6 +9,8 @@ use std::collections::{BTreeMap, HashSet};
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ImportPackage {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub company_payroll_policy: Option<Value>,
     pub format: String,
     pub version: u32,
     pub source: Source,
@@ -58,6 +60,10 @@ pub struct ImportIssue {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ImportEmployee {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tax_settings: Option<Value>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tax_history: Vec<Value>,
     pub source_ref: SourceRef,
     pub source_states: BTreeMap<String, String>,
     pub employee: Employee,

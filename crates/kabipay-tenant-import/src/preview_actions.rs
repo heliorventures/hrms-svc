@@ -26,6 +26,24 @@ pub async fn actions<C: ConnectionTrait>(
 ) -> Result<Vec<PlannedAction>> {
     let readiness = crate::validation::validate(package);
     let mut result = Vec::new();
+    if let (Some(value), Some(first)) = (&package.company_payroll_policy, package.employees.first())
+    {
+        let valid = serde_json::from_value::<
+            kabipay_payroll::services::contribution_rules::ContributionPolicy,
+        >(value.clone())
+        .is_ok_and(|policy| policy.validate().is_ok());
+        result.push(PlannedAction {
+            source_ref: first.source_ref.clone(),
+            section: "company_payroll_policy".into(),
+            action: if valid { "RECONCILE" } else { "DEFERRED" }.into(),
+            code: if valid {
+                "VALIDATE_EXISTING_COMPANY_POLICY"
+            } else {
+                "COMPANY_POLICY_REVIEW_REQUIRED"
+            }
+            .into(),
+        });
+    }
     for (row, ready) in package.employees.iter().zip(readiness) {
         let mut existing = None;
         let mut ambiguous = false;
@@ -110,6 +128,16 @@ pub async fn actions<C: ConnectionTrait>(
             code: login_code.into(),
         });
         for (section, supplied, valid) in [
+            (
+                "tax_settings",
+                row.tax_settings.is_some(),
+                crate::tax_import::settings_valid(row.tax_settings.as_ref()).is_ok(),
+            ),
+            (
+                "tax_history",
+                !row.tax_history.is_empty(),
+                crate::tax_import::history_valid(&row.tax_history).is_ok(),
+            ),
             ("profile", true, true),
             ("department", row.employee.department.is_some(), true),
             ("designation", row.employee.designation.is_some(), true),

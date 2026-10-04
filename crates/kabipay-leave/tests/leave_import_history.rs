@@ -28,3 +28,22 @@ fn source_inconsistency_and_fabricated_paid_balance_are_rejected() {
     value.paid_remaining = Some("10".into());
     assert!(validate_opening(&value).is_err());
 }
+
+#[test]
+fn normalized_snapshot_preserves_raw_evidence_without_using_it_as_entitlement() {
+    let value: OpeningSnapshot = serde_json::from_value(json!({
+        "year":2026,"as_of":"2026-08-31","carry_forward":"0","grant":"0",
+        "source_taken":"6","source_balance":"-6","paid_used":"0","paid_remaining":"0",
+        "pending":null,"planned":null,"ready":true,
+        "raw_source_values":{"carry_forward":null,"grant":"0","taken":"6","balance":"0"}
+    }))
+    .unwrap();
+    assert_eq!(
+        validate_opening(&value).unwrap().historical_lwp.to_string(),
+        "6"
+    );
+    assert_eq!(
+        serde_json::to_value(value).unwrap()["raw_source_values"]["balance"],
+        "0"
+    );
+}

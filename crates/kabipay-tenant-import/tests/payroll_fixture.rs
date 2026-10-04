@@ -2,6 +2,10 @@
 use kabipay_payroll::services::{payroll_period_input, payroll_service, payslip_presentation};
 use sea_orm::{ConnectOptions, ConnectionTrait, Database, DbBackend, Statement, TransactionTrait};
 use uuid::Uuid;
+#[path = "fixtures/release_regressions.rs"]
+mod release_regressions;
+#[path = "fixtures/tax_projection_acceptance.rs"]
+mod tax_projection_acceptance;
 #[tokio::test]
 #[ignore = "requires the disposable integration fixture"]
 async fn imported_month_uses_the_normal_pay_run_and_immutable_statement() {
@@ -29,6 +33,13 @@ async fn imported_month_uses_the_normal_pay_run_and_immutable_statement() {
         .unwrap()
         .unwrap();
     assert!(input.ready);
+    let catalog=db.query_one(Statement::from_sql_and_values(DbBackend::Postgres,
+        "SELECT bool_and(is_taxable) AS taxable FROM salary_component WHERE tenant_id=$1 AND type='EARNING'",[tenant.into()])).await.unwrap().unwrap();
+    assert_eq!(
+        catalog.try_get::<Option<bool>>("", "taxable").unwrap(),
+        Some(true),
+        "new salary earnings are taxable before applicable exemptions"
+    );
     let source: kabipay_payroll::services::payroll_rules::PeriodInput =
         serde_json::from_value(input.input.clone()).unwrap();
     verify_financial_review_guards(&db, tenant, actor, employee).await;
@@ -44,9 +55,7 @@ async fn imported_month_uses_the_normal_pay_run_and_immutable_statement() {
     )
     .await
     .unwrap();
-    let result = payroll_service::run_payroll_for_cycle(&db, tenant, cycle.id, actor)
-        .await
-        .unwrap();
+    let result = reviewed_run(&db, tenant, cycle.id, actor).await.unwrap();
     assert_eq!(result.status, "PROCESSED");
     let slips = payroll_service::list_payslips(&db, tenant, Some(employee), 10)
         .await
@@ -135,7 +144,9 @@ async fn imported_month_uses_the_normal_pay_run_and_immutable_statement() {
     .await
     .is_err());
     transaction.rollback().await.unwrap();
+    tax_projection_acceptance::verify(&db, tenant, actor, employee).await;
     verify_reviewed_dated_lwp(&db, tenant, actor, employee).await;
+    release_regressions::verify(&db, tenant, actor, employee).await;
     db.close().await.unwrap();
 }
 
@@ -167,17 +178,31 @@ async fn verify_midmonth_rule_guard(
     transaction.execute(Statement::from_sql_and_values(DbBackend::Postgres,
         "INSERT INTO employee_payroll_rule(tenant_id,employee_id,effective_from,rules,updated_by) SELECT tenant_id,$2,'2026-09-15',rules,updated_by FROM employee_payroll_rule WHERE tenant_id=$1 AND employee_id=$3 LIMIT 1",
         [tenant.into(),midmonth.id.into(),source_employee.into()])).await.unwrap();
-    let result = kabipay_payroll::services::imported_payroll::run(
-        &transaction,
-        tenant,
-        Uuid::new_v4(),
-        &midmonth,
-        chrono::NaiveDate::from_ymd_opt(2026, 9, 1).unwrap(),
-    )
-    .await;
-    assert!(
-        result.is_err(),
-        "midmonth imported employee must never enter legacy payroll without reviewed period inputs"
+    let now = chrono::Utc::now();
+    let cycle = kabipay_db_entities::tenant::d0012_payroll::payroll_cycle::Model {
+        id: Uuid::new_v4(),
+        tenant_id: tenant,
+        name: "Preview".into(),
+        month: 9,
+        year: 2026,
+        status: "DRAFT".into(),
+        payment_date: None,
+        processed_by: None,
+        processed_at: None,
+        created_at: now,
+        updated_at: now,
+    };
+    let results =
+        kabipay_payroll::services::payroll_preview::employees(&transaction, tenant, &cycle)
+            .await
+            .unwrap();
+    let result = results
+        .iter()
+        .find(|row| row.employee_id == midmonth.id)
+        .unwrap();
+    assert_eq!(
+        result.outcome, "REVIEW",
+        "midmonth employee requires reviewed input"
     );
     transaction.rollback().await.unwrap();
 }
@@ -270,9 +295,7 @@ async fn verify_reviewed_dated_lwp(
     )
     .await
     .unwrap();
-    payroll_service::run_payroll_for_cycle(db, tenant, cycle.id, actor)
-        .await
-        .unwrap();
+    reviewed_run(db, tenant, cycle.id, actor).await.unwrap();
     let expected = kabipay_payroll::services::payroll_rules::calculate_period(&input).unwrap();
     let slips = payroll_service::list_payslips(db, tenant, Some(employee), 10)
         .await
@@ -379,4 +402,168 @@ async fn verify_financial_review_guards(
     .is_err();
     transaction.rollback().await.unwrap();
     assert!(salary_guard && leave_guard,"review guards: changed immutable salary={salary_guard}, manually changed leave balance={leave_guard}");
+}
+
+async fn reviewed_run(
+    db: &sea_orm::DatabaseConnection,
+    tenant: Uuid,
+    cycle: Uuid,
+    actor: Uuid,
+) -> kabipay_common::KabiPayResult<kabipay_payroll::services::payroll_finalize::PayrollFinalization>
+{
+    use kabipay_payroll::services::{payroll_draft, payroll_finalize};
+    let first = payroll_draft::calculate_payroll_cycle(db, tenant, actor, cycle, None).await?;
+    let mut draft =
+        payroll_draft::calculate_payroll_cycle(db, tenant, actor, cycle, Some(first.revision))
+            .await?;
+    assert_eq!(draft.revision, first.revision + 1);
+    let count = db
+        .query_one(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "SELECT COUNT(*) AS n FROM payslip WHERE tenant_id=$1 AND payroll_cycle_id=$2",
+            [tenant.into(), cycle.into()],
+        ))
+        .await?
+        .unwrap();
+    assert_eq!(
+        count.try_get::<i64>("", "n")?,
+        0,
+        "drafts must not publish financial records"
+    );
+    assert!(
+        draft.can_finalize,
+        "{:?}",
+        draft
+            .employees
+            .iter()
+            .map(|e| (&e.outcome, &e.reason))
+            .collect::<Vec<_>>()
+    );
+    let ack = payroll_draft::FinalizeAcknowledgement {
+        provisional_tax_employees: draft
+            .employees
+            .iter()
+            .filter(|e| {
+                e.prepared
+                    .as_ref()
+                    .is_some_and(|p| p.requires_tax_acknowledgement)
+            })
+            .map(|e| e.employee_id)
+            .collect(),
+    };
+    let employee = draft
+        .employees
+        .iter()
+        .find(|row| row.outcome == "READY")
+        .unwrap()
+        .employee_id;
+    db.execute(Statement::from_sql_and_values(DbBackend::Postgres,
+        "INSERT INTO employee_tax_declaration(tenant_id,employee_id,fiscal_year,revision,payload,actor_id) VALUES($1,$2,2026,1,'{}',$3) ON CONFLICT(tenant_id,employee_id,fiscal_year) DO UPDATE SET revision=employee_tax_declaration.revision+1",
+        [tenant.into(),employee.into(),actor.into()])).await?;
+    assert!(
+        payroll_finalize::finalize_payroll_cycle(
+            db,
+            tenant,
+            actor,
+            cycle,
+            draft.revision,
+            &draft.fingerprint,
+            ack.clone()
+        )
+        .await
+        .is_err(),
+        "a declaration edit invalidates the reviewed draft"
+    );
+    draft = payroll_draft::calculate_payroll_cycle(db, tenant, actor, cycle, Some(draft.revision))
+        .await?;
+    db.execute_unprepared("CREATE FUNCTION fixture_fail_statement() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'fixture rollback'; END $$; CREATE TRIGGER fixture_fail_statement BEFORE INSERT ON payslip_statement FOR EACH ROW EXECUTE FUNCTION fixture_fail_statement()").await?;
+    assert!(
+        payroll_finalize::finalize_payroll_cycle(
+            db,
+            tenant,
+            actor,
+            cycle,
+            draft.revision,
+            &draft.fingerprint,
+            ack.clone()
+        )
+        .await
+        .is_err(),
+        "statement failure must abort finalization"
+    );
+    db.execute_unprepared("DROP TRIGGER fixture_fail_statement ON payslip_statement; DROP FUNCTION fixture_fail_statement()").await?;
+    let count = db
+        .query_one(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "SELECT COUNT(*) AS n FROM payslip WHERE tenant_id=$1 AND payroll_cycle_id=$2",
+            [tenant.into(), cycle.into()],
+        ))
+        .await?
+        .unwrap();
+    assert_eq!(
+        count.try_get::<i64>("", "n")?,
+        0,
+        "failed finalization rolls back payslips"
+    );
+    assert_eq!(
+        payroll_draft::cycle(db, tenant, cycle).await?.status,
+        "DRAFT"
+    );
+    // Even an idempotent editor must reserve its write lock before reading DRAFT.
+    // Otherwise it could pass the check, wait for finalization, then write afterward.
+    let editor = db.begin().await?;
+    let period = payroll_draft::cycle(&editor, tenant, cycle).await?;
+    let input = payroll_period_input::find(&editor, tenant, employee, period.year, period.month)
+        .await?
+        .unwrap();
+    payroll_period_input::save(
+        &editor,
+        tenant,
+        actor,
+        employee,
+        serde_json::from_value(input.input).unwrap(),
+        None,
+        Some(input.revision),
+    )
+    .await?;
+    let finalize = payroll_finalize::finalize_payroll_cycle(
+        db,
+        tenant,
+        actor,
+        cycle,
+        draft.revision,
+        &draft.fingerprint,
+        ack.clone(),
+    );
+    tokio::pin!(finalize);
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(250), &mut finalize)
+            .await
+            .is_err(),
+        "finalization must wait for an editor that already checked DRAFT"
+    );
+    editor.rollback().await?;
+    let (a, b) = tokio::join!(
+        &mut finalize,
+        payroll_finalize::finalize_payroll_cycle(
+            db,
+            tenant,
+            actor,
+            cycle,
+            draft.revision,
+            &draft.fingerprint,
+            ack
+        )
+    );
+    assert_ne!(
+        a.is_ok(),
+        b.is_ok(),
+        "exactly one concurrent finalizer succeeds"
+    );
+    assert!(
+        payroll_draft::calculate_payroll_cycle(db, tenant, actor, cycle, Some(draft.revision))
+            .await
+            .is_err()
+    );
+    a.or(b)
 }

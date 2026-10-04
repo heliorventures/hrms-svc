@@ -47,6 +47,10 @@ pub fn validate(package: &ImportPackage) -> Vec<RowReadiness> {
             });
             let (period_ready, period_code) = match &row.period_input {
                 None => (false, "PERIOD_NOT_SUPPLIED".into()),
+                Some(period) if period.automatic.is_some() => (
+                    false,
+                    "AUTOMATIC_PERIOD_REQUIRES_TENANT_CONFIGURATION".into(),
+                ),
                 Some(period) => match calculate_period(period) {
                     Ok(_) if period.ready => (true, "PERIOD_FINANCIALLY_RECONCILED".into()),
                     Ok(_) => (false, "PERIOD_REVIEW_REQUIRED".into()),

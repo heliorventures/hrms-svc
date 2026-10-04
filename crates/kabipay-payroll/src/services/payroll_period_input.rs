@@ -1,5 +1,5 @@
 //! Transaction-aware period writes shared by HR and the importer.
-use super::payroll_rules::{calculate_period, PeriodInput};
+use super::payroll_rules::PeriodInput;
 use chrono::Utc;
 use kabipay_common::{KabiPayError, KabiPayResult};
 use kabipay_db_entities::tenant::d0012_payroll::{payroll_cycle, payslip};
@@ -26,8 +26,9 @@ pub async fn find<C: ConnectionTrait>(
         .await?)
 }
 
-/// Caller owns the transaction; the same advisory lock serializes edits with pay runs.
-pub async fn save<C: ConnectionTrait + Sync>(
+/// Caller owns the transaction. Reserve the write lock before checking cycle status;
+/// finalization's input-table lock must wait for this whole edit (or finish first).
+pub async fn save<C: ConnectionTrait + Send + Sync>(
     db: &C,
     tenant: Uuid,
     actor: Uuid,
@@ -36,6 +37,11 @@ pub async fn save<C: ConnectionTrait + Sync>(
     source_ref: Option<serde_json::Value>,
     expected_revision: Option<i32>,
 ) -> KabiPayResult<payroll_period_input::Model> {
+    db.execute(Statement::from_string(
+        DbBackend::Postgres,
+        "LOCK TABLE payroll_period_input IN ROW EXCLUSIVE MODE",
+    ))
+    .await?;
     db.execute(Statement::from_sql_and_values(
         DbBackend::Postgres,
         "SELECT pg_advisory_xact_lock(hashtextextended($1,0))",
@@ -62,11 +68,15 @@ pub async fn save<C: ConnectionTrait + Sync>(
             ));
         }
     }
-    let ready = input.ready
-        && calculate_period(&input).is_ok()
-        && super::imported_lwp::validate(db, tenant, employee, &input, false)
-            .await
-            .is_ok();
+    let prepared = super::prepare_payroll::prepare(db, tenant, employee, &input).await;
+    let ready = if let Ok(prepared) = &prepared {
+        input.ready
+            && super::imported_lwp::validate(db, tenant, employee, &prepared.input, false)
+                .await
+                .is_ok()
+    } else {
+        false
+    };
     let value = serde_json::to_value(&input)
         .map_err(|_| KabiPayError::Validation("invalid period input".into()))?;
     let existing = find(db, tenant, employee, input.year, input.month).await?;

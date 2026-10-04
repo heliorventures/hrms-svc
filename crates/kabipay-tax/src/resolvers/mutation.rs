@@ -3,9 +3,7 @@
 use async_graphql::{Context, Object, Result, ID};
 use kabipay_common::{
     client_data_scope::data_scope_from_claims,
-    context::{
-        ClientClaims, ScopeType, PERM_TAX_APPROVE, PERM_TAX_MANAGE, PERM_TAX_SUBMIT,
-    },
+    context::{ClientClaims, ScopeType, PERM_TAX_APPROVE, PERM_TAX_MANAGE, PERM_TAX_SUBMIT},
     subgraph::{require_tenant_id, tenant_db},
     KabiPayError, KabiPayResult,
 };
@@ -14,8 +12,8 @@ use std::str::FromStr;
 use uuid::Uuid;
 
 use crate::resolvers::types::{
-    SubmitTaxProofLineInput, TaxComputationDto, TaxProofLineDto, TaxSectionDefinitionDto,
-    TaxSlabDto, TaxConfigurationVersionDto, UpsertTaxComputationInput,
+    SubmitTaxProofLineInput, TaxComputationDto, TaxConfigurationVersionDto, TaxProofLineDto,
+    TaxSectionDefinitionDto, TaxSlabDto, UpsertTaxComputationInput,
     UpsertTaxConfigurationVersionInput, UpsertTaxSectionDefinitionInput, UpsertTaxSlabInput,
 };
 use crate::services::tax_service;
@@ -29,11 +27,76 @@ pub struct MutationRoot;
 
 #[Object]
 impl MutationRoot {
-    /// Create or update the `tax_computation` row for this employee, config version, and year.
-    ///
-    /// **Note:** `totalDeductions` may be **overwritten** when tax proof lines are approved
-    /// (see `submitTaxProofLine` / `approveTaxProofLine`); use `taxProofLines` + approved
-    /// workflow for year-end truth.
+    async fn save_employee_tax_settings(
+        &self,
+        ctx: &Context<'_>,
+        employee_id: ID,
+        input: async_graphql::Json<crate::domain::TaxSettingsInput>,
+        expected_revision: Option<i32>,
+    ) -> Result<async_graphql::Json<crate::domain::TaxSettings>> {
+        use sea_orm::TransactionTrait;
+        let actor = super::settings::manager(ctx)?;
+        let tenant = require_tenant_id(ctx)?;
+        let employee = super::settings::employee_id(&employee_id)?;
+        let db = tenant_db(ctx, tenant).await?;
+        let txn = db
+            .begin()
+            .await
+            .map_err(KabiPayError::from)
+            .map_err(KabiPayError::into_graphql)?;
+        let result = crate::services::tax_settings::save_tax_settings(
+            &txn,
+            tenant,
+            actor,
+            employee,
+            input.0,
+            expected_revision,
+        )
+        .await
+        .map_err(KabiPayError::into_graphql)?;
+        txn.commit()
+            .await
+            .map_err(KabiPayError::from)
+            .map_err(KabiPayError::into_graphql)?;
+        Ok(async_graphql::Json(result))
+    }
+
+    async fn save_employee_tax_history(
+        &self,
+        ctx: &Context<'_>,
+        employee_id: ID,
+        input: async_graphql::Json<crate::domain::TaxHistoryEntry>,
+        expected_revision: Option<i32>,
+    ) -> Result<async_graphql::Json<crate::services::tax_history::HistoryVersion>> {
+        use sea_orm::TransactionTrait;
+        let actor = super::settings::manager(ctx)?;
+        let tenant = require_tenant_id(ctx)?;
+        let employee = super::settings::employee_id(&employee_id)?;
+        let db = tenant_db(ctx, tenant).await?;
+        let txn = db
+            .begin()
+            .await
+            .map_err(KabiPayError::from)
+            .map_err(KabiPayError::into_graphql)?;
+        let result = crate::services::tax_history::save_tax_history(
+            &txn,
+            tenant,
+            actor,
+            employee,
+            input.0,
+            expected_revision,
+        )
+        .await
+        .map_err(KabiPayError::into_graphql)?;
+        txn.commit()
+            .await
+            .map_err(KabiPayError::from)
+            .map_err(KabiPayError::into_graphql)?;
+        Ok(async_graphql::Json(result))
+    }
+
+    /// Save editable declaration inputs without changing calculated tax or finalized payroll.
+    /// Approved proofs remain separate from the employee's declared deductions.
     async fn upsert_tax_computation(
         &self,
         ctx: &Context<'_>,
@@ -41,6 +104,15 @@ impl MutationRoot {
     ) -> Result<TaxComputationDto> {
         let employee_id = tax_submit_self_from_claims(ctx.data_opt::<ClientClaims>())
             .map_err(KabiPayError::into_graphql)?;
+        if input.taxable_income.is_some()
+            || input.final_tax.is_some()
+            || input.tds_per_month.is_some()
+        {
+            return Err(KabiPayError::Forbidden(
+                "declarations cannot supply calculated tax fields".into(),
+            )
+            .into_graphql());
+        }
         let tenant_id = require_tenant_id(ctx)?;
         let db = tenant_db(ctx, tenant_id).await?;
         let v = parse_uuid(&input.tax_config_version_id, "taxConfigVersionId")?;
@@ -52,7 +124,8 @@ impl MutationRoot {
             input.fiscal_year,
             input.tax_regime_chosen,
             tax_service::opt_decimal(&input.gross_income).map_err(KabiPayError::into_graphql)?,
-            tax_service::opt_decimal(&input.total_deductions).map_err(KabiPayError::into_graphql)?,
+            tax_service::opt_decimal(&input.total_deductions)
+                .map_err(KabiPayError::into_graphql)?,
             tax_service::opt_decimal(&input.taxable_income).map_err(KabiPayError::into_graphql)?,
             tax_service::opt_decimal(&input.final_tax).map_err(KabiPayError::into_graphql)?,
             tax_service::opt_decimal(&input.tds_per_month).map_err(KabiPayError::into_graphql)?,
@@ -71,7 +144,11 @@ impl MutationRoot {
         require_tax_manage_all(ctx)?;
         let tenant_id = require_tenant_id(ctx)?;
         let db = tenant_db(ctx, tenant_id).await?;
-        let oid = input.id.as_ref().map(|id| parse_uuid(id, "id")).transpose()?;
+        let oid = input
+            .id
+            .as_ref()
+            .map(|id| parse_uuid(id, "id"))
+            .transpose()?;
         let m = tax_service::upsert_tax_configuration_version(
             &db,
             tenant_id,
@@ -95,27 +172,22 @@ impl MutationRoot {
         require_tax_manage_all(ctx)?;
         let tenant_id = require_tenant_id(ctx)?;
         let db = tenant_db(ctx, tenant_id).await?;
-        let sid = input.id.as_ref().map(|id| parse_uuid(id, "id")).transpose()?;
+        let sid = input
+            .id
+            .as_ref()
+            .map(|id| parse_uuid(id, "id"))
+            .transpose()?;
         let cfg = parse_uuid(&input.tax_config_version_id, "taxConfigVersionId")?;
         let from = Decimal::from_str(input.income_from.trim())
             .map_err(|_| KabiPayError::Validation("invalid incomeFrom decimal".into()))?;
         let to = tax_service::opt_decimal(&input.income_to).map_err(KabiPayError::into_graphql)?;
         let tr = tax_service::opt_decimal(&input.tax_rate).map_err(KabiPayError::into_graphql)?;
-        let sr = tax_service::opt_decimal(&input.surcharge_rate).map_err(KabiPayError::into_graphql)?;
+        let sr =
+            tax_service::opt_decimal(&input.surcharge_rate).map_err(KabiPayError::into_graphql)?;
         let cr = tax_service::opt_decimal(&input.cess_rate).map_err(KabiPayError::into_graphql)?;
-        let m = tax_service::upsert_tax_slab(
-            &db,
-            tenant_id,
-            sid,
-            cfg,
-            from,
-            to,
-            tr,
-            sr,
-            cr,
-        )
-        .await
-        .map_err(KabiPayError::into_graphql)?;
+        let m = tax_service::upsert_tax_slab(&db, tenant_id, sid, cfg, from, to, tr, sr, cr)
+            .await
+            .map_err(KabiPayError::into_graphql)?;
         Ok(TaxSlabDto::from(m))
     }
 
@@ -267,11 +339,7 @@ fn tax_manage_all_from_claims(claims: Option<&ClientClaims>) -> KabiPayResult<Sc
 }
 
 fn tax_approve_scope_from_claims(claims: Option<&ClientClaims>) -> KabiPayResult<ScopeType> {
-    exact_scope_from_claims(
-        claims,
-        PERM_TAX_APPROVE,
-        &[ScopeType::Team, ScopeType::All],
-    )
+    exact_scope_from_claims(claims, PERM_TAX_APPROVE, &[ScopeType::Team, ScopeType::All])
 }
 
 fn tax_approval_actor_from_claims(
@@ -298,8 +366,7 @@ mod authorization_tests {
     use kabipay_common::{
         client_data_scope::EmployeeScopeFilter,
         context::{
-            ClientClaims, CLIENT_JWT_ISSUER, PERM_TAX_APPROVE, PERM_TAX_MANAGE,
-            PERM_TAX_SUBMIT,
+            ClientClaims, CLIENT_JWT_ISSUER, PERM_TAX_APPROVE, PERM_TAX_MANAGE, PERM_TAX_SUBMIT,
         },
         subgraph::TenantId,
     };
@@ -342,14 +409,22 @@ mod authorization_tests {
     }
 
     fn assert_denied_before_db(response: &async_graphql::Response, expected: &str) {
-        assert_eq!(response.errors.len(), 1, "unexpected response: {response:?}");
+        assert_eq!(
+            response.errors.len(),
+            1,
+            "unexpected response: {response:?}"
+        );
         let message = &response.errors[0].message;
         assert!(message.contains(expected), "unexpected denial: {message}");
         assert!(!message.contains("TenantDbCache"));
     }
 
     fn assert_allowed_through_gate(response: &async_graphql::Response) {
-        assert_eq!(response.errors.len(), 1, "unexpected response: {response:?}");
+        assert_eq!(
+            response.errors.len(),
+            1,
+            "unexpected response: {response:?}"
+        );
         let code = response.errors[0]
             .extensions
             .as_ref()
@@ -373,13 +448,15 @@ mod authorization_tests {
         ]
     }
 
-    fn manage_mutations() -> [String; 3] {
+    fn manage_mutations() -> [String; 5] {
         [
             "mutation { upsertTaxConfigurationVersion(input: { fiscalYear: 2026, countryCode: \"IN\", isActive: true }) { id } }".into(),
             format!(
                 "mutation {{ upsertTaxSlab(input: {{ taxConfigVersionId: \"{CONFIG_ID}\", incomeFrom: \"0\" }}) {{ id }} }}"
             ),
             "mutation { upsertTaxSectionDefinition(input: { sectionCode: \"80C\", sectionLabel: \"Section 80C\" }) { id } }".into(),
+            format!(r#"mutation {{ saveEmployeeTaxSettings(employeeId: "{LINE_ID}", input: {{regime:"NEW", method:"ANNUAL_PROJECTION",basis_components:[],effective_from:"2026-10-01"}}) }}"#),
+            format!(r#"mutation {{ saveEmployeeTaxHistory(employeeId: "{LINE_ID}", input: {{fiscal_year:2026,period_start:"2026-04-01",period_end:"2026-08-31",employer:"CURRENT",source_key:"opening",earnings:"1000",components:{{BASIC:"1000"}},coverage:"INCOMPLETE",reason:"HR supplied",evidence:"IMPORTED_ACTUAL"}}) }}"#),
         ]
     }
 
@@ -457,11 +534,9 @@ mod authorization_tests {
             assert_denied_before_db(&response, "tax:manage permission required");
         }
         for mutation in approval_mutations() {
-            let response = execute_mutation(
-                claims(PERM_TAX_MANAGE, Some("ALL"), employee_id),
-                &mutation,
-            )
-            .await;
+            let response =
+                execute_mutation(claims(PERM_TAX_MANAGE, Some("ALL"), employee_id), &mutation)
+                    .await;
             assert_denied_before_db(&response, "tax:approve permission required");
         }
     }
@@ -480,11 +555,8 @@ mod authorization_tests {
         }
         for mutation in manage_mutations() {
             assert_allowed_through_gate(
-                &execute_mutation(
-                    claims(PERM_TAX_MANAGE, Some("ALL"), employee_id),
-                    &mutation,
-                )
-                .await,
+                &execute_mutation(claims(PERM_TAX_MANAGE, Some("ALL"), employee_id), &mutation)
+                    .await,
             );
         }
         for mutation in approval_mutations() {
@@ -505,24 +577,20 @@ mod authorization_tests {
         let outside_id = Uuid::new_v4();
         let team = EmployeeScopeFilter::EmployeeIds(vec![approver_employee_id, report_id]);
 
-        assert!(tax_service::require_tax_approval_target(
-            &team,
-            approver_employee_id,
-            report_id,
-        )
-        .is_ok());
+        assert!(
+            tax_service::require_tax_approval_target(&team, approver_employee_id, report_id,)
+                .is_ok()
+        );
         assert!(tax_service::require_tax_approval_target(
             &EmployeeScopeFilter::Unrestricted,
             approver_employee_id,
             outside_id,
         )
         .is_ok());
-        assert!(tax_service::require_tax_approval_target(
-            &team,
-            approver_employee_id,
-            outside_id,
-        )
-        .is_err());
+        assert!(
+            tax_service::require_tax_approval_target(&team, approver_employee_id, outside_id,)
+                .is_err()
+        );
         assert!(tax_service::require_tax_approval_target(
             &EmployeeScopeFilter::Unrestricted,
             approver_employee_id,

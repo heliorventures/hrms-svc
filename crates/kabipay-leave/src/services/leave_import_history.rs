@@ -16,7 +16,19 @@ use uuid::Uuid;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct RawLeaveValues {
+    pub carry_forward: Option<String>,
+    pub grant: Option<String>,
+    pub taken: Option<String>,
+    pub balance: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct OpeningSnapshot {
+    /// Evidence only: calculations use the reconciled normalized quantities.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw_source_values: Option<RawLeaveValues>,
     pub year: i32,
     pub as_of: NaiveDate,
     pub carry_forward: Option<String>,

@@ -10,6 +10,7 @@ authors.workspace = true
 path = "src/lib.rs"
 
 [dependencies]
+rust_decimal.workspace = true
 argon2.workspace = true
 async-graphql.workspace = true
 async-graphql-axum.workspace = true

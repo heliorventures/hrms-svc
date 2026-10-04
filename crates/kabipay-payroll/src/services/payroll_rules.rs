@@ -17,6 +17,8 @@ pub struct AdditionalDeduction {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PeriodInput {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub automatic: Option<super::automatic_payroll::AutomaticSettings>,
     pub year: i32,
     pub month: i32,
     pub gross_rule: String,

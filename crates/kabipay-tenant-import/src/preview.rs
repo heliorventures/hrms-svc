@@ -131,7 +131,9 @@ pub async fn preview<C: ConnectionTrait>(
         .iter()
         .filter_map(|r| r.period_input.as_ref())
         .filter(|p| {
-            p.ready && kabipay_payroll::services::payroll_rules::calculate_period(p).is_ok()
+            p.automatic.is_none()
+                && p.ready
+                && kabipay_payroll::services::payroll_rules::calculate_period(p).is_ok()
         })
         .count();
     let blocking_issues = package

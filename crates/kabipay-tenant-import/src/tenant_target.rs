@@ -103,11 +103,36 @@ pub async fn resolve(
             bail!("IMPORT_ACTOR_UNAUTHORIZED");
         }
     }
+    if package
+        .employees
+        .iter()
+        .any(|row| row.tax_settings.is_some() || !row.tax_history.is_empty())
+        && permissions
+            .permission_scopes
+            .get(kabipay_common::context::PERM_TAX_MANAGE)
+            .is_none_or(|scope| scope != "ALL")
+    {
+        bail!("IMPORT_ACTOR_TAX_MANAGE_REQUIRED");
+    }
     let migration=db.query_one(Statement::from_sql_and_values(DbBackend::Postgres,
         "SELECT COUNT(*) AS n FROM information_schema.tables WHERE table_schema=$1 AND table_name IN ('tenant_import_run','tenant_import_record','payroll_period_input','payslip_statement','leave_import_history','employee_payroll_rule')",
         [options.schema_name.clone().into()])).await?.ok_or_else(||anyhow::anyhow!("MIGRATION_STATE_UNRESOLVED"))?;
     if migration.try_get::<i64>("", "n")? != 6 {
         bail!("IMPORT_MIGRATIONS_REQUIRED");
+    }
+    if package.company_payroll_policy.is_some()
+        || package
+            .employees
+            .iter()
+            .any(|row| row.tax_settings.is_some() || !row.tax_history.is_empty())
+    {
+        let state = db.query_one(Statement::from_sql_and_values(DbBackend::Postgres,
+            "SELECT COUNT(*) AS n FROM information_schema.tables WHERE table_schema=$1 AND table_name IN ('employee_tax_settings','employee_tax_history','employee_tax_declaration','company_payroll_rule')",
+            [options.schema_name.clone().into()])).await?
+            .ok_or_else(|| anyhow::anyhow!("MIGRATION_STATE_UNRESOLVED"))?;
+        if state.try_get::<i64>("", "n")? != 4 {
+            bail!("TAX_IMPORT_MIGRATIONS_REQUIRED");
+        }
     }
     let columns=db.query_one(Statement::from_sql_and_values(DbBackend::Postgres,
         "SELECT COUNT(*) AS n FROM information_schema.columns WHERE table_schema=$1 AND (table_name,column_name) IN (('employee','confirmation_date'),('employee','imported_exit_date'),('employee','imported_last_working_date'),('employee','payroll_excluded'),('employee_bank','account_holder'),('employee_bank','branch_name'),('employee_salary_structure','annual_gross'),('employee_salary_structure','annual_employer_pf'),('salary_component','show_on_payslip'),('leave_import_history','leave_type_id'),('payroll_period_input','revision'))",

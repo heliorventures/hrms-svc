@@ -53,3 +53,6 @@ pub mod d0089_user_guidance_state;
 pub mod d0090_payroll_period_configuration;
 pub mod d0091_leave_import_history;
 pub mod d0092_tenant_import_tracking;
+pub mod d0093_tax_projection_configuration;
+
+pub mod d0094_payroll_draft_calculation;

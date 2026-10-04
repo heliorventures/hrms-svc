@@ -14,6 +14,33 @@ pub async fn write_section(
     let tenant = options.tenant_id;
     let actor = options.actor_id;
     match section {
+        "tax_settings" => {
+            crate::tax_import::settings(
+                transaction,
+                tenant,
+                actor,
+                employee,
+                row.tax_settings.as_ref(),
+            )
+            .await
+        }
+        "tax_history" => {
+            if let Some(period) = &row.period_input {
+                let (start, end) =
+                    kabipay_tax::domain::tax_year::month_bounds(period.year, period.month as u32)?;
+                if crate::tax_import::history_valid(&row.tax_history)?
+                    .iter()
+                    .any(|entry| {
+                        entry.employer == "CURRENT"
+                            && entry.period_start <= end
+                            && entry.period_end >= start
+                    })
+                {
+                    bail!("TAX_HISTORY_OVERLAPS_PACKAGE_PAYROLL");
+                }
+            }
+            crate::tax_import::history(transaction, tenant, actor, employee, &row.tax_history).await
+        }
         "department" => Ok((
             crate::organization_import::department(transaction, tenant, employee, row).await?,
             "DEPARTMENT_IMPORTED",
