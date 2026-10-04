@@ -11,7 +11,12 @@ use sea_orm::{ActiveModelTrait, ColumnTrait, ConnectionTrait, EntityTrait, Query
 use uuid::Uuid;
 
 pub fn rule_cutoff(date: NaiveDate) -> KabiPayResult<NaiveDate> {
-    Ok(date)
+    date.with_day(1)
+        .and_then(|first| first.checked_add_months(chrono::Months::new(1)))
+        .and_then(|next| next.pred_opt())
+        .ok_or_else(|| {
+            KabiPayError::Validation("payroll month is outside the supported range".into())
+        })
 }
 
 pub async fn run<C: ConnectionTrait + Sync>(

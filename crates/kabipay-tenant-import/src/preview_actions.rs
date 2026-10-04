@@ -82,17 +82,33 @@ pub async fn actions<C: ConnectionTrait>(
             action: core_action.into(),
             code: core_code.into(),
         });
-        let linked_login = existing.as_ref().is_some_and(|value|
-            value.try_get::<Option<Uuid>>("", "user_id").ok().flatten().is_some())
-            && (!replace || retained);
-        let login_supplied = row.employee.code.as_ref().is_some_and(|code|
-            options.login_by_employee_code.contains_key(code));
-        let (login_action, login_code) = if blocked {("DEFERRED", "CORE_IDENTITY_UNRESOLVED")}
-            else if linked_login {("RECONCILE", "VALIDATE_EXISTING_LOGIN_LINK")}
-            else if login_supplied {("CREATE", "VALIDATE_REVIEWED_LOGIN_MANIFEST")}
-            else {("DEFERRED", "LOGIN_MANIFEST_NOT_SUPPLIED")};
-        result.push(PlannedAction {source_ref:row.source_ref.clone(),section:"login".into(),
-            action:login_action.into(),code:login_code.into()});
+        let linked_login = existing.as_ref().is_some_and(|value| {
+            value
+                .try_get::<Option<Uuid>>("", "user_id")
+                .ok()
+                .flatten()
+                .is_some()
+        }) && (!replace || retained);
+        let login_supplied = row
+            .employee
+            .code
+            .as_ref()
+            .is_some_and(|code| options.login_by_employee_code.contains_key(code));
+        let (login_action, login_code) = if blocked {
+            ("DEFERRED", "CORE_IDENTITY_UNRESOLVED")
+        } else if linked_login {
+            ("RECONCILE", "VALIDATE_EXISTING_LOGIN_LINK")
+        } else if login_supplied {
+            ("CREATE", "VALIDATE_REVIEWED_LOGIN_MANIFEST")
+        } else {
+            ("DEFERRED", "LOGIN_MANIFEST_NOT_SUPPLIED")
+        };
+        result.push(PlannedAction {
+            source_ref: row.source_ref.clone(),
+            section: "login".into(),
+            action: login_action.into(),
+            code: login_code.into(),
+        });
         for (section, supplied, valid) in [
             ("profile", true, true),
             ("department", row.employee.department.is_some(), true),
@@ -143,9 +159,17 @@ pub async fn actions<C: ConnectionTrait>(
                 code: code.into(),
             });
         }
-        if row.recurring_salary.as_ref().is_some_and(|salary|salary["annual_employer_pf"].is_null()) {
-            result.push(PlannedAction {source_ref:row.source_ref.clone(),section:"employer_cost".into(),
-                action:"DEFERRED".into(),code:"EMPLOYER_COST_RULE_UNRESOLVED".into()});
+        if row
+            .recurring_salary
+            .as_ref()
+            .is_some_and(|salary| salary["annual_employer_pf"].is_null())
+        {
+            result.push(PlannedAction {
+                source_ref: row.source_ref.clone(),
+                section: "employer_cost".into(),
+                action: "DEFERRED".into(),
+                code: "EMPLOYER_COST_RULE_UNRESOLVED".into(),
+            });
         }
     }
     Ok(result)

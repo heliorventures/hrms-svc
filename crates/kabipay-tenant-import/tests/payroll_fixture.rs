@@ -139,20 +139,46 @@ async fn imported_month_uses_the_normal_pay_run_and_immutable_statement() {
     db.close().await.unwrap();
 }
 
-async fn verify_midmonth_rule_guard(db:&sea_orm::DatabaseConnection,tenant:Uuid,source_employee:Uuid) {
-    use kabipay_employee::services::employee_service::{self,NewEmployee};
-    let transaction=db.begin().await.unwrap();
-    let midmonth=employee_service::create(&transaction,tenant,NewEmployee {
-        employee_code:"MIDMONTH-REVIEW".into(),first_name:"Fictional".into(),last_name:"Midmonth".into(),
-        date_of_joining:chrono::NaiveDate::from_ymd_opt(2026,9,15).unwrap(),department_id:None,
-        designation_id:None,reporting_manager_id:None,employment_type:None,status:"ACTIVE".into(),user_id:None,
-    }).await.unwrap();
+async fn verify_midmonth_rule_guard(
+    db: &sea_orm::DatabaseConnection,
+    tenant: Uuid,
+    source_employee: Uuid,
+) {
+    use kabipay_employee::services::employee_service::{self, NewEmployee};
+    let transaction = db.begin().await.unwrap();
+    let midmonth = employee_service::create(
+        &transaction,
+        tenant,
+        NewEmployee {
+            employee_code: "MIDMONTH-REVIEW".into(),
+            first_name: "Fictional".into(),
+            last_name: "Midmonth".into(),
+            date_of_joining: chrono::NaiveDate::from_ymd_opt(2026, 9, 15).unwrap(),
+            department_id: None,
+            designation_id: None,
+            reporting_manager_id: None,
+            employment_type: None,
+            status: "ACTIVE".into(),
+            user_id: None,
+        },
+    )
+    .await
+    .unwrap();
     transaction.execute(Statement::from_sql_and_values(DbBackend::Postgres,
-        "INSERT INTO employee_payroll_rule(tenant_id,employee_id,effective_from,rules) SELECT tenant_id,$2,'2026-09-15',rules FROM employee_payroll_rule WHERE tenant_id=$1 AND employee_id=$3 LIMIT 1",
+        "INSERT INTO employee_payroll_rule(tenant_id,employee_id,effective_from,rules,updated_by) SELECT tenant_id,$2,'2026-09-15',rules,updated_by FROM employee_payroll_rule WHERE tenant_id=$1 AND employee_id=$3 LIMIT 1",
         [tenant.into(),midmonth.id.into(),source_employee.into()])).await.unwrap();
-    let result=kabipay_payroll::services::imported_payroll::run(&transaction,tenant,Uuid::new_v4(),&midmonth,
-        chrono::NaiveDate::from_ymd_opt(2026,9,1).unwrap()).await;
-    assert!(result.is_err(),"midmonth imported employee must never enter legacy payroll without reviewed period inputs");
+    let result = kabipay_payroll::services::imported_payroll::run(
+        &transaction,
+        tenant,
+        Uuid::new_v4(),
+        &midmonth,
+        chrono::NaiveDate::from_ymd_opt(2026, 9, 1).unwrap(),
+    )
+    .await;
+    assert!(
+        result.is_err(),
+        "midmonth imported employee must never enter legacy payroll without reviewed period inputs"
+    );
     transaction.rollback().await.unwrap();
 }
 
