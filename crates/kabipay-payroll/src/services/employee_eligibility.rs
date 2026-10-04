@@ -44,6 +44,9 @@ pub async fn save<C: ConnectionTrait>(
     mut setting: EligibilitySetting,
 ) -> KabiPayResult<EligibilitySetting> {
     kabipay_tax::domain::validate_reason(Some(&setting.reason))?;
+    if let Some(value) = setting.eligibility.professional_tax {
+        kabipay_tax::domain::validate_amount(value)?;
+    }
     if setting.effective_from.day() != 1 {
         return Err(KabiPayError::Validation(
             "employee payroll settings must start on the first day of a payroll month".into(),

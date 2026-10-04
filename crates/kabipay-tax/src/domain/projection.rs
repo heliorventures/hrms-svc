@@ -60,6 +60,8 @@ pub struct TaxProjectionInput {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TaxProjection {
     pub fiscal_year: i32,
+    #[serde(default)]
+    pub configuration: Option<ProjectionConfiguration>,
     pub months: Vec<ProjectionMonth>,
     pub annual_earnings: Decimal,
     pub tax: Option<IncomeTaxResult>,
@@ -70,6 +72,14 @@ pub struct TaxProjection {
     pub limitations: Vec<String>,
     pub note: String,
     pub opening_history: Vec<super::TaxHistoryEntry>,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ProjectionConfiguration {
+    pub regime: super::TaxRegime,
+    pub method: WithholdingMethod,
+    pub percentage: Option<Decimal>,
+    pub basis_components: Vec<String>,
+    pub effective_from: NaiveDate,
 }
 fn money(value: Decimal) -> Decimal {
     value.round_dp_with_strategy(2, RoundingStrategy::MidpointAwayFromZero)
@@ -478,6 +488,6 @@ pub fn calculate_projection(input: &TaxProjectionInput) -> KabiPayResult<TaxProj
                 withholding.as_ref().map(|value| value.monthly)
             };
     }
-    Ok(TaxProjection{fiscal_year:input.fiscal_year,months,annual_earnings,tax,withholding,recorded_tds,history_complete,selected_monthly_tds,limitations,opening_history:input.opening_history.clone(),
+    Ok(TaxProjection{fiscal_year:input.fiscal_year,configuration:Some(ProjectionConfiguration{regime:input.settings.regime,method:input.settings.method,percentage:input.settings.percentage,basis_components:input.settings.basis_components.clone(),effective_from:input.settings.effective_from}),months,annual_earnings,tax,withholding,recorded_tds,history_complete,selected_monthly_tds,limitations,opening_history:input.opening_history.clone(),
         note:"Estimated tax based on your current salary structure, joining date and available payroll information. Missing historical earnings are estimated. Actual deductions may change when HR updates your records. Contact HR for confirmation.".into()})
 }

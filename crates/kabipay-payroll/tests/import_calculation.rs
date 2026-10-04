@@ -97,3 +97,34 @@ fn employer_cost_does_not_change_gross_based_salary_split() {
     assert_eq!(validated.annual_ctc.unwrap().to_string(), "395100.00");
     assert_eq!(validated.components["BASIC"].to_string(), "15000.00");
 }
+
+#[test]
+fn reviewed_fixed_employer_cost_is_annualized_without_changing_gross() {
+    use kabipay_payroll::services::salary_rules::{validate_recurring_salary, RecurringSalary};
+    let example: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../../hrms-database/import-templates/v1/example.synthetic.json"
+    ))
+    .unwrap();
+    let mut value = example["employees"][0]["recurring_salary"].clone();
+    value["employer_pf_rule"] = json!({"fixed_monthly_amount":"3000.00","basis_components":[],"rate":"0","ceiling":null,"rounding":"HALF_UP_2DP","origin":"REVIEWED_CONFIGURATION"});
+    value["annual_employer_pf"] = json!("36000.00");
+    value["annual_ctc"] = json!("396000.00");
+    let salary: RecurringSalary = serde_json::from_value(value.clone()).unwrap();
+    let calculated = validate_recurring_salary(&salary).unwrap();
+    assert_eq!(calculated.annual_ctc.unwrap().to_string(), "396000.00");
+    assert_eq!(calculated.components["BASIC"].to_string(), "15000.00");
+    let mut zero = value.clone();
+    zero["employer_pf_rule"]["fixed_monthly_amount"] = json!("0.00");
+    zero["annual_employer_pf"] = json!("0.00");
+    zero["annual_ctc"] = json!("360000.00");
+    let zero_salary =
+        validate_recurring_salary(&serde_json::from_value(zero.clone()).unwrap()).unwrap();
+    assert_eq!(zero_salary.annual_ctc.unwrap().to_string(), "360000.00");
+    zero["employer_pf_rule"]["fixed_monthly_amount"] = json!("-1.00");
+    assert!(validate_recurring_salary(&serde_json::from_value(zero).unwrap()).is_err());
+    value["employer_pf_rule"]["basis_components"] = json!(["BASIC"]);
+    assert!(
+        validate_recurring_salary(&serde_json::from_value(value).unwrap()).is_err(),
+        "fixed amount cannot also apply a wage formula"
+    );
+}

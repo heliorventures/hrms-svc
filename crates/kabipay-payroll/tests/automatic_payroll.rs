@@ -55,6 +55,37 @@ fn automatic_lwp_tax_basis_and_advance_settlement_reconcile() {
     assert_eq!(result.calculation.remaining_payable, Decimal::from(22800));
     assert!(result.requires_tax_acknowledgement);
 }
+
+#[test]
+fn recurring_employee_pt_overrides_company_default_including_zero() {
+    use kabipay_payroll::services::automatic_payroll::calculate_employee_payroll;
+    let mut input = automatic_input();
+    let mut value =
+        serde_json::to_value(&input.period.automatic.as_ref().unwrap().eligibility).unwrap();
+    value["professional_tax"] = serde_json::json!("0");
+    input.period.automatic.as_mut().unwrap().eligibility =
+        serde_json::from_value(value.clone()).unwrap();
+    assert_eq!(
+        calculate_employee_payroll(&input)
+            .unwrap()
+            .calculation
+            .statutory["PT"],
+        "0.00"
+    );
+    value["professional_tax"] = serde_json::json!("150");
+    input.period.automatic.as_mut().unwrap().eligibility =
+        serde_json::from_value(value.clone()).unwrap();
+    assert_eq!(
+        calculate_employee_payroll(&input)
+            .unwrap()
+            .calculation
+            .statutory["PT"],
+        "150.00"
+    );
+    value["professional_tax"] = serde_json::json!("-1");
+    input.period.automatic.as_mut().unwrap().eligibility = serde_json::from_value(value).unwrap();
+    assert!(calculate_employee_payroll(&input).is_err());
+}
 #[test]
 fn invalid_divisor_and_historical_usage_are_rejected_before_calculation() {
     use kabipay_payroll::services::automatic_payroll::calculate_employee_payroll;

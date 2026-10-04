@@ -115,6 +115,8 @@ pub struct EsiResult {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StatutoryEligibility {
+    #[serde(default)]
+    pub professional_tax: Option<Decimal>,
     pub pf_applicable: Option<bool>,
     pub esi_applicable: Option<bool>,
     pub esi_continuation_until: Option<NaiveDate>,

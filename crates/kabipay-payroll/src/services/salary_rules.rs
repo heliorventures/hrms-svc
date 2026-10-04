@@ -8,6 +8,8 @@ use std::collections::BTreeMap;
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EmployerPfRule {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fixed_monthly_amount: Option<String>,
     pub basis_components: Vec<String>,
     pub rate: String,
     pub ceiling: Option<String>,
@@ -72,6 +74,22 @@ pub fn validate_recurring_salary(input: &RecurringSalary) -> KabiPayResult<Valid
         ));
     }
     let annual_pf = match &input.employer_pf_rule {
+        Some(rule) if rule.fixed_monthly_amount.is_some() => {
+            if !rule.basis_components.is_empty()
+                || amount(Some(&rule.rate), "PF rate")? != Decimal::ZERO
+                || rule.ceiling.is_some()
+                || rule.rounding != "HALF_UP_2DP"
+                || rule.origin != "REVIEWED_CONFIGURATION"
+            {
+                return Err(KabiPayError::Validation("fixed employer PF requires a reviewed amount without a simultaneous wage formula".into()));
+            }
+            Some(
+                money(amount(
+                    rule.fixed_monthly_amount.as_deref(),
+                    "fixed employer PF",
+                )?) * Decimal::from(12),
+            )
+        }
         Some(rule) => {
             if rule.rounding != "HALF_UP_2DP" || rule.basis_components.is_empty() {
                 return Err(KabiPayError::Validation(

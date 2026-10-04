@@ -175,16 +175,22 @@ pub fn calculate_contributions(
             wage_basis: basis,
         }
     };
+    let professional_tax = input
+        .eligibility
+        .professional_tax
+        .or(policy.professional_tax)
+        .ok_or_else(|| {
+            KabiPayError::Validation(
+                "professional tax requires HR configuration for future periods".into(),
+            )
+        })?;
+    validate_amount(professional_tax)?;
     Ok(ContributionResult {
         pf_employee,
         pf_employer,
         esi_employee: esi.employee,
         esi_employer: esi.employer,
-        professional_tax: policy.professional_tax.ok_or_else(|| {
-            KabiPayError::Validation(
-                "professional tax requires HR configuration for future periods".into(),
-            )
-        })?,
+        professional_tax,
         esi_wage_basis: esi.wage_basis,
         origin: policy.origin.clone(),
         reason: policy.reason.clone(),

@@ -190,7 +190,7 @@ pub async fn salary<C: ConnectionTrait>(
         "CREATED"
     };
     db.execute(Statement::from_sql_and_values(DbBackend::Postgres,
-        "INSERT INTO employee_payroll_rule(tenant_id,employee_id,effective_from,rules,updated_by) VALUES($1,$2,$3,$4,$5) ON CONFLICT(tenant_id,employee_id,effective_from) DO UPDATE SET rules=EXCLUDED.rules,updated_by=EXCLUDED.updated_by,updated_at=NOW() WHERE employee_payroll_rule.rules IS DISTINCT FROM EXCLUDED.rules",
+        "INSERT INTO employee_payroll_rule(tenant_id,employee_id,effective_from,rules,updated_by) VALUES($1,$2,$3,$4,$5) ON CONFLICT(tenant_id,employee_id,effective_from) DO UPDATE SET rules=employee_payroll_rule.rules || EXCLUDED.rules,updated_by=EXCLUDED.updated_by,updated_at=NOW() WHERE employee_payroll_rule.rules IS DISTINCT FROM employee_payroll_rule.rules || EXCLUDED.rules",
         [tenant.into(),employee.into(),effective.into(),value.clone().into(),actor.into()])).await?;
     Ok(outcome)
 }
