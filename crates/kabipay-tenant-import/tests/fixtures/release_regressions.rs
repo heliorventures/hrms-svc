@@ -64,6 +64,7 @@ pub async fn verify(db: &DatabaseConnection, tenant: Uuid, actor: Uuid, employee
     assert_eq!(prepared.calculation.components["OVERTIME"], "1000.00");
     assert_eq!(prepared.calculation.statutory["TDS"], "3250.00");
     assert_eq!(prepared.calculation.statutory["PF"], "2100.00");
+    fixed_employer_pf(&tx, tenant, employee, &input, &prepared).await;
     assert_eq!(prepared.arrears.len(), 1);
     assert_eq!(prepared.arrears[0].id, arrear.id);
     tx.execute_unprepared("UPDATE salary_component SET is_active=false WHERE code='OVERTIME'")
@@ -162,6 +163,29 @@ pub async fn verify(db: &DatabaseConnection, tenant: Uuid, actor: Uuid, employee
         cycle.id
     );
     export_history(db, tenant, actor, employee).await;
+}
+
+async fn fixed_employer_pf<C: ConnectionTrait + Send + Sync>(
+    db: &C,
+    tenant: Uuid,
+    employee: Uuid,
+    input: &kabipay_payroll::services::payroll_rules::PeriodInput,
+    baseline: &kabipay_payroll::services::automatic_payroll::PreparedEmployeePayroll,
+) {
+    db.execute_unprepared("SAVEPOINT fixed_pf_regression").await.unwrap();
+    db.execute(Statement::from_sql_and_values(DbBackend::Postgres,
+        "UPDATE employee_payroll_rule SET rules=jsonb_set(rules,'{employer_pf_rule}',$3) WHERE tenant_id=$1 AND employee_id=$2",
+        [tenant.into(),employee.into(),serde_json::json!({"fixed_monthly_amount":"3000.00","basis_components":[],"rate":"0","ceiling":null,"rounding":"HALF_UP_2DP","origin":"REVIEWED_CONFIGURATION"}).into()])).await.unwrap();
+    let fixed = prepare_payroll::prepare(db, tenant, employee, input).await.unwrap();
+    assert_eq!(fixed.calculation.employer["pf"], "3000.00");
+    assert_eq!(fixed.contribution_evidence.as_ref().unwrap().pf_employer, Decimal::from(3000));
+    assert_eq!(fixed.calculation.net_earned, baseline.calculation.net_earned);
+    assert_eq!(fixed.tax_projection.as_ref().unwrap().annual_earnings, baseline.tax_projection.as_ref().unwrap().annual_earnings);
+    let mut partial = input.clone();
+    partial.lwp_days = Some("1".into());
+    let partial = prepare_payroll::prepare(db, tenant, employee, &partial).await.unwrap();
+    assert_eq!(partial.calculation.employer["pf"], "3000.00");
+    db.execute_unprepared("ROLLBACK TO SAVEPOINT fixed_pf_regression").await.unwrap();
 }
 
 async fn source_only_component(db: &DatabaseConnection, tenant: Uuid, employee: Uuid) {

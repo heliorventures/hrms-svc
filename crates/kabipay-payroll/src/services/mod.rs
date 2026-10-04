@@ -23,6 +23,7 @@ pub mod contribution_policy_store;
 pub mod contribution_rules;
 pub mod earned_catalog;
 pub mod employee_eligibility;
+pub mod employer_pf;
 pub mod payroll_export_evidence;
 pub mod prepare_payroll;
 pub mod reviewed_arrears;

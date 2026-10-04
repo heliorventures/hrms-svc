@@ -78,6 +78,7 @@ pub async fn prepare<C: ConnectionTrait + Send + Sync>(
             month_components: month.components,
             policy,
             projection,
+            employer_pf_rule: super::employer_pf::effective(db, tenant, employee, end).await?,
         },
         arrear_total,
     )?;

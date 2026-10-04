@@ -125,6 +125,7 @@ pub struct StatutoryEligibility {
 }
 #[derive(Clone, Debug)]
 pub struct ContributionInput {
+    pub employer_pf_rule: Option<super::salary_rules::EmployerPfRule>,
     pub as_of: NaiveDate,
     pub regular_components: BTreeMap<String, Decimal>,
     pub earned_components: BTreeMap<String, Decimal>,
@@ -132,6 +133,8 @@ pub struct ContributionInput {
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ContributionResult {
+    #[serde(default)]
+    pub employer_pf_rule: Option<super::salary_rules::EmployerPfRule>,
     pub pf_employee: Decimal,
     pub pf_employer: Decimal,
     pub esi_employee: Decimal,

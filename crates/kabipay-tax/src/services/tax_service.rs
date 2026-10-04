@@ -79,7 +79,7 @@ pub async fn upsert_tax_computation(
     db: &DatabaseConnection,
     tenant_id: Uuid,
     employee_id: Uuid,
-    tax_config_version_id: Uuid,
+    tax_config_version_id: Option<Uuid>,
     fiscal_year: i32,
     tax_regime_chosen: Option<String>,
     gross_income: Option<Decimal>,
@@ -93,28 +93,15 @@ pub async fn upsert_tax_computation(
         final_tax,
         tds_per_month,
     )?;
-    let _ver = tax_configuration_version::Entity::find()
-        .filter(tax_configuration_version::Column::Id.eq(tax_config_version_id))
-        .filter(tax_configuration_version::Column::TenantId.eq(tenant_id))
-        .one(db)
-        .await?
-        .ok_or_else(|| KabiPayError::NotFound {
-            entity: "tax_configuration_version",
-            id: tax_config_version_id.to_string(),
-        })?;
-    if _ver.fiscal_year != fiscal_year {
-        return Err(KabiPayError::Validation(
-            "fiscalYear does not match the selected tax configuration version".into(),
-        ));
-    }
     let txn = db.begin().await?;
+    let version = super::tax_submission::resolve_version(&txn, tenant_id, employee_id, fiscal_year, tax_config_version_id, tax_regime_chosen.as_deref()).await?;
     let result = super::tax_declarations::save_declaration(
         &txn,
         tenant_id,
         employee_id,
-        tax_config_version_id,
+        version.id,
         fiscal_year,
-        tax_regime_chosen,
+        version.regime.as_deref().and_then(super::tax_submission::canonical).map(str::to_owned),
         gross_income,
         total_deductions,
     )
@@ -207,7 +194,7 @@ pub async fn submit_tax_proof_line(
     tenant_id: Uuid,
     employee_id: Uuid,
     submitting_user_id: Uuid,
-    tax_config_version_id: Uuid,
+    tax_config_version_id: Option<Uuid>,
     fiscal_year: i32,
     section_code: String,
     declared_amount: Decimal,
@@ -229,20 +216,7 @@ pub async fn submit_tax_proof_line(
         .await?;
     assert_tax_proof_file(db, tenant_id, file_storage_id, Some(submitting_user_id)).await?;
 
-    let _ver = tax_configuration_version::Entity::find()
-        .filter(tax_configuration_version::Column::Id.eq(tax_config_version_id))
-        .filter(tax_configuration_version::Column::TenantId.eq(tenant_id))
-        .one(db)
-        .await?
-        .ok_or_else(|| KabiPayError::NotFound {
-            entity: "tax_configuration_version",
-            id: tax_config_version_id.to_string(),
-        })?;
-    if _ver.fiscal_year != fiscal_year {
-        return Err(KabiPayError::Validation(
-            "fiscalYear does not match the tax configuration version".into(),
-        ));
-    }
+    let tax_config_version_id = super::tax_submission::resolve_version(db, tenant_id, employee_id, fiscal_year, tax_config_version_id, None).await?.id;
 
     let existing = tax_proof_line::Entity::find()
         .filter(tax_proof_line::Column::TenantId.eq(tenant_id))
@@ -713,8 +687,8 @@ pub async fn upsert_tax_section_definition(
     }
 }
 
-pub async fn upsert_tax_configuration_version(
-    db: &DatabaseConnection,
+pub async fn upsert_tax_configuration_version<C: ConnectionTrait>(
+    db: &C,
     tenant_id: Uuid,
     id_opt: Option<Uuid>,
     fiscal_year: i32,

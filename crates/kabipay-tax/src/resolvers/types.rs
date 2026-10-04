@@ -87,7 +87,7 @@ impl From<tax_computation::Model> for TaxComputationDto {
 
 #[derive(InputObject, Clone, Debug)]
 pub struct UpsertTaxComputationInput {
-    pub tax_config_version_id: ID,
+    pub tax_config_version_id: Option<ID>,
     pub fiscal_year: i32,
     pub tax_regime_chosen: Option<String>,
     pub gross_income: Option<String>,
@@ -138,7 +138,7 @@ impl From<tax_proof_line::Model> for TaxProofLineDto {
 
 #[derive(InputObject, Clone, Debug)]
 pub struct SubmitTaxProofLineInput {
-    pub tax_config_version_id: ID,
+    pub tax_config_version_id: Option<ID>,
     pub fiscal_year: i32,
     pub section_code: String,
     /// Declared amount at the start of the year (string decimal).

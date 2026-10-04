@@ -17,6 +17,23 @@ pub async fn verify(db: &DatabaseConnection, tenant: Uuid, actor: Uuid, employee
     tax_settings::save_tax_settings(&tx, tenant, actor, employee, settings, None)
         .await
         .unwrap();
+    let configured = tx.query_one(Statement::from_sql_and_values(DbBackend::Postgres,
+        "SELECT COUNT(*) AS n FROM tax_configuration_version WHERE tenant_id=$1 AND fiscal_year=2026 AND regime='NEW' AND is_active=true", [tenant.into()])).await.unwrap().unwrap();
+    assert_eq!(configured.try_get::<i64>("", "n").unwrap(), 1, "normal employee tax configuration must establish the declaration/proof association");
+    let context = kabipay_tax::services::tax_submission::context(&tx, tenant, employee, 2026).await.unwrap().unwrap();
+    assert_eq!(context.settings.regime, kabipay_tax::domain::TaxRegime::New);
+    let version = kabipay_tax::services::tax_submission::resolve_version(&tx, tenant, employee, 2026, None, Some("NEW")).await.unwrap();
+    let repeat = kabipay_tax::services::tax_submission::resolve_version(&tx, tenant, employee, 2026, None, Some("NEW_REGIME")).await.unwrap();
+    assert_eq!(version.id, repeat.id);
+    assert!(kabipay_tax::services::tax_submission::resolve_version(&tx, tenant, employee, 2026, None, Some("OLD")).await.is_err());
+    assert!(kabipay_tax::services::tax_submission::context(&tx, Uuid::new_v4(), employee, 2026).await.is_err());
+    kabipay_tax::services::tax_declarations::save_declaration(&tx, tenant, employee, version.id, 2026, Some("NEW".into()), Some(Decimal::from(360000)), Some(Decimal::from(1000))).await.unwrap();
+    let saved = kabipay_tax::services::tax_submission::context(&tx, tenant, employee, 2026).await.unwrap().unwrap().declaration.unwrap();
+    assert_eq!(saved["input"]["gross_income"], "360000");
+    assert_eq!(saved["input"]["regime"], "NEW");
+    let future = kabipay_tax::services::tax_submission::resolve_version(&tx, tenant, employee, 2027, None, None).await.unwrap();
+    assert_eq!(future.fiscal_year, 2027);
+    assert_ne!(future.id, version.id);
     let input = serde_json::from_value(serde_json::json!({"year":2026,"month":10,"gross_rule":"FIXED_MINUS_LWP","fixed_gross":"30000",
         "lwp_days":"1","lwp_divisor":"31","lwp_basis":"GROSS","lwp_handling":"SOURCE_GROSS_INCLUDES_REDUCTION",
         "variable_allowance_ot":"0","incentive":"1000","advance_already_paid":"5000","additional_deductions":[],
@@ -62,6 +79,9 @@ pub async fn verify(db: &DatabaseConnection, tenant: Uuid, actor: Uuid, employee
         tx.execute(Statement::from_sql_and_values(DbBackend::Postgres,
             "INSERT INTO tax_configuration_version(id,tenant_id,fiscal_year,regime,country_code,is_active) VALUES($1,$2,2026,$3,'IN',false)",
             [id.into(),tenant.into(),regime.into()])).await.unwrap();
+    }
+    for (year, regime, country) in [(2027, "OLD_REGIME", "IN"), (2026, "NEW", "IN"), (2026, "OLD", "US")] {
+        assert!(kabipay_tax::services::tax_service::upsert_tax_configuration_version(&tx, tenant, Some(old), year, Some(regime.into()), country.into(), true).await.is_err(), "a referenced definition's financial year, regime and country identity must be immutable");
     }
     for (id, status, amount, offset) in [
         (old, "APPROVED", 1000, 0),

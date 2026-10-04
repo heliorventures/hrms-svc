@@ -34,6 +34,7 @@ pub struct EmployeePayrollInput {
     pub month_components: BTreeMap<String, Decimal>,
     pub policy: ContributionPolicy,
     pub projection: TaxProjectionInput,
+    pub employer_pf_rule: Option<super::salary_rules::EmployerPfRule>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PreparedEmployeePayroll {
@@ -107,6 +108,7 @@ pub(crate) fn calculate_with_arrears(
     }
     let contributions = calculate_contributions(
         &ContributionInput {
+            employer_pf_rule: input.employer_pf_rule.clone(),
             as_of: input.projection.as_of,
             regular_components,
             earned_components: remuneration.clone(),

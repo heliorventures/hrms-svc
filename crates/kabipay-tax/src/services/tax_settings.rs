@@ -1,5 +1,5 @@
 use crate::domain::{TaxSettings, TaxSettingsInput};
-use chrono::NaiveDate;
+use chrono::{Datelike, NaiveDate};
 use kabipay_common::{KabiPayError, KabiPayResult};
 use kabipay_db_entities::tenant::{
     d0007_employee_core::employee,
@@ -74,6 +74,8 @@ pub async fn save_tax_settings<C: ConnectionTrait>(
         .one(db)
         .await?;
     check_revision(current.as_ref().map(|v| v.revision), expected_revision)?;
+    let year = input.effective_from.year() - i32::from(input.effective_from.month() < 4);
+    super::tax_submission::ensure_definition(db, tenant, year, input.regime).await?;
     let revision = current.map_or(1, |v| v.revision + 1);
     let row = settings::ActiveModel {
         id: Set(Uuid::new_v4()),

@@ -41,6 +41,7 @@ fn automatic_input() -> kabipay_payroll::services::automatic_payroll::EmployeePa
         month_components: components,
         policy,
         projection,
+        employer_pf_rule: None,
     }
 }
 #[test]
@@ -54,6 +55,24 @@ fn automatic_lwp_tax_basis_and_advance_settlement_reconcile() {
     assert_eq!(result.calculation.net_earned, Decimal::from(27800));
     assert_eq!(result.calculation.remaining_payable, Decimal::from(22800));
     assert!(result.requires_tax_acknowledgement);
+}
+
+#[test]
+fn fixed_employer_pf_is_unchanged_for_partial_service_and_never_taxable() {
+    use kabipay_payroll::services::automatic_payroll::calculate_employee_payroll;
+    use rust_decimal::Decimal;
+    let mut input = automatic_input();
+    input.period.automatic.as_mut().unwrap().eligibility.pf_applicable = Some(true);
+    input.employer_pf_rule = Some(serde_json::from_value(serde_json::json!({"fixed_monthly_amount":"3000.00","basis_components":[],"rate":"0","ceiling":null,"rounding":"HALF_UP_2DP","origin":"REVIEWED_CONFIGURATION"})).unwrap());
+    for earnings in [31000, 16000] {
+        input.month_components.insert("BASIC".into(), Decimal::from(earnings));
+        let result = calculate_employee_payroll(&input).unwrap();
+        assert_eq!(result.calculation.employer["pf"], "3000.00");
+        assert!(!result.calculation.components.contains_key("EMPLOYER_PF"));
+        assert_eq!(result.calculation.statutory["TDS"].parse::<Decimal>().unwrap(), result.calculation.gross / Decimal::TEN);
+    }
+    input.period.automatic.as_mut().unwrap().eligibility.pf_applicable = Some(false);
+    assert_eq!(calculate_employee_payroll(&input).unwrap().calculation.employer["pf"], "0.00");
 }
 
 #[test]

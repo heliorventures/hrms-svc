@@ -133,13 +133,16 @@ pub fn calculate_contributions(
     } else {
         Decimal::ZERO
     };
-    let pf_employer = if pf {
+    let employer_amount = input.employer_pf_rule.as_ref().map(|rule| super::employer_pf::monthly(rule, &input.earned_components)).transpose()?;
+    let pf_employer = if !pf {
+        Decimal::ZERO
+    } else if let Some(value) = employer_amount {
+        value
+    } else {
         round_contribution(
             formula_basis(&input.earned_components, &policy.pf_employer)? * policy.pf_employer.rate,
             &policy.pf_employer.rounding,
         )
-    } else {
-        Decimal::ZERO
     };
     let esi = if policy.esi_mode == "INDIA_COSS_2025" {
         calculate_esi(&EsiInput {
@@ -186,6 +189,7 @@ pub fn calculate_contributions(
         })?;
     validate_amount(professional_tax)?;
     Ok(ContributionResult {
+        employer_pf_rule: input.employer_pf_rule.clone(),
         pf_employee,
         pf_employer,
         esi_employee: esi.employee,

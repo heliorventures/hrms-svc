@@ -30,6 +30,7 @@ fn finalized_selected_month_is_counted_once_and_never_reprojected() {
     let result = calculate_projection(&input).unwrap();
     assert_eq!(result.recorded_tds, Decimal::from(60000));
     assert_eq!(result.selected_monthly_tds, Some(Decimal::from(10000)));
+    assert_eq!(serde_json::to_value(&result).unwrap()["selected_month"], serde_json::json!({"year":2026,"month":9,"evidence":"FINALIZED_PAYROLL"}));
     assert_eq!(result.withholding.unwrap().monthly, Decimal::from(38750));
 }
 #[test]

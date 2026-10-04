@@ -73,54 +73,7 @@ pub fn validate_recurring_salary(input: &RecurringSalary) -> KabiPayResult<Valid
             "recurring components do not reconcile to gross".into(),
         ));
     }
-    let annual_pf = match &input.employer_pf_rule {
-        Some(rule) if rule.fixed_monthly_amount.is_some() => {
-            if !rule.basis_components.is_empty()
-                || amount(Some(&rule.rate), "PF rate")? != Decimal::ZERO
-                || rule.ceiling.is_some()
-                || rule.rounding != "HALF_UP_2DP"
-                || rule.origin != "REVIEWED_CONFIGURATION"
-            {
-                return Err(KabiPayError::Validation("fixed employer PF requires a reviewed amount without a simultaneous wage formula".into()));
-            }
-            Some(
-                money(amount(
-                    rule.fixed_monthly_amount.as_deref(),
-                    "fixed employer PF",
-                )?) * Decimal::from(12),
-            )
-        }
-        Some(rule) => {
-            if rule.rounding != "HALF_UP_2DP" || rule.basis_components.is_empty() {
-                return Err(KabiPayError::Validation(
-                    "unsupported employer PF rounding or basis".into(),
-                ));
-            }
-            let mut seen = std::collections::HashSet::new();
-            let mut base = Decimal::ZERO;
-            for code in &rule.basis_components {
-                if !seen.insert(code) {
-                    return Err(KabiPayError::Validation(
-                        "duplicate employer PF basis component".into(),
-                    ));
-                }
-                base += components.get(code).ok_or_else(|| {
-                    KabiPayError::Validation("employer PF basis component is missing".into())
-                })?;
-            }
-            if let Some(ceiling) = &rule.ceiling {
-                base = base.min(amount(Some(ceiling), "PF ceiling")?);
-            }
-            let rate = amount(Some(&rule.rate), "employer PF rate")?;
-            if rate > Decimal::ONE {
-                return Err(KabiPayError::Validation(
-                    "employer PF rate exceeds one".into(),
-                ));
-            }
-            Some(money(base * rate) * Decimal::from(12))
-        }
-        None => None,
-    };
+    let annual_pf = input.employer_pf_rule.as_ref().map(|rule| super::employer_pf::monthly(rule, &components).map(|value| value * Decimal::from(12))).transpose()?;
     let supplied_pf = input
         .annual_employer_pf
         .as_deref()

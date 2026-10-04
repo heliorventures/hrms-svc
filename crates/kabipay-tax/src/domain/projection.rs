@@ -69,6 +69,8 @@ pub struct TaxProjection {
     pub recorded_tds: Decimal,
     pub history_complete: bool,
     pub selected_monthly_tds: Option<Decimal>,
+    #[serde(default)]
+    pub selected_month: Option<SelectedMonth>,
     pub limitations: Vec<String>,
     pub note: String,
     pub opening_history: Vec<super::TaxHistoryEntry>,
@@ -80,6 +82,12 @@ pub struct ProjectionConfiguration {
     pub percentage: Option<Decimal>,
     pub basis_components: Vec<String>,
     pub effective_from: NaiveDate,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SelectedMonth {
+    pub year: i32,
+    pub month: u32,
+    pub evidence: EvidenceKind,
 }
 fn money(value: Decimal) -> Decimal {
     value.round_dp_with_strategy(2, RoundingStrategy::MidpointAwayFromZero)
@@ -458,6 +466,8 @@ pub fn calculate_projection(input: &TaxProjectionInput) -> KabiPayResult<TaxProj
         withholding.as_ref().map(|v| v.monthly)
     };
     let employment_count = months.len() as u32;
+    let selected_month = months.iter().find(|m| m.year == input.as_of.year() && m.month == input.as_of.month())
+        .map(|m| SelectedMonth { year: m.year, month: m.month, evidence: m.evidence });
     for month in &mut months {
         if month.aggregate_source.is_some()
             || matches!(
@@ -488,6 +498,6 @@ pub fn calculate_projection(input: &TaxProjectionInput) -> KabiPayResult<TaxProj
                 withholding.as_ref().map(|value| value.monthly)
             };
     }
-    Ok(TaxProjection{fiscal_year:input.fiscal_year,configuration:Some(ProjectionConfiguration{regime:input.settings.regime,method:input.settings.method,percentage:input.settings.percentage,basis_components:input.settings.basis_components.clone(),effective_from:input.settings.effective_from}),months,annual_earnings,tax,withholding,recorded_tds,history_complete,selected_monthly_tds,limitations,opening_history:input.opening_history.clone(),
+    Ok(TaxProjection{fiscal_year:input.fiscal_year,configuration:Some(ProjectionConfiguration{regime:input.settings.regime,method:input.settings.method,percentage:input.settings.percentage,basis_components:input.settings.basis_components.clone(),effective_from:input.settings.effective_from}),months,annual_earnings,tax,withholding,recorded_tds,history_complete,selected_monthly_tds,selected_month,limitations,opening_history:input.opening_history.clone(),
         note:"Estimated tax based on your current salary structure, joining date and available payroll information. Missing historical earnings are estimated. Actual deductions may change when HR updates your records. Contact HR for confirmation.".into()})
 }

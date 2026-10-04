@@ -93,6 +93,13 @@ pub struct QueryRoot;
 
 #[Object]
 impl QueryRoot {
+    async fn employee_tax_submission_context(&self, ctx: &Context<'_>, employee_id: Option<ID>, fiscal_year: i32) -> Result<Option<async_graphql::Json<crate::services::tax_submission::SubmissionContext>>> {
+        tax_read_scope(ctx)?;
+        let tenant = require_tenant_id(ctx)?;
+        let db = tenant_db(ctx, tenant).await?;
+        let employee = super::settings::target(ctx, &db, tenant, employee_id).await?;
+        crate::services::tax_submission::context(&db, tenant, employee, fiscal_year).await.map(|value| value.map(async_graphql::Json)).map_err(KabiPayError::into_graphql)
+    }
     async fn employee_tax_projection(
         &self,
         ctx: &Context<'_>,
@@ -810,6 +817,7 @@ mod tests {
             format!("{{ employeeTaxSettings(employeeId: \"{employee_id}\") }}"),
             format!("{{ employeeTaxHistory(employeeId: \"{employee_id}\", fiscalYear: 2026) }}"),
             format!("{{ employeeTaxDeclaration(employeeId: \"{employee_id}\", fiscalYear: 2026) }}"),
+            format!("{{ employeeTaxSubmissionContext(employeeId: \"{employee_id}\", fiscalYear: 2026) }}"),
             format!("{{ employeeTaxProjection(employeeId: \"{employee_id}\", fiscalYear: 2026, month: 10) }}"),
         ];
 
