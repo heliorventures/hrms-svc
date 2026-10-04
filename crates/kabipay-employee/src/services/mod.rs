@@ -15,6 +15,7 @@ pub mod offboarding_fnf_service;
 pub mod onboarding_service;
 pub mod org_service;
 pub mod profile_extras_service;
+pub mod imported_profile;
 pub mod profile_change_service;
 pub mod profile_payload_crypto;
 pub mod profile_record_service;

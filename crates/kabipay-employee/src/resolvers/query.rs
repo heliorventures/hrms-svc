@@ -960,6 +960,19 @@ impl QueryRoot {
         Ok(row.as_ref().map(EmployeeBankAccountDto::from_model))
     }
 
+    /// Imported nullable fields use the existing employee-target authorization.
+    async fn employee_imported_profile(
+        &self, ctx: &Context<'_>, employee_id: ID,
+    ) -> Result<async_graphql::Json<serde_json::Value>> {
+        let eid=parse_uuid(&employee_id,"employeeId")?;
+        let access=employee_target_access(ctx,eid)?;
+        let tenant_id=require_tenant_id(ctx)?;
+        let db=tenant_db(ctx,tenant_id).await?;
+        authorize_employee_target(ctx,&db,tenant_id,eid,access).await?;
+        crate::services::imported_profile::read(&db,tenant_id,eid).await
+            .map(async_graphql::Json).map_err(KabiPayError::into_graphql)
+    }
+
     /// Masked PAN / Aadhaar primary rows for the employee profile.
     async fn employee_identity_profile(
         &self,

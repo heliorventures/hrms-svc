@@ -50,3 +50,6 @@ pub mod d0080_prejoining;
 pub mod d0084_survey_targeting_corrections;
 pub mod d0087_attendance_day_boundary;
 pub mod d0089_user_guidance_state;
+pub mod d0090_payroll_period_configuration;
+pub mod d0091_leave_import_history;
+pub mod d0092_tenant_import_tracking;

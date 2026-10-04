@@ -36,7 +36,7 @@ mod handlers;
 mod jwt;
 mod password_tasks;
 mod request_metrics;
-mod rbac;
+use kabipay_auth::rbac;
 mod state;
 mod tokens;
 

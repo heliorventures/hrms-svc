@@ -22,9 +22,7 @@ use sea_orm::DatabaseConnection;
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
 
-mod entities;
-mod resolvers;
-mod services;
+use kabipay_employee::{resolvers, services};
 mod http_prejoining;
 
 use resolvers::{MutationRoot, QueryRoot};

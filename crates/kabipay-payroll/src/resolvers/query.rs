@@ -124,6 +124,29 @@ pub struct QueryRoot;
 
 #[Object]
 impl QueryRoot {
+    async fn payroll_approved_lwp_review(&self,ctx:&Context<'_>,employee_id:ID,year:i32,month:i32)->Result<async_graphql::Json<serde_json::Value>> {
+        use sea_orm::TransactionTrait;
+        require_payroll_tenant_all_scope(ctx,PERM_PAYROLL_MANAGE)?;
+        let tenant=require_tenant_id(ctx)?;let db=tenant_db(ctx,tenant).await?;
+        let transaction=db.begin().await.map_err(KabiPayError::from).map_err(KabiPayError::into_graphql)?;
+        let review=crate::services::imported_lwp::review(&transaction,tenant,parse_uuid(&employee_id,"employeeId")?,year,month,false).await.map_err(KabiPayError::into_graphql)?;
+        transaction.rollback().await.map_err(KabiPayError::from).map_err(KabiPayError::into_graphql)?;
+        Ok(async_graphql::Json(review))
+    }
+    async fn payslip_presentation(&self,ctx:&Context<'_>,payslip_id:ID)->Result<Option<crate::services::payslip_presentation::PayslipPresentation>> {
+        let tenant=require_tenant_id(ctx)?;let scope=payroll_read_scope(ctx)?;
+        let db=tenant_db(ctx,tenant).await?;let viewer=resolve_viewer_employee(ctx,&db,tenant).await?;
+        let filter=resolve_employee_scope_filter(&db,tenant,scope,viewer).await.map_err(KabiPayError::into_graphql)?;
+        let row=payroll_service::find_scoped_payslip_detail(&db,tenant,parse_uuid(&payslip_id,"payslipId")?,&filter).await.map_err(KabiPayError::into_graphql)?;
+        let Some((slip,lines))=row else {return Ok(None);};
+        Ok(Some(crate::services::payslip_presentation::load(&db,tenant,&slip,&lines).await.map_err(KabiPayError::into_graphql)?))
+    }
+    async fn payroll_period_input(&self,ctx:&Context<'_>,employee_id:ID,year:i32,month:i32)->Result<Option<async_graphql::Json<serde_json::Value>>> {
+        require_payroll_tenant_all_scope(ctx,PERM_PAYROLL_MANAGE)?;
+        let tenant=require_tenant_id(ctx)?;let db=tenant_db(ctx,tenant).await?;
+        let row=crate::services::payroll_period_input::find(&db,tenant,parse_uuid(&employee_id,"employeeId")?,year,month).await.map_err(KabiPayError::into_graphql)?;
+        Ok(row.map(|row|async_graphql::Json(serde_json::json!({"id":row.id,"input":row.input,"revision":row.revision,"ready":row.ready}))))
+    }
     async fn payroll_unpaid_leave_policy(&self, ctx: &Context<'_>) -> Result<Option<super::types::PayrollUnpaidLeavePolicy>> {
         require_payroll_tenant_all_scope(ctx, PERM_PAYROLL_MANAGE)?;
         let tenant = require_tenant_id(ctx)?;
@@ -160,7 +183,11 @@ impl QueryRoot {
         let rows = payroll_service::list_components(&db, tenant_id, active_only, limit)
             .await
             .map_err(KabiPayError::into_graphql)?;
-        Ok(rows.into_iter().map(SalaryComponentDto::from).collect())
+        let visibility=crate::services::component_display::catalog(&db,tenant_id).await.map_err(KabiPayError::into_graphql)?;
+        Ok(rows.into_iter().map(|row| {
+            let visible=visibility.get(&row.id).copied().unwrap_or(row.r#type!="EMPLOYER_CONTRIBUTION");
+            let mut dto=SalaryComponentDto::from(row);dto.show_on_payslip=visible;dto
+        }).collect())
     }
 
     async fn salary_structures(
@@ -241,6 +268,7 @@ impl QueryRoot {
             return Ok(None);
         };
         Ok(Some(SalaryBreakupPreviewDto {
+            financials:crate::services::salary_financials::for_assignment(&db,tenant_id,preview.employee_salary_structure_id).await.map_err(KabiPayError::into_graphql)?.map(async_graphql::Json),
             employee_id: ID(preview.employee_id.to_string()),
             employee_salary_structure_id: preview
                 .employee_salary_structure_id

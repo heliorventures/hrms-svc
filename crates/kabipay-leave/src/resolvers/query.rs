@@ -43,6 +43,17 @@ pub struct QueryRoot;
 
 #[Object]
 impl QueryRoot {
+    async fn leave_import_history(&self,ctx:&Context<'_>,employee_id:Option<ID>,year:i32)->Result<Option<async_graphql::Json<serde_json::Value>>> {
+        use kabipay_db_entities::tenant::d0091_leave_import_history::leave_import_history;
+        let tenant=require_tenant_id(ctx)?;let scope=leave_read_scope(ctx)?;let db=tenant_db(ctx,tenant).await?;
+        let employee=match employee_id {Some(id)=>parse_uuid(&id,"employeeId")?,None=>resolve_client_employee_id(ctx,&db,tenant).await.map_err(KabiPayError::into_graphql)?};
+        let viewer=resolve_viewer_employee(ctx,&db,tenant).await?;
+        let filter=resolve_employee_scope_filter(&db,tenant,scope,viewer).await.map_err(KabiPayError::into_graphql)?;
+        if !filter.allows_employee(employee) {return Ok(None);}
+        let row=leave_import_history::Entity::find().filter(leave_import_history::Column::TenantId.eq(tenant)).filter(leave_import_history::Column::EmployeeId.eq(employee))
+            .filter(leave_import_history::Column::Year.eq(year)).one(&db).await.map_err(KabiPayError::from).map_err(KabiPayError::into_graphql)?;
+        Ok(row.map(|row|async_graphql::Json(serde_json::json!({"leave_type_id":row.leave_type_id,"as_of":row.as_of,"opening":row.opening,"historical_lwp":if row.ready {Some(row.historical_lwp.to_string())}else{None},"ready":row.ready}))))
+    }
     /// Complete date/read-scope queue. Summary counts are independent of the selected tab.
     async fn leave_approval_queue(
         &self,

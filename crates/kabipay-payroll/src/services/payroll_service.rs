@@ -825,7 +825,7 @@ pub async fn india_pf_esi_monthly_summary_csv(
 }
 
 /// **Bank disbursement (CSV).** One row per payslip in the payroll cycle for `month` + `year`, with
-/// the employee’s **primary** `employee_bank` when present. `net_salary` is the transfer amount; not
+/// the employee’s **primary** `employee_bank` when present. Imported settlements transfer only
 /// a bank NEFT/RTGS file format from any one bank—generic prep for upload / ops.
 pub async fn payroll_bank_transfer_csv(
     db: &DatabaseConnection,
@@ -891,6 +891,7 @@ pub async fn payroll_bank_transfer_csv(
     }
 
     let cycle_name = &cycle_row.name;
+    let settlements=super::salary_settlement::remaining_by_payslip(db,tenant_id,&slips.iter().map(|p|p.id).collect::<Vec<_>>()).await?;
     for p in slips {
         let (code, name) = match emp_map.get(&p.employee_id) {
             Some(e) => (
@@ -920,7 +921,7 @@ pub async fn payroll_bank_transfer_csv(
             csv_cell(ifsc),
             csv_cell(atype),
             csv_cell("INR"),
-            dec_cell(p.net_salary),
+            dec_cell(settlements.get(&p.id).copied().unwrap_or(p.net_salary)),
             month,
             year,
             csv_cell(cycle_name),
@@ -1024,6 +1025,7 @@ pub async fn payroll_india_bulk_neft_credit_csv(
         .unwrap_or_default();
 
     let mut seq: i32 = 0;
+    let settlements=super::salary_settlement::remaining_by_payslip(db,tenant_id,&slips.iter().map(|p|p.id).collect::<Vec<_>>()).await?;
     for p in slips {
         seq += 1;
         let (code, disp_name) = match emp_map.get(&p.employee_id) {
@@ -1045,7 +1047,7 @@ pub async fn payroll_india_bulk_neft_credit_csv(
             csv_cell(&disp_name),
             csv_cell(acc),
             csv_cell(ifsc),
-            dec_cell(p.net_salary),
+            dec_cell(settlements.get(&p.id).copied().unwrap_or(p.net_salary)),
             csv_cell(&value_date),
             csv_cell("NEFT"),
             csv_cell(&narration),
@@ -2195,6 +2197,9 @@ pub async fn run_payroll_for_cycle(
         )));
     }
 
+    txn.execute(sea_orm::Statement::from_sql_and_values(sea_orm::DbBackend::Postgres,
+        "SELECT pg_advisory_xact_lock(hashtextextended($1,0))",
+        [format!("payroll-period:{tenant_id}:{}:{}",cycle_row.year,cycle_row.month).into()])).await?;
     let comp_cfg = find_payroll_compliance_setting(&txn, tenant_id).await?;
     let unpaid_policy = super::unpaid_leave_policy::find(&txn, tenant_id).await?
         .filter(|policy| policy.enabled);
@@ -2232,8 +2237,16 @@ pub async fn run_payroll_for_cycle(
 
     let now = Utc::now();
     let payroll_period_start = period_start(cycle_row.month, cycle_row.year)?;
+    let excluded=txn.query_all(sea_orm::Statement::from_sql_and_values(sea_orm::DbBackend::Postgres,
+        "SELECT id FROM employee WHERE tenant_id=$1 AND payroll_excluded",[tenant_id.into()])).await?
+        .into_iter().map(|row|row.try_get::<Uuid>("","id")).collect::<Result<HashSet<_>,_>>()?;
     for emp in employees {
+        if excluded.contains(&emp.id) {continue;}
         if have.contains(&emp.id) {
+            continue;
+        }
+        if super::imported_payroll::run(&txn,tenant_id,cycle_id,&emp,payroll_period_start).await? {
+            have.insert(emp.id);
             continue;
         }
         let base = latest_employment_salary(&txn, tenant_id, emp.id)

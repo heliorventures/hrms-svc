@@ -231,15 +231,26 @@ pub async fn resolve_tenant_db(
     cache: &TenantDbCache,
     fallback_cfg: &TenantDbConfig,
 ) -> KabiPayResult<DatabaseConnection> {
+    resolve_tenant_handle(tenant_id, ops_db, cache, fallback_cfg)
+        .await
+        .map(|handle| handle.conn)
+}
+
+/// Fail-closed resolver with the effective connection metadata, also used for backups.
+pub async fn resolve_required_tenant_handle(
+    tenant_id: Uuid,
+    ops_db: &DatabaseConnection,
+    cache: &TenantDbCache,
+    fallback_cfg: &TenantDbConfig,
+) -> KabiPayResult<TenantDbHandle> {
     resolve_tenant_handle_with_policy(
         tenant_id,
         ops_db,
         cache,
         fallback_cfg,
-        MissingTenantDbPolicy::DerivedFallback,
+        MissingTenantDbPolicy::FailClosed,
     )
         .await
-        .map(|h| h.conn)
 }
 
 /// Resolve a tenant database only when it has an active control-plane mapping.
@@ -251,15 +262,9 @@ pub async fn resolve_required_tenant_db(
     cache: &TenantDbCache,
     fallback_cfg: &TenantDbConfig,
 ) -> KabiPayResult<DatabaseConnection> {
-    resolve_tenant_handle_with_policy(
-        tenant_id,
-        ops_db,
-        cache,
-        fallback_cfg,
-        MissingTenantDbPolicy::FailClosed,
-    )
-    .await
-    .map(|handle| handle.conn)
+    resolve_required_tenant_handle(tenant_id, ops_db, cache, fallback_cfg)
+        .await
+        .map(|handle| handle.conn)
 }
 
 /// Like [`resolve_tenant_db`] but exposes the full [`TenantDbHandle`] (handy

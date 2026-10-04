@@ -2129,12 +2129,14 @@ dependencies = [
  "axum",
  "chrono",
  "dotenvy",
+ "hex",
  "kabipay-common",
  "kabipay-db-entities",
  "rust_decimal",
  "sea-orm",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror 1.0.69",
  "tokio",
  "tower 0.4.13",
@@ -2264,6 +2266,31 @@ dependencies = [
  "tower-http 0.5.2",
  "tracing",
  "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
+name = "kabipay-tenant-import"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-graphql",
+ "chrono",
+ "dotenvy",
+ "hex",
+ "kabipay-auth",
+ "kabipay-common",
+ "kabipay-db-entities",
+ "kabipay-employee",
+ "kabipay-leave",
+ "kabipay-payroll",
+ "rand 0.8.6",
+ "rust_decimal",
+ "sea-orm",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokio",
  "uuid",
 ]
 

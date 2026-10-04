@@ -85,6 +85,11 @@ fn resolved_dates(saved: Option<&allocation::Model>, request: &leave_request::Mo
 }
 
 pub async fn calculate<C: ConnectionTrait + Sync>(db: &C, tenant: Uuid, employee: Uuid, period: NaiveDate, policy: &policy::Model, basic: Decimal) -> KabiPayResult<Calculation> {
+    calculate_with_mode(db,tenant,employee,period,policy,basic,true).await
+}
+
+/// Review uses the same dated allocation without freezing it before payroll consumes it.
+pub async fn calculate_with_mode<C: ConnectionTrait + Sync>(db: &C, tenant: Uuid, employee: Uuid, period: NaiveDate, policy: &policy::Model, basic: Decimal, freeze:bool) -> KabiPayResult<Calculation> {
     validate(policy.enabled, policy.basic_component_code.as_deref(), policy.day_divisor, policy.treatment.as_deref())?;
     let end = if period.month() == 12 { NaiveDate::from_ymd_opt(period.year() + 1, 1, 1) } else { NaiveDate::from_ymd_opt(period.year(), period.month() + 1, 1) }
         .and_then(|v| v.pred_opt()).ok_or_else(|| KabiPayError::Validation("invalid payroll month".into()))?;
@@ -123,7 +128,7 @@ pub async fn calculate<C: ConnectionTrait + Sync>(db: &C, tenant: Uuid, employee
         let existing = allocation::Entity::find_by_id(request.id).filter(allocation::Column::TenantId.eq(tenant))
             .filter(allocation::Column::EmployeeId.eq(employee)).one(db).await.map_err(KabiPayError::from)?;
         let dates = resolved_dates(existing.as_ref(), &request, leave_type.sandwich_rule, &holidays)?;
-        if existing.is_none() {
+        if freeze && existing.is_none() {
             allocation::ActiveModel {
                 leave_request_id: Set(request.id), tenant_id: Set(tenant), employee_id: Set(employee),
                 from_date: Set(request.from_date), to_date: Set(request.to_date), approved_days: Set(request.days_requested),

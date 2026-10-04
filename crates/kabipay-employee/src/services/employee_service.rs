@@ -1105,9 +1105,22 @@ pub async fn provision_login(
 ) -> KabiPayResult<employee::Model> {
     rbac_admin_service::require_nonempty_role_assignment(&account.role_ids)?;
     let txn = db.begin().await?;
+    let updated = provision_login_in_transaction(&txn, tenant_id, employee_id, account).await?;
+    txn.commit().await?;
+    Ok(updated)
+}
+
+/// Share employee login validation with tenant imports and other atomic onboarding operations.
+pub async fn provision_login_in_transaction(
+    txn: &sea_orm::DatabaseTransaction,
+    tenant_id: Uuid,
+    employee_id: Uuid,
+    account: NewLoginAccount,
+) -> KabiPayResult<employee::Model> {
+    rbac_admin_service::require_nonempty_role_assignment(&account.role_ids)?;
     let validated_role_ids =
-        rbac_admin_service::validated_active_role_ids(&txn, tenant_id, &account.role_ids).await?;
-    let existing = find_by_id(&txn, tenant_id, employee_id)
+        rbac_admin_service::validated_active_role_ids(txn, tenant_id, &account.role_ids).await?;
+    let existing = find_by_id(txn, tenant_id, employee_id)
         .await?
         .ok_or_else(|| KabiPayError::NotFound {
             entity: "employee",
@@ -1119,7 +1132,7 @@ pub async fn provision_login(
         ));
     }
     let user_id = insert_login_user(
-        &txn,
+        txn,
         tenant_id,
         account,
         validated_role_ids,
@@ -1129,11 +1142,10 @@ pub async fn provision_login(
     let mut am: employee::ActiveModel = existing.into();
     am.user_id = Set(Some(user_id));
     am.updated_at = Set(Utc::now());
-    am.update(&txn).await?;
-    let updated = find_by_id(&txn, tenant_id, employee_id)
+    am.update(txn).await?;
+    let updated = find_by_id(txn, tenant_id, employee_id)
         .await?
         .ok_or_else(|| KabiPayError::Internal("updated employee not found".into()))?;
-    txn.commit().await?;
     Ok(updated)
 }
 

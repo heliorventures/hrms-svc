@@ -47,6 +47,7 @@ use kabipay_db_entities::tenant::d0012_payroll::{
 #[derive(SimpleObject, Clone, Debug)]
 #[graphql(name = "SalaryComponent")]
 pub struct SalaryComponentDto {
+    pub show_on_payslip: bool,
     pub id: ID,
     pub tenant_id: ID,
     pub name: String,
@@ -63,6 +64,7 @@ pub struct SalaryComponentDto {
 impl From<salary_component::Model> for SalaryComponentDto {
     fn from(m: salary_component::Model) -> Self {
         Self {
+            show_on_payslip: m.r#type != "EMPLOYER_CONTRIBUTION",
             id: ID(m.id.to_string()),
             tenant_id: ID(m.tenant_id.to_string()),
             name: m.name,
@@ -181,6 +183,7 @@ pub struct SalaryBreakupLineDto {
 #[derive(SimpleObject, Clone, Debug)]
 #[graphql(name = "SalaryBreakupPreview")]
 pub struct SalaryBreakupPreviewDto {
+    pub financials:Option<async_graphql::Json<serde_json::Value>>,
     pub employee_id: ID,
     pub employee_salary_structure_id: Option<ID>,
     pub annual_ctc: String,
