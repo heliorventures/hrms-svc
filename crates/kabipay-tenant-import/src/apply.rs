@@ -5,7 +5,7 @@ use crate::{
     report::ImportReport,
     tenant_target::VerifiedTenantTarget,
 };
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use kabipay_db_entities::tenant::d0092_tenant_import_tracking::tenant_import_run;
 use sea_orm::{
     ColumnTrait, ConnectionTrait, DbBackend, EntityTrait, QueryFilter, Statement, TransactionTrait,
@@ -138,18 +138,23 @@ pub async fn apply(
             .reset
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("RESET_REVIEW_REQUIRED"))?;
-        let bin = execution
-            .pg_bin
-            .ok_or_else(|| anyhow::anyhow!("BACKUP_TOOLS_REQUIRED"))?;
-        crate::backup::backup(
-            &transaction,
-            options,
-            &target.connection_host,
-            execution.output,
-            bin,
-        )
-        .await?;
-        crate::reset::apply(&transaction, &options.schema_name, manifest).await?;
+        if options.replacement_backup.required() {
+            let bin = execution
+                .pg_bin
+                .ok_or_else(|| anyhow::anyhow!("BACKUP_TOOLS_REQUIRED"))?;
+            crate::backup::backup(
+                &transaction,
+                options,
+                &target.connection_host,
+                execution.output,
+                bin,
+            )
+            .await
+            .context("RESET_BACKUP_FAILED")?;
+        }
+        crate::reset::apply(&transaction, &options.schema_name, manifest)
+            .await
+            .context("RESET_EXECUTION_FAILED")?;
     }
     for id in &options.payroll_excluded_employee_ids {
         let row = transaction
@@ -174,6 +179,9 @@ pub async fn apply(
         run_id: Uuid::new_v4(),
         tenant_id: options.tenant_id,
         committed: false,
+        replacement_backup: execution
+            .replace
+            .then(|| options.replacement_backup.clone()),
         sections: Vec::new(),
         issues: package
             .issues

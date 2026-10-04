@@ -2,10 +2,37 @@
 use crate::options::ImportOptions;
 use anyhow::{bail, Result};
 use sea_orm::{ConnectionTrait, DbBackend, Statement};
+use serde::{Deserialize, Serialize};
 use std::{
     path::{Path, PathBuf},
     process::Command,
 };
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(tag = "mode", rename_all = "SCREAMING_SNAKE_CASE", deny_unknown_fields)]
+pub enum BackupPolicy {
+    #[default]
+    Required,
+    Skip {
+        reason: String,
+    },
+}
+impl BackupPolicy {
+    pub fn validate(&self) -> Result<()> {
+        if let Self::Skip { reason } = self {
+            if reason.trim().is_empty()
+                || reason.len() > 200
+                || reason.chars().any(char::is_control)
+            {
+                bail!("BACKUP_SKIP_REASON_REQUIRED");
+            }
+        }
+        Ok(())
+    }
+    pub fn required(&self) -> bool {
+        matches!(self, Self::Required)
+    }
+}
 
 pub async fn backup<C: ConnectionTrait>(
     db: &C,

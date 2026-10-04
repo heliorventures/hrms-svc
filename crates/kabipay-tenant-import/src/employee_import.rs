@@ -112,22 +112,22 @@ pub async fn optional_profile<C: ConnectionTrait>(
         (
             "birth_date",
             "date_of_birth",
-            data.birth_date.map(|v| Value::from(v)),
+            data.birth_date.map(Value::from),
         ),
         (
             "confirmation_date",
             "confirmation_date",
-            data.confirmation_date.map(|v| Value::from(v)),
+            data.confirmation_date.map(Value::from),
         ),
         (
             "exit_date",
             "imported_exit_date",
-            data.exit_date.map(|v| Value::from(v)),
+            data.exit_date.map(Value::from),
         ),
         (
             "last_working_date",
             "imported_last_working_date",
-            data.last_working_date.map(|v| Value::from(v)),
+            data.last_working_date.map(Value::from),
         ),
         ("gender", "gender", data.gender.clone().map(Value::from)),
         ("uan", "uan_number", data.uan.clone().map(Value::from)),

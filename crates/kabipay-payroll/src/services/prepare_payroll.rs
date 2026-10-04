@@ -14,6 +14,8 @@ pub async fn prepare<C: ConnectionTrait + Send + Sync>(
     employee: Uuid,
     input: &PeriodInput,
 ) -> KabiPayResult<PreparedEmployeePayroll> {
+    let resolved = super::automatic_period::resolve(db, tenant, employee, input).await?;
+    let input = &resolved;
     let arrears = super::reviewed_arrears::pending(db, tenant, employee).await?;
     let arrear_total: rust_decimal::Decimal = arrears.iter().map(|r| r.amount).sum();
     if input.automatic.is_none() {

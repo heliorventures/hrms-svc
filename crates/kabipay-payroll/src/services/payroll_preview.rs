@@ -37,6 +37,7 @@ fn period_eligibility(
 pub async fn employees<C: ConnectionTrait + Send + Sync>(
     db: &C,
     tenant: Uuid,
+    actor: Uuid,
     cycle: &payroll_cycle::Model,
 ) -> KabiPayResult<Vec<DraftEmployee>> {
     let rows = db.query_all(Statement::from_sql_and_values(DbBackend::Postgres,
@@ -66,7 +67,7 @@ pub async fn employees<C: ConnectionTrait + Send + Sync>(
             });
             continue;
         }
-        let outcome = prepare_employee(db, tenant, employee, cycle).await;
+        let outcome = prepare_employee(db, tenant, actor, employee, cycle).await;
         results.push(match outcome {
             Ok(prepared) => DraftEmployee {
                 employee_id: employee,
@@ -128,21 +129,40 @@ fn review_reason(error: KabiPayError) -> String {
 async fn prepare_employee<C: ConnectionTrait + Send + Sync>(
     db: &C,
     tenant: Uuid,
+    actor: Uuid,
     employee: Uuid,
     cycle: &payroll_cycle::Model,
 ) -> KabiPayResult<super::automatic_payroll::PreparedEmployeePayroll> {
-    let period = super::payroll_period_input::find(db, tenant, employee, cycle.year, cycle.month)
+    let existing =
+        super::payroll_period_input::find(db, tenant, employee, cycle.year, cycle.month).await?;
+    let mut input: PeriodInput = match &existing {
+        Some(period) => serde_json::from_value(period.input.clone())
+            .map_err(|_| KabiPayError::Validation("Stored monthly input is invalid".into()))?,
+        None => super::automatic_period::new_input(cycle.year, cycle.month)?,
+    };
+    let period = if input.automatic.is_some() {
+        input.ready = true;
+        super::payroll_period_input::save(
+            db,
+            tenant,
+            actor,
+            employee,
+            input.clone(),
+            None,
+            existing.as_ref().map(|row| row.revision),
+        )
         .await?
-        .ok_or_else(|| {
-            KabiPayError::Validation("Review monthly payroll inputs before calculating".into())
-        })?;
+    } else {
+        existing
+            .ok_or_else(|| KabiPayError::Validation("Reviewed source input is missing".into()))?
+    };
     if !period.ready {
+        // Re-evaluate to return the precise missing setting, rather than a stale readiness flag.
+        super::prepare_payroll::prepare(db, tenant, employee, &input).await?;
         return Err(KabiPayError::Validation(
             "Monthly payroll inputs require review".into(),
         ));
     }
-    let input: PeriodInput = serde_json::from_value(period.input)
-        .map_err(|_| KabiPayError::Validation("Stored monthly input is invalid".into()))?;
     let prepared = super::prepare_payroll::prepare(db, tenant, employee, &input).await?;
     if prepared.calculation.components.is_empty() {
         return Err(KabiPayError::Validation(

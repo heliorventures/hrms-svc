@@ -231,7 +231,59 @@ impl QueryRoot {
         )
         .await
         .map_err(KabiPayError::into_graphql)?;
-        Ok(row.map(|row|async_graphql::Json(serde_json::json!({"id":row.id,"input":row.input,"revision":row.revision,"ready":row.ready}))))
+        let employee = parse_uuid(&employee_id, "employeeId")?;
+        if self.payroll_period_locked(ctx, year, month).await? {
+            return Ok(row.map(|value| {
+                async_graphql::Json(serde_json::json!({
+                    "id":value.id,"input":value.input,"revision":value.revision,
+                    "ready":value.ready,"derived":false,"validationError":null
+                }))
+            }));
+        }
+        let input = match &row {
+            Some(value) => serde_json::from_value(value.input.clone()).map_err(|_| {
+                KabiPayError::Validation("stored monthly input is invalid".into()).into_graphql()
+            })?,
+            None => crate::services::automatic_period::new_input(year, month)
+                .map_err(KabiPayError::into_graphql)?,
+        };
+        let prepared =
+            crate::services::prepare_payroll::prepare(&db, tenant, employee, &input).await;
+        let error = prepared.as_ref().err().map(|error| match error {
+            KabiPayError::Validation(message) | KabiPayError::Conflict(message) => message.clone(),
+            _ => "Unable to calculate this employee. Check configuration or contact support.".into(),
+        });
+        let display = prepared
+            .as_ref()
+            .map(|value| &value.input)
+            .unwrap_or(&input);
+        Ok(Some(async_graphql::Json(serde_json::json!({
+            "id":row.as_ref().map(|value|value.id),"input":display,
+            "revision":row.as_ref().map(|value|value.revision),
+            "ready":prepared.is_ok() && row.as_ref().is_none_or(|value|value.ready || input.automatic.is_some()),
+            "derived":row.is_none(),"validationError":error
+        }))))
+    }
+    async fn employee_payroll_eligibility(
+        &self,
+        ctx: &Context<'_>,
+        employee_id: ID,
+        as_of: chrono::NaiveDate,
+    ) -> Result<
+        Option<async_graphql::Json<crate::services::employee_eligibility::EligibilitySetting>>,
+    > {
+        require_payroll_tenant_all_scope(ctx, PERM_PAYROLL_MANAGE)?;
+        let tenant = require_tenant_id(ctx)?;
+        let db = tenant_db(ctx, tenant).await?;
+        Ok(crate::services::employee_eligibility::find(
+            &db,
+            tenant,
+            parse_uuid(&employee_id, "employeeId")?,
+            as_of,
+        )
+        .await
+        .map_err(KabiPayError::into_graphql)?
+        .map(async_graphql::Json))
     }
     async fn payroll_period_locked(
         &self,

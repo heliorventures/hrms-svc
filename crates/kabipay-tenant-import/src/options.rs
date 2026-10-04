@@ -26,9 +26,14 @@ pub struct ImportOptions {
     pub reset_delete_tables: Vec<String>,
     #[serde(default)]
     pub reset_retain_tables: Vec<String>,
+    #[serde(default)]
+    pub reset_truncate_tables: Vec<String>,
+    #[serde(default)]
+    pub replacement_backup: crate::backup::BackupPolicy,
 }
 impl ImportOptions {
     pub fn validate(&self) -> Result<()> {
+        self.replacement_backup.validate()?;
         if !valid_schema(&self.schema_name)
             || self.runtime_contract_version != 1
             || self.tenant_code.trim().is_empty()

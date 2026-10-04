@@ -46,10 +46,10 @@ fn source(kind:HrReportKind,domains:&[&str])->Source {
  HrReportKind::LeaveBalances => (vec!["Employee code","Employee","Leave type","Leave year","Current entitled","Current used","Current pending","Carried forward","Current balance"],format!("SELECT {labels},t.name,r.year,r.entitled_days,r.used_days,r.pending_days,r.carried_forward_days,r.balance_days FROM leave_balance r {employee_join} JOIN leave_type t ON t.id=r.leave_type_id AND t.tenant_id=r.tenant_id WHERE {predicate} AND t.code<>'COMP_OFF' AND r.year BETWEEN extract(year FROM $2::date) AND extract(year FROM $3::date) ORDER BY r.year,e.employee_code,t.code,r.id")),
  HrReportKind::PayrollRegister|HrReportKind::UnpaidLeave => {
  let unpaid=kind==HrReportKind::UnpaidLeave;
- let extra=if unpaid {",u.basic_component_code,u.basic_amount,u.day_divisor,u.unpaid_days,u.amount,u.treatment,u.source_days"}else{""};
+ let extra=if unpaid {",CASE WHEN s.payslip_id IS NOT NULL THEN 'GROSS' ELSE u.basic_component_code END,CASE WHEN s.payslip_id IS NOT NULL THEN s.statement->>'lwp_basis_amount' ELSE u.basic_amount::text END,CASE WHEN s.payslip_id IS NOT NULL THEN s.statement->>'lwp_divisor' ELSE u.day_divisor::text END,CASE WHEN s.payslip_id IS NOT NULL THEN s.statement->>'lwp_days' ELSE u.unpaid_days::text END,CASE WHEN s.payslip_id IS NOT NULL THEN s.statement->>'lwp_amount' ELSE u.amount::text END,CASE WHEN s.payslip_id IS NOT NULL THEN 'INCLUDED_IN_EARNED_GROSS' ELSE u.treatment END,CASE WHEN s.payslip_id IS NOT NULL THEN (s.statement->'dated_lwp'->'source_days')::text ELSE u.source_days::text END"}else{""};
  let mut cols=vec!["Employee code","Employee","Payroll month","Gross salary","Deductions","Net salary generated","Payslip status"];
- if unpaid {cols.extend(["Basic component","Stored basic amount","Day divisor","Unpaid days","Unpaid amount","Treatment","Source day snapshot"]);}
- (cols,format!("SELECT {labels},to_char(make_date(c.year,c.month,1),'YYYY-MM'),r.gross_salary,r.total_deductions,r.net_salary,r.status{extra} FROM payslip r {employee_join} JOIN payroll_cycle c ON c.id=r.payroll_cycle_id AND c.tenant_id=r.tenant_id {} WHERE {predicate} AND make_date(c.year,c.month,1)<= $3 AND (make_date(c.year,c.month,1)+interval '1 month')::date>$2 ORDER BY c.year,c.month,e.employee_code,r.id",if unpaid {"JOIN payslip_unpaid_leave u ON u.payslip_id=r.id AND u.tenant_id=r.tenant_id"}else{""}))
+ if unpaid {cols.extend(["Wage basis","Stored wage basis amount","Day divisor","Unpaid days","Unpaid amount","Treatment","Source day snapshot"]);}
+ (cols,format!("SELECT {labels},to_char(make_date(c.year,c.month,1),'YYYY-MM'),r.gross_salary,r.total_deductions,r.net_salary,r.status{extra} FROM payslip r {employee_join} JOIN payroll_cycle c ON c.id=r.payroll_cycle_id AND c.tenant_id=r.tenant_id {} WHERE {predicate} {} AND make_date(c.year,c.month,1)<= $3 AND (make_date(c.year,c.month,1)+interval '1 month')::date>$2 ORDER BY c.year,c.month,e.employee_code,r.id",if unpaid {"LEFT JOIN payslip_statement s ON s.payslip_id=r.id AND s.tenant_id=r.tenant_id LEFT JOIN payslip_unpaid_leave u ON u.payslip_id=r.id AND u.tenant_id=r.tenant_id"}else{""},if unpaid {"AND (s.payslip_id IS NOT NULL OR u.payslip_id IS NOT NULL)"}else{""}))
  },
  HrReportKind::EmployeeMovements => (vec!["Employee code","Employee","Movement","Effective date","Current department","Current designation"],format!("WITH movements AS (SELECT id employee_id,tenant_id,'Joined' movement,date_of_joining effective_date,id FROM employee WHERE tenant_id=$1 AND NOT is_deleted UNION ALL SELECT employee_id,tenant_id,'Exited',last_working_date,id FROM separation WHERE tenant_id=$1 AND offboarded_at IS NOT NULL AND last_working_date<=$6) SELECT {labels},r.movement,r.effective_date,d.name,g.title FROM movements r {employee_join} LEFT JOIN department d ON d.id=e.department_id AND d.tenant_id=e.tenant_id LEFT JOIN designation g ON g.id=e.designation_id AND g.tenant_id=e.tenant_id WHERE {predicate} AND r.effective_date BETWEEN $2 AND $3 ORDER BY r.effective_date,e.employee_code,r.movement,r.id")),
  HrReportKind::TimesheetHours => (vec!["Employee code","Employee","Work date","Project code","Work description","Hours","Approval status"],format!("SELECT {labels},r.work_date,r.project_code,r.description,r.hours_worked,r.status FROM timesheet_entry r {employee_join} WHERE {predicate} AND NOT r.is_deleted AND r.work_date BETWEEN $2 AND $3 ORDER BY r.work_date,e.employee_code,r.id")),
@@ -92,6 +92,15 @@ async fn load_sql(db:&DatabaseConnection,tenant_id:Uuid,claims:&ClientClaims,kin
 #[cfg(test)]
 mod tests {
  use super::*;
+ #[test]
+ fn unpaid_report_covers_current_statements_and_legacy_snapshots_without_duplicate_rows() {
+     let report = source(HrReportKind::UnpaidLeave, &[]);
+     assert!(report.sql.contains("LEFT JOIN payslip_statement"));
+     assert!(report.sql.contains("LEFT JOIN payslip_unpaid_leave"));
+     assert!(report.sql.contains("s.statement->>'lwp_amount'"));
+     assert!(!report.sql.contains("UNION ALL"));
+     assert!(report.columns.contains(&"Wage basis"));
+ }
  #[test]
  fn employee_movements_selects_designation_title_from_entity_schema() {
      use kabipay_db_entities::tenant::d0006_org_hierarchy::{department, designation};

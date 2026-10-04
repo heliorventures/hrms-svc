@@ -21,6 +21,10 @@ pub struct WithholdingOverride {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AutomaticSettings {
+    #[serde(default)]
+    pub use_employee_configuration: bool,
+    #[serde(default)]
+    pub lwp_override: Option<super::automatic_period::LwpOverride>,
     pub eligibility: StatutoryEligibility,
     pub withholding_override: Option<WithholdingOverride>,
 }

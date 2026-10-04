@@ -2,7 +2,10 @@
 use crate::{contract::ImportPackage, options::ImportOptions, preview::ImportPlan};
 use anyhow::{bail, Result};
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
-use std::{collections::BTreeMap, path::PathBuf};
+use std::{
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+};
 
 pub struct Arguments {
     pub command: String,
@@ -67,7 +70,7 @@ fn bounded_read(path: &str) -> Result<Vec<u8>> {
 }
 pub async fn run(args: Arguments) -> Result<()> {
     if args.command == "help" {
-        println!("tenant-import validate|preview|apply|reconcile --package PATH --options PATH --output NEW_DIRECTORY\napply additionally requires --plan PATH --confirm DIGEST; replacement also requires --replace --writes-paused --pg-bin PATH. Optional --env-file PATH. No command migrates or deploys.");
+        println!("tenant-import validate|preview|apply|reconcile --package PATH --options PATH --output NEW_DIRECTORY\napply additionally requires --plan PATH --confirm DIGEST; replacement also requires --replace --writes-paused. Backup defaults to REQUIRED with --pg-bin PATH; an explicit reviewed replacement_backup SKIP reason may be supplied in options. Optional --env-file PATH. No command migrates or deploys.");
         return Ok(());
     }
     let bytes = bounded_read(args.required("--package")?)?;
@@ -116,6 +119,28 @@ pub async fn run(args: Arguments) -> Result<()> {
         }
     }
     let output = crate::private_output::create(&PathBuf::from(args.required("--output")?))?;
+    let result = run_connected(args, options, package, bytes, &output).await;
+    if let Err(error) = &result {
+        if crate::private_output::write_json(
+            &output,
+            "failure.json",
+            &crate::failure::describe(error),
+        )
+        .is_err()
+        {
+            eprintln!("FAILURE_REPORT_WRITE_FAILED");
+        }
+    }
+    result
+}
+
+async fn run_connected(
+    args: Arguments,
+    options: ImportOptions,
+    package: ImportPackage,
+    bytes: Vec<u8>,
+    output: &Path,
+) -> Result<()> {
     let ops =
         kabipay_common::db::connect_ops_db(&kabipay_common::subgraph::ops_dsn_from_env()).await?;
     let target = crate::tenant_target::resolve(
@@ -136,7 +161,7 @@ pub async fn run(args: Arguments) -> Result<()> {
                 args.replace,
             )
             .await?;
-            crate::private_output::write_json(&output, "plan.json", &plan)?;
+            crate::private_output::write_json(output, "plan.json", &plan)?;
             println!(
                 "PREVIEW_ONLY rows={} core_ready={} period_ready={} blocked={} digest={}",
                 plan.source_rows,
@@ -167,7 +192,7 @@ pub async fn run(args: Arguments) -> Result<()> {
                     confirm_digest: args.required("--confirm")?,
                     replace: args.replace,
                     write_paused: args.write_paused,
-                    output: &output,
+                    output,
                     pg_bin: pg_bin.as_deref(),
                 },
             )
@@ -184,7 +209,7 @@ pub async fn run(args: Arguments) -> Result<()> {
                 .one(&target.db)
                 .await?
                 .ok_or_else(|| anyhow::anyhow!("RUN_NOT_COMMITTED"))?;
-            crate::private_output::write_json(&output, "committed-report.json", &run.report)?;
+            crate::private_output::write_json(output, "committed-report.json", &run.report)?;
             println!("RUN_CONFIRMED_COMMITTED run_id={id}");
         }
         _ => bail!("COMMAND_INVALID"),

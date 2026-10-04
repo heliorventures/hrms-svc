@@ -112,7 +112,7 @@ pub async fn calculate_payroll_cycle(
     ensure_draft(&cycle.status)?;
     let prior = find(&txn, tenant, id).await?;
     let revision = next_revision(prior.map(|d| d.revision), expected_revision)?;
-    let employees = super::payroll_preview::employees(&txn, tenant, &cycle).await?;
+    let employees = super::payroll_preview::employees(&txn, tenant, actor, &cycle).await?;
     let can_finalize = employees.iter().any(|e| e.outcome == "READY")
         && !employees.iter().any(|e| e.outcome == "REVIEW");
     let draft = PayrollDraft {

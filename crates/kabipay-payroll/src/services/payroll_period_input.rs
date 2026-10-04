@@ -77,7 +77,10 @@ pub async fn save<C: ConnectionTrait + Send + Sync>(
     } else {
         false
     };
-    let value = serde_json::to_value(&input)
+    // Retain the resolved month used by payroll for read-only locked-period review.
+    // Automatic recalculation still resolves effective settings and approved leave afresh.
+    let stored_input = prepared.as_ref().map(|value| &value.input).unwrap_or(&input);
+    let value = serde_json::to_value(stored_input)
         .map_err(|_| KabiPayError::Validation("invalid period input".into()))?;
     let existing = find(db, tenant, employee, input.year, input.month).await?;
     if let Some(row) = &existing {

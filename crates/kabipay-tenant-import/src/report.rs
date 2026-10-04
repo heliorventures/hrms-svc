@@ -14,6 +14,8 @@ pub struct ImportReport {
     pub run_id: uuid::Uuid,
     pub tenant_id: uuid::Uuid,
     pub committed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replacement_backup: Option<crate::backup::BackupPolicy>,
     pub sections: Vec<SectionOutcome>,
     #[serde(default)]
     pub issues: Vec<SourceIssue>,

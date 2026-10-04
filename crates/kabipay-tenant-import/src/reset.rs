@@ -12,6 +12,10 @@ use uuid::Uuid;
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ResetManifest {
     pub delete_order: Vec<String>,
+    #[serde(default)]
+    pub truncate_tables: Vec<String>,
+    #[serde(default)]
+    pub backup: crate::backup::BackupPolicy,
     pub retained_tables: Vec<String>,
     pub preserved_user_ids: Vec<Uuid>,
     pub preserved_employee_ids: Vec<Uuid>,
@@ -103,25 +107,36 @@ pub async fn prepare<C: ConnectionTrait>(
     }
     let names: HashSet<_> = plan.tables.iter().map(|t| t.name.as_str()).collect();
     let delete_set: HashSet<_> = deletes.iter().map(String::as_str).collect();
+    let truncate_set: HashSet<_> = options
+        .reset_truncate_tables
+        .iter()
+        .map(String::as_str)
+        .collect();
+    let reset_set: HashSet<_> = delete_set.union(&truncate_set).copied().collect();
     let retain_set: HashSet<_> = options
         .reset_retain_tables
         .iter()
         .map(String::as_str)
         .collect();
     if delete_set.len() != deletes.len()
+        || truncate_set.len() != options.reset_truncate_tables.len()
         || retain_set.len() != options.reset_retain_tables.len()
-        || !delete_set.is_disjoint(&retain_set)
-        || deletes.iter().any(|name| {
-            !safe_identifier(name)
-                || !names.contains(name.as_str())
-                || foundational(name, &options.schema_name)
-        })
+        || !reset_set.is_disjoint(&retain_set)
+        || !delete_set.is_disjoint(&truncate_set)
+        || deletes
+            .iter()
+            .chain(&options.reset_truncate_tables)
+            .any(|name| {
+                !safe_identifier(name)
+                    || !names.contains(name.as_str())
+                    || foundational(name, &options.schema_name)
+            })
         || retain_set.iter().any(|name| !names.contains(name))
     {
         bail!("RESET_TABLE_MANIFEST_INVALID");
     }
     if names.iter().any(|name| {
-        !delete_set.contains(name)
+        !reset_set.contains(name)
             && !retain_set.contains(name)
             && !foundational(name, &options.schema_name)
     }) {
@@ -137,19 +152,32 @@ pub async fn prepare<C: ConnectionTrait>(
         "SELECT child.relname AS child,parent.relname AS parent,cn.nspname AS child_schema,pn.nspname AS parent_schema FROM pg_constraint f JOIN pg_class child ON child.oid=f.conrelid JOIN pg_namespace cn ON cn.oid=child.relnamespace JOIN pg_class parent ON parent.oid=f.confrelid JOIN pg_namespace pn ON pn.oid=parent.relnamespace WHERE f.contype='f' AND pn.nspname=$1",
         [options.schema_name.clone().into()])).await?;
     let mut dependencies = Vec::new();
-    let mut clear_nullable_links = Vec::new();
-    for fk in fks {
+    crate::reset_scope::validate_truncate_references(
+        &options.schema_name,
+        &options.reset_truncate_tables,
+        &fks,
+    )?;
+    crate::reset_scope::validate_lifecycle(db, options, plan).await?;
+    for fk in &fks {
         if fk.try_get::<String>("", "child_schema")? != options.schema_name {
             bail!("RESET_EXTERNAL_FOREIGN_KEY");
         }
     }
     let relations=db.query_all(Statement::from_sql_and_values(DbBackend::Postgres,
-        "SELECT child.relname AS child,parent.relname AS parent,f.confmatchtype::text AS match_type,string_agg(ca.attname,',' ORDER BY k.ordinality) AS child_columns,string_agg(pa.attname,',' ORDER BY k.ordinality) AS parent_columns,string_agg(ca.attname,',' ORDER BY k.ordinality) FILTER(WHERE NOT ca.attnotnull) AS nullable_columns FROM pg_constraint f JOIN pg_class child ON child.oid=f.conrelid JOIN pg_namespace cn ON cn.oid=child.relnamespace JOIN pg_class parent ON parent.oid=f.confrelid JOIN pg_namespace pn ON pn.oid=parent.relnamespace CROSS JOIN LATERAL unnest(f.conkey,f.confkey) WITH ORDINALITY k(child_att,parent_att,ordinality) JOIN pg_attribute ca ON ca.attrelid=child.oid AND ca.attnum=k.child_att JOIN pg_attribute pa ON pa.attrelid=parent.oid AND pa.attnum=k.parent_att WHERE f.contype='f' AND cn.nspname=$1 AND pn.nspname=$1 GROUP BY f.oid,child.relname,parent.relname",
+        "SELECT child.relname AS child,parent.relname AS parent,f.confmatchtype::text AS match_type,string_agg(ca.attname,',' ORDER BY k.ordinality) AS child_columns,string_agg(pa.attname,',' ORDER BY k.ordinality) AS parent_columns,string_agg(ca.attname,',' ORDER BY k.ordinality) FILTER(WHERE NOT ca.attnotnull AND ca.attname<>'tenant_id' AND NOT EXISTS(SELECT 1 FROM pg_constraint ck WHERE ck.conrelid=ca.attrelid AND ck.contype='c' AND ca.attnum=ANY(ck.conkey))) AS nullable_columns FROM pg_constraint f JOIN pg_class child ON child.oid=f.conrelid JOIN pg_namespace cn ON cn.oid=child.relnamespace JOIN pg_class parent ON parent.oid=f.confrelid JOIN pg_namespace pn ON pn.oid=parent.relnamespace CROSS JOIN LATERAL unnest(f.conkey,f.confkey) WITH ORDINALITY k(child_att,parent_att,ordinality) JOIN pg_attribute ca ON ca.attrelid=child.oid AND ca.attnum=k.child_att JOIN pg_attribute pa ON pa.attrelid=parent.oid AND pa.attnum=k.parent_att WHERE f.contype='f' AND cn.nspname=$1 AND pn.nspname=$1 GROUP BY f.oid,child.relname,parent.relname ORDER BY child.relname,parent.relname,f.oid",
         [options.schema_name.clone().into()])).await?;
     for relation in relations {
         let child: String = relation.try_get("", "child")?;
         let parent: String = relation.try_get("", "parent")?;
-        if !delete_set.contains(parent.as_str()) {
+        if !delete_set.contains(parent.as_str()) || truncate_set.contains(child.as_str()) {
+            continue;
+        }
+        // Apply repeats the complete table fingerprint review under locks before using this plan.
+        if plan
+            .tables
+            .iter()
+            .any(|table| (table.name == child || table.name == parent) && table.rows == 0)
+        {
             continue;
         }
         let child_columns: String = relation.try_get("", "child_columns")?;
@@ -167,16 +195,20 @@ pub async fn prepare<C: ConnectionTrait>(
             "TRUE".into()
         };
         let sql=format!("SELECT COUNT(*) AS n FROM \"{}\".\"{child}\" c JOIN \"{}\".\"{parent}\" p ON {} WHERE {retained_child} AND {} AND cardinality($1::uuid[])>=0 AND cardinality($2::uuid[])>=0",options.schema_name,options.schema_name,predicates.join(" AND "),qualified_selector(&parent,"p"));
-        let count = db
-            .query_one(Statement::from_sql_and_values(
-                DbBackend::Postgres,
-                sql,
-                arrays(&users, &employees),
-            ))
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("RESET_DEPENDENCIES_UNRESOLVED"))?;
-        if count.try_get::<i64>("", "n")? > 0 {
-            bail!("RESET_RETAINED_ROW_REFERENCES_DELETED_DATA");
+        if !delete_set.contains(child.as_str())
+            || matches!(child.as_str(), "user" | "employee" | "user_role")
+        {
+            let count = db
+                .query_one(Statement::from_sql_and_values(
+                    DbBackend::Postgres,
+                    sql,
+                    arrays(&users, &employees),
+                ))
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("RESET_DEPENDENCIES_UNRESOLVED"))?;
+            if count.try_get::<i64>("", "n")? > 0 {
+                bail!("RESET_RETAINED_ROW_REFERENCES_DELETED_DATA");
+            }
         }
         if !delete_set.contains(child.as_str()) {
             continue;
@@ -199,20 +231,25 @@ pub async fn prepare<C: ConnectionTrait>(
             .map(|v| v.split(',').map(String::from).collect())
             .unwrap_or_default();
         let simple = relation.try_get::<String>("", "match_type")? == "s";
-        if !clear_columns.is_empty()
+        let clear = if !clear_columns.is_empty()
             && (simple || clear_columns.len() == child_columns.split(',').count())
         {
-            clear_nullable_links.push(ClearLink {
-                child,
-                parent,
+            Some(ClearLink {
+                child: child.clone(),
+                parent: parent.clone(),
                 child_columns: child_columns.split(',').map(String::from).collect(),
                 parent_columns: parent_columns.split(',').map(String::from).collect(),
                 clear_columns,
                 rows: count,
-            });
+            })
         } else {
-            dependencies.push((child, parent));
-        }
+            None
+        };
+        dependencies.push(crate::reset_order::Dependency {
+            child,
+            parent,
+            clear,
+        });
     }
     // Refuse a schema containing another tenant's rows even though it has a tenant-like name.
     let owned=db.query_all(Statement::from_sql_and_values(DbBackend::Postgres,
@@ -221,6 +258,13 @@ pub async fn prepare<C: ConnectionTrait>(
         let table: String = row.try_get("", "table_name")?;
         if !safe_identifier(&table) {
             bail!("TABLE_IDENTIFIER_UNSUPPORTED");
+        }
+        if plan
+            .tables
+            .iter()
+            .any(|state| state.name == table && state.rows == 0)
+        {
+            continue;
         }
         let result = db
             .query_one(Statement::from_sql_and_values(
@@ -237,12 +281,15 @@ pub async fn prepare<C: ConnectionTrait>(
             bail!("RESET_SCHEMA_CONTAINS_FOREIGN_TENANT_ROWS");
         }
     }
+    let (delete_order, clear_nullable_links) = crate::reset_order::plan(deletes, dependencies)?;
     Ok(ResetManifest {
-        delete_order: deletion_order(deletes, &dependencies)?,
+        delete_order,
+        truncate_tables: options.reset_truncate_tables.clone(),
+        backup: options.replacement_backup.clone(),
         retained_tables: plan
             .tables
             .iter()
-            .filter(|table| !delete_set.contains(table.name.as_str()))
+            .filter(|table| !reset_set.contains(table.name.as_str()))
             .map(|t| t.name.clone())
             .collect(),
         preserved_user_ids: users,
@@ -257,6 +304,29 @@ pub async fn apply<C: ConnectionTrait>(
 ) -> Result<()> {
     if !crate::options::valid_schema(schema) {
         bail!("RESET_SCHEMA_INVALID");
+    }
+    if !manifest.truncate_tables.is_empty() {
+        for table in &manifest.truncate_tables {
+            if !safe_identifier(table)
+                || foundational(table, schema)
+                || matches!(table.as_str(), "user" | "employee" | "user_role")
+                || manifest.delete_order.contains(table)
+                || manifest.retained_tables.contains(table)
+            {
+                bail!("RESET_TRUNCATE_PRESERVED_TABLE");
+            }
+        }
+        let targets = manifest
+            .truncate_tables
+            .iter()
+            .map(|table| format!("ONLY \"{schema}\".\"{table}\""))
+            .collect::<Vec<_>>()
+            .join(",");
+        db.execute(Statement::from_string(
+            DbBackend::Postgres,
+            format!("TRUNCATE TABLE {targets} CONTINUE IDENTITY RESTRICT"),
+        ))
+        .await?;
     }
     for link in &manifest.clear_nullable_links {
         if !manifest.delete_order.contains(&link.child)

@@ -6,6 +6,8 @@ use uuid::Uuid;
 mod release_regressions;
 #[path = "fixtures/tax_projection_acceptance.rs"]
 mod tax_projection_acceptance;
+#[path = "fixtures/automatic_month.rs"]
+mod automatic_month;
 #[tokio::test]
 #[ignore = "requires the disposable integration fixture"]
 async fn imported_month_uses_the_normal_pay_run_and_immutable_statement() {
@@ -43,7 +45,7 @@ async fn imported_month_uses_the_normal_pay_run_and_immutable_statement() {
     let source: kabipay_payroll::services::payroll_rules::PeriodInput =
         serde_json::from_value(input.input.clone()).unwrap();
     verify_financial_review_guards(&db, tenant, actor, employee).await;
-    verify_midmonth_rule_guard(&db, tenant, employee).await;
+    verify_midmonth_rule_guard(&db, tenant, actor, employee).await;
     let expected = kabipay_payroll::services::payroll_rules::calculate_period(&source).unwrap();
     let cycle = payroll_service::create_payroll_cycle(
         &db,
@@ -147,12 +149,14 @@ async fn imported_month_uses_the_normal_pay_run_and_immutable_statement() {
     tax_projection_acceptance::verify(&db, tenant, actor, employee).await;
     verify_reviewed_dated_lwp(&db, tenant, actor, employee).await;
     release_regressions::verify(&db, tenant, actor, employee).await;
+    automatic_month::verify(&db, tenant, actor, employee).await;
     db.close().await.unwrap();
 }
 
 async fn verify_midmonth_rule_guard(
     db: &sea_orm::DatabaseConnection,
     tenant: Uuid,
+    actor: Uuid,
     source_employee: Uuid,
 ) {
     use kabipay_employee::services::employee_service::{self, NewEmployee};
@@ -193,7 +197,7 @@ async fn verify_midmonth_rule_guard(
         updated_at: now,
     };
     let results =
-        kabipay_payroll::services::payroll_preview::employees(&transaction, tenant, &cycle)
+        kabipay_payroll::services::payroll_preview::employees(&transaction, tenant, actor, &cycle)
             .await
             .unwrap();
     let result = results

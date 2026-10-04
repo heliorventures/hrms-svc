@@ -183,6 +183,38 @@ impl MutationRoot {
             serde_json::json!({"id":saved.id,"input":saved.input,"revision":saved.revision,"ready":saved.ready,"validationError":validation_error,"calculation":prepared.ok()}),
         ))
     }
+    async fn save_employee_payroll_eligibility(
+        &self,
+        ctx: &Context<'_>,
+        employee_id: ID,
+        input: async_graphql::Json<crate::services::employee_eligibility::EligibilitySetting>,
+    ) -> Result<async_graphql::Json<crate::services::employee_eligibility::EligibilitySetting>>
+    {
+        use sea_orm::TransactionTrait;
+        let actor = require_payroll_manage_all(ctx)?;
+        let tenant = require_tenant_id(ctx)?;
+        let db = tenant_db(ctx, tenant).await?;
+        let transaction = db
+            .begin()
+            .await
+            .map_err(KabiPayError::from)
+            .map_err(KabiPayError::into_graphql)?;
+        let result = crate::services::employee_eligibility::save(
+            &transaction,
+            tenant,
+            parse_uuid(&employee_id, "employeeId")?,
+            actor,
+            input.0,
+        )
+        .await
+        .map_err(KabiPayError::into_graphql)?;
+        transaction
+            .commit()
+            .await
+            .map_err(KabiPayError::from)
+            .map_err(KabiPayError::into_graphql)?;
+        Ok(async_graphql::Json(result))
+    }
     async fn set_salary_component_payslip_visibility(
         &self,
         ctx: &Context<'_>,
