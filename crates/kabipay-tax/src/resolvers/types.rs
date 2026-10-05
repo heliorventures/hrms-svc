@@ -138,6 +138,8 @@ impl From<tax_proof_line::Model> for TaxProofLineDto {
 
 #[derive(InputObject, Clone, Debug)]
 pub struct SubmitTaxProofLineInput {
+    /// Regime displayed when preparing the proof; rejects a changed assignment.
+    pub tax_regime_chosen: Option<String>,
     pub tax_config_version_id: Option<ID>,
     pub fiscal_year: i32,
     pub section_code: String,

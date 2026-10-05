@@ -94,14 +94,26 @@ pub async fn upsert_tax_computation(
         tds_per_month,
     )?;
     let txn = db.begin().await?;
-    let version = super::tax_submission::resolve_version(&txn, tenant_id, employee_id, fiscal_year, tax_config_version_id, tax_regime_chosen.as_deref()).await?;
+    let version = super::tax_submission::resolve_version(
+        &txn,
+        tenant_id,
+        employee_id,
+        fiscal_year,
+        tax_config_version_id,
+        tax_regime_chosen.as_deref(),
+    )
+    .await?;
     let result = super::tax_declarations::save_declaration(
         &txn,
         tenant_id,
         employee_id,
         version.id,
         fiscal_year,
-        version.regime.as_deref().and_then(super::tax_submission::canonical).map(str::to_owned),
+        version
+            .regime
+            .as_deref()
+            .and_then(super::tax_submission::canonical)
+            .map(str::to_owned),
         gross_income,
         total_deductions,
     )
@@ -189,8 +201,8 @@ pub async fn list_tax_proof_lines(
 /// Employee submits or updates a proof line (e.g. 80C, HRA) — goes to **PENDING** until approved.
 /// Only **APPROVED** lines roll into `tax_computation.total_deductions` (see
 /// `recompute_total_deductions_from_approved_proofs`).
-pub async fn submit_tax_proof_line(
-    db: &DatabaseConnection,
+pub async fn submit_tax_proof_line<C: ConnectionTrait + TransactionTrait>(
+    db: &C,
     tenant_id: Uuid,
     employee_id: Uuid,
     submitting_user_id: Uuid,
@@ -200,6 +212,7 @@ pub async fn submit_tax_proof_line(
     declared_amount: Decimal,
     actual_amount: Decimal,
     file_storage_id: Uuid,
+    tax_regime_chosen: Option<String>,
 ) -> KabiPayResult<tax_proof_line::Model> {
     if declared_amount < Decimal::ZERO || actual_amount < Decimal::ZERO {
         return Err(KabiPayError::Validation(
@@ -216,7 +229,19 @@ pub async fn submit_tax_proof_line(
         .await?;
     assert_tax_proof_file(db, tenant_id, file_storage_id, Some(submitting_user_id)).await?;
 
-    let tax_config_version_id = super::tax_submission::resolve_version(db, tenant_id, employee_id, fiscal_year, tax_config_version_id, None).await?.id;
+    if tax_config_version_id.is_none() && tax_regime_chosen.is_none() {
+        return Err(KabiPayError::Validation("proof submission requires the displayed assigned regime or a matching tax definition ID; refresh your tax settings".into()));
+    }
+    let tax_config_version_id = super::tax_submission::resolve_version(
+        db,
+        tenant_id,
+        employee_id,
+        fiscal_year,
+        tax_config_version_id,
+        tax_regime_chosen.as_deref(),
+    )
+    .await?
+    .id;
 
     let existing = tax_proof_line::Entity::find()
         .filter(tax_proof_line::Column::TenantId.eq(tenant_id))
@@ -722,10 +747,25 @@ pub async fn upsert_tax_configuration_version<C: ConnectionTrait>(
                 entity: "tax_configuration_version",
                 id: id.to_string(),
             })?;
+        let same_regime = match (row.regime.as_deref(), reg.as_deref()) {
+            (Some(left), Some(right)) => {
+                match (
+                    super::tax_submission::canonical(left),
+                    super::tax_submission::canonical(right),
+                ) {
+                    (Some(left), Some(right)) => left == right,
+                    _ => left == right,
+                }
+            }
+            (None, None) => true,
+            _ => false,
+        };
+        if row.fiscal_year != fiscal_year || row.country_code != cc || !same_regime {
+            return Err(KabiPayError::Validation("a tax definition's financial year, regime and country are immutable; create a new definition instead".into()));
+        }
         let mut am: tax_configuration_version::ActiveModel = row.into();
-        am.fiscal_year = Set(fiscal_year);
-        am.regime = Set(reg);
-        am.country_code = Set(cc);
+        // Do not rewrite identity, even for accepted aliases. This also prevents
+        // concurrent admin status edits from relabelling historical proof evidence.
         am.is_active = Set(is_active);
         am.updated_at = Set(now);
         am.update(db).await.map_err(KabiPayError::from)?;

@@ -115,7 +115,11 @@ impl MutationRoot {
         }
         let tenant_id = require_tenant_id(ctx)?;
         let db = tenant_db(ctx, tenant_id).await?;
-        let v = input.tax_config_version_id.as_ref().map(|id| parse_uuid(id, "taxConfigVersionId")).transpose()?;
+        let v = input
+            .tax_config_version_id
+            .as_ref()
+            .map(|id| parse_uuid(id, "taxConfigVersionId"))
+            .transpose()?;
         let m = tax_service::upsert_tax_computation(
             &db,
             tenant_id,
@@ -235,7 +239,11 @@ impl MutationRoot {
             .map_err(|_| KabiPayError::Unauthorised.into_graphql())?;
         let tenant_id = require_tenant_id(ctx)?;
         let db = tenant_db(ctx, tenant_id).await?;
-        let tid = input.tax_config_version_id.as_ref().map(|id| parse_uuid(id, "taxConfigVersionId")).transpose()?;
+        let tid = input
+            .tax_config_version_id
+            .as_ref()
+            .map(|id| parse_uuid(id, "taxConfigVersionId"))
+            .transpose()?;
         let declared = Decimal::from_str(input.declared_amount.trim())
             .map_err(|_| KabiPayError::Validation("invalid declaredAmount".into()))?;
         let actual = Decimal::from_str(input.actual_amount.trim())
@@ -252,6 +260,7 @@ impl MutationRoot {
             declared,
             actual,
             fid,
+            input.tax_regime_chosen,
         )
         .await
         .map_err(KabiPayError::into_graphql)?;
