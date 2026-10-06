@@ -23,7 +23,7 @@ async fn imported_location_persists_both_links_and_replays_without_new_history()
         .await
         .unwrap();
     txn.execute(Statement::from_sql_and_values(DbBackend::Postgres,
-        "INSERT INTO employee(id,tenant_id,employee_code,first_name,last_name,date_of_joining) VALUES($1,$2,$3,'Location','Fixture','2020-01-01')",
+        "INSERT INTO employee(id,tenant_id,employee_code,first_name,last_name,date_of_joining,status) VALUES($1,$2,$3,'Location','Fixture','2020-01-01','ACTIVE')",
         [employee.into(), tenant.into(), format!("LOCATION-{employee}").into()])).await.unwrap();
     let input = LocationInput {
         name: format!("Fixture Office {employee}"),
