@@ -13,6 +13,28 @@ fn base() -> ReportFilter {
 }
 
 #[test]
+fn claim_travel_filter_accepts_every_expense_payment_state() {
+    for status in ["NONE", "PENDING_PAYMENT", "PAID", "FAILED", "ON_HOLD"] {
+        let input = ClaimTravelReportFilterInput {
+            payment_status: Some(format!(" {} ", status.to_lowercase())),
+            ..Default::default()
+        };
+        let filter = ClaimTravelFilter::new(base(), Some(input), HrReportKind::ExpenseClaims)
+            .unwrap_or_else(|error| panic!("supported payment status {status}: {error}"));
+        assert_eq!(filter.payment_status.as_deref(), Some(status));
+        assert!(ClaimTravelFilter::new(
+            base(),
+            Some(ClaimTravelReportFilterInput {
+                payment_status: Some(status.into()),
+                ..Default::default()
+            }),
+            HrReportKind::TravelRequests,
+        )
+        .is_err());
+    }
+}
+
+#[test]
 fn claim_travel_filter_rejects_incompatible_fields_and_invalid_statuses() {
     for (kind, input) in [
         (

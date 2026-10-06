@@ -443,6 +443,8 @@ impl MutationRoot {
         input: UpsertPayrollComplianceSettingInput,
     ) -> Result<PayrollComplianceSettingDto> {
         require_payroll_manage_all(ctx)?;
+        crate::services::payslip_template::resolve_payslip_template(None, input.payslip_template.as_deref())
+            .map_err(KabiPayError::into_graphql)?;
         let tenant_id = require_tenant_id(ctx)?;
         let db = tenant_db(ctx, tenant_id).await?;
         let logo = input
@@ -459,6 +461,7 @@ impl MutationRoot {
             input.arrear_salary_component_code,
             input.payslip_header_title,
             logo,
+            input.payslip_template,
         )
         .await
         .map_err(KabiPayError::into_graphql)?;

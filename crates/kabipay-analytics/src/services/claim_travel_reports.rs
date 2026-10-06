@@ -36,8 +36,18 @@ pub async fn load_options(
             groups.push(vec![]);
             continue;
         }
+        // Historical claims retain their category after retirement. Submission pickers
+        // remain active-only; reporting must still let users find the old category.
+        let (label, visibility) = if table == "expense_category" {
+            (
+                "CASE WHEN is_deleted THEN name || ' (retired)' ELSE name END",
+                "",
+            )
+        } else {
+            ("name", "AND NOT is_deleted")
+        };
         let sql = format!(
-            r"SELECT id,name FROM {table} WHERE tenant_id=$1 AND NOT is_deleted AND ($2::text IS NULL OR name ILIKE $2 ESCAPE E'\\') ORDER BY lower(name),id LIMIT $3"
+            r"SELECT id,{label} AS name FROM {table} WHERE tenant_id=$1 {visibility} AND ($2::text IS NULL OR name ILIKE $2 ESCAPE E'\\') ORDER BY lower(name),id LIMIT $3"
         );
         let result = db
             .query_all(Statement::from_sql_and_values(

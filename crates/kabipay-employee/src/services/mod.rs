@@ -29,3 +29,4 @@ pub mod prejoining;
 mod prejoining_tests;
 pub mod company_location_service;
 pub mod company_location_repository;
+pub mod company_location_assignment_reader;

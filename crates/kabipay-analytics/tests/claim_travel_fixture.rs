@@ -10,7 +10,7 @@ use kabipay_common::tenant_business_clock::TenantBusinessClock;
 use resolvers::hr_report_types::{ClaimTravelReportFilterInput, HrReportKind};
 use sea_orm::{ConnectOptions, ConnectionTrait, Database, DbBackend, Statement};
 use services::claim_travel_report_filters::ClaimTravelFilter;
-use services::claim_travel_reports::{load_csv, load_page};
+use services::claim_travel_reports::{load_csv, load_options, load_page};
 use services::hr_reports::ReportFilter;
 use uuid::Uuid;
 
@@ -148,6 +148,102 @@ async fn claim_travel_filters_pages_csv_overlap_and_foreign_ids() {
         .total_rows,
         1
     );
+    // Retiring a category must preserve discovery and filtering of its old claims.
+    db.execute(Statement::from_sql_and_values(
+        DbBackend::Postgres,
+        "UPDATE expense_category SET is_deleted=true WHERE tenant_id=$1 AND id=$2",
+        vec![tenant.into(), category.into()],
+    ))
+    .await
+    .unwrap();
+    db.execute(Statement::from_sql_and_values(
+        DbBackend::Postgres,
+        "INSERT INTO expense_category(id,tenant_id,name,is_deleted) VALUES($1,$2,'Fixture',true)",
+        vec![Uuid::new_v4().into(), Uuid::new_v4().into()],
+    ))
+    .await
+    .unwrap();
+    let options = load_options(
+        &db,
+        tenant,
+        &claims("expense:read"),
+        HrReportKind::ExpenseClaims,
+        Some("Fixture"),
+        50,
+    )
+    .await
+    .unwrap();
+    assert_eq!(options.expense_categories.len(), 1);
+    assert_eq!(
+        options.expense_categories[0].id.as_str(),
+        category.to_string()
+    );
+    assert_eq!(options.expense_categories[0].name, "Fixture (retired)");
+    assert!(load_options(
+        &db,
+        tenant,
+        &claims("travel:read"),
+        HrReportKind::TravelRequests,
+        None,
+        50,
+    )
+    .await
+    .unwrap()
+    .expense_categories
+    .is_empty());
+    // Failed/held reimbursements use the same category/status predicates in rows and CSV.
+    for status in ["FAILED", "ON_HOLD"] {
+        db.execute(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "UPDATE expense SET status='APPROVED',payment_status=$2 WHERE tenant_id=$1",
+            vec![tenant.into(), status.into()],
+        ))
+        .await
+        .unwrap();
+        let state_filter = ClaimTravelFilter::new(
+            base(),
+            Some(ClaimTravelReportFilterInput {
+                expense_category_id: Some(category.to_string().into()),
+                payment_status: Some(status.into()),
+                ..Default::default()
+            }),
+            HrReportKind::ExpenseClaims,
+        )
+        .unwrap();
+        let page = load_page(
+            &db,
+            tenant,
+            &claims("expense:read"),
+            HrReportKind::ExpenseClaims,
+            &state_filter,
+            0,
+            50,
+            clock,
+        )
+        .await
+        .unwrap();
+        assert_eq!(page.total_rows, 125);
+        assert!(page.rows.iter().all(|row| row[12] == status));
+        let export = load_csv(
+            &db,
+            tenant,
+            &claims("expense:read"),
+            HrReportKind::ExpenseClaims,
+            &state_filter,
+            clock,
+        )
+        .await
+        .unwrap();
+        assert_eq!(export.row_count, 125);
+        assert!(export.csv.contains(&format!("\"{status}\"")));
+    }
+    db.execute(Statement::from_sql_and_values(
+        DbBackend::Postgres,
+        "UPDATE expense SET status='PENDING',payment_status='NONE' WHERE tenant_id=$1",
+        vec![tenant.into()],
+    ))
+    .await
+    .unwrap();
     let foreign_location = Uuid::new_v4();
     db.execute(Statement::from_sql_and_values(
         DbBackend::Postgres,

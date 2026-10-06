@@ -19,6 +19,7 @@ pub mod entitlement_graphql;
 pub mod entitlements;
 pub mod env_file;
 pub mod error;
+pub mod expense_payment;
 pub mod file_download_token;
 pub mod ids;
 pub mod jwt;

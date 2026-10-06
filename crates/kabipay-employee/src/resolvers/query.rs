@@ -499,12 +499,9 @@ impl QueryRoot {
     async fn employee_location_assignment(&self, ctx: &Context<'_>, employee_id: ID) -> Result<super::company_location_types::EmployeeLocationAssignment> {
         super::company_location_types::require_location_authority(ctx,false)?;
         let tenant = require_tenant_id(ctx)?; let db = tenant_db(ctx,tenant).await?; let id = parse_uuid(&employee_id,"employeeId")?;
-        let employee = employee_service::find_by_id(&db,tenant,id).await.map_err(KabiPayError::into_graphql)?.ok_or_else(|| KabiPayError::Validation("employee does not belong to this company".into()).into_graphql())?;
-        use kabipay_db_entities::tenant::d0097_location_working_calendar::employee_location_assignment as assignment;
-        let latest = assignment::Entity::find().filter(assignment::Column::TenantId.eq(tenant)).filter(assignment::Column::EmployeeId.eq(id)).order_by_desc(assignment::Column::EffectiveFrom).one(&db).await.map_err(KabiPayError::from).map_err(KabiPayError::into_graphql)?;
-        let name = if let Some(location_id) = employee.location_id { Some(crate::services::company_location_repository::active_location(&db,tenant,location_id).await.map_err(KabiPayError::into_graphql)?.name) } else { None };
+        let assignment = crate::services::company_location_assignment_reader::read_assignment(&db,tenant,id).await.map_err(KabiPayError::into_graphql)?;
         let today = kabipay_common::tenant_business_clock::TenantBusinessClock::load(kabipay_common::subgraph::ops_db(ctx)?,tenant).await.map_err(KabiPayError::into_graphql)?.now_date();
-        Ok(super::company_location_types::EmployeeLocationAssignment { employee_id,location_id:employee.location_id.map(Into::into),location_name:name,effective_from:latest.as_ref().map(|r|r.effective_from),revision:latest.map_or(0,|r|r.revision),business_date:today })
+        Ok(super::company_location_types::EmployeeLocationAssignment { employee_id,location_id:assignment.location_id.map(Into::into),location_name:assignment.location_name,effective_from:assignment.effective_from,revision:assignment.revision,business_date:today })
     }
     async fn prejoining_conversion_options(&self, ctx: &Context<'_>, manager_search: Option<String>, manager_offset: Option<i32>) -> Result<async_graphql::Json<serde_json::Value>> { super::prejoining_options::options(ctx, manager_search, manager_offset).await }
     async fn prejoining_config(&self, ctx: &Context<'_>) -> Result<async_graphql::Json<serde_json::Value>> { super::prejoining::config(ctx).await }

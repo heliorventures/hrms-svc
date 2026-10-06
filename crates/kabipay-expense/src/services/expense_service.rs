@@ -2,6 +2,10 @@
 
 use chrono::{Datelike, NaiveDate, Utc};
 use kabipay_common::client_data_scope::EmployeeScopeFilter;
+pub use kabipay_common::expense_payment::{
+    normalize_expense_payment_status_wire, PAYMENT_STATUS_FAILED, PAYMENT_STATUS_NONE,
+    PAYMENT_STATUS_ON_HOLD, PAYMENT_STATUS_PAID, PAYMENT_STATUS_PENDING,
+};
 use kabipay_common::workflow_approval;
 use kabipay_common::{KabiPayError, KabiPayResult};
 use kabipay_db_entities::tenant::d0005_auth_rbac::user_role;
@@ -359,12 +363,6 @@ const STATUS_PENDING: &str = "PENDING";
 const STATUS_APPROVED: &str = "APPROVED";
 const STATUS_PARTIAL_APPROVED: &str = "PARTIAL_APPROVED";
 const STATUS_REJECTED: &str = "REJECTED";
-
-pub const PAYMENT_STATUS_NONE: &str = "NONE";
-pub const PAYMENT_STATUS_PENDING: &str = "PENDING_PAYMENT";
-pub const PAYMENT_STATUS_PAID: &str = "PAID";
-pub const PAYMENT_STATUS_FAILED: &str = "FAILED";
-pub const PAYMENT_STATUS_ON_HOLD: &str = "ON_HOLD";
 
 const POLICY_ALL: &str = "ALL";
 const POLICY_DEPT: &str = "DEPARTMENT";
@@ -1019,20 +1017,6 @@ pub async fn delete_expense_category(
     am.updated_at = Set(now);
     am.update(db).await?;
     Ok(())
-}
-
-pub fn normalize_expense_payment_status_wire(s: &str) -> KabiPayResult<&'static str> {
-    match s.trim() {
-        "NONE" | "none" => Ok(PAYMENT_STATUS_NONE),
-        "PENDING_PAYMENT" | "pending_payment" | "PendingPayment" => Ok(PAYMENT_STATUS_PENDING),
-        "PAID" | "paid" => Ok(PAYMENT_STATUS_PAID),
-        "FAILED" | "failed" => Ok(PAYMENT_STATUS_FAILED),
-        "ON_HOLD" | "on_hold" | "OnHold" => Ok(PAYMENT_STATUS_ON_HOLD),
-        _ => Err(KabiPayError::Validation(
-            "unknown expense payment status; expected NONE | PENDING_PAYMENT | PAID | FAILED | ON_HOLD"
-                .into(),
-        )),
-    }
 }
 
 pub async fn mark_expense_payment_status(

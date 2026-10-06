@@ -1,4 +1,6 @@
-use kabipay_common::{KabiPayError, KabiPayResult};
+use kabipay_common::{
+    expense_payment::normalize_expense_payment_status_wire, KabiPayError, KabiPayResult,
+};
 use uuid::Uuid;
 
 use super::hr_reports::ReportFilter;
@@ -67,11 +69,11 @@ impl ClaimTravelFilter {
             &["PENDING", "APPROVED", "PARTIAL_APPROVED", "REJECTED"]
         };
         validate_status(self.approval_status.as_deref(), statuses, "approvalStatus")?;
-        validate_status(
-            self.payment_status.as_deref(),
-            &["NONE", "PENDING_PAYMENT", "PAID"],
-            "paymentStatus",
-        )
+        if let Some(status) = self.payment_status.as_deref() {
+            normalize_expense_payment_status_wire(status)
+                .map_err(|_| KabiPayError::Validation("invalid paymentStatus".into()))?;
+        }
+        Ok(())
     }
 }
 
