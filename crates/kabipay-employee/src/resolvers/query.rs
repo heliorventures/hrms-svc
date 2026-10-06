@@ -205,6 +205,13 @@ fn employment_history_read_access(
     }
 }
 
+pub(super) fn require_payroll_sensitive_access(
+    ctx: &Context<'_>,
+    target_employee_id: Uuid,
+) -> Result<()> {
+    employment_history_read_access(ctx, target_employee_id).map(|_| ())
+}
+
 async fn authorize_employee_target(
     ctx: &Context<'_>,
     db: &DatabaseConnection,
@@ -811,6 +818,21 @@ impl QueryRoot {
             .map_err(KabiPayError::into_graphql)?;
         let dtos: Vec<EmployeeDto> = models.into_iter().map(EmployeeDto::from).collect();
         enrich_employee_dtos(&db, tenant_id, dtos).await
+    }
+
+    /// Employee UAN is payroll-sensitive and never part of directory results.
+    async fn employee_uan_number(
+        &self,
+        ctx: &Context<'_>,
+        employee_id: ID,
+    ) -> Result<Option<String>> {
+        let eid = parse_uuid(&employee_id, "employeeId")?;
+        require_payroll_sensitive_access(ctx, eid)?;
+        let tenant_id = require_tenant_id(ctx)?;
+        let db = tenant_db(ctx, tenant_id).await?;
+        crate::services::employee_uan_service::read(&db, tenant_id, eid)
+            .await
+            .map_err(KabiPayError::into_graphql)
     }
 
     /// Salary-bearing employment history, newest first.
@@ -1851,6 +1873,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn uan_read_rejects_other_employees_and_team_scope_before_db_access() {
+        let own_id = Uuid::new_v4();
+        let other_id = Uuid::new_v4();
+        for (scope, target) in [("SELF", other_id), ("TEAM", own_id), ("TEAM", other_id)] {
+            let response = execute_query(
+                claims(PERM_PAYROLL_READ, Some(scope), Some(own_id)),
+                &format!("{{ employeeUanNumber(employeeId: \"{target}\") }}"),
+            )
+            .await;
+            assert_forbidden_before_db(&response, PERM_PAYROLL_READ);
+        }
+    }
+
+    #[tokio::test]
+    async fn uan_write_requires_employee_management_and_payroll_access_before_db_access() {
+        let own_id = Uuid::new_v4();
+        for (permission, denied_permission) in [
+            (PERM_PAYROLL_READ, "employee:write"),
+            ("employee:write", PERM_PAYROLL_READ),
+        ] {
+            let caller = claims(permission, Some("ALL"), Some(own_id));
+            let response = Schema::build(
+                QueryRoot,
+                crate::resolvers::mutation::MutationRoot,
+                EmptySubscription,
+            )
+                .data(TenantId(caller.tenant_id))
+                .data(caller)
+                .finish()
+                .execute(Request::new(format!(
+                    "mutation {{ setEmployeeUanNumber(input: {{ employeeId: \"{own_id}\", uanNumber: \"012345678901\" }}) }}"
+                )))
+                .await;
+            assert_forbidden_before_db(&response, denied_permission);
+        }
+    }
+
+    #[tokio::test]
     async fn every_protected_employee_query_requires_its_exact_permission_before_db_access() {
         let own_id = Uuid::new_v4();
         let other_id = Uuid::new_v4();
@@ -1925,6 +1985,11 @@ mod tests {
             ),
             (
                 format!("{{ employmentHistoryRecords(employeeId: \"{own_id}\") {{ __typename }} }}"),
+                PERM_PAYROLL_READ,
+                false,
+            ),
+            (
+                format!("{{ employeeUanNumber(employeeId: \"{own_id}\") }}"),
                 PERM_PAYROLL_READ,
                 false,
             ),

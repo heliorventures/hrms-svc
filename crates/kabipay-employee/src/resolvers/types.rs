@@ -530,6 +530,13 @@ pub struct UpdateEmployeeInput {
     pub linked_user_email: Option<String>,
 }
 
+#[derive(InputObject, Clone)]
+pub struct SetEmployeeUanNumberInput {
+    pub employee_id: ID,
+    /// Exactly 12 digits, or an empty string to explicitly clear the stored number.
+    pub uan_number: String,
+}
+
 #[derive(InputObject, Clone, Debug)]
 pub struct UpdateEmployeePersonalProfileInput {
     pub employee_id: ID,

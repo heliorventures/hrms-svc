@@ -7,6 +7,9 @@ pub mod document_file_service;
 pub mod document_service;
 pub mod directory_service;
 pub mod employee_service;
+pub mod employee_uan_service;
+#[cfg(test)]
+mod employee_uan_tests;
 pub mod employment_history_service;
 pub mod guidance_service;
 /// Pluggable file backends: `LOCAL` disk, S3/R2/MinIO (`s3_compat`), future Azure

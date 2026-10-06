@@ -364,6 +364,7 @@ A scalar that can represent any JSON value.
 scalar JSON
 
 type MutationRoot {
+	setEmployeeUanNumber(input: SetEmployeeUanNumberInput!): String
 	savePrejoiningConfig(config: JSON!): JSON!
 	invitePrejoining(email: String!, sendEmail: Boolean!): PrejoiningInvitation!
 	reissuePrejoining(id: ID!, revision: Int!, sendEmail: Boolean!): PrejoiningInvitation!
@@ -572,6 +573,7 @@ input ProvisionEmployeeLoginInput {
 }
 
 type QueryRoot {
+	employeeUanNumber(employeeId: ID!): String
 	prejoiningConversionOptions(managerSearch: String, managerOffset: Int): JSON!
 	prejoiningConfig: JSON!
 	prejoiningFieldCatalog: JSON!
@@ -827,6 +829,11 @@ type TenantPermissionScopeAssignment {
 	resource: String!
 	action: String!
 	scopeType: String!
+}
+
+input SetEmployeeUanNumberInput {
+	employeeId: ID!
+	uanNumber: String!
 }
 
 input UpdateEmployeeInput {
