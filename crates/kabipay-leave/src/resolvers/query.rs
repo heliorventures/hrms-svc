@@ -43,6 +43,14 @@ pub struct QueryRoot;
 
 #[Object]
 impl QueryRoot {
+    async fn leave_date_preview(&self, ctx: &Context<'_>, leave_type_id: ID, from_date: NaiveDate, to_date: NaiveDate, #[graphql(default = false)] is_half_day: bool) -> Result<async_graphql::Json<serde_json::Value>> {
+        let scope = data_scope_from_claims(ctx.data_opt::<ClientClaims>(),kabipay_common::context::PERM_LEAVE_SUBMIT).map_err(KabiPayError::into_graphql)?;
+        if scope != ScopeType::Self_ { return Err(KabiPayError::Forbidden("leave preview requires leave:submit SELF scope".into()).into_graphql()); }
+        let tenant = require_tenant_id(ctx)?; let db = tenant_db(ctx,tenant).await?;
+        let employee = resolve_client_employee_id(ctx,&db,tenant).await.map_err(KabiPayError::into_graphql)?;
+        let dates = crate::services::leave_working_dates::preview_leave_date_units(&db,tenant,employee,parse_uuid(&leave_type_id,"leaveTypeId")?,from_date,to_date,is_half_day).await.map_err(KabiPayError::into_graphql)?;
+        Ok(async_graphql::Json(serde_json::json!({"requestedDays":dates.iter().map(|(_,units)|*units).sum::<Decimal>().to_string(),"dateUnits":dates.iter().map(|(date,units)|serde_json::json!({"date":date,"units":units.to_string()})).collect::<Vec<_>>()})))
+    }
     async fn leave_import_history(&self,ctx:&Context<'_>,employee_id:Option<ID>,year:i32)->Result<Option<async_graphql::Json<serde_json::Value>>> {
         use kabipay_db_entities::tenant::d0091_leave_import_history::leave_import_history;
         let tenant=require_tenant_id(ctx)?;let scope=leave_read_scope(ctx)?;let db=tenant_db(ctx,tenant).await?;

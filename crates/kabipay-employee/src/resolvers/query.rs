@@ -484,6 +484,28 @@ async fn list_scoped_directory_hierarchy(
 
 #[Object]
 impl QueryRoot {
+    async fn company_locations(&self, ctx: &Context<'_>, page: Option<kabipay_common::PageInput>, search: Option<String>, #[graphql(default = true)] active_only: bool) -> Result<super::company_location_types::CompanyLocationPage> {
+        super::company_location_types::require_location_authority(ctx,false)?;
+        let tenant = require_tenant_id(ctx)?; let db = tenant_db(ctx,tenant).await?; let page = page.unwrap_or_default().clamp();
+        let (rows,total) = crate::services::company_location_repository::list(&db,tenant,page,search,active_only).await.map_err(KabiPayError::into_graphql)?;
+        Ok(super::company_location_types::CompanyLocationPage { nodes: rows.into_iter().map(Into::into).collect(), page_info: kabipay_common::PageInfo::compute(page,total) })
+    }
+    async fn company_location_options(&self, ctx: &Context<'_>, search: Option<String>, #[graphql(default = 50)] limit: u64) -> Result<Vec<super::company_location_types::CompanyLocationOption>> {
+        super::company_location_types::require_location_authority(ctx,true)?;
+        let tenant = require_tenant_id(ctx)?; let db = tenant_db(ctx,tenant).await?;
+        let (rows,_) = crate::services::company_location_repository::list(&db,tenant,kabipay_common::PageInput { page:1, per_page:limit.clamp(1,100) },search,true).await.map_err(KabiPayError::into_graphql)?;
+        Ok(rows.into_iter().map(|r| super::company_location_types::CompanyLocationOption { id:r.id.into(),name:r.name }).collect())
+    }
+    async fn employee_location_assignment(&self, ctx: &Context<'_>, employee_id: ID) -> Result<super::company_location_types::EmployeeLocationAssignment> {
+        super::company_location_types::require_location_authority(ctx,false)?;
+        let tenant = require_tenant_id(ctx)?; let db = tenant_db(ctx,tenant).await?; let id = parse_uuid(&employee_id,"employeeId")?;
+        let employee = employee_service::find_by_id(&db,tenant,id).await.map_err(KabiPayError::into_graphql)?.ok_or_else(|| KabiPayError::Validation("employee does not belong to this company".into()).into_graphql())?;
+        use kabipay_db_entities::tenant::d0097_location_working_calendar::employee_location_assignment as assignment;
+        let latest = assignment::Entity::find().filter(assignment::Column::TenantId.eq(tenant)).filter(assignment::Column::EmployeeId.eq(id)).order_by_desc(assignment::Column::EffectiveFrom).one(&db).await.map_err(KabiPayError::from).map_err(KabiPayError::into_graphql)?;
+        let name = if let Some(location_id) = employee.location_id { Some(crate::services::company_location_repository::active_location(&db,tenant,location_id).await.map_err(KabiPayError::into_graphql)?.name) } else { None };
+        let today = kabipay_common::tenant_business_clock::TenantBusinessClock::load(kabipay_common::subgraph::ops_db(ctx)?,tenant).await.map_err(KabiPayError::into_graphql)?.now_date();
+        Ok(super::company_location_types::EmployeeLocationAssignment { employee_id,location_id:employee.location_id.map(Into::into),location_name:name,effective_from:latest.as_ref().map(|r|r.effective_from),revision:latest.map_or(0,|r|r.revision),business_date:today })
+    }
     async fn prejoining_conversion_options(&self, ctx: &Context<'_>, manager_search: Option<String>, manager_offset: Option<i32>) -> Result<async_graphql::Json<serde_json::Value>> { super::prejoining_options::options(ctx, manager_search, manager_offset).await }
     async fn prejoining_config(&self, ctx: &Context<'_>) -> Result<async_graphql::Json<serde_json::Value>> { super::prejoining::config(ctx).await }
     async fn prejoining_field_catalog(&self, ctx: &Context<'_>) -> Result<async_graphql::Json<serde_json::Value>> { super::prejoining::catalog(ctx) }
@@ -1559,9 +1581,22 @@ pub(crate) async fn enrich_employee_dtos(
         .await
         .map_err(KabiPayError::into_graphql)?;
 
+    use kabipay_db_entities::tenant::{d0006_org_hierarchy::location, d0097_location_working_calendar::employee_location_assignment as assignment};
+    let location_ids: Vec<Uuid> = dtos.iter().filter_map(|d| d.location_id.as_ref().and_then(|id|Uuid::parse_str(id.as_str()).ok())).collect();
+    let location_map: std::collections::HashMap<_,_> = if location_ids.is_empty() { Default::default() } else {
+        location::Entity::find().filter(location::Column::TenantId.eq(tenant_id)).filter(location::Column::Id.is_in(location_ids)).all(db).await.map_err(KabiPayError::from).map_err(KabiPayError::into_graphql)?.into_iter().map(|row|(row.id,row.name)).collect()
+    };
+    let ids: Vec<Uuid> = dtos.iter().filter_map(|d|Uuid::parse_str(d.id.as_str()).ok()).collect();
+    let assignments = if ids.is_empty() { Vec::new() } else {
+        assignment::Entity::find().filter(assignment::Column::TenantId.eq(tenant_id)).filter(assignment::Column::EmployeeId.is_in(ids)).order_by_desc(assignment::Column::EffectiveFrom).all(db).await.map_err(KabiPayError::from).map_err(KabiPayError::into_graphql)?
+    };
     Ok(dtos
         .into_iter()
-        .map(|d| d.with_reference_labels(&dept_map, &desig_map, &user_map, &mgr_map))
+        .map(|mut d| {
+            d.location_name = d.location_id.as_ref().and_then(|id|Uuid::parse_str(id.as_str()).ok()).and_then(|id|location_map.get(&id).cloned());
+            d.location_assignment_effective_from = Uuid::parse_str(d.id.as_str()).ok().and_then(|id|assignments.iter().find(|row|row.employee_id == id).map(|row|row.effective_from));
+            d.with_reference_labels(&dept_map, &desig_map, &user_map, &mgr_map)
+        })
         .collect())
 }
 

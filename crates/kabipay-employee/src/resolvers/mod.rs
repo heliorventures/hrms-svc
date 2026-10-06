@@ -6,6 +6,7 @@
 pub mod mutation;
 pub mod query;
 pub mod scope;
+pub mod company_location_types;
 pub mod types;
 pub mod prejoining;
 pub mod prejoining_options;

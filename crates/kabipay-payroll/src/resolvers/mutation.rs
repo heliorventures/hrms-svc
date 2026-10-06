@@ -598,6 +598,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn payslip_template_write_requires_company_wide_payroll_management() {
+        let mutation = r#"mutation { upsertPayrollComplianceSetting(input: { payslipTemplate: "TABLE" }) { payslipTemplate } }"#;
+        for scope in [None, Some("SELF"), Some("TEAM")] {
+            let response = execute_mutation(claims(PERM_PAYROLL_MANAGE, scope), mutation).await;
+            assert_permission_denied_before_db(&response, PERM_PAYROLL_MANAGE);
+        }
+    }
+
+    #[tokio::test]
+    async fn payslip_template_write_accepts_the_company_admin_contract() {
+        let response = execute_mutation(
+            claims(PERM_PAYROLL_MANAGE, Some("ALL")),
+            r#"mutation { upsertPayrollComplianceSetting(input: { payslipTemplate: "TABLE" }) { payslipTemplate } }"#,
+        )
+        .await;
+        assert_authorization_reached_db(&response);
+    }
+
+    #[tokio::test]
     async fn every_payroll_mutation_rejects_sibling_permission_before_database_access() {
         for sibling_permission in [PERM_PAYROLL_STATUTORY_EXPORT, PERM_COMPENSATION_MANAGE] {
             for mutation in protected_mutations() {

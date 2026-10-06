@@ -86,6 +86,18 @@ pub struct QueryRoot;
 
 #[Object]
 impl QueryRoot {
+    async fn working_calendar_policy(&self, ctx: &Context<'_>, location_id: Option<ID>) -> Result<super::weekly_off_types::WorkingCalendarPolicy> {
+        super::mutation::require_all_authority(ctx,kabipay_common::context::PERM_ATTENDANCE_PUNCH_POLICY)?;
+        let tenant = require_tenant_id(ctx)?; let db = tenant_db(ctx,tenant).await?;
+        let location = location_id.map(|id| Uuid::parse_str(id.as_str()).map_err(|_|KabiPayError::Validation("invalid locationId".into()).into_graphql())).transpose()?;
+        let clock = TenantBusinessClock::load(ops_db(ctx)?,tenant).await.map_err(KabiPayError::into_graphql)?;
+        let state = crate::services::weekly_off_policy_service::read(&db,tenant,location).await.map_err(KabiPayError::into_graphql)?;
+        super::weekly_off_types::dto(state,location,clock.now_date()).map_err(KabiPayError::into_graphql)
+    }
+    async fn preview_weekly_off_month(&self, ctx: &Context<'_>, rule: super::weekly_off_types::WeeklyOffRuleInput, month: u32, year: i32) -> Result<Vec<NaiveDate>> {
+        super::mutation::require_all_authority(ctx,kabipay_common::context::PERM_ATTENDANCE_PUNCH_POLICY)?;
+        crate::services::weekly_off_policy_service::preview(&rule.rule().map_err(KabiPayError::into_graphql)?,month,year).map_err(KabiPayError::into_graphql)
+    }
     /// Tenant configuration metadata; only explicit ALL configuration authority.
     async fn attendance_day_policy(&self, ctx: &Context<'_>) -> Result<crate::resolvers::types::AttendanceDayPolicyDto> {
         let tenant_id = require_tenant_id(ctx)?;
@@ -476,7 +488,10 @@ impl QueryRoot {
             .await
             .map_err(KabiPayError::into_graphql)?;
         let from = from_date.unwrap_or_else(|| clock.now_date());
-        let rows = attendance_service::list_upcoming_holidays(&db, tenant_id, from, limit)
+        let employee = if ctx.data_opt::<ClientClaims>().and_then(|claims|claims.employee_id).is_some() {
+            Some(resolve_client_employee_id(ctx,&db,tenant_id).await.map_err(KabiPayError::into_graphql)?)
+        } else { None };
+        let rows = crate::services::employee_holidays::upcoming(&db, tenant_id, employee, from, limit)
             .await
             .map_err(KabiPayError::into_graphql)?;
         Ok(rows

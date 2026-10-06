@@ -8,6 +8,7 @@ use uuid::Uuid;
 const INPUT_TABLES: &[&str] = &[
     "company_payroll_rule",
     "employee",
+    "employee_location_assignment",
     "employee_payroll_rule",
     "employee_salary_component_override",
     "employee_salary_structure",
@@ -17,6 +18,7 @@ const INPUT_TABLES: &[&str] = &[
     "holiday",
     "holiday_calendar",
     "leave_request",
+    "leave_working_date_snapshot",
     "leave_type",
     "payroll_arrear",
     "payroll_cycle",
@@ -31,6 +33,8 @@ const INPUT_TABLES: &[&str] = &[
     "salary_structure_component",
     "tax_proof_line",
     "tax_configuration_version",
+    "weekly_off_policy_version",
+    "working_calendar_profile",
 ];
 
 pub async fn lock_inputs<C: ConnectionTrait>(db: &C) -> KabiPayResult<()> {

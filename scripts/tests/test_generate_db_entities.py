@@ -20,6 +20,13 @@ SPEC.loader.exec_module(generator)
 
 
 class ForwardAmendmentTests(unittest.TestCase):
+    def test_column_declared_non_id_primary_key_is_preserved(self) -> None:
+        directory = generator.MIGRATIONS / "0097_location_working_calendar"
+        tables, keys, _ = generator.collect_domain_tables(directory)
+        self.assertEqual(keys.get("working_calendar_profile"), ["tenant_id"])
+        emitted = generator.emit_entity("working_calendar_profile", tables["working_calendar_profile"], keys["working_calendar_profile"])
+        self.assertIn("#[sea_orm(primary_key, auto_increment = false)]\n        pub tenant_id: Uuid", emitted)
+
     def test_forward_amendments_are_applied_without_consuming_rollback(self) -> None:
         with tempfile.TemporaryDirectory(dir=REPOSITORY_ROOT / ".codex-tmp") as temporary_directory:
             output = Path(temporary_directory)

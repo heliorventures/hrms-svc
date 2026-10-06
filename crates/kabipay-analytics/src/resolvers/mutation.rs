@@ -25,10 +25,10 @@ impl MutationRoot {
     async fn requeue_outbox_event(&self, ctx: &Context<'_>, id: ID) -> Result<OutboxEventDto> {
         let claims = require_client_claims(ctx)?;
         if !claims.can_manage_employee_directory() {
-            return Err(
-                KabiPayError::Forbidden("HR or directory access required to requeue outbox".into())
-                    .into_graphql(),
-            );
+            return Err(KabiPayError::Forbidden(
+                "HR or directory access required to requeue outbox".into(),
+            )
+            .into_graphql());
         }
         let tenant_id = require_tenant_id(ctx)?;
         let db = tenant_db(ctx, tenant_id).await?;
@@ -47,12 +47,10 @@ impl MutationRoot {
     ) -> Result<TenantIntegrationDto> {
         let claims = require_client_claims(ctx)?;
         if !claims.can_manage_employee_directory() {
-            return Err(
-                KabiPayError::Forbidden(
-                    "HR or employee directory access required to connect integrations".into(),
-                )
-                .into_graphql(),
-            );
+            return Err(KabiPayError::Forbidden(
+                "HR or employee directory access required to connect integrations".into(),
+            )
+            .into_graphql());
         }
         let tenant_id = require_tenant_id(ctx)?;
         let db = tenant_db(ctx, tenant_id).await?;
@@ -71,12 +69,10 @@ impl MutationRoot {
     ) -> Result<WebhookSubscriptionDto> {
         let claims = require_client_claims(ctx)?;
         if !claims.can_manage_employee_directory() {
-            return Err(
-                KabiPayError::Forbidden(
-                    "HR or employee directory access required for webhook registration".into(),
-                )
-                .into_graphql(),
-            );
+            return Err(KabiPayError::Forbidden(
+                "HR or employee directory access required for webhook registration".into(),
+            )
+            .into_graphql());
         }
         let tenant_id = require_tenant_id(ctx)?;
         let db = tenant_db(ctx, tenant_id).await?;
@@ -100,20 +96,17 @@ impl MutationRoot {
     ) -> Result<WebhookSubscriptionDto> {
         let claims = require_client_claims(ctx)?;
         if !claims.can_manage_employee_directory() {
-            return Err(
-                KabiPayError::Forbidden(
-                    "HR or employee directory access required to change webhooks".into(),
-                )
-                .into_graphql(),
-            );
+            return Err(KabiPayError::Forbidden(
+                "HR or employee directory access required to change webhooks".into(),
+            )
+            .into_graphql());
         }
         let tenant_id = require_tenant_id(ctx)?;
         let db = tenant_db(ctx, tenant_id).await?;
         let wid = parse_uuid(&id, "id")?;
-        let m =
-            analytics_service::set_webhook_subscription_active(&db, tenant_id, wid, active)
-                .await
-                .map_err(KabiPayError::into_graphql)?;
+        let m = analytics_service::set_webhook_subscription_active(&db, tenant_id, wid, active)
+            .await
+            .map_err(KabiPayError::into_graphql)?;
         Ok(WebhookSubscriptionDto::from(m))
     }
 }

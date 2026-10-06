@@ -353,6 +353,7 @@ pub async fn submit_leave_request(
     )?;
 
     let txn = db.begin().await?;
+    kabipay_common::working_calendar::lock_calendar(&txn,tenant_id).await?;
     let actor_candidate = resolve_leave_actor_candidate(
         &txn,
         tenant_id,
@@ -429,13 +430,9 @@ pub async fn submit_leave_request(
 
     let holiday_dates = tenant_holiday_dates_between(&txn, tenant_id, from_date, to_date).await?;
 
-    let days = compute_requested_days(
-        from_date,
-        to_date,
-        is_half_day,
-        lt.sandwich_rule,
-        &holiday_dates,
-    )?;
+    let calendar = kabipay_common::working_calendar::load_calendar(&txn,tenant_id,&[employee_id],from_date,to_date).await?;
+    let chargeable_dates = super::leave_working_dates::build_leave_date_units(&calendar,employee_id,from_date,to_date,is_half_day,lt.sandwich_rule,&holiday_dates)?;
+    let days: Decimal = chargeable_dates.iter().map(|(_,units)|*units).sum();
 
     let doc_ref = supporting_document_reference
         .map(|s| s.trim().to_string())
@@ -488,7 +485,7 @@ pub async fn submit_leave_request(
     };
     am_req.insert(&txn).await?;
 
-    let chargeable_dates = requested_date_units(from_date, to_date, is_half_day, lt.sandwich_rule, &holiday_dates)?;
+    super::leave_working_dates::save_leave_date_snapshot(&txn,tenant_id,req_id,employee_id,&calendar,&chargeable_dates).await?;
     let uses_comp_off = crate::services::comp_off::reserve_for_leave(
         &txn, tenant_id, employee_id, req_id, leave_type_id, business_date, &chargeable_dates,
     ).await?;
@@ -1192,6 +1189,7 @@ pub async fn approve_leave_request(
     if model.employee_id != subject.id {
         return Err(pending_leave_decision_unavailable());
     }
+    super::leave_working_dates::validate_saved_request_dates(&txn,tenant_id,&model).await?;
     let authority = WorkflowApprovalAuthority {
         actor_user_id,
         actor_employee: Some(actor),
@@ -1975,7 +1973,7 @@ async fn leave_notify_employee(
     }
 }
 
-async fn tenant_holiday_dates_between<C: ConnectionTrait + Sync>(
+pub(super) async fn tenant_holiday_dates_between<C: ConnectionTrait + Sync>(
     conn: &C,
     tenant_id: Uuid,
     from_date: NaiveDate,

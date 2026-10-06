@@ -131,8 +131,34 @@ fn require_expense_configuration(ctx: &Context<'_>) -> Result<()> {
 
 pub struct QueryRoot;
 
+impl QueryRoot {
+    async fn request_attachment(
+        &self, ctx: &Context<'_>, request_id: ID, scope: ScopeType,
+        kind: crate::services::request_attachment_service::RequestKind,
+    ) -> Result<Option<crate::services::request_attachment_service::RequestAttachment>> {
+        let tenant_id = require_tenant_id(ctx)?;
+        let id = parse_uuid(&request_id, "requestId")?;
+        let db = tenant_db(ctx, tenant_id).await?;
+        let viewer = resolve_viewer_employee(ctx, &db, tenant_id).await?;
+        let filter = resolve_employee_scope_filter(&db, tenant_id, scope, viewer)
+            .await.map_err(KabiPayError::into_graphql)?;
+        crate::services::request_attachment_service::load_attachment(&db, tenant_id, id, kind, &filter)
+            .await.map_err(KabiPayError::into_graphql)
+    }
+}
+
 #[Object]
 impl QueryRoot {
+    async fn expense_attachment(&self, ctx: &Context<'_>, expense_id: ID) -> Result<Option<crate::services::request_attachment_service::RequestAttachment>> {
+        let scope = expense_list_scope(ctx)?;
+        self.request_attachment(ctx, expense_id, scope, crate::services::request_attachment_service::RequestKind::Expense).await
+    }
+
+    async fn travel_request_attachment(&self, ctx: &Context<'_>, travel_request_id: ID) -> Result<Option<crate::services::request_attachment_service::RequestAttachment>> {
+        let scope = travel_list_scope(ctx)?;
+        self.request_attachment(ctx, travel_request_id, scope, crate::services::request_attachment_service::RequestKind::Travel).await
+    }
+
     async fn expense_health(&self) -> &'static str {
         "ok"
     }
@@ -298,6 +324,22 @@ mod tests {
         );
         assert!(!message.contains("TenantDbCache"));
         assert!(!message.contains("database"));
+    }
+
+    #[tokio::test]
+    async fn request_file_attachment_permissions_match_parent_domains_before_database_access() {
+        for (query, denied, message) in [
+            ("{ expenseAttachment(expenseId: \"00000000-0000-0000-0000-000000000000\") { fileName } }", PERM_TRAVEL_READ, "scoped expense permission"),
+            ("{ travelRequestAttachment(travelRequestId: \"00000000-0000-0000-0000-000000000000\") { fileName } }", PERM_EXPENSE_READ, "scoped travel permission"),
+        ] {
+            let response = execute_query(claims(denied, Some("ALL")), query).await;
+            assert_permission_denied_before_db(&response, message);
+        }
+        for permission in [PERM_EXPENSE_APPROVE, PERM_TRAVEL_APPROVE] {
+            let scoped = claims(permission, Some("TEAM"));
+            let gate = if permission == PERM_EXPENSE_APPROVE { expense_list_scope_from_claims } else { travel_list_scope_from_claims };
+            assert_eq!(gate(Some(&scoped)).unwrap(), ScopeType::Team);
+        }
     }
 
     #[test]

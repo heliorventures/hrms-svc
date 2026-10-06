@@ -13,3 +13,7 @@ pub mod timesheet_policy;
 pub mod timesheet_project_assignment_service;
 pub mod attendance_day;
 pub mod attendance_day_runtime;
+pub mod weekly_off_policy_service;
+pub mod employee_holidays;
+
+pub mod holiday_management;

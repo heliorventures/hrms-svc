@@ -1,4 +1,4 @@
-//! Auto-generated from `kabipay-database/changelog/migrations/0033_travel_request/travel_request.xml`.
+//! Auto-generated from `hrms-database/changelog/migrations/0033_travel_request/travel_request.xml, hrms-database/changelog/migrations/0043_travel_request_workflow/travel_request_workflow.xml, hrms-database/changelog/migrations/0096_travel_supporting_file/travel_supporting_file.xml`.
 
 pub mod travel_request {
     use crate::tenant::prelude::*;
@@ -20,12 +20,12 @@ pub mod travel_request {
         pub status: String,
         pub rejection_reason: Option<String>,
         pub approved_by: Option<Uuid>,
-        pub rejected_by: Option<Uuid>,
-        /// When set, approvals follow **`TRAVEL_REQUEST`** workflow steps (**M32** style).
-        pub workflow_instance_id: Option<Uuid>,
         pub submitted_at: DateTimeUtc,
         pub created_at: DateTimeUtc,
         pub updated_at: DateTimeUtc,
+        pub rejected_by: Option<Uuid>,
+        pub workflow_instance_id: Option<Uuid>,
+        pub supporting_file_storage_id: Option<Uuid>,
     }
 
     impl ActiveModelBehavior for ActiveModel {}

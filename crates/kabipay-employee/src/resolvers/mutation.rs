@@ -248,6 +248,27 @@ pub struct MutationRoot;
 
 #[Object]
 impl MutationRoot {
+    async fn save_company_location(&self, ctx: &Context<'_>, input: super::company_location_types::SaveCompanyLocationInput) -> Result<super::company_location_types::CompanyLocation> {
+        super::company_location_types::require_location_authority(ctx,false)?;
+        let tenant = require_tenant_id(ctx)?; let actor = require_client_claims(ctx)?.sub; let db = tenant_db(ctx,tenant).await?;
+        let command = crate::services::company_location_repository::SaveLocationCommand { id:input.id.as_ref().map(|id|parse_uuid(id,"id")).transpose()?,expected_updated_at:input.expected_updated_at,name:input.name,address:input.address,city:input.city,state:input.state,country:input.country };
+        crate::services::company_location_repository::save_location(&db,tenant,actor,command).await.map(Into::into).map_err(KabiPayError::into_graphql)
+    }
+    async fn retire_company_location(&self, ctx: &Context<'_>, id: ID, expected_updated_at: chrono::DateTime<chrono::Utc>) -> Result<super::company_location_types::CompanyLocation> {
+        super::company_location_types::require_location_authority(ctx,false)?;
+        let tenant = require_tenant_id(ctx)?; let actor = require_client_claims(ctx)?.sub; let db = tenant_db(ctx,tenant).await?;
+        let clock = TenantBusinessClock::load(ops_db(ctx)?,tenant).await.map_err(KabiPayError::into_graphql)?;
+        crate::services::company_location_repository::retire_location(&db,tenant,actor,parse_uuid(&id,"id")?,expected_updated_at,clock.now_date()).await.map(Into::into).map_err(KabiPayError::into_graphql)
+    }
+    async fn assign_employee_location(&self, ctx: &Context<'_>, input: super::company_location_types::AssignEmployeeLocationInput) -> Result<super::company_location_types::EmployeeLocationAssignment> {
+        super::company_location_types::require_location_authority(ctx,false)?;
+        let tenant = require_tenant_id(ctx)?; let actor = require_client_claims(ctx)?.sub; let db = tenant_db(ctx,tenant).await?;
+        let clock = TenantBusinessClock::load(ops_db(ctx)?,tenant).await.map_err(KabiPayError::into_graphql)?;
+        let location = input.location_id.as_ref().map(|id|parse_uuid(id,"locationId")).transpose()?;
+        let row = crate::services::company_location_repository::assign_employee_location(&db,tenant,parse_uuid(&input.employee_id,"employeeId")?,actor,location,input.effective_date,input.expected_revision,clock).await.map_err(KabiPayError::into_graphql)?;
+        let name = if let Some(id) = location { Some(crate::services::company_location_repository::active_location(&db,tenant,id).await.map_err(KabiPayError::into_graphql)?.name) } else { None };
+        Ok(super::company_location_types::EmployeeLocationAssignment { employee_id:input.employee_id,location_id:location.map(Into::into),location_name:name,effective_from:Some(row.effective_from),revision:row.revision,business_date:clock.now_date() })
+    }
     /// Idempotently dismiss the overview for the authenticated user.
     async fn dismiss_my_application_overview(
         &self,

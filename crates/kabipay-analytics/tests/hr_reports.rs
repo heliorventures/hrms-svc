@@ -12,6 +12,23 @@ async fn hr_reports_require_authorization_before_database_access() {
 fn claims(permission:&str,scope:Option<&str>)->kabipay_common::context::ClientClaims {
  serde_json::from_value(serde_json::json!({"sub":uuid::Uuid::nil(),"iss":"test","exp":9999999999i64,"iat":0,"tenant_id":uuid::Uuid::nil(),"permissions":[permission],"permission_scopes":scope.map(|s|serde_json::json!({permission:s})).unwrap_or(serde_json::json!({}))})).unwrap()
 }
+
+#[tokio::test]
+async fn claim_travel_reports_require_their_exact_domain_all_scope() {
+ for (kind,permission,scope) in [
+    ("EXPENSE_CLAIMS","expense:read",Some("SELF")),
+    ("EXPENSE_CLAIMS","expense:approve",Some("ALL")),
+    ("EXPENSE_CLAIMS","travel:read",Some("ALL")),
+    ("TRAVEL_REQUESTS","travel:read",Some("TEAM")),
+    ("TRAVEL_REQUESTS","travel:manage",Some("ALL")),
+    ("TRAVEL_REQUESTS","expense:read",Some("ALL")),
+ ] {
+    let schema=Schema::build(resolvers::QueryRoot,resolvers::MutationRoot,EmptySubscription).data(claims(permission,scope)).finish();
+    let result=schema.execute(format!(r#"{{hrReportRows(kind:{kind},fromDate:"2026-10-01",toDate:"2026-10-31"){{totalRows}}}}"#)).await;
+    assert_eq!(result.errors.len(),1);
+    assert!(result.errors[0].message.contains("domain read permission"),"{:?}",result.errors);
+ }
+}
 #[tokio::test]
 async fn report_rejects_self_team_missing_scope_and_payroll_manage_before_database() {
  for (kind,permission,scope) in [("ATTENDANCE_PUNCTUALITY","attendance:read",Some("SELF")),("LEAVE_REQUESTS","leave:read",Some("TEAM")),("PAYROLL_REGISTER","payroll:read",None),("PAYROLL_REGISTER","payroll:manage",Some("ALL")),("TIMESHEET_HOURS","timesheet:read",Some("SELF")),("EMPLOYEE_MOVEMENTS","analytics:read",Some("ALL"))] {

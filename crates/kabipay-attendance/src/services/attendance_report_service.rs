@@ -381,6 +381,7 @@ pub async fn attendance_report(
         .filter(leave_request::Column::ToDate.gte(from_date))
         .all(db)
         .await?;
+    let calendar = kabipay_common::working_calendar::load_calendar(db,tenant_id,&employee_ids,from_date,to_date).await?;
     let separation_dates: HashMap<Uuid, NaiveDate> = separation::Entity::find()
         .filter(separation::Column::TenantId.eq(tenant_id))
         .filter(separation::Column::EmployeeId.is_in(employee_ids))
@@ -418,12 +419,14 @@ pub async fn attendance_report(
             let expected_minutes = scheduled_shift_id
                 .and_then(|shift_id| shifts.get(&shift_id))
                 .and_then(shift_expected_minutes);
-            let is_holiday = holiday_locations.contains(&(date, None))
+            let mut is_holiday = holiday_locations.contains(&(date, None))
                 || employee.location_id.is_some_and(|location| holiday_locations.contains(&(date, Some(location))));
             let is_on_leave = leaves.iter().any(|leave| {
                 leave.employee_id == employee.id && leave.from_date <= date && leave.to_date >= date
             });
-            let weekly_off = is_weekly_off(date, expected_minutes);
+            let mut weekly_off = is_weekly_off(date, expected_minutes);
+            let calendar_day = calendar.day(employee.id,date)?;
+            if calendar_day.activated { is_holiday = calendar_day.holiday; weekly_off = calendar_day.weekly_off; }
             rows.push(AttendanceDailyReportRow {
                 employee_id: employee.id,
                 employee_name: format!("{} {}", employee.first_name, employee.last_name).trim().to_owned(),

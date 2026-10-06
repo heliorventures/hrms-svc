@@ -23,9 +23,11 @@ pub mod file_download_token;
 pub mod ids;
 pub mod jwt;
 pub mod middleware;
+pub mod object_store_config;
 pub mod pagination;
 pub mod password;
 pub mod private_file_cleanup;
+pub mod private_file_reader;
 pub mod subgraph;
 pub mod telemetry;
 pub mod tenant_business_clock;
@@ -33,6 +35,7 @@ pub mod tenant_seed;
 pub mod workflow_approval;
 pub mod workflow_current_step;
 pub mod workflow_inbox;
+pub mod working_calendar;
 
 pub use context::{
     ClientContext, ClientRequestHints, ClientViewerEmployee, OperatorContext, ScopeType,

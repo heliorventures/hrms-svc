@@ -27,3 +27,5 @@ pub mod separation_service;
 pub mod prejoining;
 #[cfg(test)]
 mod prejoining_tests;
+pub mod company_location_service;
+pub mod company_location_repository;

@@ -220,6 +220,13 @@ def collect_domain_tables(
                 columns = parse_columns(change)
                 if columns:
                     tables[table] = columns
+                    declared_primary_keys = []
+                    for column in change.findall("db:column", NS):
+                        constraints = column.find("db:constraints", NS)
+                        if constraints is not None and constraints.attrib.get("primaryKey") == "true":
+                            declared_primary_keys.append(column.attrib["name"])
+                    if declared_primary_keys:
+                        primary_keys[table] = declared_primary_keys
                     source_used = True
                 continue
 

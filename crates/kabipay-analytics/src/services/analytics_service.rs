@@ -2,13 +2,13 @@
 
 use kabipay_common::{KabiPayError, KabiPayResult};
 use kabipay_db_entities::ops::integration_connector as ic_connector;
+use kabipay_db_entities::tenant::d0024_analytics::{
+    dashboard, dashboard_widget, report_definition, report_schedule, workforce_snapshot,
+};
 use kabipay_db_entities::tenant::d0026_integrations::{
     tenant_integration, webhook_delivery_log, webhook_subscription,
 };
 use kabipay_db_entities::tenant::d0027_communication_audit::audit_log;
-use kabipay_db_entities::tenant::d0024_analytics::{
-    dashboard, dashboard_widget, report_definition, report_schedule, workforce_snapshot,
-};
 use kabipay_db_entities::tenant::d0030_outbox_events::outbox_event;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, QueryOrder,
@@ -68,8 +68,8 @@ pub async fn list_dashboard_widgets(
     limit: u64,
 ) -> KabiPayResult<Vec<dashboard_widget::Model>> {
     let limit = limit.clamp(1, 200);
-    let mut q = dashboard_widget::Entity::find()
-        .filter(dashboard_widget::Column::TenantId.eq(tenant_id));
+    let mut q =
+        dashboard_widget::Entity::find().filter(dashboard_widget::Column::TenantId.eq(tenant_id));
     if let Some(did) = dashboard_id {
         q = q.filter(dashboard_widget::Column::DashboardId.eq(did));
     }
@@ -104,7 +104,8 @@ pub async fn list_outbox_events(
     allowed_aggregates: Vec<&str>,
 ) -> KabiPayResult<Vec<outbox_event::Model>> {
     let limit = limit.clamp(1, 500);
-    let mut q = outbox_event::Entity::find().filter(outbox_event::Column::TenantId.eq(tenant_id))
+    let mut q = outbox_event::Entity::find()
+        .filter(outbox_event::Column::TenantId.eq(tenant_id))
         .filter(outbox_event::Column::AggregateType.is_in(allowed_aggregates));
     if let Some(s) = status {
         let t = s.trim();
@@ -320,7 +321,9 @@ pub async fn register_webhook_subscription(
         tenant_id: Set(tenant_id),
         event_name: Set(evt.into()),
         endpoint_url: Set(url),
-        secret_hash: Set(hash_optional_webhook_secret(webhook_secret_plain.as_deref())),
+        secret_hash: Set(hash_optional_webhook_secret(
+            webhook_secret_plain.as_deref(),
+        )),
         is_active: Set(true),
         created_at: Set(now),
         updated_at: Set(now),

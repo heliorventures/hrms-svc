@@ -4,6 +4,7 @@ use kabipay_db_entities::tenant::{
     d0010_time_shift_roster::{holiday, holiday_calendar},
     d0011_leave::{leave_request, leave_type},
     d0012_payroll::salary_component,
+    d0098_leave_working_dates::leave_working_date_snapshot as request_snapshot,
     d0077_unpaid_leave_payroll::{payroll_unpaid_leave_policy as policy, payslip_unpaid_leave as snapshot, payroll_unpaid_leave_allocation as allocation},
 };
 use rust_decimal::Decimal;
@@ -84,6 +85,17 @@ fn resolved_dates(saved: Option<&allocation::Model>, request: &leave_request::Mo
     }
 }
 
+fn resolved_request_dates(frozen: Option<&allocation::Model>, snapshot: Option<&request_snapshot::Model>, request: &leave_request::Model, sandwich: bool, holidays: &HashSet<NaiveDate>) -> KabiPayResult<Vec<(NaiveDate, Decimal)>> {
+    if frozen.is_some() { return resolved_dates(frozen,request,sandwich,holidays); }
+    if let Some(snapshot)=snapshot {
+        if snapshot.tenant_id!=request.tenant_id || snapshot.employee_id!=request.employee_id || snapshot.leave_request_id!=request.id || snapshot.from_date!=request.from_date || snapshot.to_date!=request.to_date || snapshot.requested_days!=request.days_requested {
+            return Err(KabiPayError::Validation("saved leave dates no longer match the approved request; HR review required".into()));
+        }
+        return kabipay_common::working_calendar::decode_leave_units(snapshot.date_units.clone(),request.from_date,request.to_date,request.days_requested);
+    }
+    resolved_dates(None,request,sandwich,holidays)
+}
+
 pub async fn calculate<C: ConnectionTrait + Sync>(db: &C, tenant: Uuid, employee: Uuid, period: NaiveDate, policy: &policy::Model, basic: Decimal) -> KabiPayResult<Calculation> {
     calculate_with_mode(db,tenant,employee,period,policy,basic,true).await
 }
@@ -127,7 +139,9 @@ pub async fn calculate_with_mode<C: ConnectionTrait + Sync>(db: &C, tenant: Uuid
         // the WHOLE approved allocation so later calendar changes cannot charge it twice.
         let existing = allocation::Entity::find_by_id(request.id).filter(allocation::Column::TenantId.eq(tenant))
             .filter(allocation::Column::EmployeeId.eq(employee)).one(db).await.map_err(KabiPayError::from)?;
-        let dates = resolved_dates(existing.as_ref(), &request, leave_type.sandwich_rule, &holidays)?;
+        let snapshot = if existing.is_none() { request_snapshot::Entity::find_by_id(request.id).filter(request_snapshot::Column::TenantId.eq(tenant))
+            .filter(request_snapshot::Column::EmployeeId.eq(employee)).one(db).await? } else {None};
+        let dates = resolved_request_dates(existing.as_ref(),snapshot.as_ref(),&request,leave_type.sandwich_rule,&holidays)?;
         if freeze && existing.is_none() {
             allocation::ActiveModel {
                 leave_request_id: Set(request.id), tenant_id: Set(tenant), employee_id: Set(employee),
@@ -212,6 +226,15 @@ mod tests {
         let after_calendar_change = resolved_dates(Some(&saved), &request, false, &HashSet::from([request.from_date])).unwrap();
         assert_eq!(after_calendar_change, dates);
         assert!(after_calendar_change.iter().all(|(date, _)| date.month() != 10));
+        let mut submission_snapshot = request_snapshot::Model {
+            leave_request_id:request.id,tenant_id:request.tenant_id,employee_id:request.employee_id,
+            from_date:request.from_date,to_date:request.to_date,requested_days:request.days_requested,
+            date_units:serde_json::json!([{"date":request.to_date.to_string(),"units":"1"}]),calendar_provenance:serde_json::json!({}),created_at:now,
+        };
+        assert_eq!(resolved_request_dates(None,Some(&submission_snapshot),&request,false,&HashSet::from([request.to_date])).unwrap(),vec![(request.to_date,Decimal::ONE)]);
+        assert_eq!(resolved_request_dates(Some(&saved),Some(&submission_snapshot),&request,false,&HashSet::new()).unwrap(),dates);
+        submission_snapshot.employee_id=Uuid::new_v4();
+        assert!(resolved_request_dates(None,Some(&submission_snapshot),&request,false,&HashSet::new()).is_err());
         let mut changed_request = request;
         changed_request.days_requested = Decimal::from(2);
         assert!(resolved_dates(Some(&saved), &changed_request, false, &HashSet::new()).is_err());

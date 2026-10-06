@@ -133,6 +133,21 @@ pub struct MutationRoot;
 
 #[Object]
 impl MutationRoot {
+    async fn activate_working_calendar(&self, ctx: &Context<'_>, activation_date: chrono::NaiveDate) -> Result<super::weekly_off_types::WorkingCalendarPolicy> {
+        require_all_authority(ctx,PERM_ATTENDANCE_PUNCH_POLICY)?;
+        let tenant = require_tenant_id(ctx)?; let actor = require_client_claims(ctx)?.sub; let db = tenant_db(ctx,tenant).await?;
+        let clock = TenantBusinessClock::load(ops_db(ctx)?,tenant).await.map_err(KabiPayError::into_graphql)?;
+        let state = crate::services::weekly_off_policy_service::activate(&db,tenant,actor,activation_date,clock).await.map_err(KabiPayError::into_graphql)?;
+        super::weekly_off_types::dto(state,None,clock.now_date()).map_err(KabiPayError::into_graphql)
+    }
+    async fn schedule_weekly_off_policy(&self, ctx: &Context<'_>, input: super::weekly_off_types::ScheduleWeeklyOffPolicyInput) -> Result<super::weekly_off_types::WorkingCalendarPolicy> {
+        require_all_authority(ctx,PERM_ATTENDANCE_PUNCH_POLICY)?;
+        let command = input.command().map_err(KabiPayError::into_graphql)?; let location = command.location_id;
+        let tenant = require_tenant_id(ctx)?; let actor = require_client_claims(ctx)?.sub; let db = tenant_db(ctx,tenant).await?;
+        let clock = TenantBusinessClock::load(ops_db(ctx)?,tenant).await.map_err(KabiPayError::into_graphql)?;
+        let state = crate::services::weekly_off_policy_service::schedule(&db,tenant,actor,command,clock).await.map_err(KabiPayError::into_graphql)?;
+        super::weekly_off_types::dto(state,location,clock.now_date()).map_err(KabiPayError::into_graphql)
+    }
     async fn schedule_attendance_day_policy(
         &self, ctx: &Context<'_>, input: crate::resolvers::types::ScheduleAttendanceDayPolicyInput,
     ) -> Result<crate::resolvers::types::AttendanceDayPolicyDto> {
