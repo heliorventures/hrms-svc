@@ -61,6 +61,8 @@ pub struct ImportIssue {
 #[serde(deny_unknown_fields)]
 pub struct ImportEmployee {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub location: Option<crate::location_import::LocationInput>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tax_settings: Option<Value>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tax_history: Vec<Value>,
@@ -179,6 +181,9 @@ impl ImportPackage {
         }
         crate::configuration::validate(&package.configuration)?;
         for row in &package.employees {
+            if let Some(location) = &row.location {
+                location.normalized_name()?;
+            }
             if !valid_source_ref(&row.source_ref, &package.source.file_hash)
                 || !source_rows.insert((row.source_ref.sheet.clone(), row.source_ref.row))
                 || row.source_states.values().any(|state| {

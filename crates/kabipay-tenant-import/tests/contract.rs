@@ -16,6 +16,28 @@ fn standard_template_is_consumed_without_client_profile_logic() {
 }
 
 #[test]
+fn explicit_location_is_supported_without_changing_legacy_packages() {
+    let mut document = example();
+    document["employees"][0]["location"] = serde_json::json!({
+        "name": "Pune Office", "effective_from": "2026-10-07"
+    });
+    assert!(ImportPackage::parse(&serde_json::to_vec(&document).unwrap()).is_ok());
+}
+
+#[test]
+fn location_requires_a_nonblank_name_and_an_explicit_date() {
+    for value in [
+        serde_json::json!({"name":"Pune"}),
+        serde_json::json!({"name":"  ","effective_from":"2026-10-07"}),
+        serde_json::json!({"name":"Pune","effective_from":"invalid"}),
+    ] {
+        let mut document = example();
+        document["employees"][0]["location"] = value;
+        assert!(ImportPackage::parse(&serde_json::to_vec(&document).unwrap()).is_err());
+    }
+}
+
+#[test]
 fn unsupported_version_and_unknown_top_level_fields_fail_closed() {
     for (key, value) in [
         ("version", serde_json::json!(2)),

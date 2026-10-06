@@ -134,6 +134,15 @@ pub async fn resolve(
             bail!("TAX_IMPORT_MIGRATIONS_REQUIRED");
         }
     }
+    if package.employees.iter().any(|row| row.location.is_some()) {
+        let state = db.query_one(Statement::from_sql_and_values(DbBackend::Postgres,
+            "SELECT (SELECT COUNT(*) FROM information_schema.tables WHERE table_schema=$1 AND table_name IN ('employee_location_assignment','working_calendar_profile'))=2 AND EXISTS(SELECT 1 FROM pg_indexes WHERE schemaname=$1 AND indexname='uq_location_active_normalized_name') AS ready",
+            [options.schema_name.clone().into()])).await?
+            .ok_or_else(|| anyhow::anyhow!("MIGRATION_STATE_UNRESOLVED"))?;
+        if !state.try_get::<bool>("", "ready")? {
+            bail!("LOCATION_IMPORT_MIGRATIONS_REQUIRED");
+        }
+    }
     let columns=db.query_one(Statement::from_sql_and_values(DbBackend::Postgres,
         "SELECT COUNT(*) AS n FROM information_schema.columns WHERE table_schema=$1 AND (table_name,column_name) IN (('employee','confirmation_date'),('employee','imported_exit_date'),('employee','imported_last_working_date'),('employee','payroll_excluded'),('employee_bank','account_holder'),('employee_bank','branch_name'),('employee_salary_structure','annual_gross'),('employee_salary_structure','annual_employer_pf'),('salary_component','show_on_payslip'),('leave_import_history','leave_type_id'),('payroll_period_input','revision'))",
         [options.schema_name.clone().into()])).await?.ok_or_else(||anyhow::anyhow!("MIGRATION_STATE_UNRESOLVED"))?;

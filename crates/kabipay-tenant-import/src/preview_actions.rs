@@ -140,6 +140,13 @@ pub async fn actions<C: ConnectionTrait>(
             ),
             ("profile", true, true),
             ("department", row.employee.department.is_some(), true),
+            (
+                "location",
+                row.location.is_some(),
+                row.location
+                    .as_ref()
+                    .is_none_or(|input| input.normalized_name().is_ok()),
+            ),
             ("designation", row.employee.designation.is_some(), true),
             (
                 "identity",

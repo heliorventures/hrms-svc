@@ -10,10 +10,23 @@ pub async fn write_section(
     options: &crate::options::ImportOptions,
     employee: Uuid,
     section: &str,
+    business_date: Option<chrono::NaiveDate>,
 ) -> Result<(&'static str, &'static str)> {
     let tenant = options.tenant_id;
     let actor = options.actor_id;
     match section {
+        "location" => {
+            let Some(input) = &row.location else {
+                return Ok(("DEFERRED", "LOCATION_NOT_SUPPLIED"));
+            };
+            let today =
+                business_date.ok_or_else(|| anyhow::anyhow!("LOCATION_BUSINESS_DATE_REQUIRED"))?;
+            Ok((
+                crate::location_import::save(transaction, tenant, actor, employee, input, today)
+                    .await?,
+                "LOCATION_IMPORTED",
+            ))
+        }
         "tax_settings" => {
             crate::tax_import::settings(
                 transaction,

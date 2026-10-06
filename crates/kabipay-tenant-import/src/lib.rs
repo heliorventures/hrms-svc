@@ -7,6 +7,7 @@ pub mod contract;
 pub mod employee_import;
 pub mod failure;
 pub mod login_import;
+pub mod location_import;
 pub mod options;
 pub mod organization_import;
 pub mod preview;

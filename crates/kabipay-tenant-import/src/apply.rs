@@ -59,6 +59,17 @@ pub async fn apply(
     if execution.replace && (plan.core_ready_rows != plan.source_rows || plan.blocking_issues > 0) {
         bail!("REPLACEMENT_REQUIRES_ALL_EMPLOYEE_IDENTITIES_RESOLVED");
     }
+    let location_clock = if package.employees.iter().any(|row| row.location.is_some()) {
+        Some(
+            kabipay_common::tenant_business_clock::TenantBusinessClock::load(
+                &target.ops,
+                options.tenant_id,
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
     let mapping_lock = crate::tenant_target::lock_mapping(target).await?;
     let transaction = target.db.begin().await?;
     transaction
@@ -73,6 +84,10 @@ pub async fn apply(
             "SET LOCAL lock_timeout='15s'",
         ))
         .await?;
+    // Match ordinary location writers: acquire the calendar lock before table/row locks.
+    if location_clock.is_some() {
+        kabipay_common::working_calendar::lock_calendar(&transaction, options.tenant_id).await?;
+    }
     preview::lock_tables(&transaction, &options.schema_name, &plan.tables).await?;
     transaction
         .execute(Statement::from_sql_and_values(
@@ -261,6 +276,7 @@ pub async fn apply(
                 "employee",
                 "profile",
                 "department",
+                "location",
                 "designation",
                 "identity",
                 "bank",
@@ -295,6 +311,7 @@ pub async fn apply(
                 for section in [
                     "profile",
                     "department",
+                    "location",
                     "designation",
                     "identity",
                     "bank",
@@ -330,6 +347,7 @@ pub async fn apply(
         for section in [
             "profile",
             "department",
+            "location",
             "designation",
             "identity",
             "bank",
@@ -341,7 +359,13 @@ pub async fn apply(
         ] {
             let savepoint = transaction.begin().await?;
             let result = crate::import_sections::write_section(
-                &savepoint, package, row, options, employee, section,
+                &savepoint,
+                package,
+                row,
+                options,
+                employee,
+                section,
+                location_clock.map(|clock| clock.now_date()),
             )
             .await;
             match result {
