@@ -2228,6 +2228,7 @@ mod decision_authorization_tests {
             last_name: "Employee".into(),
             date_of_birth: None,
             gender: None,
+            marital_status: None,
             blood_group: None,
             nationality: None,
             employment_type: Some("FULL_TIME".into()),

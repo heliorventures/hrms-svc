@@ -462,6 +462,7 @@ impl MutationRoot {
             input.payslip_header_title,
             logo,
             input.payslip_template,
+            input.payslip_employee_fields,
         )
         .await
         .map_err(KabiPayError::into_graphql)?;

@@ -634,8 +634,12 @@ pub async fn upsert_payroll_compliance_setting(
     payslip_header_title: Option<String>,
     payslip_logo_file_storage_id: Option<Uuid>,
     payslip_template: Option<String>,
+    payslip_employee_fields: Option<Vec<String>>,
 ) -> KabiPayResult<payroll_compliance_setting::Model> {
     let template = super::payslip_template::resolve_payslip_template(None, payslip_template.as_deref())?;
+    if let Some(fields) = &payslip_employee_fields {
+        super::payslip_employee_fields::validate(fields)?;
+    }
     let tan_o = trim_opt(employer_tan);
     let legal_o = trim_opt(employer_legal_name);
     let base_code = norm_component_code(base_salary_component_code, "BASIC");
@@ -651,6 +655,9 @@ pub async fn upsert_payroll_compliance_setting(
         active.arrear_salary_component_code = Set(arrear_code.clone());
         active.payslip_header_title = Set(title_o);
         active.payslip_logo_file_storage_id = Set(payslip_logo_file_storage_id);
+        if let Some(fields) = payslip_employee_fields {
+            active.payslip_employee_fields = Set(serde_json::json!(fields));
+        }
         if payslip_template.is_some() {
             active.payslip_template = Set(template);
         }
@@ -668,6 +675,9 @@ pub async fn upsert_payroll_compliance_setting(
             payslip_header_title: Set(title_o),
             payslip_logo_file_storage_id: Set(payslip_logo_file_storage_id),
             payslip_template: Set(template),
+            payslip_employee_fields: Set(serde_json::json!(
+                payslip_employee_fields.unwrap_or_else(super::payslip_employee_fields::defaults)
+            )),
             created_at: Set(now),
             updated_at: Set(now),
         }

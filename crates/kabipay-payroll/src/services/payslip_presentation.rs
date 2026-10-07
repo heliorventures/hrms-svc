@@ -20,6 +20,7 @@ pub struct PayslipDisplayLine {
 #[derive(Clone, Debug, async_graphql::SimpleObject)]
 pub struct PayslipPresentation {
     pub template: String,
+    pub employee_details: Vec<super::payslip_employee_fields::PayslipEmployeeDetail>,
     pub lines: Vec<PayslipDisplayLine>,
     pub statement: Option<async_graphql::Json<serde_json::Value>>,
 }
@@ -36,6 +37,7 @@ pub async fn load<C: ConnectionTrait>(
     lines: &[payslip_component::Model],
 ) -> KabiPayResult<PayslipPresentation> {
     let template = super::payslip_template::load(db, tenant).await?;
+    let employee_details = super::payslip_employee_fields::load(db, tenant, slip).await?;
     let rows = db
         .query_all(Statement::from_sql_and_values(
             DbBackend::Postgres,
@@ -130,6 +132,7 @@ pub async fn load<C: ConnectionTrait>(
     }
     Ok(PayslipPresentation {
         template,
+        employee_details,
         lines: display,
         statement: statement.map(async_graphql::Json),
     })

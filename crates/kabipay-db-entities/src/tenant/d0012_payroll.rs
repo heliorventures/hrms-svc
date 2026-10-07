@@ -221,6 +221,7 @@ pub mod payroll_compliance_setting {
         pub payslip_header_title: Option<String>,
         pub payslip_logo_file_storage_id: Option<Uuid>,
         pub payslip_template: String,
+        pub payslip_employee_fields: Json,
         pub created_at: DateTimeUtc,
         pub updated_at: DateTimeUtc,
     }

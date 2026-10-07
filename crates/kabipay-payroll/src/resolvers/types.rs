@@ -362,6 +362,7 @@ pub struct CreatePayrollArrearInput {
 #[graphql(name = "PayrollComplianceSetting")]
 pub struct PayrollComplianceSettingDto {
     pub payslip_template: String,
+    pub payslip_employee_fields: async_graphql::Json<serde_json::Value>,
     pub employer_tan: Option<String>,
     pub employer_legal_name: Option<String>,
     /// Salary `salary_component.code` used as the employment **base** line on pay run (`EARNING`).
@@ -378,6 +379,7 @@ impl From<payroll_compliance_setting::Model> for PayrollComplianceSettingDto {
     fn from(m: payroll_compliance_setting::Model) -> Self {
         Self {
             payslip_template: m.payslip_template,
+            payslip_employee_fields: async_graphql::Json(m.payslip_employee_fields),
             employer_tan: m.employer_tan,
             employer_legal_name: m.employer_legal_name,
             base_salary_component_code: m.base_salary_component_code,
@@ -393,6 +395,7 @@ impl From<payroll_compliance_setting::Model> for PayrollComplianceSettingDto {
 #[derive(InputObject, Clone, Debug)]
 pub struct UpsertPayrollComplianceSettingInput {
     pub payslip_template: Option<String>,
+    pub payslip_employee_fields: Option<Vec<String>>,
     pub employer_tan: Option<String>,
     pub employer_legal_name: Option<String>,
     pub base_salary_component_code: Option<String>,

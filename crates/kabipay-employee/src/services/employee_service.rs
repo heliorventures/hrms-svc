@@ -1005,6 +1005,7 @@ pub async fn create<C: ConnectionTrait>(
         last_name: Set(data.last_name),
         date_of_birth: Set(None),
         gender: Set(None),
+        marital_status: Set(None),
         blood_group: Set(None),
         nationality: Set(None),
         employment_type: Set(data.employment_type),
@@ -1269,6 +1270,7 @@ pub struct PersonalProfilePatch {
     pub last_name: Option<String>,
     pub date_of_birth: Option<NaiveDate>,
     pub gender: Option<String>,
+    pub marital_status: Option<String>,
     pub nationality: Option<String>,
     pub blood_group: Option<String>,
     pub emergency_contact_name: Option<String>,
@@ -1306,6 +1308,9 @@ pub async fn update_personal_profile(
     if let Some(d) = patch.date_of_birth {
         am.date_of_birth = Set(Some(d));
     }
+    if let Some(value) = patch.marital_status {
+        am.marital_status = Set(crate::services::marital_status::normalize(&value)?);
+    }
     if let Some(g) = patch.gender {
         am.gender = Set(Some(g));
     }
@@ -1342,6 +1347,7 @@ pub struct SelfServiceProfilePatch {
     pub current_address: Option<String>,
     pub permanent_address: Option<String>,
     pub gender: Option<String>,
+    pub marital_status: Option<String>,
     pub nationality: Option<String>,
     pub blood_group: Option<String>,
     pub emergency_contact_name: Option<String>,
@@ -1381,6 +1387,9 @@ pub async fn update_self_service_profile(
     }
     if let Some(value) = patch.permanent_address {
         active.permanent_address = Set(trimmed_optional(value));
+    }
+    if let Some(value) = patch.marital_status {
+        active.marital_status = Set(crate::services::marital_status::normalize(&value)?);
     }
     if let Some(value) = patch.gender {
         active.gender = Set(trimmed_optional(value));

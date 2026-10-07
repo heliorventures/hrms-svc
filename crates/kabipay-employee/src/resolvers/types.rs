@@ -44,6 +44,7 @@ pub struct EmployeeDto {
     #[graphql(name = "dateOfBirth")]
     pub date_of_birth: Option<NaiveDate>,
     pub gender: Option<String>,
+    pub marital_status: Option<String>,
     pub nationality: Option<String>,
     #[graphql(name = "emergencyContactName")]
     pub emergency_contact_name: Option<String>,
@@ -547,6 +548,7 @@ pub struct UpdateEmployeePersonalProfileInput {
     pub last_name: Option<String>,
     pub date_of_birth: Option<NaiveDate>,
     pub gender: Option<String>,
+    pub marital_status: Option<String>,
     pub nationality: Option<String>,
     #[graphql(name = "bloodGroup")]
     pub blood_group: Option<String>,
@@ -562,6 +564,7 @@ pub struct UpdateEmployeeSelfServiceProfileInput {
     pub current_address: Option<String>,
     pub permanent_address: Option<String>,
     pub gender: Option<String>,
+    pub marital_status: Option<String>,
     pub nationality: Option<String>,
     #[graphql(name = "bloodGroup")]
     pub blood_group: Option<String>,
@@ -1141,6 +1144,7 @@ impl From<employee::Model> for EmployeeDto {
             user_id: m.user_id.map(|id| ID(id.to_string())),
             date_of_birth: m.date_of_birth,
             gender: m.gender,
+            marital_status: m.marital_status,
             nationality: m.nationality,
             emergency_contact_name: m.emergency_contact_name,
             emergency_contact_phone: m.emergency_contact_phone,

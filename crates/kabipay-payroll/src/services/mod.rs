@@ -8,6 +8,7 @@ pub mod payroll_rules;
 mod payroll_run_lock_tests;
 pub mod payroll_service;
 pub mod payslip_presentation;
+pub mod payslip_employee_fields;
 pub mod payslip_template;
 #[cfg(test)]
 mod payslip_template_tests;

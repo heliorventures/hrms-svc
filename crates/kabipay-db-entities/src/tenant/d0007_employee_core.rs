@@ -20,6 +20,7 @@ pub mod employee {
         pub last_name: String,
         pub date_of_birth: Option<NaiveDate>,
         pub gender: Option<String>,
+        pub marital_status: Option<String>,
         pub blood_group: Option<String>,
         pub nationality: Option<String>,
         pub employment_type: Option<String>,
