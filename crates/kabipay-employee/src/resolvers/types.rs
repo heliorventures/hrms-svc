@@ -541,6 +541,13 @@ pub struct SetEmployeeUanNumberInput {
     pub uan_number: String,
 }
 
+#[derive(InputObject, Clone)]
+pub struct SetEmployeeEsicNumberInput {
+    pub employee_id: ID,
+    /// Exactly 10 digits, or an empty string to explicitly clear the stored number.
+    pub esic_number: String,
+}
+
 #[derive(InputObject, Clone, Debug)]
 pub struct UpdateEmployeePersonalProfileInput {
     pub employee_id: ID,

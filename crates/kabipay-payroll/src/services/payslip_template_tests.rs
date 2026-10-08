@@ -39,6 +39,15 @@ fn row(tenant: Uuid, template: &str) -> ProxyRow {
 }
 
 pub(super) fn row_with_fields(tenant: Uuid, template: &str, fields: Vec<String>) -> ProxyRow {
+    row_with_address(tenant, template, fields, None)
+}
+
+fn row_with_address(
+    tenant: Uuid,
+    template: &str,
+    fields: Vec<String>,
+    address: Option<&str>,
+) -> ProxyRow {
     let now = Utc::now();
     ProxyRow::new(BTreeMap::from([
         ("id".into(), Uuid::new_v4().into()),
@@ -48,6 +57,7 @@ pub(super) fn row_with_fields(tenant: Uuid, template: &str, fields: Vec<String>)
         ("base_salary_component_code".into(), "BASIC".into()),
         ("arrear_salary_component_code".into(), "ARREAR".into()),
         ("payslip_header_title".into(), Option::<String>::None.into()),
+        ("payslip_company_address".into(), address.map(str::to_owned).into()),
         (
             "payslip_logo_file_storage_id".into(),
             Option::<Uuid>::None.into(),
@@ -107,7 +117,7 @@ async fn payslip_template_omitted_update_does_not_overwrite_saved_selection() {
     let saved = row(tenant, "TABLE");
     let (db, queries) = connection(vec![vec![saved.clone()], vec![saved]], false).await;
     let result = upsert_payroll_compliance_setting(
-        &db, tenant, None, None, None, None, None, None, None, None,
+        &db, tenant, None, None, None, None, None, None, None, None, None,
     )
     .await
     .unwrap();
@@ -144,6 +154,7 @@ async fn employee_fields_explicit_empty_selection_is_persisted() {
         None,
         None,
         Some(vec![]),
+        None,
     )
     .await
     .unwrap();
@@ -171,6 +182,7 @@ async fn invalid_employee_field_selection_is_rejected_before_database_access() {
         None,
         None,
         Some(vec!["BANK_ACCOUNT".into()]),
+        None,
     )
     .await;
     assert!(result.is_err());
@@ -193,6 +205,7 @@ async fn payslip_template_explicit_update_is_persisted() {
         None,
         Some("TABLE".into()),
         None,
+        None,
     )
     .await
     .unwrap();
@@ -201,4 +214,106 @@ async fn payslip_template_explicit_update_is_persisted() {
     assert!(queries
         .iter()
         .any(|query| query.contains("\"payslip_template\" = 'TABLE'")));
+}
+
+#[tokio::test]
+async fn payslip_company_address_insert_and_update_are_normalized_and_tenant_scoped() {
+    for existing in [false, true] {
+        let tenant = Uuid::new_v4();
+        let address = "801, Business Court\nPune - 411038";
+        let template = if existing { "TABLE" } else { "EXISTING" };
+        let saved = row_with_address(
+            tenant,
+            template,
+            super::payslip_employee_fields::defaults(),
+            Some(address),
+        );
+        let initial = if existing {
+            vec![row(tenant, "TABLE")]
+        } else {
+            vec![]
+        };
+        let (db, queries) = connection(vec![initial, vec![saved]], false).await;
+        let result = upsert_payroll_compliance_setting(
+            &db,
+            tenant,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(Some("  801, Business Court\r\nPune - 411038  ".into())),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.payslip_company_address.as_deref(), Some(address));
+        assert_eq!(result.payslip_template, template);
+        let queries = queries.lock().unwrap();
+        assert!(queries[0].contains(&format!("\"tenant_id\" = '{}'", tenant)));
+        let write = &queries[1];
+        assert!(write.contains("payslip_company_address"));
+        assert!(write.contains(address));
+        if !existing {
+            assert!(write.contains(&tenant.to_string()));
+        }
+    }
+}
+
+#[tokio::test]
+async fn payslip_company_address_omission_preserves_and_explicit_null_or_blank_clears() {
+    for input in [None, Some(None), Some(Some(" \n ".into()))] {
+        let tenant = Uuid::new_v4();
+        let address = "Saved company address";
+        let saved = row_with_address(
+            tenant,
+            "TABLE",
+            super::payslip_employee_fields::defaults(),
+            Some(address),
+        );
+        let expected = input.is_none().then_some(address);
+        let returned = row_with_address(
+            tenant,
+            "TABLE",
+            super::payslip_employee_fields::defaults(),
+            expected,
+        );
+        let (db, queries) = connection(vec![vec![saved], vec![returned]], false).await;
+        let result = upsert_payroll_compliance_setting(
+            &db, tenant, None, None, None, None, None, None, None, None, input,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.payslip_company_address.as_deref(), expected);
+        let queries = queries.lock().unwrap();
+        let assignments = queries[1].split(" RETURNING ").next().unwrap();
+        if expected.is_some() {
+            assert!(!assignments.contains("payslip_company_address"));
+        } else {
+            assert!(assignments.contains("\"payslip_company_address\" = NULL"));
+        }
+    }
+}
+
+#[tokio::test]
+async fn invalid_payslip_company_address_is_rejected_before_database_access() {
+    let (db, queries) = connection(vec![], false).await;
+    let result = upsert_payroll_compliance_setting(
+        &db,
+        Uuid::new_v4(),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some(Some("a".repeat(1001))),
+    )
+    .await;
+    assert!(result.is_err());
+    assert!(queries.lock().unwrap().is_empty());
 }

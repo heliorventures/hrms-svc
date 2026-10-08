@@ -219,6 +219,7 @@ pub mod payroll_compliance_setting {
         pub base_salary_component_code: String,
         pub arrear_salary_component_code: String,
         pub payslip_header_title: Option<String>,
+        pub payslip_company_address: Option<String>,
         pub payslip_logo_file_storage_id: Option<Uuid>,
         pub payslip_template: String,
         pub payslip_employee_fields: Json,

@@ -854,6 +854,21 @@ impl QueryRoot {
             .map_err(KabiPayError::into_graphql)
     }
 
+    /// Employee ESIC is payroll-sensitive and never part of directory results.
+    async fn employee_esic_number(
+        &self,
+        ctx: &Context<'_>,
+        employee_id: ID,
+    ) -> Result<Option<String>> {
+        let eid = parse_uuid(&employee_id, "employeeId")?;
+        require_payroll_sensitive_access(ctx, eid)?;
+        let tenant_id = require_tenant_id(ctx)?;
+        let db = tenant_db(ctx, tenant_id).await?;
+        crate::services::employee_esic_service::read(&db, tenant_id, eid)
+            .await
+            .map_err(KabiPayError::into_graphql)
+    }
+
     /// Salary-bearing employment history, newest first.
     ///
     /// Access is limited to exact `payroll:read=SELF` for the JWT-linked employee or
@@ -1919,6 +1934,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn esic_read_rejects_other_employees_and_team_scope_before_db_access() {
+        let own_id = Uuid::new_v4();
+        let other_id = Uuid::new_v4();
+        for (scope, target) in [("SELF", other_id), ("TEAM", own_id), ("TEAM", other_id)] {
+            let response = execute_query(
+                claims(PERM_PAYROLL_READ, Some(scope), Some(own_id)),
+                &format!("{{ employeeEsicNumber(employeeId: \"{target}\") }}"),
+            )
+            .await;
+            assert_forbidden_before_db(&response, PERM_PAYROLL_READ);
+        }
+    }
+
+    #[tokio::test]
+    async fn esic_write_requires_employee_management_and_payroll_access_before_db_access() {
+        let own_id = Uuid::new_v4();
+        for (permission, denied_permission) in [
+            (PERM_PAYROLL_READ, "employee:write"),
+            ("employee:write", PERM_PAYROLL_READ),
+        ] {
+            let caller = claims(permission, Some("ALL"), Some(own_id));
+            let response = Schema::build(
+                QueryRoot,
+                crate::resolvers::mutation::MutationRoot,
+                EmptySubscription,
+            )
+            .data(TenantId(caller.tenant_id))
+            .data(caller)
+            .finish()
+            .execute(Request::new(format!(
+                "mutation {{ setEmployeeEsicNumber(input: {{ employeeId: \"{own_id}\", esicNumber: \"0123456789\" }}) }}"
+            )))
+            .await;
+            assert_forbidden_before_db(&response, denied_permission);
+        }
+    }
+
+    #[tokio::test]
     async fn uan_write_requires_employee_management_and_payroll_access_before_db_access() {
         let own_id = Uuid::new_v4();
         for (permission, denied_permission) in [
@@ -2022,6 +2075,11 @@ mod tests {
             ),
             (
                 format!("{{ employeeUanNumber(employeeId: \"{own_id}\") }}"),
+                PERM_PAYROLL_READ,
+                false,
+            ),
+            (
+                format!("{{ employeeEsicNumber(employeeId: \"{own_id}\") }}"),
                 PERM_PAYROLL_READ,
                 false,
             ),

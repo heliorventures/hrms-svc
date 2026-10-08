@@ -452,6 +452,11 @@ impl MutationRoot {
             .as_ref()
             .map(|id| parse_uuid(id, "payslipLogoFileStorageId"))
             .transpose()?;
+        let address = match input.payslip_company_address {
+            async_graphql::MaybeUndefined::Undefined => None,
+            async_graphql::MaybeUndefined::Null => Some(None),
+            async_graphql::MaybeUndefined::Value(value) => Some(Some(value)),
+        };
         let m = payroll_service::upsert_payroll_compliance_setting(
             &db,
             tenant_id,
@@ -463,6 +468,7 @@ impl MutationRoot {
             logo,
             input.payslip_template,
             input.payslip_employee_fields,
+            address,
         )
         .await
         .map_err(KabiPayError::into_graphql)?;

@@ -1186,6 +1186,24 @@ impl MutationRoot {
             .map_err(KabiPayError::into_graphql)
     }
 
+    /// Employee managers may save or explicitly clear the ESIC identifier in their data scope.
+    async fn set_employee_esic_number(
+        &self,
+        ctx: &Context<'_>,
+        input: crate::resolvers::types::SetEmployeeEsicNumberInput,
+    ) -> Result<Option<String>> {
+        require_employee_mutation_rbac(ctx)?;
+        require_client_claims(ctx)?;
+        let tenant_id = require_tenant_id(ctx)?;
+        let eid = parse_uuid(&input.employee_id, "employeeId")?;
+        super::query::require_payroll_sensitive_access(ctx, eid)?;
+        let db = tenant_db(ctx, tenant_id).await?;
+        assert_employee_in_data_scope(ctx, &db, tenant_id, eid).await?;
+        crate::services::employee_esic_service::set(&db, tenant_id, eid, &input.esic_number)
+            .await
+            .map_err(KabiPayError::into_graphql)
+    }
+
     /// Upsert the primary bank row (self or **`employee:write`**).
     async fn upsert_employee_primary_bank(
         &self,

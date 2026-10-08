@@ -635,7 +635,12 @@ pub async fn upsert_payroll_compliance_setting(
     payslip_logo_file_storage_id: Option<Uuid>,
     payslip_template: Option<String>,
     payslip_employee_fields: Option<Vec<String>>,
+    payslip_company_address: Option<Option<String>>,
 ) -> KabiPayResult<payroll_compliance_setting::Model> {
+    // Preserve omitted input from older clients; an explicit null/blank clears the address.
+    let address = payslip_company_address
+        .map(super::payslip_company_address::normalize)
+        .transpose()?;
     let template = super::payslip_template::resolve_payslip_template(None, payslip_template.as_deref())?;
     if let Some(fields) = &payslip_employee_fields {
         super::payslip_employee_fields::validate(fields)?;
@@ -654,6 +659,9 @@ pub async fn upsert_payroll_compliance_setting(
         active.base_salary_component_code = Set(base_code.clone());
         active.arrear_salary_component_code = Set(arrear_code.clone());
         active.payslip_header_title = Set(title_o);
+        if let Some(address) = address {
+            active.payslip_company_address = Set(address);
+        }
         active.payslip_logo_file_storage_id = Set(payslip_logo_file_storage_id);
         if let Some(fields) = payslip_employee_fields {
             active.payslip_employee_fields = Set(serde_json::json!(fields));
@@ -673,6 +681,7 @@ pub async fn upsert_payroll_compliance_setting(
             base_salary_component_code: Set(base_code),
             arrear_salary_component_code: Set(arrear_code),
             payslip_header_title: Set(title_o),
+            payslip_company_address: Set(address.flatten()),
             payslip_logo_file_storage_id: Set(payslip_logo_file_storage_id),
             payslip_template: Set(template),
             payslip_employee_fields: Set(serde_json::json!(

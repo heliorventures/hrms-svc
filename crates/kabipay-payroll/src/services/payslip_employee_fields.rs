@@ -1,4 +1,4 @@
-//! Allow-listed employee details, resolved only after the caller is authorized for the payslip.
+//! Allow-listed payslip details, resolved only after the caller is authorized for the payslip.
 use kabipay_common::{KabiPayError, KabiPayResult};
 use kabipay_db_entities::tenant::d0012_payroll::{payroll_compliance_setting, payslip};
 use sea_orm::{ColumnTrait, ConnectionTrait, DbBackend, EntityTrait, QueryFilter, Statement};
@@ -15,6 +15,8 @@ const FIELDS: &[(&str, &str)] = &[
     ("MARITAL_STATUS", "Marital status"),
     ("UAN", "UAN"),
     ("ESIC", "ESIC"),
+    ("PAYSLIP_STATUS", "Status"),
+    ("GENERATED_DATE", "Generated date"),
 ];
 
 pub fn defaults() -> Vec<String> {
@@ -71,8 +73,13 @@ pub async fn load<C: ConnectionTrait>(
     if selected.is_empty() {
         return Ok(Vec::new());
     }
-    let row = db.query_one(Statement::from_sql_and_values(DbBackend::Postgres,
-        "SELECT trim(concat_ws(' ', e.first_name, e.last_name)) AS \"EMPLOYEE_NAME\", \
+    let needs_employee = selected
+        .iter()
+        .any(|field| !matches!(field.as_str(), "PAYSLIP_STATUS" | "GENERATED_DATE"));
+    let row = if needs_employee {
+        db.query_one(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "SELECT trim(concat_ws(' ', e.first_name, e.last_name)) AS \"EMPLOYEE_NAME\", \
          e.employee_code AS \"EMPLOYEE_CODE\", d.name AS \"DEPARTMENT\", \
          g.title AS \"DESIGNATION\", to_char(e.date_of_joining, 'DD Mon YYYY') AS \"JOINING_DATE\", \
          e.gender AS \"GENDER\", initcap(replace(e.marital_status, '_', ' ')) AS \"MARITAL_STATUS\", \
@@ -82,17 +89,30 @@ pub async fn load<C: ConnectionTrait>(
          LEFT JOIN department d ON d.id=e.department_id AND d.tenant_id=e.tenant_id AND NOT d.is_deleted \
          LEFT JOIN designation g ON g.id=e.designation_id AND g.tenant_id=e.tenant_id AND NOT g.is_deleted \
          WHERE e.id=$1 AND e.tenant_id=$2 AND NOT e.is_deleted",
-        [slip.employee_id.into(), tenant.into(), slip.uan_number.clone().into(), slip.esic_number.clone().into()],
-    )).await?;
-    let Some(row) = row else {
-        return Ok(Vec::new());
+            [
+                slip.employee_id.into(),
+                tenant.into(),
+                slip.uan_number.clone().into(),
+                slip.esic_number.clone().into(),
+            ],
+        ))
+        .await?
+    } else {
+        None
     };
     let mut details = Vec::new();
     for (field, label) in FIELDS {
         if !selected.iter().any(|selected| selected.as_str() == *field) {
             continue;
         }
-        let value: Option<String> = row.try_get("", *field)?;
+        let value: Option<String> = match *field {
+            "PAYSLIP_STATUS" => Some(slip.status.clone()),
+            "GENERATED_DATE" => Some(slip.generated_at.to_rfc3339()),
+            _ => match &row {
+                Some(row) => row.try_get("", *field)?,
+                None => None,
+            },
+        };
         if let Some(value) = value.filter(|value| !value.trim().is_empty()) {
             details.push(PayslipEmployeeDetail {
                 field: (*field).into(),
@@ -142,6 +162,7 @@ mod tests {
         );
         assert_eq!(decode(serde_json::json!([])).unwrap(), Vec::<String>::new());
         assert!(decode(serde_json::json!(["GENDER", "MARITAL_STATUS", "UAN"])).is_ok());
+        assert!(decode(serde_json::json!(["PAYSLIP_STATUS", "GENERATED_DATE"])).is_ok());
         for value in [
             serde_json::json!(["BANK_ACCOUNT"]),
             serde_json::json!(["UAN", "UAN"]),
@@ -186,6 +207,50 @@ mod tests {
             connection(vec![vec![row_with_fields(tenant, "TABLE", vec![])]], false).await;
         assert!(load(&db, tenant, &slip(tenant)).await.unwrap().is_empty());
         assert_eq!(queries.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn document_metadata_is_independent_and_does_not_fetch_employee_details() {
+        let tenant = Uuid::new_v4();
+        let slip = slip(tenant);
+        for selected in [
+            vec!["PAYSLIP_STATUS".into()],
+            vec!["GENERATED_DATE".into()],
+            vec!["PAYSLIP_STATUS".into(), "GENERATED_DATE".into()],
+        ] {
+            let expected_count = selected.len();
+            let (db, queries) = connection(
+                vec![vec![row_with_fields(tenant, "TABLE", selected)]],
+                false,
+            )
+            .await;
+            let details = load(&db, tenant, &slip).await.unwrap();
+            assert_eq!(details.len(), expected_count);
+            for detail in details {
+                match detail.field.as_str() {
+                    "PAYSLIP_STATUS" => assert_eq!(detail.value, slip.status),
+                    "GENERATED_DATE" => assert_eq!(detail.value, slip.generated_at.to_rfc3339()),
+                    _ => panic!("unexpected employee detail"),
+                }
+            }
+            assert_eq!(queries.lock().unwrap().len(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_employee_does_not_hide_selected_document_metadata() {
+        let tenant = Uuid::new_v4();
+        let slip = slip(tenant);
+        let setting = row_with_fields(
+            tenant,
+            "TABLE",
+            vec!["EMPLOYEE_NAME".into(), "PAYSLIP_STATUS".into()],
+        );
+        let (db, _) = connection(vec![vec![setting], vec![]], false).await;
+        let details = load(&db, tenant, &slip).await.unwrap();
+        assert_eq!(details.len(), 1);
+        assert_eq!(details[0].field, "PAYSLIP_STATUS");
+        assert_eq!(details[0].value, slip.status);
     }
 
     #[tokio::test]

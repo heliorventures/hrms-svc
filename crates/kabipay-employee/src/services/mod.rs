@@ -7,6 +7,9 @@ pub mod document_file_service;
 pub mod document_service;
 pub mod directory_service;
 pub mod employee_service;
+pub mod employee_esic_service;
+#[cfg(test)]
+mod employee_esic_tests;
 pub mod marital_status;
 pub mod employee_uan_service;
 #[cfg(test)]

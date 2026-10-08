@@ -1,6 +1,6 @@
 //! GraphQL DTOs for kabipay-payroll.
 
-use async_graphql::{InputObject, SimpleObject, ID};
+use async_graphql::{InputObject, MaybeUndefined, SimpleObject, ID};
 
 #[derive(InputObject)]
 pub struct SavePayrollUnpaidLeavePolicyInput {
@@ -371,6 +371,8 @@ pub struct PayrollComplianceSettingDto {
     pub arrear_salary_component_code: String,
     /// Heading text on payslip when rendered (e.g. company display name).
     pub payslip_header_title: Option<String>,
+    /// Optional address displayed immediately below the company name.
+    pub payslip_company_address: Option<String>,
     /// Uploaded logo in **`file_storage`** (tenant-scoped blob); optional.
     pub payslip_logo_file_storage_id: Option<ID>,
 }
@@ -385,6 +387,7 @@ impl From<payroll_compliance_setting::Model> for PayrollComplianceSettingDto {
             base_salary_component_code: m.base_salary_component_code,
             arrear_salary_component_code: m.arrear_salary_component_code,
             payslip_header_title: m.payslip_header_title,
+            payslip_company_address: m.payslip_company_address,
             payslip_logo_file_storage_id: m
                 .payslip_logo_file_storage_id
                 .map(|u| ID(u.to_string())),
@@ -401,6 +404,8 @@ pub struct UpsertPayrollComplianceSettingInput {
     pub base_salary_component_code: Option<String>,
     pub arrear_salary_component_code: Option<String>,
     pub payslip_header_title: Option<String>,
+    /// Omitted preserves the saved address; null or blank clears it.
+    pub payslip_company_address: MaybeUndefined<String>,
     pub payslip_logo_file_storage_id: Option<ID>,
 }
 
