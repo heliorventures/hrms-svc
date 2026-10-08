@@ -1,6 +1,42 @@
 //! GraphQL DTOs for kabipay-payroll.
 
-use async_graphql::{InputObject, SimpleObject, ID};
+use async_graphql::{InputObject, MaybeUndefined, SimpleObject, ID};
+
+#[derive(InputObject)]
+pub struct SavePayrollUnpaidLeavePolicyInput {
+    pub enabled: bool,
+    pub basic_component_code: Option<String>,
+    pub day_divisor: Option<String>,
+    pub treatment: Option<String>,
+}
+
+#[derive(SimpleObject)]
+pub struct PayrollUnpaidLeavePolicy {
+    pub enabled: bool,
+    pub basic_component_code: Option<String>,
+    pub day_divisor: Option<String>,
+    pub treatment: Option<String>,
+}
+impl From<kabipay_db_entities::tenant::d0077_unpaid_leave_payroll::payroll_unpaid_leave_policy::Model> for PayrollUnpaidLeavePolicy {
+    fn from(m: kabipay_db_entities::tenant::d0077_unpaid_leave_payroll::payroll_unpaid_leave_policy::Model) -> Self {
+        Self { enabled: m.enabled, basic_component_code: m.basic_component_code, day_divisor: m.day_divisor.map(|v| v.to_string()), treatment: m.treatment }
+    }
+}
+
+#[derive(SimpleObject)]
+pub struct PayslipUnpaidLeave {
+    pub basic_component_code: String,
+    pub basic_amount: String,
+    pub day_divisor: String,
+    pub unpaid_days: String,
+    pub amount: String,
+    pub treatment: String,
+}
+impl From<kabipay_db_entities::tenant::d0077_unpaid_leave_payroll::payslip_unpaid_leave::Model> for PayslipUnpaidLeave {
+    fn from(m: kabipay_db_entities::tenant::d0077_unpaid_leave_payroll::payslip_unpaid_leave::Model) -> Self {
+        Self { basic_component_code: m.basic_component_code, basic_amount: m.basic_amount.to_string(), day_divisor: m.day_divisor.to_string(), unpaid_days: m.unpaid_days.to_string(), amount: m.amount.to_string(), treatment: m.treatment }
+    }
+}
 use kabipay_db_entities::tenant::d0035_payroll_arrear::payroll_arrear;
 use chrono::{DateTime, NaiveDate, Utc};
 use kabipay_db_entities::tenant::d0012_payroll::{
@@ -11,6 +47,7 @@ use kabipay_db_entities::tenant::d0012_payroll::{
 #[derive(SimpleObject, Clone, Debug)]
 #[graphql(name = "SalaryComponent")]
 pub struct SalaryComponentDto {
+    pub show_on_payslip: bool,
     pub id: ID,
     pub tenant_id: ID,
     pub name: String,
@@ -27,6 +64,7 @@ pub struct SalaryComponentDto {
 impl From<salary_component::Model> for SalaryComponentDto {
     fn from(m: salary_component::Model) -> Self {
         Self {
+            show_on_payslip: m.r#type != "EMPLOYER_CONTRIBUTION",
             id: ID(m.id.to_string()),
             tenant_id: ID(m.tenant_id.to_string()),
             name: m.name,
@@ -145,6 +183,7 @@ pub struct SalaryBreakupLineDto {
 #[derive(SimpleObject, Clone, Debug)]
 #[graphql(name = "SalaryBreakupPreview")]
 pub struct SalaryBreakupPreviewDto {
+    pub financials:Option<async_graphql::Json<serde_json::Value>>,
     pub employee_id: ID,
     pub employee_salary_structure_id: Option<ID>,
     pub annual_ctc: String,
@@ -322,6 +361,8 @@ pub struct CreatePayrollArrearInput {
 #[derive(SimpleObject, Clone, Debug)]
 #[graphql(name = "PayrollComplianceSetting")]
 pub struct PayrollComplianceSettingDto {
+    pub payslip_template: String,
+    pub payslip_employee_fields: async_graphql::Json<serde_json::Value>,
     pub employer_tan: Option<String>,
     pub employer_legal_name: Option<String>,
     /// Salary `salary_component.code` used as the employment **base** line on pay run (`EARNING`).
@@ -330,6 +371,8 @@ pub struct PayrollComplianceSettingDto {
     pub arrear_salary_component_code: String,
     /// Heading text on payslip when rendered (e.g. company display name).
     pub payslip_header_title: Option<String>,
+    /// Optional address displayed immediately below the company name.
+    pub payslip_company_address: Option<String>,
     /// Uploaded logo in **`file_storage`** (tenant-scoped blob); optional.
     pub payslip_logo_file_storage_id: Option<ID>,
 }
@@ -337,11 +380,14 @@ pub struct PayrollComplianceSettingDto {
 impl From<payroll_compliance_setting::Model> for PayrollComplianceSettingDto {
     fn from(m: payroll_compliance_setting::Model) -> Self {
         Self {
+            payslip_template: m.payslip_template,
+            payslip_employee_fields: async_graphql::Json(m.payslip_employee_fields),
             employer_tan: m.employer_tan,
             employer_legal_name: m.employer_legal_name,
             base_salary_component_code: m.base_salary_component_code,
             arrear_salary_component_code: m.arrear_salary_component_code,
             payslip_header_title: m.payslip_header_title,
+            payslip_company_address: m.payslip_company_address,
             payslip_logo_file_storage_id: m
                 .payslip_logo_file_storage_id
                 .map(|u| ID(u.to_string())),
@@ -351,11 +397,15 @@ impl From<payroll_compliance_setting::Model> for PayrollComplianceSettingDto {
 
 #[derive(InputObject, Clone, Debug)]
 pub struct UpsertPayrollComplianceSettingInput {
+    pub payslip_template: Option<String>,
+    pub payslip_employee_fields: Option<Vec<String>>,
     pub employer_tan: Option<String>,
     pub employer_legal_name: Option<String>,
     pub base_salary_component_code: Option<String>,
     pub arrear_salary_component_code: Option<String>,
     pub payslip_header_title: Option<String>,
+    /// Omitted preserves the saved address; null or blank clears it.
+    pub payslip_company_address: MaybeUndefined<String>,
     pub payslip_logo_file_storage_id: Option<ID>,
 }
 

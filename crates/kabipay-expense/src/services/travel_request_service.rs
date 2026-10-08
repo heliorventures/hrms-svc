@@ -70,7 +70,10 @@ pub async fn submit_travel_request(
     purpose: &str,
     estimated_amount: Option<Decimal>,
     currency: &str,
+    logged_in_user_id: Uuid,
+    supporting_file_storage_id: Option<Uuid>,
 ) -> KabiPayResult<travel_request::Model> {
+    let file_id = super::request_file_service::required_file_id(supporting_file_storage_id)?;
     if from_date > to_date {
         return Err(KabiPayError::Validation(
             "from_date must be on or before to_date".into(),
@@ -87,6 +90,9 @@ pub async fn submit_travel_request(
         }
     }
     let txn = db.begin().await?;
+    super::request_file_service::require_submission_file(
+        &txn, tenant_id, logged_in_user_id, file_id,
+    ).await?;
     let id = Uuid::new_v4();
     let now = Utc::now();
     let am = travel_request::ActiveModel {
@@ -100,6 +106,7 @@ pub async fn submit_travel_request(
         purpose: Set(purpose.trim().to_string()),
         estimated_amount: Set(estimated_amount),
         currency: Set(currency.to_string()),
+        supporting_file_storage_id: Set(supporting_file_storage_id),
         status: Set(STATUS_PENDING.into()),
         rejection_reason: Set(None),
         approved_by: Set(None),

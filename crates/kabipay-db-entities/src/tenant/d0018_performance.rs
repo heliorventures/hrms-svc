@@ -66,6 +66,8 @@ pub mod kpi {
         pub actual_value: Option<Decimal>,
         pub unit: Option<String>,
         pub measurement_date: Option<NaiveDate>,
+        pub evidence: Option<String>,
+        pub comment: Option<String>,
         pub created_at: DateTimeUtc,
         pub updated_at: DateTimeUtc,
     }

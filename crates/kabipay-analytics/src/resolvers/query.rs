@@ -16,13 +16,19 @@ use crate::services::analytics_service;
 
 pub struct QueryRoot;
 
+fn entitled_report_claims(ctx: &Context<'_>) -> Result<kabipay_common::context::ClientClaims> {
+    let claims = require_client_claims(ctx)?;
+    let state = ctx.data::<kabipay_common::entitlements::Entitlements>()?;
+    state
+        .filter_claims(claims)
+        .map_err(KabiPayError::into_graphql)
+}
+
 fn parse_opt_uuid(id: &Option<ID>, field: &'static str) -> Result<Option<Uuid>> {
     match id {
         None => Ok(None),
         Some(v) => Uuid::parse_str(v.as_str())
-            .map_err(|e| {
-                KabiPayError::Validation(format!("invalid {field}: {e}")).into_graphql()
-            })
+            .map_err(|e| KabiPayError::Validation(format!("invalid {field}: {e}")).into_graphql())
             .map(Some),
     }
 }
@@ -39,6 +45,235 @@ fn require_analytics_insights(ctx: &Context<'_>) -> Result<()> {
 
 #[Object]
 impl QueryRoot {
+    async fn claim_travel_report_options(
+        &self,
+        ctx: &Context<'_>,
+        kind: super::hr_report_types::HrReportKind,
+        search: Option<String>,
+        #[graphql(default = 50)] limit: i32,
+    ) -> Result<super::hr_report_types::ClaimTravelReportOptions> {
+        let claims = require_client_claims(ctx)?;
+        crate::services::hr_reports::authorize(claims, kind).map_err(KabiPayError::into_graphql)?;
+        if !crate::services::claim_travel_reports::is_claim_travel(kind) {
+            return Err(KabiPayError::Validation(
+                "an expense or travel report kind is required".into(),
+            )
+            .into_graphql());
+        }
+        if search.as_ref().is_some_and(|s| s.chars().count() > 200) {
+            return Err(KabiPayError::Validation(
+                "report search must be 200 characters or fewer".into(),
+            )
+            .into_graphql());
+        }
+        let entitled = entitled_report_claims(ctx)?;
+        crate::services::hr_reports::authorize(&entitled, kind)
+            .map_err(KabiPayError::into_graphql)?;
+        let tenant = require_tenant_id(ctx)?;
+        if tenant != entitled.tenant_id {
+            return Err(KabiPayError::Forbidden(
+                "report tenant does not match authenticated tenant".into(),
+            )
+            .into_graphql());
+        }
+        let db = tenant_db(ctx, tenant).await?;
+        crate::services::claim_travel_reports::load_options(
+            &db,
+            tenant,
+            &entitled,
+            kind,
+            search.as_deref(),
+            limit,
+        )
+        .await
+        .map_err(KabiPayError::into_graphql)
+    }
+
+    async fn hr_report_rows(
+        &self,
+        ctx: &Context<'_>,
+        kind: super::hr_report_types::HrReportKind,
+        from_date: chrono::NaiveDate,
+        to_date: chrono::NaiveDate,
+        employee_id: Option<Uuid>,
+        employee_search: Option<String>,
+        #[graphql(default = 0)] offset: i32,
+        #[graphql(default = 50)] limit: i32,
+        claim_travel_filter: Option<super::hr_report_types::ClaimTravelReportFilterInput>,
+    ) -> Result<super::hr_report_types::HrReportRows> {
+        let claims = require_client_claims(ctx)?;
+        crate::services::hr_reports::authorize(claims, kind).map_err(KabiPayError::into_graphql)?;
+        let filter = crate::services::hr_reports::ReportFilter {
+            from_date,
+            to_date,
+            employee_id,
+            employee_search,
+        };
+        filter.validate().map_err(KabiPayError::into_graphql)?;
+        let claim_filter = crate::services::claim_travel_report_filters::ClaimTravelFilter::new(
+            filter.clone(),
+            claim_travel_filter,
+            kind,
+        )
+        .map_err(KabiPayError::into_graphql)?;
+        let entitled = entitled_report_claims(ctx)?;
+        let claims = &entitled;
+        crate::services::hr_reports::authorize(claims, kind).map_err(KabiPayError::into_graphql)?;
+        if offset < 0 || !(1..=100).contains(&limit) {
+            return Err(KabiPayError::Validation(
+                "offset must be non-negative and limit between 1 and 100".into(),
+            )
+            .into_graphql());
+        }
+        let tenant_id = require_tenant_id(ctx)?;
+        if tenant_id != claims.tenant_id {
+            return Err(KabiPayError::Forbidden(
+                "report tenant does not match authenticated tenant".into(),
+            )
+            .into_graphql());
+        }
+        let clock = kabipay_common::tenant_business_clock::TenantBusinessClock::load(
+            ops_db(ctx)?,
+            tenant_id,
+        )
+        .await
+        .map_err(KabiPayError::into_graphql)?;
+        let db = tenant_db(ctx, tenant_id).await?;
+        if crate::services::claim_travel_reports::is_claim_travel(kind) {
+            return crate::services::claim_travel_reports::load_page(
+                &db,
+                tenant_id,
+                claims,
+                kind,
+                &claim_filter,
+                offset,
+                limit,
+                clock,
+            )
+            .await
+            .map_err(KabiPayError::into_graphql);
+        }
+        crate::services::hr_reports::load(&db, tenant_id, claims, kind, &filter, clock)
+            .await
+            .and_then(|data| data.preview(offset, limit))
+            .map_err(KabiPayError::into_graphql)
+    }
+
+    async fn hr_report_csv(
+        &self,
+        ctx: &Context<'_>,
+        kind: super::hr_report_types::HrReportKind,
+        from_date: chrono::NaiveDate,
+        to_date: chrono::NaiveDate,
+        employee_id: Option<Uuid>,
+        employee_search: Option<String>,
+        claim_travel_filter: Option<super::hr_report_types::ClaimTravelReportFilterInput>,
+    ) -> Result<super::hr_report_types::HrReportCsv> {
+        let claims = require_client_claims(ctx)?;
+        crate::services::hr_reports::authorize(claims, kind).map_err(KabiPayError::into_graphql)?;
+        let filter = crate::services::hr_reports::ReportFilter {
+            from_date,
+            to_date,
+            employee_id,
+            employee_search,
+        };
+        filter.validate().map_err(KabiPayError::into_graphql)?;
+        let claim_filter = crate::services::claim_travel_report_filters::ClaimTravelFilter::new(
+            filter.clone(),
+            claim_travel_filter,
+            kind,
+        )
+        .map_err(KabiPayError::into_graphql)?;
+        let entitled = entitled_report_claims(ctx)?;
+        let claims = &entitled;
+        crate::services::hr_reports::authorize(claims, kind).map_err(KabiPayError::into_graphql)?;
+        let tenant_id = require_tenant_id(ctx)?;
+        if tenant_id != claims.tenant_id {
+            return Err(KabiPayError::Forbidden(
+                "report tenant does not match authenticated tenant".into(),
+            )
+            .into_graphql());
+        }
+        let clock = kabipay_common::tenant_business_clock::TenantBusinessClock::load(
+            ops_db(ctx)?,
+            tenant_id,
+        )
+        .await
+        .map_err(KabiPayError::into_graphql)?;
+        let db = tenant_db(ctx, tenant_id).await?;
+        if crate::services::claim_travel_reports::is_claim_travel(kind) {
+            return crate::services::claim_travel_reports::load_csv(
+                &db,
+                tenant_id,
+                claims,
+                kind,
+                &claim_filter,
+                clock,
+            )
+            .await
+            .map_err(KabiPayError::into_graphql);
+        }
+        crate::services::hr_reports::load(&db, tenant_id, claims, kind, &filter, clock)
+            .await
+            .and_then(|data| data.csv(kind, &filter))
+            .map_err(KabiPayError::into_graphql)
+    }
+
+    async fn hr_insights(
+        &self,
+        ctx: &Context<'_>,
+        from_date: chrono::NaiveDate,
+        to_date: chrono::NaiveDate,
+    ) -> Result<super::hr_report_types::HrInsights> {
+        let claims = require_client_claims(ctx)?;
+        if !crate::services::hr_reports::has_all(claims, "analytics:read") {
+            return Err(KabiPayError::Forbidden(
+                "analytics:read permission requires ALL scope".into(),
+            )
+            .into_graphql());
+        }
+        let entitled = entitled_report_claims(ctx)?;
+        let claims = &entitled;
+        let filter = crate::services::hr_reports::ReportFilter {
+            from_date,
+            to_date,
+            employee_id: None,
+            employee_search: None,
+        };
+        filter.validate().map_err(KabiPayError::into_graphql)?;
+        if ![
+            "attendance:read",
+            "employee:read",
+            "payroll:read",
+            "leave:read",
+            "timesheet:read",
+            "expense:read",
+            "travel:read",
+        ]
+        .iter()
+        .any(|permission| crate::services::hr_reports::has_all(claims, permission))
+        {
+            return Ok(super::hr_report_types::HrInsights::default());
+        }
+        let tenant_id = require_tenant_id(ctx)?;
+        if tenant_id != claims.tenant_id {
+            return Err(KabiPayError::Forbidden(
+                "report tenant does not match authenticated tenant".into(),
+            )
+            .into_graphql());
+        }
+        let clock = kabipay_common::tenant_business_clock::TenantBusinessClock::load(
+            ops_db(ctx)?,
+            tenant_id,
+        )
+        .await
+        .map_err(KabiPayError::into_graphql)?;
+        let db = tenant_db(ctx, tenant_id).await?;
+        crate::services::hr_insights::load(&db, tenant_id, claims, &filter, clock)
+            .await
+            .map_err(KabiPayError::into_graphql)
+    }
+
     async fn analytics_health(&self) -> &'static str {
         "ok"
     }
@@ -112,7 +347,17 @@ impl QueryRoot {
         let rows = analytics_service::list_workforce_snapshots(&db, tenant_id, limit)
             .await
             .map_err(KabiPayError::into_graphql)?;
-        Ok(rows.into_iter().map(WorkforceSnapshotDto::from).collect())
+        let state = ctx.data::<kabipay_common::entitlements::Entitlements>()?;
+        Ok(rows
+            .into_iter()
+            .map(|row| {
+                let mut dto = WorkforceSnapshotDto::from(row);
+                if !state.allows("RECRUITMENT") {
+                    dto.open_positions = None;
+                }
+                dto
+            })
+            .collect())
     }
 
     /// **HR / directory admins only** — inspect transactional outbox rows (e.g. after leave approval).
@@ -124,18 +369,26 @@ impl QueryRoot {
     ) -> Result<Vec<OutboxEventDto>> {
         let claims = require_client_claims(ctx)?;
         if !claims.can_manage_employee_directory() {
-            return Err(
-                KabiPayError::Forbidden(
-                    "HR or employee directory access required to view outbox".into(),
-                )
-                .into_graphql(),
-            );
+            return Err(KabiPayError::Forbidden(
+                "HR or employee directory access required to view outbox".into(),
+            )
+            .into_graphql());
         }
         let tenant_id = require_tenant_id(ctx)?;
         let db = tenant_db(ctx, tenant_id).await?;
-        let rows = analytics_service::list_outbox_events(&db, tenant_id, status, limit)
-            .await
+        let state = ctx.data::<kabipay_common::entitlements::Entitlements>()?;
+        state
+            .require_tenant(tenant_id)
             .map_err(KabiPayError::into_graphql)?;
+        let rows = analytics_service::list_outbox_events(
+            &db,
+            tenant_id,
+            status,
+            limit,
+            state.outbox_aggregates(),
+        )
+        .await
+        .map_err(KabiPayError::into_graphql)?;
         Ok(rows.into_iter().map(OutboxEventDto::from).collect())
     }
 
@@ -147,19 +400,20 @@ impl QueryRoot {
     ) -> Result<Vec<IntegrationConnectorCatalogDto>> {
         let claims = require_client_claims(ctx)?;
         if !claims.can_manage_employee_directory() {
-            return Err(
-                KabiPayError::Forbidden(
-                    "HR or employee directory access required to view integration connectors".into(),
-                )
-                .into_graphql(),
-            );
+            return Err(KabiPayError::Forbidden(
+                "HR or employee directory access required to view integration connectors".into(),
+            )
+            .into_graphql());
         }
         let _ = require_tenant_id(ctx)?;
         let db = ops_db(ctx)?;
         let rows = analytics_service::list_integration_connectors_global(db, limit)
             .await
             .map_err(KabiPayError::into_graphql)?;
-        Ok(rows.into_iter().map(IntegrationConnectorCatalogDto::from).collect())
+        Ok(rows
+            .into_iter()
+            .map(IntegrationConnectorCatalogDto::from)
+            .collect())
     }
 
     /// **HR / directory admins only** — tenant integration rows.
@@ -170,12 +424,10 @@ impl QueryRoot {
     ) -> Result<Vec<TenantIntegrationDto>> {
         let claims = require_client_claims(ctx)?;
         if !claims.can_manage_employee_directory() {
-            return Err(
-                KabiPayError::Forbidden(
-                    "HR or employee directory access required to view tenant integrations".into(),
-                )
-                .into_graphql(),
-            );
+            return Err(KabiPayError::Forbidden(
+                "HR or employee directory access required to view tenant integrations".into(),
+            )
+            .into_graphql());
         }
         let tenant_id = require_tenant_id(ctx)?;
         let db = tenant_db(ctx, tenant_id).await?;
@@ -193,12 +445,10 @@ impl QueryRoot {
     ) -> Result<Vec<WebhookSubscriptionDto>> {
         let claims = require_client_claims(ctx)?;
         if !claims.can_manage_employee_directory() {
-            return Err(
-                KabiPayError::Forbidden(
-                    "HR or employee directory access required to view webhook subscriptions".into(),
-                )
-                .into_graphql(),
-            );
+            return Err(KabiPayError::Forbidden(
+                "HR or employee directory access required to view webhook subscriptions".into(),
+            )
+            .into_graphql());
         }
         let tenant_id = require_tenant_id(ctx)?;
         let db = tenant_db(ctx, tenant_id).await?;
@@ -216,19 +466,37 @@ impl QueryRoot {
     ) -> Result<Vec<WebhookDeliveryLogDto>> {
         let claims = require_client_claims(ctx)?;
         if !claims.can_manage_employee_directory() {
-            return Err(
-                KabiPayError::Forbidden(
-                    "HR or employee directory access required to view webhook delivery logs".into(),
-                )
-                .into_graphql(),
-            );
+            return Err(KabiPayError::Forbidden(
+                "HR or employee directory access required to view webhook delivery logs".into(),
+            )
+            .into_graphql());
         }
         let tenant_id = require_tenant_id(ctx)?;
         let db = tenant_db(ctx, tenant_id).await?;
         let rows = analytics_service::list_webhook_delivery_logs(&db, tenant_id, limit)
             .await
             .map_err(KabiPayError::into_graphql)?;
-        Ok(rows.into_iter().map(WebhookDeliveryLogDto::from).collect())
+        let state = ctx.data::<kabipay_common::entitlements::Entitlements>()?;
+        state
+            .require_tenant(tenant_id)
+            .map_err(KabiPayError::into_graphql)?;
+        let allowed = state.outbox_aggregates();
+        Ok(rows
+            .into_iter()
+            .map(|row| {
+                let mut dto = WebhookDeliveryLogDto::from(row);
+                let entitled = dto
+                    .event_name
+                    .as_deref()
+                    .and_then(|name| name.rsplit_once('.'))
+                    .is_some_and(|(aggregate, _)| allowed.contains(&aggregate));
+                if !entitled {
+                    dto.payload_json = None;
+                    dto.response_body = None;
+                }
+                dto
+            })
+            .collect())
     }
 
     /// **HR / directory admins only** — communication/entity audit log (most recent first).
@@ -239,12 +507,10 @@ impl QueryRoot {
     ) -> Result<Vec<AuditLogDto>> {
         let claims = require_client_claims(ctx)?;
         if !claims.can_manage_employee_directory() {
-            return Err(
-                KabiPayError::Forbidden(
-                    "HR or employee directory access required to view audit logs".into(),
-                )
-                .into_graphql(),
-            );
+            return Err(KabiPayError::Forbidden(
+                "HR or employee directory access required to view audit logs".into(),
+            )
+            .into_graphql());
         }
         let tenant_id = require_tenant_id(ctx)?;
         let db = tenant_db(ctx, tenant_id).await?;

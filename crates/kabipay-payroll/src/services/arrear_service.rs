@@ -1,8 +1,8 @@
 use kabipay_common::{KabiPayError, KabiPayResult};
 use kabipay_db_entities::tenant::d0035_payroll_arrear::payroll_arrear;
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect,
-    Set,
+    ActiveModelTrait, ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter, QueryOrder,
+    QuerySelect, Set,
 };
 use uuid::Uuid;
 
@@ -36,6 +36,7 @@ pub async fn create_arrear(
     amount: rust_decimal::Decimal,
     reason: Option<String>,
 ) -> KabiPayResult<payroll_arrear::Model> {
+    kabipay_tax::domain::validate_amount(amount)?;
     if amount <= rust_decimal::Decimal::ZERO {
         return Err(KabiPayError::Validation(
             "arrear amount must be positive".into(),
@@ -79,7 +80,9 @@ pub async fn mark_applied(
                 id: aid.to_string(),
             })?;
         if m.status != STATUS_PENDING {
-            continue;
+            return Err(KabiPayError::Validation(
+                "Arrear has already been applied; recalculate the draft".into(),
+            ));
         }
         let mut a: payroll_arrear::ActiveModel = m.into();
         a.status = Set(STATUS_APPLIED.to_string());

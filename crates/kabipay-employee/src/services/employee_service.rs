@@ -773,24 +773,13 @@ pub async fn map_full_names(
         .collect())
 }
 
+#[cfg(test)]
 fn employee_ids_from_scope_filter(filter: EmployeeScopeFilter) -> Option<Vec<Uuid>> {
     match filter {
         EmployeeScopeFilter::Unrestricted => None,
         EmployeeScopeFilter::Empty => Some(Vec::new()),
         EmployeeScopeFilter::EmployeeIds(ids) => Some(ids),
     }
-}
-
-/// Resolve all employee IDs visible to a caller for cross-record approval queues.
-/// `None` means unrestricted tenant scope; `Some([])` means no visible employees.
-pub async fn employee_ids_in_scope(
-    db: &DatabaseConnection,
-    tenant_id: Uuid,
-    scope: ScopeType,
-    viewer: Option<ClientViewerEmployee>,
-) -> KabiPayResult<Option<Vec<Uuid>>> {
-    let filter = resolve_employee_scope_filter(db, tenant_id, scope, viewer).await?;
-    Ok(employee_ids_from_scope_filter(filter))
 }
 
 /// List the first `limit` non-deleted employees, filtered by the caller’s data scope
@@ -1016,6 +1005,7 @@ pub async fn create<C: ConnectionTrait>(
         last_name: Set(data.last_name),
         date_of_birth: Set(None),
         gender: Set(None),
+        marital_status: Set(None),
         blood_group: Set(None),
         nationality: Set(None),
         employment_type: Set(data.employment_type),
@@ -1065,6 +1055,24 @@ pub struct EmployeePatch {
 pub async fn create_with_login(
     db: &DatabaseConnection,
     tenant_id: Uuid,
+    data: NewEmployee,
+    account: NewLoginAccount,
+) -> KabiPayResult<employee::Model> {
+    if data.user_id.is_some() {
+        return Err(KabiPayError::Validation("userId cannot be supplied when loginAccount is used".into()));
+    }
+    rbac_admin_service::require_nonempty_role_assignment(&account.role_ids)?;
+    canonical_employment_status(&data.status)?;
+    let txn = db.begin().await?;
+    let created = create_with_login_in_transaction(&txn, tenant_id, data, account).await?;
+    txn.commit().await?;
+    Ok(created)
+}
+
+/// Share all account and role validation with atomic candidate conversion.
+pub async fn create_with_login_in_transaction(
+    txn: &sea_orm::DatabaseTransaction,
+    tenant_id: Uuid,
     mut data: NewEmployee,
     account: NewLoginAccount,
 ) -> KabiPayResult<employee::Model> {
@@ -1075,11 +1083,10 @@ pub async fn create_with_login(
     }
     rbac_admin_service::require_nonempty_role_assignment(&account.role_ids)?;
     data.status = canonical_employment_status(&data.status)?.to_owned();
-    let txn = db.begin().await?;
     let validated_role_ids =
-        rbac_admin_service::validated_active_role_ids(&txn, tenant_id, &account.role_ids).await?;
+        rbac_admin_service::validated_active_role_ids(txn, tenant_id, &account.role_ids).await?;
     let user_id = insert_login_user(
-        &txn,
+        txn,
         tenant_id,
         account,
         validated_role_ids,
@@ -1087,8 +1094,7 @@ pub async fn create_with_login(
     )
     .await?;
     data.user_id = Some(user_id);
-    let created = create(&txn, tenant_id, data).await?;
-    txn.commit().await?;
+    let created = create(txn, tenant_id, data).await?;
     Ok(created)
 }
 
@@ -1100,9 +1106,22 @@ pub async fn provision_login(
 ) -> KabiPayResult<employee::Model> {
     rbac_admin_service::require_nonempty_role_assignment(&account.role_ids)?;
     let txn = db.begin().await?;
+    let updated = provision_login_in_transaction(&txn, tenant_id, employee_id, account).await?;
+    txn.commit().await?;
+    Ok(updated)
+}
+
+/// Share employee login validation with tenant imports and other atomic onboarding operations.
+pub async fn provision_login_in_transaction(
+    txn: &sea_orm::DatabaseTransaction,
+    tenant_id: Uuid,
+    employee_id: Uuid,
+    account: NewLoginAccount,
+) -> KabiPayResult<employee::Model> {
+    rbac_admin_service::require_nonempty_role_assignment(&account.role_ids)?;
     let validated_role_ids =
-        rbac_admin_service::validated_active_role_ids(&txn, tenant_id, &account.role_ids).await?;
-    let existing = find_by_id(&txn, tenant_id, employee_id)
+        rbac_admin_service::validated_active_role_ids(txn, tenant_id, &account.role_ids).await?;
+    let existing = find_by_id(txn, tenant_id, employee_id)
         .await?
         .ok_or_else(|| KabiPayError::NotFound {
             entity: "employee",
@@ -1114,7 +1133,7 @@ pub async fn provision_login(
         ));
     }
     let user_id = insert_login_user(
-        &txn,
+        txn,
         tenant_id,
         account,
         validated_role_ids,
@@ -1124,11 +1143,10 @@ pub async fn provision_login(
     let mut am: employee::ActiveModel = existing.into();
     am.user_id = Set(Some(user_id));
     am.updated_at = Set(Utc::now());
-    am.update(&txn).await?;
-    let updated = find_by_id(&txn, tenant_id, employee_id)
+    am.update(txn).await?;
+    let updated = find_by_id(txn, tenant_id, employee_id)
         .await?
         .ok_or_else(|| KabiPayError::Internal("updated employee not found".into()))?;
-    txn.commit().await?;
     Ok(updated)
 }
 
@@ -1252,6 +1270,7 @@ pub struct PersonalProfilePatch {
     pub last_name: Option<String>,
     pub date_of_birth: Option<NaiveDate>,
     pub gender: Option<String>,
+    pub marital_status: Option<String>,
     pub nationality: Option<String>,
     pub blood_group: Option<String>,
     pub emergency_contact_name: Option<String>,
@@ -1289,6 +1308,9 @@ pub async fn update_personal_profile(
     if let Some(d) = patch.date_of_birth {
         am.date_of_birth = Set(Some(d));
     }
+    if let Some(value) = patch.marital_status {
+        am.marital_status = Set(crate::services::marital_status::normalize(&value)?);
+    }
     if let Some(g) = patch.gender {
         am.gender = Set(Some(g));
     }
@@ -1325,6 +1347,7 @@ pub struct SelfServiceProfilePatch {
     pub current_address: Option<String>,
     pub permanent_address: Option<String>,
     pub gender: Option<String>,
+    pub marital_status: Option<String>,
     pub nationality: Option<String>,
     pub blood_group: Option<String>,
     pub emergency_contact_name: Option<String>,
@@ -1364,6 +1387,9 @@ pub async fn update_self_service_profile(
     }
     if let Some(value) = patch.permanent_address {
         active.permanent_address = Set(trimmed_optional(value));
+    }
+    if let Some(value) = patch.marital_status {
+        active.marital_status = Set(crate::services::marital_status::normalize(&value)?);
     }
     if let Some(value) = patch.gender {
         active.gender = Set(trimmed_optional(value));

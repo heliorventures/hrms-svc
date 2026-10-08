@@ -19,6 +19,8 @@ pub mod announcement {
         pub expires_at: Option<DateTimeUtc>,
         pub image_file_storage_id: Option<Uuid>,
         pub document_file_storage_id: Option<Uuid>,
+        pub video_file_storage_id: Option<Uuid>,
+        pub video_link: Option<String>,
         pub post_source: String,
         pub created_at: DateTimeUtc,
         pub updated_at: DateTimeUtc,

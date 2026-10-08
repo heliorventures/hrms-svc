@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<databaseChangeLog xmlns="http://www.liquibase.org/xml/ns/dbchangelog">
+    <changeSet id="fixture-master-order-add" author="test">
+        <addColumn tableName="survey_assignment" schemaName="${schema}">
+            <column name="master_order_marker" type="BOOLEAN"/>
+        </addColumn>
+    </changeSet>
+</databaseChangeLog>

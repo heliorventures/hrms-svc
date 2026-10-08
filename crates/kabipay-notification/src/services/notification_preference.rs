@@ -13,7 +13,7 @@ use uuid::Uuid;
 
 /// Canonical topic keys stored in `muted_topics` JSON and accepted by GraphQL.
 pub const ALLOWED_MUTED_TOPICS: &[&str] = &[
-    "leave", "expense", "travel", "tax", "hr_direct", "other",
+    "leave", "expense", "travel", "tax", "hr_direct", "celebration", "other",
 ];
 
 #[derive(Clone, Debug)]
@@ -74,6 +74,12 @@ pub fn notification_topic_key(ntype: Option<&str>) -> String {
     }
     if u == "TAX" || u.starts_with("TAX") {
         return "tax".into();
+    }
+    if matches!(
+        u.as_str(),
+        "EMPLOYEE_BIRTHDAY" | "EMPLOYEE_WORK_ANNIVERSARY"
+    ) {
+        return "celebration".into();
     }
     if u.contains("HR") || u.contains("BROADCAST") {
         return "hr_direct".into();
@@ -164,4 +170,22 @@ pub async fn upsert_notification_prefs(
         .ok_or_else(|| {
             KabiPayError::Internal("user_notification_preference missing after upsert".into())
         })
+}
+
+#[cfg(test)]
+mod celebration_topic_tests {
+    use super::*;
+
+    #[test]
+    fn automated_employee_events_use_the_celebration_topic() {
+        assert_eq!(
+            notification_topic_key(Some("EMPLOYEE_BIRTHDAY")),
+            "celebration"
+        );
+        assert_eq!(
+            notification_topic_key(Some("EMPLOYEE_WORK_ANNIVERSARY")),
+            "celebration"
+        );
+        assert!(ALLOWED_MUTED_TOPICS.contains(&"celebration"));
+    }
 }

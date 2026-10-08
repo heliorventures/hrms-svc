@@ -115,7 +115,8 @@ pub async fn delete_blob_if_unreferenced(
         .filter(
             Condition::any()
                 .add(announcement::Column::ImageFileStorageId.eq(file_id))
-                .add(announcement::Column::DocumentFileStorageId.eq(file_id)),
+                .add(announcement::Column::DocumentFileStorageId.eq(file_id))
+                .add(announcement::Column::VideoFileStorageId.eq(file_id)),
         )
         .one(&txn)
         .await
@@ -219,7 +220,7 @@ fn storage_path_for(
     )
 }
 
-fn absolute_storage_path(storage_path: &str) -> KabiPayResult<PathBuf> {
+pub(crate) fn absolute_storage_path(storage_path: &str) -> KabiPayResult<PathBuf> {
     if storage_path.contains('\\')
         || std::path::Path::new(storage_path)
             .components()

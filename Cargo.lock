@@ -1855,6 +1855,7 @@ dependencies = [
  "jsonwebtoken",
  "kabipay-db-entities",
  "opendal",
+ "rust_decimal",
  "sea-orm",
  "serde",
  "serde_json",
@@ -1948,6 +1949,7 @@ dependencies = [
  "async-graphql",
  "async-graphql-axum",
  "axum",
+ "base64",
  "chrono",
  "dotenvy",
  "kabipay-common",
@@ -2049,6 +2051,8 @@ dependencies = [
  "base64",
  "chrono",
  "dotenvy",
+ "futures-util",
+ "hmac",
  "kabipay-common",
  "kabipay-db-entities",
  "opendal",
@@ -2057,6 +2061,7 @@ dependencies = [
  "sea-orm",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror 1.0.69",
  "tokio",
  "tower 0.4.13",
@@ -2099,8 +2104,12 @@ dependencies = [
  "chrono",
  "hex",
  "hmac",
+ "kabipay-attendance",
  "kabipay-common",
  "kabipay-db-entities",
+ "kabipay-notification",
+ "kabipay-performance",
+ "kabipay-survey",
  "reqwest",
  "sea-orm",
  "serde",
@@ -2122,12 +2131,15 @@ dependencies = [
  "axum",
  "chrono",
  "dotenvy",
+ "hex",
  "kabipay-common",
  "kabipay-db-entities",
+ "kabipay-tax",
  "rust_decimal",
  "sea-orm",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror 1.0.69",
  "tokio",
  "tower 0.4.13",
@@ -2149,6 +2161,7 @@ dependencies = [
  "dotenvy",
  "kabipay-common",
  "kabipay-db-entities",
+ "rust_decimal",
  "sea-orm",
  "serde",
  "serde_json",
@@ -2210,6 +2223,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "kabipay-survey"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-graphql",
+ "async-graphql-axum",
+ "axum",
+ "chrono",
+ "dotenvy",
+ "kabipay-common",
+ "kabipay-db-entities",
+ "rust_decimal",
+ "sea-orm",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
+ "tower 0.4.13",
+ "tower-http 0.5.2",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
 name = "kabipay-tax"
 version = "0.1.0"
 dependencies = [
@@ -2231,6 +2269,32 @@ dependencies = [
  "tower-http 0.5.2",
  "tracing",
  "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
+name = "kabipay-tenant-import"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-graphql",
+ "chrono",
+ "dotenvy",
+ "hex",
+ "kabipay-auth",
+ "kabipay-common",
+ "kabipay-db-entities",
+ "kabipay-employee",
+ "kabipay-leave",
+ "kabipay-payroll",
+ "kabipay-tax",
+ "rand 0.8.6",
+ "rust_decimal",
+ "sea-orm",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokio",
  "uuid",
 ]
 

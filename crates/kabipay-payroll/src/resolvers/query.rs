@@ -94,9 +94,8 @@ where
     ResolveJwtEmployee: FnOnce() -> ResolveJwtEmployeeFuture,
     ResolveJwtEmployeeFuture: std::future::Future<Output = Result<Uuid>>,
     ResolveViewer: FnOnce() -> ResolveViewerFuture,
-    ResolveViewerFuture: std::future::Future<
-        Output = Result<Option<kabipay_common::context::ClientViewerEmployee>>,
-    >,
+    ResolveViewerFuture:
+        std::future::Future<Output = Result<Option<kabipay_common::context::ClientViewerEmployee>>>,
     ResolveScope: FnOnce(
         ScopeType,
         Option<kabipay_common::context::ClientViewerEmployee>,
@@ -124,6 +123,231 @@ pub struct QueryRoot;
 
 #[Object]
 impl QueryRoot {
+    async fn payroll_draft(
+        &self,
+        ctx: &Context<'_>,
+        cycle_id: ID,
+    ) -> Result<Option<async_graphql::Json<crate::services::payroll_draft::PayrollDraft>>> {
+        require_payroll_tenant_all_scope(ctx, PERM_PAYROLL_MANAGE)?;
+        let tenant = require_tenant_id(ctx)?;
+        let db = tenant_db(ctx, tenant).await?;
+        crate::services::payroll_draft::find(&db, tenant, parse_uuid(&cycle_id, "cycleId")?)
+            .await
+            .map(|value| value.map(async_graphql::Json))
+            .map_err(KabiPayError::into_graphql)
+    }
+    async fn company_payroll_policies(
+        &self,
+        ctx: &Context<'_>,
+    ) -> Result<async_graphql::Json<Vec<crate::services::contribution_policy_store::PolicyVersion>>>
+    {
+        payroll_tenant_all_scope_from_claims(ctx.data_opt::<ClientClaims>(), PERM_PAYROLL_MANAGE)
+            .map_err(KabiPayError::into_graphql)?;
+        let tenant = require_tenant_id(ctx)?;
+        let db = tenant_db(ctx, tenant).await?;
+        crate::services::contribution_policy_store::list(&db, tenant)
+            .await
+            .map(async_graphql::Json)
+            .map_err(KabiPayError::into_graphql)
+    }
+    async fn payroll_approved_lwp_review(
+        &self,
+        ctx: &Context<'_>,
+        employee_id: ID,
+        year: i32,
+        month: i32,
+    ) -> Result<async_graphql::Json<serde_json::Value>> {
+        use sea_orm::TransactionTrait;
+        require_payroll_tenant_all_scope(ctx, PERM_PAYROLL_MANAGE)?;
+        let tenant = require_tenant_id(ctx)?;
+        let db = tenant_db(ctx, tenant).await?;
+        let transaction = db
+            .begin()
+            .await
+            .map_err(KabiPayError::from)
+            .map_err(KabiPayError::into_graphql)?;
+        let review = crate::services::imported_lwp::review(
+            &transaction,
+            tenant,
+            parse_uuid(&employee_id, "employeeId")?,
+            year,
+            month,
+            false,
+        )
+        .await
+        .map_err(KabiPayError::into_graphql)?;
+        transaction
+            .rollback()
+            .await
+            .map_err(KabiPayError::from)
+            .map_err(KabiPayError::into_graphql)?;
+        Ok(async_graphql::Json(review))
+    }
+    async fn payslip_presentation(
+        &self,
+        ctx: &Context<'_>,
+        payslip_id: ID,
+    ) -> Result<Option<crate::services::payslip_presentation::PayslipPresentation>> {
+        let tenant = require_tenant_id(ctx)?;
+        let scope = payroll_read_scope(ctx)?;
+        let db = tenant_db(ctx, tenant).await?;
+        let viewer = resolve_viewer_employee(ctx, &db, tenant).await?;
+        let filter = resolve_employee_scope_filter(&db, tenant, scope, viewer)
+            .await
+            .map_err(KabiPayError::into_graphql)?;
+        let row = payroll_service::find_scoped_payslip_detail(
+            &db,
+            tenant,
+            parse_uuid(&payslip_id, "payslipId")?,
+            &filter,
+        )
+        .await
+        .map_err(KabiPayError::into_graphql)?;
+        let Some((slip, lines)) = row else {
+            return Ok(None);
+        };
+        Ok(Some(
+            crate::services::payslip_presentation::load(&db, tenant, &slip, &lines)
+                .await
+                .map_err(KabiPayError::into_graphql)?,
+        ))
+    }
+    async fn payroll_period_input(
+        &self,
+        ctx: &Context<'_>,
+        employee_id: ID,
+        year: i32,
+        month: i32,
+    ) -> Result<Option<async_graphql::Json<serde_json::Value>>> {
+        require_payroll_tenant_all_scope(ctx, PERM_PAYROLL_MANAGE)?;
+        let tenant = require_tenant_id(ctx)?;
+        let db = tenant_db(ctx, tenant).await?;
+        let row = crate::services::payroll_period_input::find(
+            &db,
+            tenant,
+            parse_uuid(&employee_id, "employeeId")?,
+            year,
+            month,
+        )
+        .await
+        .map_err(KabiPayError::into_graphql)?;
+        let employee = parse_uuid(&employee_id, "employeeId")?;
+        if self.payroll_period_locked(ctx, year, month).await? {
+            return Ok(row.map(|value| {
+                async_graphql::Json(serde_json::json!({
+                    "id":value.id,"input":value.input,"revision":value.revision,
+                    "ready":value.ready,"derived":false,"validationError":null
+                }))
+            }));
+        }
+        let input = match &row {
+            Some(value) => serde_json::from_value(value.input.clone()).map_err(|_| {
+                KabiPayError::Validation("stored monthly input is invalid".into()).into_graphql()
+            })?,
+            None => crate::services::automatic_period::new_input(year, month)
+                .map_err(KabiPayError::into_graphql)?,
+        };
+        let prepared =
+            crate::services::prepare_payroll::prepare(&db, tenant, employee, &input).await;
+        let error = prepared.as_ref().err().map(|error| match error {
+            KabiPayError::Validation(message) | KabiPayError::Conflict(message) => message.clone(),
+            _ => "Unable to calculate this employee. Check configuration or contact support.".into(),
+        });
+        let display = prepared
+            .as_ref()
+            .map(|value| &value.input)
+            .unwrap_or(&input);
+        Ok(Some(async_graphql::Json(serde_json::json!({
+            "id":row.as_ref().map(|value|value.id),"input":display,
+            "revision":row.as_ref().map(|value|value.revision),
+            "ready":prepared.is_ok() && row.as_ref().is_none_or(|value|value.ready || input.automatic.is_some()),
+            "derived":row.is_none(),"validationError":error
+        }))))
+    }
+    async fn employee_payroll_eligibility(
+        &self,
+        ctx: &Context<'_>,
+        employee_id: ID,
+        as_of: chrono::NaiveDate,
+    ) -> Result<
+        Option<async_graphql::Json<crate::services::employee_eligibility::EligibilitySetting>>,
+    > {
+        require_payroll_tenant_all_scope(ctx, PERM_PAYROLL_MANAGE)?;
+        let tenant = require_tenant_id(ctx)?;
+        let db = tenant_db(ctx, tenant).await?;
+        Ok(crate::services::employee_eligibility::find(
+            &db,
+            tenant,
+            parse_uuid(&employee_id, "employeeId")?,
+            as_of,
+        )
+        .await
+        .map_err(KabiPayError::into_graphql)?
+        .map(async_graphql::Json))
+    }
+    async fn payroll_period_locked(
+        &self,
+        ctx: &Context<'_>,
+        year: i32,
+        month: i32,
+    ) -> Result<bool> {
+        use kabipay_db_entities::tenant::d0012_payroll::payroll_cycle;
+        require_payroll_tenant_all_scope(ctx, PERM_PAYROLL_MANAGE)?;
+        let tenant = require_tenant_id(ctx)?;
+        let db = tenant_db(ctx, tenant).await?;
+        let cycle = payroll_cycle::Entity::find()
+            .filter(payroll_cycle::Column::TenantId.eq(tenant))
+            .filter(payroll_cycle::Column::Year.eq(year))
+            .filter(payroll_cycle::Column::Month.eq(month))
+            .one(&db)
+            .await
+            .map_err(KabiPayError::from)
+            .map_err(KabiPayError::into_graphql)?;
+        Ok(cycle.is_some_and(|row| row.status != "DRAFT"))
+    }
+    async fn payroll_unpaid_leave_policy(
+        &self,
+        ctx: &Context<'_>,
+    ) -> Result<Option<super::types::PayrollUnpaidLeavePolicy>> {
+        require_payroll_tenant_all_scope(ctx, PERM_PAYROLL_MANAGE)?;
+        let tenant = require_tenant_id(ctx)?;
+        let db = tenant_db(ctx, tenant).await?;
+        Ok(crate::services::unpaid_leave_policy::find(&db, tenant)
+            .await
+            .map_err(KabiPayError::into_graphql)?
+            .map(Into::into))
+    }
+
+    async fn payslip_unpaid_leave(
+        &self,
+        ctx: &Context<'_>,
+        payslip_id: ID,
+    ) -> Result<Option<super::types::PayslipUnpaidLeave>> {
+        let tenant = require_tenant_id(ctx)?;
+        let scope = payroll_read_scope(ctx)?;
+        let id = parse_uuid(&payslip_id, "payslipId")?;
+        let db = tenant_db(ctx, tenant).await?;
+        let viewer = resolve_viewer_employee(ctx, &db, tenant).await?;
+        let filter = resolve_employee_scope_filter(&db, tenant, scope, viewer)
+            .await
+            .map_err(KabiPayError::into_graphql)?;
+        if payroll_service::find_scoped_payslip_detail(&db, tenant, id, &filter)
+            .await
+            .map_err(KabiPayError::into_graphql)?
+            .is_none()
+        {
+            return Ok(None);
+        }
+        use kabipay_db_entities::tenant::d0077_unpaid_leave_payroll::payslip_unpaid_leave as snapshot;
+        Ok(snapshot::Entity::find()
+            .filter(snapshot::Column::TenantId.eq(tenant))
+            .filter(snapshot::Column::PayslipId.eq(id))
+            .one(&db)
+            .await
+            .map_err(KabiPayError::from)
+            .map_err(KabiPayError::into_graphql)?
+            .map(Into::into))
+    }
     async fn payroll_health(&self) -> &'static str {
         "ok"
     }
@@ -141,7 +365,21 @@ impl QueryRoot {
         let rows = payroll_service::list_components(&db, tenant_id, active_only, limit)
             .await
             .map_err(KabiPayError::into_graphql)?;
-        Ok(rows.into_iter().map(SalaryComponentDto::from).collect())
+        let visibility = crate::services::component_display::catalog(&db, tenant_id)
+            .await
+            .map_err(KabiPayError::into_graphql)?;
+        Ok(rows
+            .into_iter()
+            .map(|row| {
+                let visible = visibility
+                    .get(&row.id)
+                    .copied()
+                    .unwrap_or(row.r#type != "EMPLOYER_CONTRIBUTION");
+                let mut dto = SalaryComponentDto::from(row);
+                dto.show_on_payslip = visible;
+                dto
+            })
+            .collect())
     }
 
     async fn salary_structures(
@@ -160,7 +398,9 @@ impl QueryRoot {
             .map(|(structure, components)| {
                 let component_dtos = components
                     .into_iter()
-                    .map(|(line, component)| SalaryStructureComponentDto::from_parts(line, component))
+                    .map(|(line, component)| {
+                        SalaryStructureComponentDto::from_parts(line, component)
+                    })
                     .collect();
                 SalaryStructureDto::from_head(structure, component_dtos)
             })
@@ -217,11 +457,18 @@ impl QueryRoot {
             },
         )
         .await?;
-        let Some(preview) = preview
-        else {
+        let Some(preview) = preview else {
             return Ok(None);
         };
         Ok(Some(SalaryBreakupPreviewDto {
+            financials: crate::services::salary_financials::for_assignment(
+                &db,
+                tenant_id,
+                preview.employee_salary_structure_id,
+            )
+            .await
+            .map_err(KabiPayError::into_graphql)?
+            .map(async_graphql::Json),
             employee_id: ID(preview.employee_id.to_string()),
             employee_salary_structure_id: preview
                 .employee_salary_structure_id
@@ -266,7 +513,10 @@ impl QueryRoot {
     /// Employer TAN, payslip branding, component codes (optional row per tenant).
     /// Requires `payroll:read` so employees can render branded payslips;
     /// `upsertPayrollComplianceSetting` remains a separately authorized mutation.
-    async fn payroll_compliance_setting(&self, ctx: &Context<'_>) -> Result<Option<PayrollComplianceSettingDto>> {
+    async fn payroll_compliance_setting(
+        &self,
+        ctx: &Context<'_>,
+    ) -> Result<Option<PayrollComplianceSettingDto>> {
         let tenant_id = require_tenant_id(ctx)?;
         payroll_read_scope(ctx)?;
         let db = tenant_db(ctx, tenant_id).await?;
@@ -292,20 +542,22 @@ impl QueryRoot {
             .await
             .map_err(KabiPayError::into_graphql)?;
         let Some(row) = compliance else {
-            return Err(
-                KabiPayError::Validation("payroll compliance setting is not configured for this tenant".into())
-                    .into_graphql(),
-            );
+            return Err(KabiPayError::Validation(
+                "payroll compliance setting is not configured for this tenant".into(),
+            )
+            .into_graphql());
         };
         let Some(logo_id) = row.payslip_logo_file_storage_id else {
             return Err(
-                KabiPayError::Validation("tenant has no payslip logo configured".into()).into_graphql(),
+                KabiPayError::Validation("tenant has no payslip logo configured".into())
+                    .into_graphql(),
             );
         };
         if logo_id != wanted {
-            return Err(
-                KabiPayError::Forbidden("file id does not match the tenant payslip logo".into()).into_graphql(),
-            );
+            return Err(KabiPayError::Forbidden(
+                "file id does not match the tenant payslip logo".into(),
+            )
+            .into_graphql());
         }
         let fs_row = file_storage::Entity::find_by_id(logo_id)
             .filter(file_storage::Column::TenantId.eq(tenant_id))
@@ -397,13 +649,9 @@ impl QueryRoot {
                 .map_err(KabiPayError::into_graphql)?;
                 let ids: Vec<Uuid> = list.iter().map(|p| p.id).collect();
                 let cycle_ids: Vec<Uuid> = list.iter().map(|p| p.payroll_cycle_id).collect();
-                let cycles = payroll_service::payroll_cycles_by_ids(
-                    load_db,
-                    tenant_id,
-                    &cycle_ids,
-                )
-                .await
-                .map_err(KabiPayError::into_graphql)?;
+                let cycles = payroll_service::payroll_cycles_by_ids(load_db, tenant_id, &cycle_ids)
+                    .await
+                    .map_err(KabiPayError::into_graphql)?;
                 let lines = payroll_service::payslip_lines_by_payslip_ids(load_db, tenant_id, &ids)
                     .await
                     .map_err(KabiPayError::into_graphql)?;
@@ -599,8 +847,8 @@ mod tests {
     };
     use kabipay_common::context::{
         ClientClaims, ScopeType, CLIENT_JWT_ISSUER, EMPLOYMENT_STATUS_ACTIVE,
-        EMPLOYMENT_STATUS_PROBATION, PERM_EMPLOYEE_READ, PERM_PAYROLL_MANAGE,
-        PERM_PAYROLL_READ, PERM_PAYROLL_STATUTORY_EXPORT,
+        EMPLOYMENT_STATUS_PROBATION, PERM_EMPLOYEE_READ, PERM_PAYROLL_MANAGE, PERM_PAYROLL_READ,
+        PERM_PAYROLL_STATUTORY_EXPORT,
     };
     use kabipay_common::subgraph::TenantId;
     use sea_orm::entity::prelude::async_trait;
@@ -653,7 +901,11 @@ mod tests {
         response: &async_graphql::Response,
         expected_message: &str,
     ) {
-        assert_eq!(response.errors.len(), 1, "unexpected response: {response:?}");
+        assert_eq!(
+            response.errors.len(),
+            1,
+            "unexpected response: {response:?}"
+        );
         let message = &response.errors[0].message;
         assert!(
             message.contains(expected_message),
@@ -758,9 +1010,12 @@ mod tests {
             scope: ScopeType,
             viewer: Option<kabipay_common::context::ClientViewerEmployee>,
         ) -> Result<EmployeeScopeFilter> {
-            self.operations.borrow_mut().push(
-                TargetBoundaryOperation::ResolveScope(scope, viewer.map(|v| v.employee_id)),
-            );
+            self.operations
+                .borrow_mut()
+                .push(TargetBoundaryOperation::ResolveScope(
+                    scope,
+                    viewer.map(|v| v.employee_id),
+                ));
             resolve_employee_scope_filter_with_connection(
                 &self.scope_db,
                 self.tenant_id,
@@ -852,8 +1107,7 @@ mod tests {
     #[tokio::test]
     async fn payroll_boundary_omitted_target_uses_jwt_employee_then_loads() {
         let jwt_employee_id = Uuid::new_v4();
-        let fixture =
-            TargetBoundaryFixture::new(Some(jwt_employee_id), None, Vec::new()).await;
+        let fixture = TargetBoundaryFixture::new(Some(jwt_employee_id), None, Vec::new()).await;
 
         assert_eq!(
             fixture
@@ -883,7 +1137,9 @@ mod tests {
                 .await
                 .expect_err("viewer-bound scope must deny without a viewer");
 
-            assert!(error.message.contains("scope does not include target employee"));
+            assert!(error
+                .message
+                .contains("scope does not include target employee"));
             assert_eq!(
                 fixture.operations(),
                 vec![
@@ -933,7 +1189,11 @@ mod tests {
         assert!(statement.sql.contains("root.tenant_id = $1"));
         assert!(statement.sql.contains("child.tenant_id = $1"));
         assert_eq!(
-            statement.values.as_ref().expect("bound TEAM query values").0,
+            statement
+                .values
+                .as_ref()
+                .expect("bound TEAM query values")
+                .0,
             vec![
                 tenant_id.into(),
                 manager_id.into(),
@@ -997,11 +1257,8 @@ mod tests {
             ("ALL", ScopeType::All),
         ] {
             assert_eq!(
-                payroll_read_scope_from_claims(Some(&claims(
-                    PERM_PAYROLL_READ,
-                    Some(wire_scope),
-                )))
-                .expect("valid exact payroll read scope"),
+                payroll_read_scope_from_claims(Some(&claims(PERM_PAYROLL_READ, Some(wire_scope),)))
+                    .expect("valid exact payroll read scope"),
                 expected
             );
         }
@@ -1022,10 +1279,10 @@ mod tests {
     #[test]
     fn tenant_wide_payroll_permissions_require_exact_all_scope() {
         for permission in [PERM_PAYROLL_MANAGE, PERM_PAYROLL_STATUTORY_EXPORT] {
-            assert!(payroll_tenant_all_scope_from_claims(Some(&claims(
-                permission,
-                Some("ALL"),
-            )), permission)
+            assert!(payroll_tenant_all_scope_from_claims(
+                Some(&claims(permission, Some("ALL"),)),
+                permission
+            )
             .is_ok());
 
             for scope in [
@@ -1118,6 +1375,18 @@ mod tests {
         let employee_id = Uuid::new_v4();
         let record_id = Uuid::new_v4();
         let fields = vec![
+            (
+                "{ payrollUnpaidLeavePolicy { enabled } }".to_string(),
+                PERM_PAYROLL_MANAGE,
+                PERM_PAYROLL_READ,
+                true,
+            ),
+            (
+                format!("{{ payslipUnpaidLeave(payslipId: \"{record_id}\") {{ amount }} }}"),
+                PERM_PAYROLL_READ,
+                PERM_EMPLOYEE_READ,
+                false,
+            ),
             (
                 "{ salaryComponents { __typename } }".to_string(),
                 PERM_PAYROLL_MANAGE,
@@ -1248,9 +1517,7 @@ mod tests {
                 let response = execute_query(claims(required_permission, scope), &query).await;
                 assert_permission_denied_before_db(
                     &response,
-                    &format!(
-                        "{required_permission} permission requires an explicit valid scope"
-                    ),
+                    &format!("{required_permission} permission requires an explicit valid scope"),
                 );
             }
 

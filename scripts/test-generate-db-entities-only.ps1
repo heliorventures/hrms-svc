@@ -28,6 +28,7 @@ $fixtureRoot = Join-Path $temporaryRoot ("hrms-generate-db-entities-only-" + [gu
 try {
     $fixtureGenerator = Join-Path $fixtureRoot 'hrms-svc\scripts\generate_db_entities.py'
     $fixtureMigrations = Join-Path $fixtureRoot 'hrms-database\changelog\migrations'
+    $fixtureMaster = Join-Path $fixtureRoot 'hrms-database\changelog\tenant.changelog-master.xml'
     $fixtureTenantEntities = Join-Path $fixtureRoot 'hrms-svc\crates\kabipay-db-entities\src\tenant'
     $legacyMigration = Join-Path $fixtureMigrations '0005_legacy'
     $targetMigration = Join-Path $fixtureMigrations '0063_target'
@@ -54,6 +55,13 @@ try {
             <column name="payload" type="JSONB"><constraints nullable="false"/></column>
         </createTable>
     </changeSet>
+</databaseChangeLog>
+'@
+    Write-Utf8File -Path $fixtureMaster -Contents @'
+<?xml version="1.0" encoding="UTF-8"?>
+<databaseChangeLog xmlns="http://www.liquibase.org/xml/ns/dbchangelog">
+    <include file="migrations/0005_legacy/legacy.xml" relativeToChangelogFile="true"/>
+    <include file="migrations/0063_target/target.xml" relativeToChangelogFile="true"/>
 </databaseChangeLog>
 '@
 

@@ -201,7 +201,7 @@ impl MutationRoot {
         ctx: &Context<'_>,
         input: SubmitTravelRequestInput,
     ) -> Result<TravelRequestDto> {
-        let (_, jwt_employee_id) = require_self_submission(ctx, PERM_TRAVEL_SUBMIT)?;
+        let (claims, jwt_employee_id) = require_self_submission(ctx, PERM_TRAVEL_SUBMIT)?;
         let tenant_id = require_tenant_id(ctx)?;
         let db = tenant_db(ctx, tenant_id).await?;
         let employee_id = resolve_client_employee_id(ctx, &db, tenant_id)
@@ -234,6 +234,9 @@ impl MutationRoot {
             &input.purpose,
             est,
             currency,
+            claims.sub,
+            input.supporting_file_storage_id.as_ref()
+                .map(|id| parse_uuid(id, "supportingFileStorageId")).transpose()?,
         )
         .await
         .map_err(KabiPayError::into_graphql)?;

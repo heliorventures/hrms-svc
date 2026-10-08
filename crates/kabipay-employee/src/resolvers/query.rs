@@ -31,7 +31,8 @@ use crate::resolvers::types::{
     EmployeePanRecordDto, EmployeeProfileAccessDto, EmployeeProfileChangeRequestDto,
     EmployeeProfileChangeReviewDetailDto, EmployeeProfileReviewQueueItemDto,
     EmployeeWorkExperienceDto, EmploymentHistoryRecordDto, FnfSettlementDto,
-    OnboardingChecklistItemDto, OrgChartRowDto, SeparationDto, TenantCatalogPermissionDto,
+    MyGuidanceStateDto, OnboardingChecklistItemDto, OrgChartRowDto, SeparationDto,
+    TenantCatalogPermissionDto,
     TenantDirectoryRoleDto, TenantDirectoryUserDto, TenantFileAttachmentDto,
     TenantPermissionScopeDto,
 };
@@ -41,6 +42,7 @@ use sea_orm::{
 };
 
 use crate::entities::d0007_employee_core::employee;
+#[cfg(test)]
 use crate::entities::d0008_document_system::employee_document;
 use crate::entities::d0029_file_storage::file_storage;
 use crate::resolvers::scope::{
@@ -52,11 +54,31 @@ use crate::resolvers::scope::{
 use crate::services::{company_document_service, document_file_service};
 use crate::services::{
     directory_service, document_service, employee_service, employment_history_service,
-    offboarding_fnf_service, onboarding_service, org_service, profile_change_service,
+    guidance_service, offboarding_fnf_service, onboarding_service, org_service,
+    profile_change_service,
     profile_extras_service, profile_record_service, rbac_admin_service, separation_service,
 };
 
 pub struct QueryRoot;
+
+pub(super) fn authenticated_guidance_identity(ctx: &Context<'_>) -> Result<(Uuid, Uuid)> {
+    let claims = require_client_claims(ctx)?;
+    let tenant_id = require_tenant_id(ctx)?;
+    Ok((tenant_id, claims.sub))
+}
+
+pub(super) async fn load_guidance_state(
+    db: &DatabaseConnection,
+    tenant_id: Uuid,
+    user_id: Uuid,
+) -> Result<MyGuidanceStateDto> {
+    let overview_dismissed_at = guidance_service::load_state(db, tenant_id, user_id)
+        .await
+        .map_err(KabiPayError::into_graphql)?;
+    Ok(MyGuidanceStateDto {
+        overview_dismissed_at,
+    })
+}
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 enum EmployeeTargetAccess {
@@ -181,6 +203,13 @@ fn employment_history_read_access(
         ))
         .into_graphql()),
     }
+}
+
+pub(super) fn require_payroll_sensitive_access(
+    ctx: &Context<'_>,
+    target_employee_id: Uuid,
+) -> Result<()> {
+    employment_history_read_access(ctx, target_employee_id).map(|_| ())
 }
 
 async fn authorize_employee_target(
@@ -455,6 +484,41 @@ async fn list_scoped_directory_hierarchy(
 
 #[Object]
 impl QueryRoot {
+    async fn company_locations(&self, ctx: &Context<'_>, page: Option<kabipay_common::PageInput>, search: Option<String>, #[graphql(default = true)] active_only: bool) -> Result<super::company_location_types::CompanyLocationPage> {
+        super::company_location_types::require_location_authority(ctx,false)?;
+        let tenant = require_tenant_id(ctx)?; let db = tenant_db(ctx,tenant).await?; let page = page.unwrap_or_default().clamp();
+        let (rows,total) = crate::services::company_location_repository::list(&db,tenant,page,search,active_only).await.map_err(KabiPayError::into_graphql)?;
+        Ok(super::company_location_types::CompanyLocationPage { nodes: rows.into_iter().map(Into::into).collect(), page_info: kabipay_common::PageInfo::compute(page,total) })
+    }
+    async fn company_location_options(&self, ctx: &Context<'_>, search: Option<String>, #[graphql(default = 50)] limit: u64) -> Result<Vec<super::company_location_types::CompanyLocationOption>> {
+        super::company_location_types::require_location_authority(ctx,true)?;
+        let tenant = require_tenant_id(ctx)?; let db = tenant_db(ctx,tenant).await?;
+        let (rows,_) = crate::services::company_location_repository::list(&db,tenant,kabipay_common::PageInput { page:1, per_page:limit.clamp(1,100) },search,true).await.map_err(KabiPayError::into_graphql)?;
+        Ok(rows.into_iter().map(|r| super::company_location_types::CompanyLocationOption { id:r.id.into(),name:r.name }).collect())
+    }
+    async fn employee_location_assignment(&self, ctx: &Context<'_>, employee_id: ID) -> Result<super::company_location_types::EmployeeLocationAssignment> {
+        super::company_location_types::require_location_authority(ctx,false)?;
+        let tenant = require_tenant_id(ctx)?; let db = tenant_db(ctx,tenant).await?; let id = parse_uuid(&employee_id,"employeeId")?;
+        let assignment = crate::services::company_location_assignment_reader::read_assignment(&db,tenant,id).await.map_err(KabiPayError::into_graphql)?;
+        let today = kabipay_common::tenant_business_clock::TenantBusinessClock::load(kabipay_common::subgraph::ops_db(ctx)?,tenant).await.map_err(KabiPayError::into_graphql)?.now_date();
+        Ok(super::company_location_types::EmployeeLocationAssignment { employee_id,location_id:assignment.location_id.map(Into::into),location_name:assignment.location_name,effective_from:assignment.effective_from,revision:assignment.revision,business_date:today })
+    }
+    async fn prejoining_conversion_options(&self, ctx: &Context<'_>, manager_search: Option<String>, manager_offset: Option<i32>) -> Result<async_graphql::Json<serde_json::Value>> { super::prejoining_options::options(ctx, manager_search, manager_offset).await }
+    async fn prejoining_config(&self, ctx: &Context<'_>) -> Result<async_graphql::Json<serde_json::Value>> { super::prejoining::config(ctx).await }
+    async fn prejoining_field_catalog(&self, ctx: &Context<'_>) -> Result<async_graphql::Json<serde_json::Value>> { super::prejoining::catalog(ctx) }
+    async fn prejoining_document_types(&self, ctx: &Context<'_>) -> Result<async_graphql::Json<serde_json::Value>> { super::prejoining::document_types(ctx).await }
+    async fn prejoining_candidates(&self, ctx: &Context<'_>, offset: Option<i32>, limit: Option<i32>, status: Option<String>) -> Result<super::prejoining::PrejoiningPage> { super::prejoining::list(ctx, offset, limit, status).await }
+    async fn prejoining_candidate(&self, ctx: &Context<'_>, id: ID) -> Result<Option<super::prejoining::PrejoiningCandidate>> { super::prejoining::detail(ctx, id).await }
+    async fn prejoining_document(&self, ctx: &Context<'_>, candidate_id: ID, document_id: ID) -> Result<super::prejoining::PrejoiningDocumentContent> { super::prejoining::download(ctx, candidate_id, document_id).await }
+    async fn prejoining_candidates_csv(&self, ctx: &Context<'_>, status: Option<String>) -> Result<String> { super::prejoining::csv(ctx, status).await }
+
+    /// Dismissal state for the authenticated user's application overview.
+    async fn my_guidance_state(&self, ctx: &Context<'_>) -> Result<MyGuidanceStateDto> {
+        let (tenant_id, user_id) = authenticated_guidance_identity(ctx)?;
+        let db = tenant_db(ctx, tenant_id).await?;
+        load_guidance_state(&db, tenant_id, user_id).await
+    }
+
     /// Liveness probe for this federated subgraph. Always returns `ok`.
     async fn employee_health(&self) -> &'static str {
         "ok"
@@ -775,6 +839,36 @@ impl QueryRoot {
         enrich_employee_dtos(&db, tenant_id, dtos).await
     }
 
+    /// Employee UAN is payroll-sensitive and never part of directory results.
+    async fn employee_uan_number(
+        &self,
+        ctx: &Context<'_>,
+        employee_id: ID,
+    ) -> Result<Option<String>> {
+        let eid = parse_uuid(&employee_id, "employeeId")?;
+        require_payroll_sensitive_access(ctx, eid)?;
+        let tenant_id = require_tenant_id(ctx)?;
+        let db = tenant_db(ctx, tenant_id).await?;
+        crate::services::employee_uan_service::read(&db, tenant_id, eid)
+            .await
+            .map_err(KabiPayError::into_graphql)
+    }
+
+    /// Employee ESIC is payroll-sensitive and never part of directory results.
+    async fn employee_esic_number(
+        &self,
+        ctx: &Context<'_>,
+        employee_id: ID,
+    ) -> Result<Option<String>> {
+        let eid = parse_uuid(&employee_id, "employeeId")?;
+        require_payroll_sensitive_access(ctx, eid)?;
+        let tenant_id = require_tenant_id(ctx)?;
+        let db = tenant_db(ctx, tenant_id).await?;
+        crate::services::employee_esic_service::read(&db, tenant_id, eid)
+            .await
+            .map_err(KabiPayError::into_graphql)
+    }
+
     /// Salary-bearing employment history, newest first.
     ///
     /// Access is limited to exact `payroll:read=SELF` for the JWT-linked employee or
@@ -920,6 +1014,19 @@ impl QueryRoot {
             .await
             .map_err(KabiPayError::into_graphql)?;
         Ok(row.as_ref().map(EmployeeBankAccountDto::from_model))
+    }
+
+    /// Imported nullable fields use the existing employee-target authorization.
+    async fn employee_imported_profile(
+        &self, ctx: &Context<'_>, employee_id: ID,
+    ) -> Result<async_graphql::Json<serde_json::Value>> {
+        let eid=parse_uuid(&employee_id,"employeeId")?;
+        let access=employee_target_access(ctx,eid)?;
+        let tenant_id=require_tenant_id(ctx)?;
+        let db=tenant_db(ctx,tenant_id).await?;
+        authorize_employee_target(ctx,&db,tenant_id,eid,access).await?;
+        crate::services::imported_profile::read(&db,tenant_id,eid).await
+            .map(async_graphql::Json).map_err(KabiPayError::into_graphql)
     }
 
     /// Masked PAN / Aadhaar primary rows for the employee profile.
@@ -1084,6 +1191,7 @@ impl QueryRoot {
                 .into_graphql()
             })?;
         let bytes = document_file_service::read_stored_file_bytes(
+            &db,
             &document_file_service::local_file_root(),
             &fs_row,
         )
@@ -1147,6 +1255,7 @@ impl QueryRoot {
                     .into_graphql()
             })?;
         let bytes = document_file_service::read_stored_file_bytes(
+            &db,
             &document_file_service::local_file_root(),
             &fs_row,
         )
@@ -1484,9 +1593,22 @@ pub(crate) async fn enrich_employee_dtos(
         .await
         .map_err(KabiPayError::into_graphql)?;
 
+    use kabipay_db_entities::tenant::{d0006_org_hierarchy::location, d0097_location_working_calendar::employee_location_assignment as assignment};
+    let location_ids: Vec<Uuid> = dtos.iter().filter_map(|d| d.location_id.as_ref().and_then(|id|Uuid::parse_str(id.as_str()).ok())).collect();
+    let location_map: std::collections::HashMap<_,_> = if location_ids.is_empty() { Default::default() } else {
+        location::Entity::find().filter(location::Column::TenantId.eq(tenant_id)).filter(location::Column::Id.is_in(location_ids)).all(db).await.map_err(KabiPayError::from).map_err(KabiPayError::into_graphql)?.into_iter().map(|row|(row.id,row.name)).collect()
+    };
+    let ids: Vec<Uuid> = dtos.iter().filter_map(|d|Uuid::parse_str(d.id.as_str()).ok()).collect();
+    let assignments = if ids.is_empty() { Vec::new() } else {
+        assignment::Entity::find().filter(assignment::Column::TenantId.eq(tenant_id)).filter(assignment::Column::EmployeeId.is_in(ids)).order_by_desc(assignment::Column::EffectiveFrom).all(db).await.map_err(KabiPayError::from).map_err(KabiPayError::into_graphql)?
+    };
     Ok(dtos
         .into_iter()
-        .map(|d| d.with_reference_labels(&dept_map, &desig_map, &user_map, &mgr_map))
+        .map(|mut d| {
+            d.location_name = d.location_id.as_ref().and_then(|id|Uuid::parse_str(id.as_str()).ok()).and_then(|id|location_map.get(&id).cloned());
+            d.location_assignment_effective_from = Uuid::parse_str(d.id.as_str()).ok().and_then(|id|assignments.iter().find(|row|row.employee_id == id).map(|row|row.effective_from));
+            d.with_reference_labels(&dept_map, &desig_map, &user_map, &mgr_map)
+        })
         .collect())
 }
 
@@ -1798,6 +1920,82 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn uan_read_rejects_other_employees_and_team_scope_before_db_access() {
+        let own_id = Uuid::new_v4();
+        let other_id = Uuid::new_v4();
+        for (scope, target) in [("SELF", other_id), ("TEAM", own_id), ("TEAM", other_id)] {
+            let response = execute_query(
+                claims(PERM_PAYROLL_READ, Some(scope), Some(own_id)),
+                &format!("{{ employeeUanNumber(employeeId: \"{target}\") }}"),
+            )
+            .await;
+            assert_forbidden_before_db(&response, PERM_PAYROLL_READ);
+        }
+    }
+
+    #[tokio::test]
+    async fn esic_read_rejects_other_employees_and_team_scope_before_db_access() {
+        let own_id = Uuid::new_v4();
+        let other_id = Uuid::new_v4();
+        for (scope, target) in [("SELF", other_id), ("TEAM", own_id), ("TEAM", other_id)] {
+            let response = execute_query(
+                claims(PERM_PAYROLL_READ, Some(scope), Some(own_id)),
+                &format!("{{ employeeEsicNumber(employeeId: \"{target}\") }}"),
+            )
+            .await;
+            assert_forbidden_before_db(&response, PERM_PAYROLL_READ);
+        }
+    }
+
+    #[tokio::test]
+    async fn esic_write_requires_employee_management_and_payroll_access_before_db_access() {
+        let own_id = Uuid::new_v4();
+        for (permission, denied_permission) in [
+            (PERM_PAYROLL_READ, "employee:write"),
+            ("employee:write", PERM_PAYROLL_READ),
+        ] {
+            let caller = claims(permission, Some("ALL"), Some(own_id));
+            let response = Schema::build(
+                QueryRoot,
+                crate::resolvers::mutation::MutationRoot,
+                EmptySubscription,
+            )
+            .data(TenantId(caller.tenant_id))
+            .data(caller)
+            .finish()
+            .execute(Request::new(format!(
+                "mutation {{ setEmployeeEsicNumber(input: {{ employeeId: \"{own_id}\", esicNumber: \"0123456789\" }}) }}"
+            )))
+            .await;
+            assert_forbidden_before_db(&response, denied_permission);
+        }
+    }
+
+    #[tokio::test]
+    async fn uan_write_requires_employee_management_and_payroll_access_before_db_access() {
+        let own_id = Uuid::new_v4();
+        for (permission, denied_permission) in [
+            (PERM_PAYROLL_READ, "employee:write"),
+            ("employee:write", PERM_PAYROLL_READ),
+        ] {
+            let caller = claims(permission, Some("ALL"), Some(own_id));
+            let response = Schema::build(
+                QueryRoot,
+                crate::resolvers::mutation::MutationRoot,
+                EmptySubscription,
+            )
+                .data(TenantId(caller.tenant_id))
+                .data(caller)
+                .finish()
+                .execute(Request::new(format!(
+                    "mutation {{ setEmployeeUanNumber(input: {{ employeeId: \"{own_id}\", uanNumber: \"012345678901\" }}) }}"
+                )))
+                .await;
+            assert_forbidden_before_db(&response, denied_permission);
+        }
+    }
+
+    #[tokio::test]
     async fn every_protected_employee_query_requires_its_exact_permission_before_db_access() {
         let own_id = Uuid::new_v4();
         let other_id = Uuid::new_v4();
@@ -1872,6 +2070,16 @@ mod tests {
             ),
             (
                 format!("{{ employmentHistoryRecords(employeeId: \"{own_id}\") {{ __typename }} }}"),
+                PERM_PAYROLL_READ,
+                false,
+            ),
+            (
+                format!("{{ employeeUanNumber(employeeId: \"{own_id}\") }}"),
+                PERM_PAYROLL_READ,
+                false,
+            ),
+            (
+                format!("{{ employeeEsicNumber(employeeId: \"{own_id}\") }}"),
                 PERM_PAYROLL_READ,
                 false,
             ),

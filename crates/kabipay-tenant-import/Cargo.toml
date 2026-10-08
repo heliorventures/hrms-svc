@@ -1,0 +1,32 @@
+[package]
+name = "kabipay-tenant-import"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+kabipay-tax = { path = "../kabipay-tax" }
+kabipay-common.workspace = true
+kabipay-auth.workspace = true
+kabipay-db-entities.workspace = true
+kabipay-payroll = { path = "../kabipay-payroll" }
+kabipay-leave = { path = "../kabipay-leave" }
+kabipay-employee = { path = "../kabipay-employee" }
+sea-orm.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+rust_decimal.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+sha2.workspace = true
+hex.workspace = true
+rand.workspace = true
+anyhow.workspace = true
+dotenvy.workspace = true
+
+[dev-dependencies]
+async-graphql.workspace = true
+sea-orm = { workspace = true, features = ["proxy"] }

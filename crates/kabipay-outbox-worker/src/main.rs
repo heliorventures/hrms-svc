@@ -5,8 +5,9 @@
 use anyhow::Context;
 use chrono::{Duration as ChronoDuration, Utc};
 use hmac::{Hmac, Mac};
-use kabipay_common::db::{connect_ops_db, resolve_tenant_db, TenantDbCache, TenantDbConfig};
+use kabipay_common::db::{connect_ops_db, resolve_required_tenant_db, TenantDbCache, TenantDbConfig};
 use kabipay_common::due_offboarding::process_due_separations;
+use kabipay_common::entitlements::Entitlements;
 use kabipay_common::load_dotenv;
 use kabipay_common::private_file_cleanup::{
     process_private_file_cleanup_tasks, sweep_expired_company_upload_stages,
@@ -17,6 +18,9 @@ use kabipay_common::tenant_business_clock::TenantBusinessClock;
 use kabipay_db_entities::ops::tenant_database;
 use kabipay_db_entities::tenant::d0026_integrations::{webhook_delivery_log, webhook_subscription};
 use kabipay_db_entities::tenant::d0030_outbox_events::outbox_event;
+use kabipay_notification::services::automated_events::process_due_celebrations;
+use kabipay_performance::services::performance_workflow::{process_due_performance_cycles, process_due_performance_stage_deadlines};
+use kabipay_survey::services::survey_lifecycle::process_due_surveys;
 use reqwest::header::{HeaderMap, HeaderValue, CONTENT_TYPE};
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseConnection, DbBackend, EntityTrait,
@@ -240,16 +244,22 @@ async fn active_tenant_ids(ops: &DatabaseConnection) -> anyhow::Result<Vec<Uuid>
 async fn claim_next_pending(
     tenant_db: &DatabaseConnection,
     tenant_id: Uuid,
+    allowed: Vec<&str>,
 ) -> anyhow::Result<Option<outbox_event::Model>> {
+    if allowed.is_empty() { return Ok(None); }
     let txn = tenant_db.begin().await.context("begin claim txn")?;
+    let placeholders = (3..3 + allowed.len()).map(|index| format!("${index}")).collect::<Vec<_>>().join(", ");
+    let mut values = vec![tenant_id.into(), STATUS_PENDING.into()];
+    values.extend(allowed.into_iter().map(sea_orm::Value::from));
     let pick_stmt = Statement::from_sql_and_values(
         DbBackend::Postgres,
-        r#"SELECT id FROM outbox_event
+        format!(r#"SELECT id FROM outbox_event
            WHERE tenant_id = $1 AND status = $2
+           AND aggregate_type IN ({placeholders})
            ORDER BY created_at ASC
            FOR UPDATE SKIP LOCKED
-           LIMIT 1"#,
-        vec![tenant_id.into(), STATUS_PENDING.into()],
+           LIMIT 1"#),
+        values,
     );
     let picked = PickId::find_by_statement(pick_stmt)
         .one(&txn)
@@ -460,6 +470,7 @@ async fn reclaim_stale_processing(
 }
 
 async fn process_tenant_outbox(
+    ops_db: &DatabaseConnection,
     tenant_db: &DatabaseConnection,
     tenant_id: Uuid,
     cap: i32,
@@ -469,7 +480,12 @@ async fn process_tenant_outbox(
         tracing::info!(%tenant_id, reclaimed = r, "outbox reclaimed stale PROCESSING rows");
     }
     let mut n = 0;
-    while let Some(ev) = claim_next_pending(tenant_db, tenant_id).await? {
+    loop {
+        // Recheck between deliveries. Disabled/unknown domains stay PENDING without retries.
+        let entitlements = Entitlements::load(ops_db, tenant_id).await?;
+        let Some(ev) = claim_next_pending(tenant_db, tenant_id, entitlements.outbox_aggregates()).await? else {
+            break;
+        };
         n += 1;
         match deliver_event(tenant_db, &ev).await {
             Ok(()) => mark_processed(tenant_db, ev.id).await?,
@@ -484,6 +500,17 @@ async fn process_tenant_outbox(
         }
     }
     Ok(n)
+}
+
+#[cfg(test)]
+mod entitlement_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn unavailable_domains_do_not_claim_or_modify_pending_events() {
+        let result = claim_next_pending(&DatabaseConnection::Disconnected, Uuid::new_v4(), Vec::new()).await;
+        assert!(matches!(result, Ok(None)));
+    }
 }
 
 #[tokio::main]
@@ -514,25 +541,106 @@ async fn main() -> anyhow::Result<()> {
         match active_tenant_ids(&ops_db).await {
             Ok(tenants) => {
                 for tid in tenants {
-                    match resolve_tenant_db(tid, &ops_db, &cache, &fallback).await {
+                    match resolve_required_tenant_db(tid, &ops_db, &cache, &fallback).await {
                         Ok(tdb) => {
                             match TenantBusinessClock::load(&ops_db, tid).await {
-                                Ok(clock) => match process_due_separations(&tdb, tid, clock.now_date()).await {
-                                    Ok(result) if result.processed > 0 => {
-                                        tracing::info!(%tid, processed = result.processed, "due employee offboarding completed");
+                                Ok(clock) => {
+                                    let now = Utc::now();
+                                    let business_date = clock.business_date(now);
+                                    let business_time = clock.local_time(now);
+                                    match process_due_separations(&tdb, tid, business_date).await {
+                                        Ok(result) if result.processed > 0 => {
+                                            tracing::info!(%tid, processed = result.processed, "due employee offboarding completed");
+                                        }
+                                        Ok(_) => {}
+                                        Err(error) => tracing::error!(%tid, code = error.code(), "due employee offboarding sweep failed"),
                                     }
-                                    Ok(_) => {}
-                                    Err(error) => tracing::error!(%tid, code = error.code(), "due employee offboarding sweep failed"),
-                                },
-                                Err(error) => tracing::error!(%tid, code = error.code(), "tenant business clock unavailable for offboarding sweep"),
+                                    let (employee_enabled, attendance_enabled) = match Entitlements::load(&ops_db, tid).await {
+                                        Ok(state) => (state.allows("EMPLOYEE"), state.allows("ATTENDANCE")),
+                                        Err(error) => {
+                                            tracing::error!(%tid, code = error.code(), "scheduled domain work held: entitlements unavailable");
+                                            (false, false)
+                                        }
+                                    };
+                                    if attendance_enabled {
+                                        match kabipay_attendance::sweep_expired_attendance(&tdb, tid, clock, 50).await {
+                                            Ok(result) if result.expired > 0 || result.failed > 0 => tracing::info!(
+                                                %tid, expired = result.expired, failed = result.failed, "attendance expiry sweep completed"
+                                            ),
+                                            Ok(_) => {},
+                                            Err(error) => tracing::error!(%tid, code = error.code(), "attendance expiry sweep failed"),
+                                        }
+                                    }
+                                    if employee_enabled {
+                                    match process_due_surveys(&tdb, tid).await {
+                                        Ok(result) if result.opened > 0 || result.closed > 0 || result.failed > 0 => tracing::info!(
+                                            %tid, opened = result.opened, closed = result.closed, failed = result.failed,
+                                            "scheduled survey sweep completed"
+                                        ),
+                                        Ok(_) => {},
+                                        Err(error) => tracing::error!(%tid, code = error.code(), "scheduled survey sweep failed"),
+                                    }
+                                    match process_due_celebrations(
+                                        &tdb,
+                                        tid,
+                                        business_date,
+                                        business_time,
+                                    )
+                                    .await
+                                    {
+                                        Ok(result) if result.notifications_created > 0 => {
+                                            tracing::info!(
+                                                %tid,
+                                                eligible_events = result.eligible_events,
+                                                notifications_created = result.notifications_created,
+                                                duplicates_skipped = result.duplicates_skipped,
+                                                "automated employee notification sweep completed"
+                                            );
+                                        }
+                                        Ok(_) => {}
+                                        Err(error) => tracing::error!(
+                                            %tid,
+                                            code = error.code(),
+                                            "automated employee notification sweep failed"
+                                        ),
+                                    }
+                                    match process_due_performance_cycles(&tdb, tid, business_date).await {
+                                        Ok(result) if result.cycles_created > 0 => tracing::info!(
+                                            %tid,
+                                            cycles_created = result.cycles_created,
+                                            participants_created = result.participants_created,
+                                            "scheduled performance cycle sweep completed"
+                                        ),
+                                        Ok(_) => {}
+                                        Err(error) => tracing::error!(
+                                            %tid,
+                                            code = error.code(),
+                                            "scheduled performance cycle sweep failed"
+                                        ),
+                                    }
+                                    match process_due_performance_stage_deadlines(&tdb, tid, business_date).await {
+                                        Ok(result) if result.stages_advanced > 0 || result.stages_blocked > 0 => tracing::info!(%tid, stages_advanced = result.stages_advanced, stages_blocked = result.stages_blocked, "scheduled performance stage sweep completed"),
+                                        Ok(_) => {}
+                                        Err(error) => tracing::error!(%tid, code = error.code(), "scheduled performance stage sweep failed"),
+                                    }
+                                    }
+                                }
+                                Err(error) => tracing::error!(
+                                    %tid,
+                                    code = error.code(),
+                                    "tenant business clock unavailable for scheduled tenant sweeps"
+                                ),
                             }
                             if let Err(error) = sweep_expired_company_upload_stages(&tdb, tid, 25).await {
                                 tracing::error!(%tid, code = error.code(), "expired file-upload stage sweep failed");
                             }
+                            if let Err(error) = kabipay_notification::services::announcement_video::sweep_expired(&tdb, tid, 25).await {
+                                tracing::error!(%tid, code=error.code(), "expired video upload sweep failed");
+                            }
                             if let Err(error) = process_private_file_cleanup_tasks(&tdb, tid, 25).await {
                                 tracing::error!(%tid, code = error.code(), "private file cleanup sweep failed");
                             }
-                            if let Err(e) = process_tenant_outbox(&tdb, tid, cap).await {
+                            if let Err(e) = process_tenant_outbox(&ops_db, &tdb, tid, cap).await {
                                 tracing::error!(%tid, error = %e, "tenant outbox sweep failed");
                             }
                         }

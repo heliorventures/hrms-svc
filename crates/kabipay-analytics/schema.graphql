@@ -1,0 +1,282 @@
+﻿type AuditLogRow {
+	id: ID!
+	userId: ID
+	entityType: String!
+	entityId: ID
+	action: String!
+	beforeJson: String
+	afterJson: String
+	ipAddress: String
+	createdAt: DateTime!
+}
+
+type DashboardRow {
+	id: ID!
+	name: String!
+	description: String
+	isDefault: Boolean!
+	createdAt: DateTime!
+}
+
+type DashboardWidgetRow {
+	id: ID!
+	dashboardId: ID!
+	reportDefinitionId: ID
+	widgetType: String
+	title: String
+	gridCol: Int
+	gridRow: Int
+	colSpan: Int
+	rowSpan: Int
+}
+
+"""
+Implement the DateTime<Utc> scalar
+
+The input/output is a string in RFC3339 format.
+"""
+scalar DateTime
+
+type HrInsights {
+	onTimeDays: Int
+	lateDays: Int
+	unknownPunctualityDays: Int
+	incompleteDays: Int
+	joiners: Int
+	exits: Int
+	activeHeadcount: Int
+	netSalaryGenerated: String
+	generatedPayslips: Int
+	pendingRequests: Int
+	monthlyPayroll: [HrMonthlyPayroll!]
+	includedPendingDomains: [String!]!
+}
+
+type HrMonthlyPayroll {
+	month: String!
+	netSalaryGenerated: String!
+	payslips: Int!
+}
+
+type HrReportCsv {
+	fileName: String!
+	csv: String!
+	rowCount: Int!
+}
+
+enum HrReportKind {
+	ATTENDANCE_PUNCTUALITY
+	LEAVE_REQUESTS
+	LEAVE_BALANCES
+	PAYROLL_REGISTER
+	UNPAID_LEAVE
+	EMPLOYEE_MOVEMENTS
+	TIMESHEET_HOURS
+	COMP_OFF_CREDITS
+	PENDING_REQUESTS
+}
+
+type HrReportRows {
+	columns: [String!]!
+	rows: [[String!]!]!
+	totalRows: Int!
+}
+
+type IntegrationConnectorCatalogRow {
+	id: ID!
+	name: String!
+	code: String!
+	category: String
+	authType: String
+	isActive: Boolean!
+}
+
+type MutationRoot {
+	"""
+	Send a **FAILED** or **PROCESSING** outbox row back to **PENDING** (same RBAC as `outboxEvents`).
+	"""
+	requeueOutboxEvent(id: ID!): OutboxEventRow!
+	"""
+	Connect (or reconnect) an integration connector for this tenant (**HR / directory admins**).
+	"""
+	connectTenantIntegration(connectorId: ID!): TenantIntegrationRow!
+	"""
+	Register a webhook subscription (**HR / directory admins**).
+	"""
+	registerWebhookSubscription(input: RegisterWebhookInput!): WebhookSubscriptionRow!
+	setWebhookSubscriptionActive(id: ID!, active: Boolean!): WebhookSubscriptionRow!
+}
+
+"""
+ISO 8601 calendar date without timezone.
+Format: %Y-%m-%d
+
+# Examples
+
+* `1994-11-13`
+* `2000-02-24`
+"""
+scalar NaiveDate
+
+type OutboxEventRow {
+	id: ID!
+	aggregateType: String!
+	aggregateId: ID!
+	eventType: String!
+	payloadJson: String!
+	status: String!
+	retryCount: Int!
+	lastError: String
+	createdAt: DateTime!
+	processedAt: DateTime
+	"""
+	Present while the outbox worker holds the row (`PROCESSING`).
+	"""
+	claimedAt: DateTime
+}
+
+type QueryRoot {
+	hrReportRows(kind: HrReportKind!, fromDate: NaiveDate!, toDate: NaiveDate!, employeeId: UUID, employeeSearch: String, offset: Int! = 0, limit: Int! = 50): HrReportRows!
+	hrReportCsv(kind: HrReportKind!, fromDate: NaiveDate!, toDate: NaiveDate!, employeeId: UUID, employeeSearch: String): HrReportCsv!
+	hrInsights(fromDate: NaiveDate!, toDate: NaiveDate!): HrInsights!
+	analyticsHealth: String!
+	reportDefinitions(limit: Int! = 100): [ReportDefinitionRow!]!
+	reportSchedules(limit: Int! = 100): [ReportScheduleRow!]!
+	dashboards(limit: Int! = 50): [DashboardRow!]!
+	dashboardWidgets(dashboardId: ID, limit: Int! = 100): [DashboardWidgetRow!]!
+	workforceSnapshots(limit: Int! = 24): [WorkforceSnapshotRow!]!
+	"""
+	**HR / directory admins only** — inspect transactional outbox rows (e.g. after leave approval).
+	"""
+	outboxEvents(status: String, limit: Int! = 100): [OutboxEventRow!]!
+	"""
+	**HR / directory admins only** — global connector catalogue (ops DB).
+	"""
+	integrationConnectors(limit: Int! = 100): [IntegrationConnectorCatalogRow!]!
+	"""
+	**HR / directory admins only** — tenant integration rows.
+	"""
+	tenantIntegrations(limit: Int! = 100): [TenantIntegrationRow!]!
+	"""
+	**HR / directory admins only** — outbound webhook subscriptions.
+	"""
+	webhookSubscriptions(limit: Int! = 100): [WebhookSubscriptionRow!]!
+	"""
+	**HR / directory admins only** — webhook POST attempts (**`webhook_delivery_log`**), newest first.
+	"""
+	webhookDeliveryLogs(limit: Int! = 100): [WebhookDeliveryLogRow!]!
+	"""
+	**HR / directory admins only** — communication/entity audit log (most recent first).
+	"""
+	auditLogs(limit: Int! = 200): [AuditLogRow!]!
+}
+
+input RegisterWebhookInput {
+	eventName: String!
+	endpointUrl: String!
+	"""
+	Optional signing secret (**SHA256** stored server-side).
+	"""
+	webhookSecret: String
+}
+
+type ReportDefinitionRow {
+	id: ID!
+	name: String!
+	entityType: String
+	filtersJson: String
+	columnsJson: String
+	groupbyJson: String
+	chartType: String
+	isPublic: Boolean!
+	createdAt: DateTime!
+	updatedAt: DateTime!
+}
+
+type ReportScheduleRow {
+	id: ID!
+	reportDefinitionId: ID!
+	frequency: String!
+	recipientsJson: String
+	deliveryFormat: String
+	isActive: Boolean!
+	lastSentAt: DateTime
+	nextRunAt: DateTime
+	createdAt: DateTime!
+}
+
+type TenantIntegrationRow {
+	id: ID!
+	integrationConnectorId: ID!
+	isActive: Boolean!
+	connectedAt: DateTime
+	createdAt: DateTime!
+}
+
+"""
+A UUID is a unique 128-bit number, stored as 16 octets. UUIDs are parsed as
+Strings within GraphQL. UUIDs are used to assign unique identifiers to
+entities without requiring a central allocating authority.
+
+# References
+
+* [Wikipedia: Universally Unique Identifier](http://en.wikipedia.org/wiki/Universally_unique_identifier)
+* [RFC4122: A Universally Unique Identifier (UUID) URN Namespace](http://tools.ietf.org/html/rfc4122)
+"""
+scalar UUID
+
+type WebhookDeliveryLogRow {
+	id: ID!
+	webhookSubscriptionId: ID!
+	eventName: String
+	payloadJson: String
+	httpStatus: Int
+	responseBody: String
+	isSuccess: Boolean!
+	attemptNumber: Int!
+	deliveredAt: DateTime!
+	createdAt: DateTime!
+}
+
+type WebhookSubscriptionRow {
+	id: ID!
+	eventName: String!
+	endpointUrl: String!
+	"""
+	Stored as SHA256 hex (`None` when no signing secret configured).
+	"""
+	secretHash: String
+	isActive: Boolean!
+	createdAt: DateTime!
+}
+
+type WorkforceSnapshotRow {
+	id: ID!
+	snapshotDate: NaiveDate!
+	totalHeadcount: Int
+	activeEmployees: Int
+	newJoiners: Int
+	separations: Int
+	openPositions: Int
+	averageTenureMonths: String
+	attritionRate: String
+	createdAt: DateTime!
+}
+
+"""
+Directs the executor to include this field or fragment only when the `if` argument is true.
+"""
+directive @include(if: Boolean!) on FIELD | FRAGMENT_SPREAD | INLINE_FRAGMENT
+"""
+Directs the executor to skip this field or fragment when the `if` argument is true.
+"""
+directive @skip(if: Boolean!) on FIELD | FRAGMENT_SPREAD | INLINE_FRAGMENT
+"""
+Provides a scalar specification URL for specifying the behavior of custom scalar types.
+"""
+directive @specifiedBy(url: String!) on SCALAR
+schema {
+	query: QueryRoot
+	mutation: MutationRoot
+}
+

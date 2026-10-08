@@ -206,7 +206,9 @@ pub struct IntegrationConnectorCatalogDto {
     pub is_active: bool,
 }
 
-impl From<kabipay_db_entities::ops::integration_connector::Model> for IntegrationConnectorCatalogDto {
+impl From<kabipay_db_entities::ops::integration_connector::Model>
+    for IntegrationConnectorCatalogDto
+{
     fn from(m: kabipay_db_entities::ops::integration_connector::Model) -> Self {
         Self {
             id: ID(m.id.to_string()),
@@ -258,7 +260,9 @@ pub struct WebhookSubscriptionDto {
 impl From<kabipay_db_entities::tenant::d0026_integrations::webhook_subscription::Model>
     for WebhookSubscriptionDto
 {
-    fn from(m: kabipay_db_entities::tenant::d0026_integrations::webhook_subscription::Model) -> Self {
+    fn from(
+        m: kabipay_db_entities::tenant::d0026_integrations::webhook_subscription::Model,
+    ) -> Self {
         Self {
             id: ID(m.id.to_string()),
             event_name: m.event_name,
@@ -288,7 +292,9 @@ pub struct WebhookDeliveryLogDto {
 impl From<kabipay_db_entities::tenant::d0026_integrations::webhook_delivery_log::Model>
     for WebhookDeliveryLogDto
 {
-    fn from(m: kabipay_db_entities::tenant::d0026_integrations::webhook_delivery_log::Model) -> Self {
+    fn from(
+        m: kabipay_db_entities::tenant::d0026_integrations::webhook_delivery_log::Model,
+    ) -> Self {
         Self {
             id: ID(m.id.to_string()),
             webhook_subscription_id: ID(m.webhook_subscription_id.to_string()),
@@ -318,7 +324,9 @@ pub struct AuditLogDto {
     pub created_at: DateTime<Utc>,
 }
 
-impl From<kabipay_db_entities::tenant::d0027_communication_audit::audit_log::Model> for AuditLogDto {
+impl From<kabipay_db_entities::tenant::d0027_communication_audit::audit_log::Model>
+    for AuditLogDto
+{
     fn from(m: kabipay_db_entities::tenant::d0027_communication_audit::audit_log::Model) -> Self {
         Self {
             id: ID(m.id.to_string()),
@@ -326,9 +334,7 @@ impl From<kabipay_db_entities::tenant::d0027_communication_audit::audit_log::Mod
             entity_type: m.entity_type,
             entity_id: m.entity_id.map(|u| ID(u.to_string())),
             action: m.action,
-            before_json: m
-                .before_state
-                .and_then(|j| serde_json::to_string(&j).ok()),
+            before_json: m.before_state.and_then(|j| serde_json::to_string(&j).ok()),
             after_json: m.after_state.and_then(|j| serde_json::to_string(&j).ok()),
             ip_address: m.ip_address,
             created_at: m.created_at,

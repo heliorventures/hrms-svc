@@ -2,12 +2,15 @@
 
 use chrono::{Datelike, NaiveDate, Utc};
 use kabipay_common::client_data_scope::EmployeeScopeFilter;
+pub use kabipay_common::expense_payment::{
+    normalize_expense_payment_status_wire, PAYMENT_STATUS_FAILED, PAYMENT_STATUS_NONE,
+    PAYMENT_STATUS_ON_HOLD, PAYMENT_STATUS_PAID, PAYMENT_STATUS_PENDING,
+};
 use kabipay_common::workflow_approval;
 use kabipay_common::{KabiPayError, KabiPayResult};
 use kabipay_db_entities::tenant::d0005_auth_rbac::user_role;
 use kabipay_db_entities::tenant::d0007_employee_core::employee;
 use kabipay_db_entities::tenant::d0015_expense::{expense, expense_category, expense_policy};
-use kabipay_db_entities::tenant::d0029_file_storage::file_storage;
 use kabipay_db_entities::tenant::d0025_workflow::{
     workflow, workflow_action, workflow_instance, workflow_step,
 };
@@ -119,6 +122,7 @@ pub async fn submit_expense(
         ));
     }
     let currency = normalize_currency_code(currency)?;
+    let receipt_id = super::request_file_service::required_file_id(receipt_file_storage_id)?;
 
     let txn = db.begin().await?;
 
@@ -172,16 +176,9 @@ pub async fn submit_expense(
         }
     }
 
-    if constraints.receipt_required {
-        let fid = receipt_file_storage_id.ok_or_else(|| {
-            KabiPayError::Validation(
-                "a receipt attachment is required for this category/policy".into(),
-            )
-        })?;
-        assert_receipt_file_owned(&txn, tenant_id, fid, logged_in_user_id).await?;
-    } else if let Some(fid) = receipt_file_storage_id {
-        assert_receipt_file_owned(&txn, tenant_id, fid, logged_in_user_id).await?;
-    }
+    super::request_file_service::require_submission_file(
+        &txn, tenant_id, logged_in_user_id, receipt_id,
+    ).await?;
 
     if let Some(tid) = travel_request_id {
         let t = travel_request::Entity::find()
@@ -367,12 +364,6 @@ const STATUS_APPROVED: &str = "APPROVED";
 const STATUS_PARTIAL_APPROVED: &str = "PARTIAL_APPROVED";
 const STATUS_REJECTED: &str = "REJECTED";
 
-pub const PAYMENT_STATUS_NONE: &str = "NONE";
-pub const PAYMENT_STATUS_PENDING: &str = "PENDING_PAYMENT";
-pub const PAYMENT_STATUS_PAID: &str = "PAID";
-pub const PAYMENT_STATUS_FAILED: &str = "FAILED";
-pub const PAYMENT_STATUS_ON_HOLD: &str = "ON_HOLD";
-
 const POLICY_ALL: &str = "ALL";
 const POLICY_DEPT: &str = "DEPARTMENT";
 const POLICY_DES: &str = "DESIGNATION";
@@ -471,7 +462,7 @@ pub async fn resolve_expense_submit_constraints(
 
     if policies.is_empty() {
         return Ok(ExpenseSubmitConstraints {
-            receipt_required: false,
+            receipt_required: true,
             max_amount_per_claim: category_max,
             limit_per_day: None,
             limit_per_month: None,
@@ -499,14 +490,15 @@ pub async fn resolve_expense_submit_constraints(
 
     if tier_models.is_empty() {
         return Ok(ExpenseSubmitConstraints {
-            receipt_required: false,
+            receipt_required: true,
             max_amount_per_claim: category_max,
             limit_per_day: None,
             limit_per_month: None,
         });
     }
 
-    let receipt_required = tier_models.iter().any(|p| p.receipt_required);
+    // Every new claim requires evidence, including categories with historical policies.
+    let receipt_required = true;
 
     let mut caps: Vec<Decimal> = Vec::new();
     if let Some(c) = category_max.filter(|x| *x > Decimal::ZERO) {
@@ -566,28 +558,6 @@ async fn sum_month_claimed_for_category(
         .await
         .map_err(KabiPayError::from)?;
     Ok(rows.iter().map(|e| e.amount).sum())
-}
-
-async fn assert_receipt_file_owned(
-    db: &impl ConnectionTrait,
-    tenant_id: Uuid,
-    file_id: Uuid,
-    uploader_user_id: Uuid,
-) -> KabiPayResult<()> {
-    let f = file_storage::Entity::find_by_id(file_id)
-        .filter(file_storage::Column::TenantId.eq(tenant_id))
-        .one(db)
-        .await?
-        .ok_or_else(|| KabiPayError::NotFound {
-            entity: "file_storage",
-            id: file_id.to_string(),
-        })?;
-    if f.uploaded_by != Some(uploader_user_id) {
-        return Err(KabiPayError::Validation(
-            "receipt file must be uploaded by the submitting user".into(),
-        ));
-    }
-    Ok(())
 }
 
 /// Matches **`outbox_event.status`** (`PENDING` until worker processes — **M7**).
@@ -1047,20 +1017,6 @@ pub async fn delete_expense_category(
     am.updated_at = Set(now);
     am.update(db).await?;
     Ok(())
-}
-
-pub fn normalize_expense_payment_status_wire(s: &str) -> KabiPayResult<&'static str> {
-    match s.trim() {
-        "NONE" | "none" => Ok(PAYMENT_STATUS_NONE),
-        "PENDING_PAYMENT" | "pending_payment" | "PendingPayment" => Ok(PAYMENT_STATUS_PENDING),
-        "PAID" | "paid" => Ok(PAYMENT_STATUS_PAID),
-        "FAILED" | "failed" => Ok(PAYMENT_STATUS_FAILED),
-        "ON_HOLD" | "on_hold" | "OnHold" => Ok(PAYMENT_STATUS_ON_HOLD),
-        _ => Err(KabiPayError::Validation(
-            "unknown expense payment status; expected NONE | PENDING_PAYMENT | PAID | FAILED | ON_HOLD"
-                .into(),
-        )),
-    }
 }
 
 pub async fn mark_expense_payment_status(

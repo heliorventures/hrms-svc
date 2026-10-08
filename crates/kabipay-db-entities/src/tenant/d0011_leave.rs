@@ -129,6 +129,7 @@ pub mod leave_request {
         pub supporting_document_file_storage_id: Option<Uuid>,
         pub approved_by: Option<Uuid>,
         pub workflow_instance_id: Option<Uuid>,
+        pub uses_comp_off: bool,
         pub applied_at: DateTimeUtc,
         pub is_deleted: bool,
         pub deleted_at: Option<DateTimeUtc>,

@@ -36,11 +36,15 @@ pub struct EmployeeDto {
     pub date_of_joining: NaiveDate,
     pub department_id: Option<ID>,
     pub designation_id: Option<ID>,
+    pub location_id: Option<ID>,
+    pub location_name: Option<String>,
+    pub location_assignment_effective_from: Option<NaiveDate>,
     pub reporting_manager_id: Option<ID>,
     pub user_id: Option<ID>,
     #[graphql(name = "dateOfBirth")]
     pub date_of_birth: Option<NaiveDate>,
     pub gender: Option<String>,
+    pub marital_status: Option<String>,
     pub nationality: Option<String>,
     #[graphql(name = "emergencyContactName")]
     pub emergency_contact_name: Option<String>,
@@ -530,6 +534,20 @@ pub struct UpdateEmployeeInput {
     pub linked_user_email: Option<String>,
 }
 
+#[derive(InputObject, Clone)]
+pub struct SetEmployeeUanNumberInput {
+    pub employee_id: ID,
+    /// Exactly 12 digits, or an empty string to explicitly clear the stored number.
+    pub uan_number: String,
+}
+
+#[derive(InputObject, Clone)]
+pub struct SetEmployeeEsicNumberInput {
+    pub employee_id: ID,
+    /// Exactly 10 digits, or an empty string to explicitly clear the stored number.
+    pub esic_number: String,
+}
+
 #[derive(InputObject, Clone, Debug)]
 pub struct UpdateEmployeePersonalProfileInput {
     pub employee_id: ID,
@@ -537,6 +555,7 @@ pub struct UpdateEmployeePersonalProfileInput {
     pub last_name: Option<String>,
     pub date_of_birth: Option<NaiveDate>,
     pub gender: Option<String>,
+    pub marital_status: Option<String>,
     pub nationality: Option<String>,
     #[graphql(name = "bloodGroup")]
     pub blood_group: Option<String>,
@@ -552,6 +571,7 @@ pub struct UpdateEmployeeSelfServiceProfileInput {
     pub current_address: Option<String>,
     pub permanent_address: Option<String>,
     pub gender: Option<String>,
+    pub marital_status: Option<String>,
     pub nationality: Option<String>,
     #[graphql(name = "bloodGroup")]
     pub blood_group: Option<String>,
@@ -1124,10 +1144,14 @@ impl From<employee::Model> for EmployeeDto {
             date_of_joining: m.date_of_joining,
             department_id: m.department_id.map(|id| ID(id.to_string())),
             designation_id: m.designation_id.map(|id| ID(id.to_string())),
+            location_id: m.location_id.map(|id| ID(id.to_string())),
+            location_name: None,
+            location_assignment_effective_from: None,
             reporting_manager_id: m.reporting_manager_id.map(|id| ID(id.to_string())),
             user_id: m.user_id.map(|id| ID(id.to_string())),
             date_of_birth: m.date_of_birth,
             gender: m.gender,
+            marital_status: m.marital_status,
             nationality: m.nationality,
             emergency_contact_name: m.emergency_contact_name,
             emergency_contact_phone: m.emergency_contact_phone,
@@ -1242,6 +1266,13 @@ pub struct TenantPermissionScopeDto {
     pub resource: String,
     pub action: String,
     pub scope_type: String,
+}
+
+/// Dismissal state for the authenticated user's application overview.
+#[derive(SimpleObject, Clone, Debug)]
+#[graphql(name = "MyGuidanceState")]
+pub struct MyGuidanceStateDto {
+    pub overview_dismissed_at: Option<DateTime<Utc>>,
 }
 
 impl From<permission_scope::Model> for TenantPermissionScopeDto {

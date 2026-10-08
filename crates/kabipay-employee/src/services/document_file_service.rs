@@ -16,7 +16,7 @@ use uuid::Uuid;
 
 use super::object_store::{
     FileStorageMode, S3CompatSettings, ensure_tenant_bucket, s3_operator_for_bucket, s3_put,
-    s3_read, tenant_bucket_name, PROVIDER_S3_COMPAT,
+    tenant_bucket_name, PROVIDER_S3_COMPAT,
 };
 use crate::entities::d0008_document_system::employee_document;
 use crate::entities::d0029_file_storage::file_storage;
@@ -142,45 +142,7 @@ fn absolute_storage_path(storage_path: &str) -> KabiPayResult<PathBuf> {
 
 /// Read bytes for `GET /files/employee-document`. Uses row metadata (not only current env) so
 /// old local files still work after switching to R2.
-pub async fn read_stored_file_bytes(
-    file_root: &Path,
-    row: &file_storage::Model,
-) -> KabiPayResult<Vec<u8>> {
-    if row.provider == PROVIDER_LOCAL {
-        if row.storage_path.contains('\\')
-            || Path::new(&row.storage_path).components().any(|part| {
-                matches!(
-                    part,
-                    Component::ParentDir | Component::RootDir | Component::Prefix(_)
-                )
-            })
-        {
-            return Err(KabiPayError::Validation("invalid file path".into()));
-        }
-        let full = file_root.join(&row.storage_path);
-        return match tokio::fs::read(&full).await {
-            Ok(b) => Ok(b),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(KabiPayError::NotFound {
-                entity: "document",
-                id: "requested".to_string(),
-            }),
-            Err(e) => Err(KabiPayError::Internal(format!("read local file: {e}"))),
-        };
-    }
-    if row.provider == PROVIDER_S3_COMPAT {
-        let cfg = S3CompatSettings::from_env()?;
-        let b = row
-            .bucket
-            .as_ref()
-            .ok_or_else(|| KabiPayError::Internal("S3 file missing bucket name in DB".into()))?;
-        let op = s3_operator_for_bucket(&cfg, b)?;
-        return s3_read(&op, &row.storage_path).await;
-    }
-    Err(KabiPayError::Validation(format!(
-        "unsupported file_storage.provider: {}",
-        row.provider
-    )))
-}
+pub use kabipay_common::private_file_reader::read_stored_file_bytes;
 
 /// Persist `bytes` to disk or object storage, then `file_storage` + `employee_document`.
 /// When `hr_auto_approve`, status is **`APPROVED`** and verifier timestamps use the uploader.

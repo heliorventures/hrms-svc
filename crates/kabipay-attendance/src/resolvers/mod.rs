@@ -3,6 +3,7 @@ pub mod mutation;
 pub mod query;
 pub mod timesheet_assignment_auth;
 pub mod types;
+pub mod weekly_off_types;
 
 pub use mutation::MutationRoot;
 pub use query::QueryRoot;

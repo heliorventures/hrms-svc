@@ -83,7 +83,7 @@ After a **release** or **debug** build, from this directory:
 .\scripts\start-subgraphs.ps1
 ```
 
-The script starts **debug** binaries under `target\debug\kabipay-*.exe`: **ops** on **4010**, tenant modules **4013–4029**. Unless you set `KABIPAY_DB_POOL_MAX` / `KABIPAY_TENANT_DB_POOL_MAX` in your shell, it defaults both to **1** so many processes can share a small managed Postgres `max_connections` limit (otherwise startup hits “pool timed out” when the DB refuses new connections). Ensure **`kabipay-auth`** is started separately if the UI or gateway needs login.
+The script starts **debug** binaries under `target\debug\kabipay-*.exe`: **ops** on **4010**, tenant modules **4013–4030**. Unless you set `KABIPAY_DB_POOL_MAX` / `KABIPAY_TENANT_DB_POOL_MAX` in your shell, it defaults both to **1** so many processes can share a small managed Postgres `max_connections` limit (otherwise startup hits “pool timed out” when the DB refuses new connections). Ensure **`kabipay-auth`** is started separately if the UI or gateway needs login.
 
 ## Scripts (optional)
 
@@ -117,9 +117,10 @@ Database setup, tenant provisioning, tenant Liquibase updates, and demo seed dat
 | `kabipay-workflow` | GraphQL | `KABIPAY_WORKFLOW_PORT` | 4027 |
 | `kabipay-notification` | GraphQL | `KABIPAY_NOTIFICATION_PORT` | 4028 |
 | `kabipay-analytics` | GraphQL | `KABIPAY_ANALYTICS_PORT` | 4029 |
+| `kabipay-survey` | GraphQL | `KABIPAY_SURVEY_PORT` | 4030 |
 | `kabipay-outbox-worker` | Background worker (no HTTP) | — | — |
 
-Stitched URLs: `http://127.0.0.1:<port>/graphql`. Canonical list for the gateway: `kabipay-gateway/src/subgraphs.ts`. `start-subgraphs.ps1` starts **ops** plus tenant-module GraphQL executables (4010, 4013–4029); run **auth** and **outbox** separately.
+Stitched URLs: `http://127.0.0.1:<port>/graphql`. Canonical list for the gateway: `kabipay-gateway/src/subgraphs.ts`. `start-subgraphs.ps1` starts **ops** plus tenant-module GraphQL executables (4010, 4013–4030); run **auth** and **outbox** separately.
 
 ## Related repositories
 

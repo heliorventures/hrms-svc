@@ -62,6 +62,7 @@ impl From<expense_category::Model> for ExpenseCategoryDto {
 #[graphql(complex)]
 #[graphql(name = "Expense")]
 pub struct ExpenseDto {
+    pub has_supporting_file: bool,
     pub id: ID,
     pub tenant_id: ID,
     pub employee_id: ID,
@@ -103,6 +104,7 @@ pub struct SubmitExpenseInput {
 #[graphql(complex)]
 #[graphql(name = "TravelRequest")]
 pub struct TravelRequestDto {
+    pub has_supporting_file: bool,
     pub id: ID,
     pub tenant_id: ID,
     pub employee_id: ID,
@@ -111,6 +113,7 @@ pub struct TravelRequestDto {
     pub from_date: NaiveDate,
     pub to_date: NaiveDate,
     pub purpose: String,
+    pub supporting_file_storage_id: Option<ID>,
     pub estimated_amount: Option<String>,
     pub currency: String,
     pub status: String,
@@ -131,6 +134,8 @@ pub struct SubmitTravelRequestInput {
     pub from_date: NaiveDate,
     pub to_date: NaiveDate,
     pub purpose: String,
+    /// Nullable in the schema for a clear service validation error; required for new requests.
+    pub supporting_file_storage_id: Option<ID>,
     /// Optional string decimal; omit for unknown estimate.
     pub estimated_amount: Option<String>,
     pub currency: String,
@@ -221,6 +226,8 @@ impl From<kabipay_db_entities::tenant::d0033_travel_request::travel_request::Mod
             from_date: m.from_date,
             to_date: m.to_date,
             purpose: m.purpose,
+            has_supporting_file: m.supporting_file_storage_id.is_some(),
+            supporting_file_storage_id: m.supporting_file_storage_id.map(|id| ID(id.to_string())),
             estimated_amount: m.estimated_amount.map(|d| d.to_string()),
             currency: m.currency,
             status: m.status,
@@ -351,6 +358,7 @@ impl From<expense::Model> for ExpenseDto {
             payment_status: m.payment_status,
             paid_at: m.paid_at,
             payment_reference: m.payment_reference,
+            has_supporting_file: m.receipt_file_storage_id.is_some(),
             receipt_file_storage_id: m.receipt_file_storage_id.map(|u| ID(u.to_string())),
             approval_snapshot_cache: ApprovalSnapshotCache::default(),
         }
@@ -390,6 +398,7 @@ mod tests {
                 paid_at: None,
                 payment_reference: None,
                 receipt_file_storage_id: None,
+                has_supporting_file: false,
                 approval_snapshot_cache: ApprovalSnapshotCache::default(),
             }
         }
@@ -404,6 +413,8 @@ mod tests {
                 from_date: NaiveDate::from_ymd_opt(2026, 8, 27).expect("valid date"),
                 to_date: NaiveDate::from_ymd_opt(2026, 8, 28).expect("valid date"),
                 purpose: "Client visit".into(),
+                supporting_file_storage_id: None,
+                has_supporting_file: false,
                 estimated_amount: None,
                 currency: "INR".into(),
                 status: "PENDING".into(),

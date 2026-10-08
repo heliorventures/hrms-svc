@@ -5,7 +5,6 @@ use std::sync::Mutex;
 use std::sync::OnceLock;
 
 use kabipay_common::{KabiPayError, KabiPayResult};
-use opendal::services::S3;
 use opendal::Operator;
 use reqsign::AwsCredential;
 use reqsign::AwsV4Signer;
@@ -32,22 +31,7 @@ pub fn tenant_bucket_name(tenant_id: Uuid, prefix: &str) -> String {
 }
 
 /// Build an OpenDAL operator for a single named bucket.
-pub fn s3_operator_for_bucket(cfg: &S3CompatSettings, bucket: &str) -> KabiPayResult<Operator> {
-    let mut s3 = S3::default();
-    s3 = s3
-        .bucket(bucket)
-        .endpoint(cfg.endpoint.as_str())
-        .region(cfg.region.as_str())
-        .access_key_id(cfg.access_key_id.as_str())
-        .secret_access_key(cfg.secret_access_key.as_str())
-        .root("/");
-    if !cfg.path_style {
-        s3 = s3.enable_virtual_host_style();
-    }
-    Operator::new(s3)
-        .map_err(|e| KabiPayError::Internal(format!("S3 operator: {e}")))
-        .map(|b| b.finish())
-}
+pub use kabipay_common::private_file_reader::s3_operator_for_bucket;
 
 /// Create bucket on the remote if not seen in-process yet (R2: same as S3 CreateBucket).
 pub async fn ensure_tenant_bucket(cfg: &S3CompatSettings, bucket: &str) -> KabiPayResult<()> {

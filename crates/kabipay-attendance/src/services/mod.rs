@@ -2,6 +2,8 @@
 pub mod attendance_regularization_service;
 pub mod attendance_management_service;
 pub mod attendance_report_service;
+pub mod attendance_summary_service;
+pub mod attendance_duration;
 pub mod hrms_master_service;
 pub mod punch_policy;
 pub mod timesheet_batch_service;
@@ -9,3 +11,9 @@ pub mod timesheet_dates;
 pub mod timesheet_notification_service;
 pub mod timesheet_policy;
 pub mod timesheet_project_assignment_service;
+pub mod attendance_day;
+pub mod attendance_day_runtime;
+pub mod weekly_off_policy_service;
+pub mod employee_holidays;
+
+pub mod holiday_management;

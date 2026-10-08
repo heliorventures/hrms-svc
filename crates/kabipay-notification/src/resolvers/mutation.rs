@@ -4,6 +4,8 @@ use async_graphql::{Context, Object, Result, ID};
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use kabipay_common::{
+    client_data_scope::data_scope_from_context,
+    context::{ScopeType, PERM_NOTIFICATION_MANAGE, PERM_NOTIFICATION_READ},
     subgraph::{require_client_claims, require_tenant_id, tenant_db},
     KabiPayError,
 };
@@ -11,10 +13,13 @@ use uuid::Uuid;
 
 use crate::resolvers::types::{
     AnnouncementDto, CreateAnnouncementInput, CreateDirectNotificationsInput,
-    NotificationDto, NotificationPreferencesGql, UpdateAnnouncementInput, UpdateNotificationAdminInput,
+    CelebrationPreferencesGql, NotificationAutomationSettingsGql, NotificationDto,
+    NotificationPreferencesGql, SaveNotificationAutomationSettingsInput,
+    UpdateAnnouncementInput, UpdateCelebrationPreferencesInput, UpdateNotificationAdminInput,
     UpdateNotificationPreferencesInput,
 };
 use crate::services::announcement_storage;
+use crate::services::automation_settings;
 use crate::services::notification_preference;
 use crate::services::notification_action;
 use crate::services::notification_service;
@@ -113,6 +118,21 @@ async fn maybe_store_doc(
     Ok(None)
 }
 
+fn require_notification_read(ctx: &Context<'_>) -> Result<()> {
+    data_scope_from_context(ctx, PERM_NOTIFICATION_READ).map(|_| ())
+}
+
+fn require_notification_manage_all(ctx: &Context<'_>) -> Result<()> {
+    let scope = data_scope_from_context(ctx, PERM_NOTIFICATION_MANAGE)?;
+    if scope != ScopeType::All {
+        return Err(KabiPayError::Forbidden(format!(
+            "{PERM_NOTIFICATION_MANAGE} permission requires ALL scope"
+        ))
+        .into_graphql());
+    }
+    Ok(())
+}
+
 async fn cleanup_attachment_ids(
     db: &sea_orm::DatabaseConnection,
     tenant_id: Uuid,
@@ -133,8 +153,161 @@ async fn cleanup_attachment_ids(
 
 pub struct MutationRoot;
 
+#[cfg(test)]
+mod tests {
+    use super::MutationRoot;
+    use async_graphql::{EmptySubscription, Object, Request, Schema};
+    use kabipay_common::context::{
+        ClientClaims, CLIENT_JWT_ISSUER, PERM_EMPLOYEE_READ, PERM_NOTIFICATION_MANAGE,
+        PERM_NOTIFICATION_READ,
+    };
+    use kabipay_common::subgraph::TenantId;
+    use std::collections::HashMap;
+    use uuid::Uuid;
+
+    struct TestQuery;
+
+    #[Object]
+    impl TestQuery {
+        async fn health(&self) -> bool {
+            true
+        }
+    }
+
+    fn claims(permission: &str, scope: Option<&str>) -> ClientClaims {
+        ClientClaims {
+            sub: Uuid::new_v4(),
+            iss: CLIENT_JWT_ISSUER.into(),
+            exp: 0,
+            iat: 0,
+            tenant_id: Uuid::new_v4(),
+            email: String::new(),
+            employee_id: Some(Uuid::new_v4()),
+            must_change_password: false,
+            roles: vec![],
+            permissions: vec![permission.into()],
+            permission_scopes: scope
+                .map(|scope| HashMap::from([(permission.into(), scope.into())]))
+                .unwrap_or_default(),
+            resource_scopes: HashMap::new(),
+        }
+    }
+
+    async fn execute(claims: ClientClaims, mutation: &str) -> async_graphql::Response {
+        let tenant_id = claims.tenant_id;
+        Schema::build(TestQuery, MutationRoot, EmptySubscription)
+            .data(TenantId(tenant_id))
+            .data(claims)
+            .finish()
+            .execute(Request::new(mutation))
+            .await
+    }
+
+    fn assert_forbidden_before_db(response: &async_graphql::Response, permission: &str) {
+        assert_eq!(response.errors.len(), 1, "unexpected response: {response:?}");
+        let message = &response.errors[0].message;
+        assert!(
+            message.contains(permission) && message.to_ascii_lowercase().contains("permission"),
+            "unexpected authorization error: {message}"
+        );
+        assert!(!message.to_ascii_lowercase().contains("database"));
+    }
+
+    #[tokio::test]
+    async fn automation_settings_mutation_requires_exact_manage_all_before_db_access() {
+        let mutation = r#"mutation {
+            saveNotificationAutomationSettings(input: {
+                birthdayEnabled: true,
+                workAnniversaryEnabled: true,
+                companySharingEnabled: true,
+                deliveryLocalTime: "09:00:00",
+                birthdayTitleTemplate: "Happy birthday, {employee_name}!",
+                birthdayMessageTemplate: "Happy birthday, {employee_name}!",
+                anniversaryTitleTemplate: "Work anniversary: {employee_name}",
+                anniversaryMessageTemplate: "{employee_name}: {service_years} years"
+            }) { __typename }
+        }"#;
+
+        for denied in [
+            claims(PERM_EMPLOYEE_READ, Some("ALL")),
+            claims(PERM_NOTIFICATION_READ, Some("ALL")),
+            claims(PERM_NOTIFICATION_MANAGE, Some("SELF")),
+            claims(PERM_NOTIFICATION_MANAGE, None),
+        ] {
+            assert_forbidden_before_db(
+                &execute(denied, mutation).await,
+                PERM_NOTIFICATION_MANAGE,
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn celebration_consent_mutation_requires_exact_read_permission_before_db_access() {
+        let mutation = r#"mutation {
+            updateMyCelebrationPreferences(input: {
+                shareBirthday: true,
+                shareWorkAnniversary: false
+            }) { __typename }
+        }"#;
+
+        for denied in [
+            claims(PERM_EMPLOYEE_READ, Some("ALL")),
+            claims(PERM_NOTIFICATION_MANAGE, Some("ALL")),
+            claims(PERM_NOTIFICATION_READ, None),
+        ] {
+            assert_forbidden_before_db(&execute(denied, mutation).await, PERM_NOTIFICATION_READ);
+        }
+    }
+}
+
 #[Object]
 impl MutationRoot {
+    /// Admin / HR: save tenant-wide automated employee-event settings.
+    async fn save_notification_automation_settings(
+        &self,
+        ctx: &Context<'_>,
+        input: SaveNotificationAutomationSettingsInput,
+    ) -> Result<NotificationAutomationSettingsGql> {
+        require_notification_manage_all(ctx)?;
+        let claims = require_client_claims(ctx)?;
+        let tenant_id = require_tenant_id(ctx)?;
+        let db = tenant_db(ctx, tenant_id).await?;
+        automation_settings::save_automation_settings(
+            &db,
+            tenant_id,
+            claims.sub,
+            input.into(),
+        )
+        .await
+        .map(NotificationAutomationSettingsGql::from)
+        .map_err(KabiPayError::into_graphql)
+    }
+
+    /// Save company-sharing consent only for the signed-in employee.
+    async fn update_my_celebration_preferences(
+        &self,
+        ctx: &Context<'_>,
+        input: UpdateCelebrationPreferencesInput,
+    ) -> Result<CelebrationPreferencesGql> {
+        require_notification_read(ctx)?;
+        let claims = require_client_claims(ctx)?;
+        let employee_id = claims.employee_id.ok_or_else(|| {
+            KabiPayError::Forbidden("a linked employee profile is required".into()).into_graphql()
+        })?;
+        let tenant_id = require_tenant_id(ctx)?;
+        let db = tenant_db(ctx, tenant_id).await?;
+        automation_settings::save_celebration_preferences(
+            &db,
+            tenant_id,
+            employee_id,
+            claims.sub,
+            input.into(),
+        )
+        .await
+        .map(CelebrationPreferencesGql::from)
+        .map_err(KabiPayError::into_graphql)
+    }
+
     /// Mark one in-app notification as read (must belong to the caller’s `user` id in the JWT).
     async fn mark_notification_read(
         &self,
@@ -163,6 +336,13 @@ impl MutationRoot {
     }
 
     /// Public bulletin visible to all authenticated users in the tenant (company news or employee post).
+    async fn prepare_announcement_video_upload(&self, ctx: &Context<'_>, file_name: String, mime_type: String, file_size_bytes: i32) -> Result<crate::services::announcement_video::AnnouncementVideoUpload> {
+        let tenant = require_tenant_id(ctx)?;
+        let owner = require_client_claims(ctx)?.sub;
+        let db = crate::services::announcement_video::required_db(ctx, tenant).await?;
+        crate::services::announcement_video::prepare(&db, tenant, owner, file_name, mime_type, file_size_bytes).await.map_err(KabiPayError::into_graphql)
+    }
+
     async fn create_announcement(
         &self,
         ctx: &Context<'_>,
@@ -232,6 +412,8 @@ impl MutationRoot {
             tenant_id,
             claims.sub,
             notification_service::NewAnnouncement {
+                video_upload_stage_id: input.video_upload_stage_id,
+                video_link: input.video_link,
                 title,
                 body: input.body,
                 target_audience,
@@ -337,6 +519,8 @@ impl MutationRoot {
         };
 
         let img_input = CreateAnnouncementInput {
+            video_upload_stage_id: None,
+            video_link: None,
             title: String::new(),
             body: None,
             target_audience: None,
@@ -402,6 +586,10 @@ impl MutationRoot {
         };
 
         let patch = notification_service::AnnouncementUpdate {
+            video_upload_stage_id: input.video_upload_stage_id,
+            video_link: input.video_link,
+            remove_video: input.remove_video.unwrap_or(false),
+            video_owner: claims.sub,
             title: input.title,
             body: input.body,
             clear_target_audience: clear_role_aud,

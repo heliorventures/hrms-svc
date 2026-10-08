@@ -4,7 +4,8 @@ use async_graphql::{Context, Object, Result, ID};
 use kabipay_common::{
     client_data_scope::data_scope_from_context,
     context::{ScopeType, PERM_LEAVE_APPROVE, PERM_LEAVE_MANAGE, PERM_LEAVE_SUBMIT},
-    subgraph::{require_client_claims, require_tenant_id, tenant_db},
+    subgraph::{ops_db, require_client_claims, require_tenant_id, tenant_db},
+    tenant_business_clock::TenantBusinessClock,
     KabiPayError,
 };
 use rust_decimal::Decimal;
@@ -12,8 +13,8 @@ use std::str::FromStr;
 
 use crate::resolvers::query::parse_uuid;
 use crate::resolvers::types::{
-    AdjustLeaveBalanceEntitlementInput, LeaveBalanceDto, LeavePolicyDto, LeaveRequestDto,
-    LeaveTypeDto, SubmitLeaveRequestInput, UpsertLeaveBalanceInput, UpsertLeavePolicyInput,
+    AdjustLeaveBalanceEntitlementInput, CompOffClaimDto, CompOffPolicyDto, LeaveBalanceDto, LeavePolicyDto, LeaveRequestDto,
+    LeaveTypeDto, SubmitCompOffClaimInput, SubmitLeaveRequestInput, UpsertCompOffPolicyInput, UpsertLeaveBalanceInput, UpsertLeavePolicyInput,
     UpsertLeaveTypeInput,
 };
 use crate::services::{leave_admin, leave_service};
@@ -60,6 +61,30 @@ fn require_leave_admin(ctx: &Context<'_>) -> Result<()> {
 
 #[Object]
 impl MutationRoot {
+    async fn submit_comp_off_claim(&self, ctx: &Context<'_>, input: SubmitCompOffClaimInput) -> Result<CompOffClaimDto> {
+        require_leave_submit(ctx)?; let tenant_id=require_tenant_id(ctx)?;let today=TenantBusinessClock::load(ops_db(ctx)?,tenant_id).await.map_err(KabiPayError::into_graphql)?.now_date(); let db=tenant_db(ctx,tenant_id).await?; let employee_id=kabipay_common::subgraph::resolve_client_employee_id(ctx,&db,tenant_id).await.map_err(KabiPayError::into_graphql)?; let units=parse_dec(&input.units,"units")?; Ok(crate::services::comp_off::submit_claim(&db,tenant_id,employee_id,today,input.worked_date,units,input.reason).await.map_err(KabiPayError::into_graphql)?.into())
+    }
+
+    async fn decide_comp_off_claim(&self, ctx: &Context<'_>, claim_id: ID, approve: bool, reason: Option<String>) -> Result<CompOffClaimDto> {
+        let claims=require_client_claims(ctx)?; let scope=leave_approval_scope(ctx)?; let tenant_id=require_tenant_id(ctx)?; let db=tenant_db(ctx,tenant_id).await?; let actor=kabipay_common::client_data_scope::resolve_viewer_employee(ctx,&db,tenant_id).await?.ok_or_else(|| KabiPayError::Forbidden("Comp-off decisions require a linked employee.".into()).into_graphql())?; let id=parse_uuid(&claim_id,"claimId")?;
+        crate::services::comp_off::claim_target(&db,tenant_id,id).await.map_err(KabiPayError::into_graphql)?;
+        let today=TenantBusinessClock::load(ops_db(ctx)?,tenant_id).await.map_err(KabiPayError::into_graphql)?.now_date();Ok(crate::services::comp_off::decide_claim(&db,tenant_id,id,claims.sub,actor.employee_id,scope,today,approve,reason).await.map_err(KabiPayError::into_graphql)?.into())
+    }
+
+    async fn cancel_comp_off_claim(&self, ctx: &Context<'_>, claim_id: ID) -> Result<CompOffClaimDto> { require_leave_submit(ctx)?; let tenant_id=require_tenant_id(ctx)?; let db=tenant_db(ctx,tenant_id).await?; let employee_id=kabipay_common::subgraph::resolve_client_employee_id(ctx,&db,tenant_id).await.map_err(KabiPayError::into_graphql)?; Ok(crate::services::comp_off::cancel_claim(&db,tenant_id,parse_uuid(&claim_id,"claimId")?,employee_id).await.map_err(KabiPayError::into_graphql)?.into()) }
+
+    async fn upsert_comp_off_policy(&self, ctx: &Context<'_>, input: UpsertCompOffPolicyInput) -> Result<CompOffPolicyDto> { require_leave_admin(ctx)?; let tenant_id=require_tenant_id(ctx)?; let db=tenant_db(ctx,tenant_id).await?; let parse_opt=|value:&Option<ID>,field| value.as_ref().map(|v|parse_uuid(v,field)).transpose(); Ok(crate::services::comp_off::upsert_policy(&db,tenant_id,parse_opt(&input.id,"id")?,parse_opt(&input.designation_id,"designationId")?,parse_opt(&input.employee_id,"employeeId")?,input.enabled,input.validity_days,input.claim_deadline_days,input.monthly_earning_limit.as_deref().map(|v|parse_dec(v,"monthlyEarningLimit")).transpose()?,input.yearly_earning_limit.as_deref().map(|v|parse_dec(v,"yearlyEarningLimit")).transpose()?,input.max_unused_balance.as_deref().map(|v|parse_dec(v,"maxUnusedBalance")).transpose()?,input.allow_approved_leave_cancellation).await.map_err(KabiPayError::into_graphql)?.into()) }
+
+    async fn cancel_approved_comp_off_leave(&self, ctx: &Context<'_>, leave_request_id: ID) -> Result<LeaveRequestDto> {
+        require_leave_admin(ctx)?;
+        let claims = require_client_claims(ctx)?;
+        let tenant_id = require_tenant_id(ctx)?;
+        let business_date = TenantBusinessClock::load(ops_db(ctx)?, tenant_id).await.map_err(KabiPayError::into_graphql)?.now_date();
+        let db = tenant_db(ctx, tenant_id).await?;
+        let model = leave_service::cancel_approved_comp_off_leave(&db, tenant_id, business_date, parse_uuid(&leave_request_id, "leaveRequestId")?, claims.sub).await.map_err(KabiPayError::into_graphql)?;
+        Ok(model.into())
+    }
+
     /// Create a PENDING leave request and reserve days against the annual balance.
     async fn submit_leave_request(
         &self,
@@ -69,6 +94,7 @@ impl MutationRoot {
         require_leave_submit(ctx)?;
         let claims = require_client_claims(ctx)?;
         let tenant_id = require_tenant_id(ctx)?;
+        let business_date = TenantBusinessClock::load(ops_db(ctx)?, tenant_id).await.map_err(KabiPayError::into_graphql)?.now_date();
         let db = tenant_db(ctx, tenant_id).await?;
         let leave_type_id = parse_uuid(&input.leave_type_id, "leaveTypeId")?;
         let supporting_document_file_storage_id = input
@@ -79,6 +105,7 @@ impl MutationRoot {
         let m = leave_service::submit_leave_request(
             &db,
             tenant_id,
+            business_date,
             claims.sub,
             claims.employee_id,
             leave_type_id,
@@ -105,12 +132,14 @@ impl MutationRoot {
         let claims = require_client_claims(ctx)?;
         let scope = leave_approval_scope(ctx)?;
         let tenant_id = require_tenant_id(ctx)?;
+        let business_date = TenantBusinessClock::load(ops_db(ctx)?, tenant_id).await.map_err(KabiPayError::into_graphql)?.now_date();
         let db = tenant_db(ctx, tenant_id).await?;
         let id = parse_uuid(&leave_request_id, "leaveRequestId")?;
         let expected_step_id = parse_uuid(&expected_workflow_step_id, "expectedWorkflowStepId")?;
         let m = leave_service::approve_leave_request(
             &db,
             tenant_id,
+            business_date,
             id,
             expected_step_id,
             claims.sub,
@@ -133,12 +162,14 @@ impl MutationRoot {
         let claims = require_client_claims(ctx)?;
         let scope = leave_approval_scope(ctx)?;
         let tenant_id = require_tenant_id(ctx)?;
+        let business_date = TenantBusinessClock::load(ops_db(ctx)?, tenant_id).await.map_err(KabiPayError::into_graphql)?.now_date();
         let db = tenant_db(ctx, tenant_id).await?;
         let id = parse_uuid(&leave_request_id, "leaveRequestId")?;
         let expected_step_id = parse_uuid(&expected_workflow_step_id, "expectedWorkflowStepId")?;
         let m = leave_service::reject_leave_request(
             &db,
             tenant_id,
+            business_date,
             id,
             expected_step_id,
             claims.sub,
@@ -160,11 +191,13 @@ impl MutationRoot {
         require_leave_submit(ctx)?;
         let claims = require_client_claims(ctx)?;
         let tenant_id = require_tenant_id(ctx)?;
+        let business_date = TenantBusinessClock::load(ops_db(ctx)?, tenant_id).await.map_err(KabiPayError::into_graphql)?.now_date();
         let db = tenant_db(ctx, tenant_id).await?;
         let id = parse_uuid(&leave_request_id, "leaveRequestId")?;
         let m = leave_service::cancel_leave_request(
             &db,
             tenant_id,
+            business_date,
             id,
             claims.sub,
             claims.employee_id,

@@ -2,9 +2,7 @@
 
 use chrono::Utc;
 use kabipay_common::{
-    client_data_scope::{
-        resolve_employee_scope_filter_with_connection, EmployeeScopeFilter,
-    },
+    client_data_scope::{resolve_employee_scope_filter_with_connection, EmployeeScopeFilter},
     context::{ClientViewerEmployee, ScopeType},
     KabiPayError, KabiPayResult,
 };
@@ -12,16 +10,16 @@ use kabipay_db_entities::tenant::d0007_employee_core::employee;
 use kabipay_db_entities::tenant::d0013_tax_statutory::{
     tax_computation, tax_configuration_version, tax_section_definition, tax_slab,
 };
-use kabipay_db_entities::tenant::d0029_file_storage::file_storage;
 use kabipay_db_entities::tenant::d0027_communication_audit::notification;
+use kabipay_db_entities::tenant::d0029_file_storage::file_storage;
 use kabipay_db_entities::tenant::d0031_tax_proof::tax_proof_line;
 use rust_decimal::Decimal;
+use sea_orm::sea_query::LockType;
+use sea_orm::PaginatorTrait;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseConnection, DatabaseTransaction,
     EntityTrait, QueryFilter, QueryOrder, QuerySelect, Select, Set, TransactionTrait,
 };
-use sea_orm::sea_query::LockType;
-use sea_orm::PaginatorTrait;
 use std::str::FromStr;
 use uuid::Uuid;
 
@@ -81,7 +79,7 @@ pub async fn upsert_tax_computation(
     db: &DatabaseConnection,
     tenant_id: Uuid,
     employee_id: Uuid,
-    tax_config_version_id: Uuid,
+    tax_config_version_id: Option<Uuid>,
     fiscal_year: i32,
     tax_regime_chosen: Option<String>,
     gross_income: Option<Decimal>,
@@ -90,65 +88,38 @@ pub async fn upsert_tax_computation(
     final_tax: Option<Decimal>,
     tds_per_month: Option<Decimal>,
 ) -> KabiPayResult<tax_computation::Model> {
-    let _ver = tax_configuration_version::Entity::find()
-        .filter(tax_configuration_version::Column::Id.eq(tax_config_version_id))
-        .filter(tax_configuration_version::Column::TenantId.eq(tenant_id))
-        .one(db)
-        .await?
-        .ok_or_else(|| KabiPayError::NotFound {
-            entity: "tax_configuration_version",
-            id: tax_config_version_id.to_string(),
-        })?;
-    if _ver.fiscal_year != fiscal_year {
-        return Err(KabiPayError::Validation(
-            "fiscalYear does not match the selected tax configuration version".into(),
-        ));
-    }
-    let existing = tax_computation::Entity::find()
-        .filter(tax_computation::Column::TenantId.eq(tenant_id))
-        .filter(tax_computation::Column::EmployeeId.eq(employee_id))
-        .filter(tax_computation::Column::TaxConfigVersionId.eq(tax_config_version_id))
-        .filter(tax_computation::Column::FiscalYear.eq(fiscal_year))
-        .one(db)
-        .await?;
-    let now = Utc::now();
-    if let Some(row) = existing {
-        let id = row.id;
-        let mut am: tax_computation::ActiveModel = row.into();
-        am.tax_regime_chosen = Set(tax_regime_chosen);
-        am.gross_income = Set(gross_income);
-        am.total_deductions = Set(total_deductions);
-        am.taxable_income = Set(taxable_income);
-        am.final_tax = Set(final_tax);
-        am.tds_per_month = Set(tds_per_month);
-        am.computed_at = Set(now);
-        am.update(db).await?;
-        tax_computation::Entity::find_by_id(id)
-            .one(db)
-            .await?
-            .ok_or_else(|| KabiPayError::Internal("updated tax_computation not found".into()))
-    } else {
-        let id = Uuid::new_v4();
-        let am = tax_computation::ActiveModel {
-            id: Set(id),
-            tenant_id: Set(tenant_id),
-            employee_id: Set(employee_id),
-            tax_config_version_id: Set(tax_config_version_id),
-            fiscal_year: Set(fiscal_year),
-            tax_regime_chosen: Set(tax_regime_chosen),
-            gross_income: Set(gross_income),
-            total_deductions: Set(total_deductions),
-            taxable_income: Set(taxable_income),
-            final_tax: Set(final_tax),
-            tds_per_month: Set(tds_per_month),
-            computed_at: Set(now),
-        };
-        am.insert(db).await?;
-        tax_computation::Entity::find_by_id(id)
-            .one(db)
-            .await?
-            .ok_or_else(|| KabiPayError::Internal("inserted tax_computation not found".into()))
-    }
+    super::tax_declarations::validate_declaration_calculated_fields(
+        taxable_income,
+        final_tax,
+        tds_per_month,
+    )?;
+    let txn = db.begin().await?;
+    let version = super::tax_submission::resolve_version(
+        &txn,
+        tenant_id,
+        employee_id,
+        fiscal_year,
+        tax_config_version_id,
+        tax_regime_chosen.as_deref(),
+    )
+    .await?;
+    let result = super::tax_declarations::save_declaration(
+        &txn,
+        tenant_id,
+        employee_id,
+        version.id,
+        fiscal_year,
+        version
+            .regime
+            .as_deref()
+            .and_then(super::tax_submission::canonical)
+            .map(str::to_owned),
+        gross_income,
+        total_deductions,
+    )
+    .await?;
+    txn.commit().await?;
+    Ok(result)
 }
 
 pub fn opt_decimal(s: &Option<String>) -> KabiPayResult<Option<Decimal>> {
@@ -167,8 +138,8 @@ const PROOF_REJECTED: &str = "REJECTED";
 const TAX_PROOF_ALLOWED_MIME_TYPES: &[&str] = &["application/pdf", "image/jpeg", "image/png"];
 
 /// If the tenant maintains an active **`tax_section_definition`** catalogue, `section_code` must exist there.
-pub async fn enforce_proof_section_catalog_match(
-    db: &DatabaseConnection,
+pub async fn enforce_proof_section_catalog_match<C: ConnectionTrait>(
+    db: &C,
     tenant_id: Uuid,
     section_normalized: &str,
     claimed_amount_for_cap_check: Decimal,
@@ -230,23 +201,26 @@ pub async fn list_tax_proof_lines(
 /// Employee submits or updates a proof line (e.g. 80C, HRA) — goes to **PENDING** until approved.
 /// Only **APPROVED** lines roll into `tax_computation.total_deductions` (see
 /// `recompute_total_deductions_from_approved_proofs`).
-pub async fn submit_tax_proof_line(
-    db: &DatabaseConnection,
+pub async fn submit_tax_proof_line<C: ConnectionTrait + TransactionTrait>(
+    db: &C,
     tenant_id: Uuid,
     employee_id: Uuid,
     submitting_user_id: Uuid,
-    tax_config_version_id: Uuid,
+    tax_config_version_id: Option<Uuid>,
     fiscal_year: i32,
     section_code: String,
     declared_amount: Decimal,
     actual_amount: Decimal,
     file_storage_id: Uuid,
+    tax_regime_chosen: Option<String>,
 ) -> KabiPayResult<tax_proof_line::Model> {
     if declared_amount < Decimal::ZERO || actual_amount < Decimal::ZERO {
         return Err(KabiPayError::Validation(
             "declared and actual amounts must be non-negative".into(),
         ));
     }
+    let transaction = db.begin().await?;
+    let db = &transaction;
     let sc = section_code.trim().to_string();
     if sc.is_empty() {
         return Err(KabiPayError::Validation("sectionCode is required".into()));
@@ -255,20 +229,19 @@ pub async fn submit_tax_proof_line(
         .await?;
     assert_tax_proof_file(db, tenant_id, file_storage_id, Some(submitting_user_id)).await?;
 
-    let _ver = tax_configuration_version::Entity::find()
-        .filter(tax_configuration_version::Column::Id.eq(tax_config_version_id))
-        .filter(tax_configuration_version::Column::TenantId.eq(tenant_id))
-        .one(db)
-        .await?
-        .ok_or_else(|| KabiPayError::NotFound {
-            entity: "tax_configuration_version",
-            id: tax_config_version_id.to_string(),
-        })?;
-    if _ver.fiscal_year != fiscal_year {
-        return Err(KabiPayError::Validation(
-            "fiscalYear does not match the tax configuration version".into(),
-        ));
+    if tax_config_version_id.is_none() && tax_regime_chosen.is_none() {
+        return Err(KabiPayError::Validation("proof submission requires the displayed assigned regime or a matching tax definition ID; refresh your tax settings".into()));
     }
+    let tax_config_version_id = super::tax_submission::resolve_version(
+        db,
+        tenant_id,
+        employee_id,
+        fiscal_year,
+        tax_config_version_id,
+        tax_regime_chosen.as_deref(),
+    )
+    .await?
+    .id;
 
     let existing = tax_proof_line::Entity::find()
         .filter(tax_proof_line::Column::TenantId.eq(tenant_id))
@@ -327,16 +300,15 @@ pub async fn submit_tax_proof_line(
         employee_id,
         tax_config_version_id,
         fiscal_year,
+        submitting_user_id,
     )
     .await?;
 
+    transaction.commit().await?;
     Ok(out)
 }
 
-fn tax_proof_for_decision_query(
-    tenant_id: Uuid,
-    line_id: Uuid,
-) -> Select<tax_proof_line::Entity> {
+fn tax_proof_for_decision_query(tenant_id: Uuid, line_id: Uuid) -> Select<tax_proof_line::Entity> {
     tax_proof_line::Entity::find()
         .filter(tax_proof_line::Column::Id.eq(line_id))
         .filter(tax_proof_line::Column::TenantId.eq(tenant_id))
@@ -403,11 +375,7 @@ async fn require_tax_approval_target_in_txn(
         }),
     )
     .await?;
-    require_tax_approval_target(
-        &target_scope,
-        approver_employee_id,
-        target_employee_id,
-    )
+    require_tax_approval_target(&target_scope, approver_employee_id, target_employee_id)
 }
 
 pub async fn approve_tax_proof_line(
@@ -446,7 +414,15 @@ pub async fn approve_tax_proof_line(
             .one(&txn)
             .await?
             .ok_or_else(|| KabiPayError::Internal("updated tax_proof_line not found".into()))?;
-        recompute_total_deductions_from_approved_proofs(&txn, tenant_id, eid, tid, fy).await?;
+        recompute_total_deductions_from_approved_proofs(
+            &txn,
+            tenant_id,
+            eid,
+            tid,
+            fy,
+            approver_user_id,
+        )
+        .await?;
         Ok::<_, KabiPayError>(out)
     }
     .await;
@@ -556,7 +532,13 @@ pub async fn reject_tax_proof_line(
             .one(&txn)
             .await?
             .ok_or_else(|| KabiPayError::Internal("updated tax_proof_line not found".into()))?;
-        recompute_total_deductions_from_approved_proofs(&txn, tenant_id, eid, tid, fy).await?;
+        let approver =
+            super::tax_settings::require_employee(&txn, tenant_id, approver_employee_id).await?;
+        let actor = approver.user_id.ok_or_else(|| {
+            KabiPayError::Validation("tax reviewer requires a linked user".into())
+        })?;
+        recompute_total_deductions_from_approved_proofs(&txn, tenant_id, eid, tid, fy, actor)
+            .await?;
         Ok::<_, KabiPayError>(out)
     }
     .await;
@@ -580,26 +562,20 @@ pub async fn reject_tax_proof_line(
             out.section_code, out.fiscal_year
         ),
     };
-    tax_proof_notify_employee(
-        db,
-        tenant_id,
-        out.employee_id,
-        "Tax proof rejected",
-        &msg,
-    )
-    .await;
+    tax_proof_notify_employee(db, tenant_id, out.employee_id, "Tax proof rejected", &msg).await;
     Ok(out)
 }
 
 /// Sums `actual_amount` for **APPROVED** lines and writes the result to
-/// `tax_computation.total_deductions` for the same employee / config / fiscal year.
-/// Year-end and payroll logic should use that column (not unapproved `actual_amount` values).
+/// the separate declaration approval total for the same employee and fiscal year.
+/// Calculated tax records and finalized payroll remain unchanged.
 pub async fn recompute_total_deductions_from_approved_proofs<C>(
     db: &C,
     tenant_id: Uuid,
     employee_id: Uuid,
     tax_config_version_id: Uuid,
     fiscal_year: i32,
+    actor: Uuid,
 ) -> KabiPayResult<()>
 where
     C: ConnectionTrait,
@@ -615,38 +591,15 @@ where
     let sum: Decimal = lines
         .iter()
         .fold(Decimal::ZERO, |acc, l| acc + l.actual_amount);
-    let now = Utc::now();
-    let existing = tax_computation::Entity::find()
-        .filter(tax_computation::Column::TenantId.eq(tenant_id))
-        .filter(tax_computation::Column::EmployeeId.eq(employee_id))
-        .filter(tax_computation::Column::TaxConfigVersionId.eq(tax_config_version_id))
-        .filter(tax_computation::Column::FiscalYear.eq(fiscal_year))
-        .one(db)
-        .await?;
-    if let Some(row) = existing {
-        let mut am: tax_computation::ActiveModel = row.into();
-        am.total_deductions = Set(Some(sum));
-        am.computed_at = Set(now);
-        am.update(db).await?;
-    } else {
-        let id = Uuid::new_v4();
-        let am = tax_computation::ActiveModel {
-            id: Set(id),
-            tenant_id: Set(tenant_id),
-            employee_id: Set(employee_id),
-            tax_config_version_id: Set(tax_config_version_id),
-            fiscal_year: Set(fiscal_year),
-            tax_regime_chosen: Set(None),
-            gross_income: Set(None),
-            total_deductions: Set(Some(sum)),
-            taxable_income: Set(None),
-            final_tax: Set(None),
-            tds_per_month: Set(None),
-            computed_at: Set(now),
-        };
-        am.insert(db).await?;
-    }
-    Ok(())
+    super::tax_declarations::save_approved_total(
+        db,
+        tenant_id,
+        employee_id,
+        fiscal_year,
+        sum,
+        actor,
+    )
+    .await
 }
 
 /// Admin-editable catalogue matching **`tax_proof_line.section_code`** labels (India IT sections, etc.).
@@ -759,8 +712,8 @@ pub async fn upsert_tax_section_definition(
     }
 }
 
-pub async fn upsert_tax_configuration_version(
-    db: &DatabaseConnection,
+pub async fn upsert_tax_configuration_version<C: ConnectionTrait>(
+    db: &C,
     tenant_id: Uuid,
     id_opt: Option<Uuid>,
     fiscal_year: i32,
@@ -770,7 +723,9 @@ pub async fn upsert_tax_configuration_version(
 ) -> KabiPayResult<tax_configuration_version::Model> {
     let cc = country_code.trim().to_uppercase();
     if cc.is_empty() {
-        return Err(KabiPayError::Validation("countryCode must not be empty".into()));
+        return Err(KabiPayError::Validation(
+            "countryCode must not be empty".into(),
+        ));
     }
     let reg = regime.and_then(|r| {
         let t = r.trim();
@@ -792,10 +747,25 @@ pub async fn upsert_tax_configuration_version(
                 entity: "tax_configuration_version",
                 id: id.to_string(),
             })?;
+        let same_regime = match (row.regime.as_deref(), reg.as_deref()) {
+            (Some(left), Some(right)) => {
+                match (
+                    super::tax_submission::canonical(left),
+                    super::tax_submission::canonical(right),
+                ) {
+                    (Some(left), Some(right)) => left == right,
+                    _ => left == right,
+                }
+            }
+            (None, None) => true,
+            _ => false,
+        };
+        if row.fiscal_year != fiscal_year || row.country_code != cc || !same_regime {
+            return Err(KabiPayError::Validation("a tax definition's financial year, regime and country are immutable; create a new definition instead".into()));
+        }
         let mut am: tax_configuration_version::ActiveModel = row.into();
-        am.fiscal_year = Set(fiscal_year);
-        am.regime = Set(reg);
-        am.country_code = Set(cc);
+        // Do not rewrite identity, even for accepted aliases. This also prevents
+        // concurrent admin status edits from relabelling historical proof evidence.
         am.is_active = Set(is_active);
         am.updated_at = Set(now);
         am.update(db).await.map_err(KabiPayError::from)?;
@@ -803,7 +773,9 @@ pub async fn upsert_tax_configuration_version(
             .one(db)
             .await
             .map_err(KabiPayError::from)?
-            .ok_or_else(|| KabiPayError::Internal("updated tax_configuration_version missing".into()))
+            .ok_or_else(|| {
+                KabiPayError::Internal("updated tax_configuration_version missing".into())
+            })
     } else {
         let id = Uuid::new_v4();
         tax_configuration_version::ActiveModel {
@@ -823,7 +795,9 @@ pub async fn upsert_tax_configuration_version(
             .one(db)
             .await
             .map_err(KabiPayError::from)?
-            .ok_or_else(|| KabiPayError::Internal("inserted tax_configuration_version missing".into()))
+            .ok_or_else(|| {
+                KabiPayError::Internal("inserted tax_configuration_version missing".into())
+            })
     }
 }
 
@@ -968,10 +942,7 @@ mod decision_transaction_tests {
                 .unwrap_or_else(|| Ok(Vec::new()))
         }
 
-        async fn execute(
-            &self,
-            statement: sea_orm::Statement,
-        ) -> Result<ProxyExecResult, DbErr> {
+        async fn execute(&self, statement: sea_orm::Statement) -> Result<ProxyExecResult, DbErr> {
             self.events
                 .lock()
                 .expect("event recorder")
@@ -983,11 +954,17 @@ mod decision_transaction_tests {
         }
 
         async fn begin(&self) {
-            self.events.lock().expect("event recorder").push("BEGIN".into());
+            self.events
+                .lock()
+                .expect("event recorder")
+                .push("BEGIN".into());
         }
 
         async fn commit(&self) {
-            self.events.lock().expect("event recorder").push("COMMIT".into());
+            self.events
+                .lock()
+                .expect("event recorder")
+                .push("COMMIT".into());
         }
 
         async fn rollback(&self) {

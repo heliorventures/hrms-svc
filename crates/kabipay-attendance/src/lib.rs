@@ -4,6 +4,8 @@ mod resolvers;
 mod services;
 
 pub use resolvers::{MutationRoot, QueryRoot};
+pub use services::attendance_day;
+pub use services::attendance_day_runtime::{sweep_expired_attendance, ExpirySweepResult};
 
 /// Public attendance-management types supported for integration consumers.
 ///

@@ -7,7 +7,7 @@ use kabipay_common::{KabiPayError, KabiPayResult};
 use kabipay_db_entities::tenant::d0005_auth_rbac::{
     permission, permission_scope, role, role_permission, user_role,
 };
-use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter};
+use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter};
 use uuid::Uuid;
 
 pub struct ClientAuthorization {
@@ -126,8 +126,8 @@ fn build_client_authorization(
 /// Resolve all client authorization claims for `user_id` with one user-role
 /// read. The connection is already schema-scoped; tenant filters are still
 /// applied where the table carries `tenant_id`.
-pub async fn load_client_authorization(
-    db: &DatabaseConnection,
+pub async fn load_client_authorization<C: ConnectionTrait>(
+    db: &C,
     tenant_id: Uuid,
     user_id: Uuid,
 ) -> KabiPayResult<ClientAuthorization> {
