@@ -56,5 +56,6 @@ pub mod d0092_tenant_import_tracking;
 pub mod d0093_tax_projection_configuration;
 pub mod d0097_location_working_calendar;
 pub mod d0098_leave_working_dates;
+pub mod d0103_employee_loans;
 
 pub mod d0094_payroll_draft_calculation;

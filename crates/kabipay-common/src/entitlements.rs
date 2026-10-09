@@ -137,7 +137,7 @@ pub fn permission_module(permission: &str) -> &'static str {
     match permission.split(':').next().unwrap_or("") {
         "attendance" | "timesheet" => "ATTENDANCE",
         "leave" | "comp_off" => "LEAVE",
-        "payroll" => "PAYROLL", "tax" => "TAX",
+        "payroll" => "PAYROLL", "tax" => "TAX", "loan" => "LOANS",
         "expense" | "travel" => "EXPENSE",
         "recruitment" => "RECRUITMENT", "workflow" => "WORKFLOW",
         _ => "EMPLOYEE",

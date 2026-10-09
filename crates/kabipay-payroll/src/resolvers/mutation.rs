@@ -41,10 +41,10 @@ fn require_payroll_manage_all(ctx: &Context<'_>) -> Result<Uuid> {
         .sub)
 }
 
-pub struct MutationRoot;
+pub struct PayrollMutationRoot;
 
 #[Object]
-impl MutationRoot {
+impl PayrollMutationRoot {
     async fn calculate_payroll_cycle(
         &self,
         ctx: &Context<'_>,
@@ -498,7 +498,7 @@ impl MutationRoot {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::resolvers::query::QueryRoot;
+    use crate::resolvers::query::PayrollQueryRoot;
     use async_graphql::{EmptySubscription, Request, Schema};
     use kabipay_common::context::{
         ClientClaims, CLIENT_JWT_ISSUER, PERM_COMPENSATION_MANAGE, PERM_PAYROLL_MANAGE,
@@ -529,7 +529,7 @@ mod tests {
 
     async fn execute_mutation(claims: ClientClaims, mutation: &str) -> async_graphql::Response {
         let tenant_id = claims.tenant_id;
-        Schema::build(QueryRoot, MutationRoot, EmptySubscription)
+        Schema::build(PayrollQueryRoot, PayrollMutationRoot, EmptySubscription)
             .data(TenantId(tenant_id))
             .data(claims)
             .finish()

@@ -2041,6 +2041,36 @@ dependencies = [
 ]
 
 [[package]]
+name = "kabipay-loans"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "hex",
+ "kabipay-common",
+ "kabipay-db-entities",
+ "kabipay-loans-domain",
+ "rust_decimal",
+ "sea-orm",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 1.0.69",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
+name = "kabipay-loans-domain"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "rust_decimal",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "kabipay-notification"
 version = "0.1.0"
 dependencies = [
@@ -2134,6 +2164,8 @@ dependencies = [
  "hex",
  "kabipay-common",
  "kabipay-db-entities",
+ "kabipay-loans",
+ "kabipay-loans-domain",
  "kabipay-tax",
  "rust_decimal",
  "sea-orm",

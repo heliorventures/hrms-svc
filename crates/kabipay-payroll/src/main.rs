@@ -8,7 +8,7 @@ use kabipay_payroll::resolvers::{MutationRoot, QueryRoot};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let schema = Schema::build(QueryRoot, MutationRoot, EmptySubscription);
+    let schema = Schema::build(QueryRoot::default(), MutationRoot::default(), EmptySubscription);
     serve_subgraph(
         SubgraphConfig {
             service_name: "kabipay-payroll",
