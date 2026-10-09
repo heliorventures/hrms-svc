@@ -27,6 +27,7 @@ const INPUT_TABLES: &[&str] = &[
     "payroll_unpaid_leave_policy",
     "payslip",
     "payslip_component",
+    "payslip_loan_snapshot",
     "payslip_statement",
     "salary_component",
     "salary_structure",

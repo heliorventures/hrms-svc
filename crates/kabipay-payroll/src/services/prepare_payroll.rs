@@ -30,6 +30,7 @@ pub async fn prepare<C: ConnectionTrait + Send + Sync>(
         }
         super::earned_catalog::validate(db, tenant, &calculation).await?;
         return Ok(PreparedEmployeePayroll {
+            loan_recovery: None,
             arrears,
             input: input.clone(),
             calculation,

@@ -25,6 +25,8 @@ pub struct PayrollDraft {
     pub fingerprint: String,
     pub employees: Vec<DraftEmployee>,
     pub can_finalize: bool,
+    #[serde(default)]
+    pub finalization_block_reason: Option<String>,
 }
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -93,35 +95,62 @@ pub async fn find<C: ConnectionTrait>(
             [tenant.into(), id.into()],
         ))
         .await?;
-    row.map(|r| {
-        serde_json::from_value(r.try_get::<serde_json::Value>("", "snapshot")?)
-            .map_err(|_| KabiPayError::Internal("stored payroll review is invalid".into()))
-    })
-    .transpose()
+    let mut draft = row
+        .map(|r| {
+            serde_json::from_value(r.try_get::<serde_json::Value>("", "snapshot")?)
+                .map_err(|_| KabiPayError::Internal("stored payroll review is invalid".into()))
+        })
+        .transpose()?;
+    if let Some(draft) = &mut draft {
+        let cycle = cycle(db, tenant, id).await?;
+        super::payroll_payment_date::refresh(db, &cycle, draft).await?;
+    }
+    Ok(draft)
 }
 pub async fn calculate_payroll_cycle(
     db: &DatabaseConnection,
     tenant: Uuid,
-    actor: Uuid,
+    claims: &kabipay_common::context::ClientClaims,
     id: Uuid,
     expected_revision: Option<i32>,
 ) -> KabiPayResult<PayrollDraft> {
+    super::loan_recovery::actor(claims, tenant)?;
+    let actor = claims.sub;
     let txn = db.begin().await?;
+    super::loan_recovery::lock(&txn, tenant).await?;
     super::payroll_fingerprint::lock_inputs(&txn).await?;
     let cycle = cycle(&txn, tenant, id).await?;
     ensure_draft(&cycle.status)?;
     let prior = find(&txn, tenant, id).await?;
     let revision = next_revision(prior.map(|d| d.revision), expected_revision)?;
-    let employees = super::payroll_preview::employees(&txn, tenant, actor, &cycle).await?;
-    let can_finalize = employees.iter().any(|e| e.outcome == "READY")
-        && !employees.iter().any(|e| e.outcome == "REVIEW");
-    let draft = PayrollDraft {
+    let mut employees = super::payroll_preview::employees(&txn, tenant, actor, &cycle).await?;
+    for entry in &mut employees {
+        if let Some(prepared) = &mut entry.prepared {
+            if let Err(error) = super::loan_recovery::prepare(
+                &txn,
+                claims,
+                &cycle,
+                revision,
+                entry.employee_id,
+                prepared,
+            )
+            .await
+            {
+                entry.outcome = "REVIEW".into();
+                entry.reason = Some(super::payroll_preview::review_reason(error));
+                entry.prepared = None;
+            }
+        }
+    }
+    let mut draft = PayrollDraft {
         cycle_id: id,
         revision,
-        fingerprint: super::payroll_fingerprint::fingerprint(&txn, tenant).await?,
+        fingerprint: super::loan_recovery::fingerprint(&txn, tenant).await?,
         employees,
-        can_finalize,
+        can_finalize: false,
+        finalization_block_reason: None,
     };
+    super::payroll_payment_date::refresh(&txn, &cycle, &mut draft).await?;
     let value = serde_json::to_value(&draft)
         .map_err(|_| KabiPayError::Internal("payroll review serialization failed".into()))?;
     txn.execute(Statement::from_sql_and_values(DbBackend::Postgres,
@@ -129,4 +158,52 @@ pub async fn calculate_payroll_cycle(
         [tenant.into(),id.into(),revision.into(),draft.fingerprint.clone().into(),value.into(),actor.into()])).await?;
     txn.commit().await?;
     Ok(draft)
+}
+
+/// Correct a draft's explicit recovery date; every existing quote becomes stale.
+pub async fn set_payment_date(
+    db: &DatabaseConnection,
+    tenant: Uuid,
+    claims: &kabipay_common::context::ClientClaims,
+    id: Uuid,
+    date: chrono::NaiveDate,
+    expected_revision: Option<i32>,
+) -> KabiPayResult<()> {
+    super::loan_recovery::actor(claims, tenant)?;
+    let tx = db.begin().await?;
+    super::loan_recovery::lock(&tx, tenant).await?;
+    super::payroll_fingerprint::lock_inputs(&tx).await?;
+    let cycle = cycle(&tx, tenant, id).await?;
+    ensure_draft(&cycle.status)?;
+    let prior = find(&tx, tenant, id).await?.ok_or_else(|| {
+        KabiPayError::Validation("Calculate a draft before changing its payment date".into())
+    })?;
+    if Some(prior.revision) != expected_revision
+        || super::loan_recovery::fingerprint(&tx, tenant).await? != prior.fingerprint
+    {
+        return Err(KabiPayError::Conflict(
+            "Payroll review changed; reload before editing its payment date".into(),
+        ));
+    }
+    let row = tx
+        .query_one(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "SELECT COUNT(*) AS n FROM payslip WHERE tenant_id=$1 AND payroll_cycle_id=$2",
+            [tenant.into(), id.into()],
+        ))
+        .await?
+        .ok_or_else(|| KabiPayError::Internal("Payslip verification unavailable".into()))?;
+    if row.try_get::<i64>("", "n")? != 0 {
+        return Err(KabiPayError::Validation(
+            "A cycle with issued financial records cannot be edited".into(),
+        ));
+    }
+    tx.execute(Statement::from_sql_and_values(
+        DbBackend::Postgres,
+        "UPDATE payroll_cycle SET payment_date=$3,updated_at=NOW() WHERE tenant_id=$1 AND id=$2",
+        [tenant.into(), id.into(), date.into()],
+    ))
+    .await?;
+    tx.commit().await?;
+    Ok(())
 }

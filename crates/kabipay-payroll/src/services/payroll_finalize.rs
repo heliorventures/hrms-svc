@@ -21,13 +21,16 @@ pub struct PayrollFinalization {
 pub async fn finalize_payroll_cycle(
     db: &DatabaseConnection,
     tenant: Uuid,
-    actor: Uuid,
+    claims: &kabipay_common::context::ClientClaims,
     id: Uuid,
     revision: i32,
     fingerprint: &str,
     acknowledgement: FinalizeAcknowledgement,
 ) -> KabiPayResult<PayrollFinalization> {
+    super::loan_recovery::actor(claims, tenant)?;
+    let actor = claims.sub;
     let txn = db.begin().await?;
+    super::loan_recovery::lock(&txn, tenant).await?;
     super::payroll_fingerprint::lock_inputs(&txn).await?;
     let cycle = payroll_draft::cycle(&txn, tenant, id).await?;
     payroll_draft::ensure_draft(&cycle.status)?;
@@ -38,11 +41,14 @@ pub async fn finalize_payroll_cycle(
         })?;
     if draft.revision != revision
         || draft.fingerprint != fingerprint
-        || super::payroll_fingerprint::fingerprint(&txn, tenant).await? != fingerprint
+        || super::loan_recovery::fingerprint(&txn, tenant).await? != fingerprint
     {
         return Err(KabiPayError::Validation(
             "Payroll inputs changed; recalculate and review the new draft".into(),
         ));
+    }
+    if let Some(reason) = &draft.finalization_block_reason {
+        return Err(KabiPayError::Validation(reason.clone()));
     }
     if !draft.can_finalize {
         return Err(KabiPayError::Validation(
@@ -76,9 +82,25 @@ pub async fn finalize_payroll_cycle(
         ));
     }
     let mut payslips = 0;
+    let loan_state = kabipay_loans::payroll_loan_state(&txn, tenant)
+        .await
+        .map_err(|_| {
+            KabiPayError::Validation("Review Loans configuration before finalizing payroll".into())
+        })?;
     for entry in &draft.employees {
         let Some(prepared) = &entry.prepared else {
             continue;
+        };
+        super::loan_recovery::validate_calculation(
+            prepared,
+            &cycle,
+            entry.employee_id,
+            revision,
+            loan_state.enabled,
+        )?;
+        let loan_snapshot = match &prepared.loan_recovery {
+            Some(reviewed) => Some(super::loan_recovery::post(&txn, claims, reviewed).await?),
+            None => None,
         };
         let employee = employee::Entity::find()
             .filter(employee::Column::TenantId.eq(tenant))
@@ -86,15 +108,19 @@ pub async fn finalize_payroll_cycle(
             .one(&txn)
             .await?
             .ok_or_else(|| KabiPayError::Validation("Reviewed employee no longer exists".into()))?;
-        super::imported_payroll::persist_reviewed(
+        let payslip = super::imported_payroll::persist_reviewed(
             &txn,
             tenant,
             id,
             &employee,
             date,
             prepared.clone(),
+            loan_snapshot.as_ref(),
         )
         .await?;
+        if let Some(snapshot) = &loan_snapshot {
+            super::loan_recovery::persist(&txn, tenant, payslip, snapshot).await?;
+        }
         payslips += 1;
     }
     txn.execute(Statement::from_sql_and_values(DbBackend::Postgres,

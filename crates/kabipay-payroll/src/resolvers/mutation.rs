@@ -45,19 +45,41 @@ pub struct PayrollMutationRoot;
 
 #[Object]
 impl PayrollMutationRoot {
+    async fn set_payroll_cycle_payment_date(
+        &self,
+        ctx: &Context<'_>,
+        cycle_id: ID,
+        payment_date: chrono::NaiveDate,
+        expected_revision: Option<i32>,
+    ) -> Result<bool> {
+        require_payroll_manage_all(ctx)?;
+        let tenant = require_tenant_id(ctx)?;
+        let db = tenant_db(ctx, tenant).await?;
+        crate::services::payroll_draft::set_payment_date(
+            &db,
+            tenant,
+            ctx.data::<ClientClaims>()?,
+            parse_uuid(&cycle_id, "cycleId")?,
+            payment_date,
+            expected_revision,
+        )
+        .await
+        .map_err(KabiPayError::into_graphql)?;
+        Ok(true)
+    }
     async fn calculate_payroll_cycle(
         &self,
         ctx: &Context<'_>,
         cycle_id: ID,
         expected_revision: Option<i32>,
     ) -> Result<async_graphql::Json<crate::services::payroll_draft::PayrollDraft>> {
-        let actor = require_payroll_manage_all(ctx)?;
+        require_payroll_manage_all(ctx)?;
         let tenant = require_tenant_id(ctx)?;
         let db = tenant_db(ctx, tenant).await?;
         crate::services::payroll_draft::calculate_payroll_cycle(
             &db,
             tenant,
-            actor,
+            ctx.data::<ClientClaims>()?,
             parse_uuid(&cycle_id, "cycleId")?,
             expected_revision,
         )
@@ -75,13 +97,13 @@ impl PayrollMutationRoot {
             crate::services::payroll_draft::FinalizeAcknowledgement,
         >,
     ) -> Result<async_graphql::Json<crate::services::payroll_finalize::PayrollFinalization>> {
-        let actor = require_payroll_manage_all(ctx)?;
+        require_payroll_manage_all(ctx)?;
         let tenant = require_tenant_id(ctx)?;
         let db = tenant_db(ctx, tenant).await?;
         crate::services::payroll_finalize::finalize_payroll_cycle(
             &db,
             tenant,
-            actor,
+            ctx.data::<ClientClaims>()?,
             parse_uuid(&cycle_id, "cycleId")?,
             draft_revision,
             &fingerprint,

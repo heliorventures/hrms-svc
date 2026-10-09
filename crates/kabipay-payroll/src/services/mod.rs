@@ -36,6 +36,8 @@ pub mod prepare_payroll;
 pub mod reviewed_arrears;
 
 pub mod payroll_draft;
+pub(crate) mod payroll_payment_date;
 pub mod payroll_finalize;
 pub mod payroll_fingerprint;
 pub mod payroll_preview;
+pub mod loan_recovery;

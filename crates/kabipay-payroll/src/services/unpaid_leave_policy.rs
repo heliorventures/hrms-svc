@@ -18,6 +18,10 @@ pub const AFTER: &str = "AFTER_STATUTORY";
 pub const DEDUCTION_CODE: &str = "UNPAID_LEAVE";
 
 pub fn ensure_manual_component(code: &str) -> KabiPayResult<()> {
+    let code = code.to_ascii_uppercase();
+    if code == "LOAN" || code.starts_with("LOAN_") {
+        return Err(KabiPayError::Validation("Loan components are managed by the Loans ledger and cannot be entered manually".into()));
+    }
     if code.eq_ignore_ascii_case(DEDUCTION_CODE) {
         return Err(KabiPayError::Validation("UNPAID_LEAVE is managed by payroll; remove it from manual salary structures and configure the unpaid leave policy instead".into()));
     }

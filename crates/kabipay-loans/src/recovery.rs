@@ -11,15 +11,15 @@ use kabipay_loans_domain::{
 };
 use rust_decimal::Decimal;
 use sea_orm::DatabaseTransaction;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RecoverySource {
     Payroll,
     Fnf,
 }
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RecoveryInput {
     pub employee_id: Uuid,
     pub source: RecoverySource,
@@ -31,12 +31,17 @@ pub struct RecoveryInput {
     /// before loan recovery. FNF: reviewed eligible set-off pool. Supplied by the owning
     /// financial module from persisted sources, never by a browser.
     pub eligible_net: Decimal,
+    /// Cash remaining in this specific run after non-loan deductions and prior payments.
+    pub available_net: Decimal,
     pub currency: Currency,
 }
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RecoveryLine {
     pub loan_id: Uuid,
     pub terms_version_id: Uuid,
+    pub policy_version_id: Uuid,
+    pub schedule_version_id: Option<Uuid>,
+    pub calculator_version: String,
     pub account_version: i64,
     pub currency: String,
     pub principal_before: Decimal,
@@ -47,7 +52,7 @@ pub struct RecoveryLine {
     pub requested: Decimal,
     pub deferred: Decimal,
 }
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RecoveryQuote {
     input: RecoveryInput,
     employee_revision: i64,
@@ -113,6 +118,10 @@ async fn authorized(
     }
     access::employee(tx, actor, input.employee_id).await?;
     input.currency.validate_amount(input.eligible_net)?;
+    input.currency.validate_amount(input.available_net)?;
+    if input.available_net > input.eligible_net {
+        return Err(LoanModuleError::InvalidCommand);
+    }
     Ok(())
 }
 struct Candidate {
@@ -166,6 +175,7 @@ pub async fn prepare_recovery_quote(
         let payable = principal
             .checked_add(due_interest)
             .ok_or(LoanModuleError::InvalidCommand)?;
+        let mut schedule_version_id = None;
         let requested = match input.source {
             RecoverySource::Fnf => {
                 if policy.exit_recovery.allow_fnf {
@@ -179,6 +189,7 @@ pub async fn prepare_recovery_quote(
                 if let Some(schedule) = schedule {
                     let mode: String = schedule.try_get("", "recovery_mode")?;
                     let schedule_id: Uuid = schedule.try_get("", "id")?;
+                    schedule_version_id = Some(schedule_id);
                     let due=store::one(tx,"SELECT id FROM loan_schedule_item WHERE tenant_id=$1 AND loan_id=$2 AND schedule_version_id=$3 AND date_trunc('month',due_date)::date=$4 AND due_date<=$5 LIMIT 1",vec![actor.tenant_id.into(),loan.into(),schedule_id.into(),input.period_start.into(),input.value_date.into()]).await?.is_some();
                     if mode == "EXTERNAL" || !due {
                         Decimal::ZERO
@@ -224,6 +235,9 @@ pub async fn prepare_recovery_quote(
             line: RecoveryLine {
                 loan_id: loan,
                 terms_version_id: version.id,
+                policy_version_id: version.policy_version_id,
+                schedule_version_id,
+                calculator_version: terms.calculator_version.clone(),
                 account_version: account.version,
                 currency: terms.currency.code.clone(),
                 principal_before: principal,
@@ -271,6 +285,7 @@ pub async fn prepare_recovery_quote(
             .ok_or(LoanModuleError::InvalidCommand)?
             .max(Decimal::ZERO);
     }
+    budget = budget.min(input.available_net);
     candidates.sort_by(|a, b| {
         let order = match priority {
             Some(RecoveryPriority::OldestApprovedFirst) => a.created_at.cmp(&b.created_at),
