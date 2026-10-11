@@ -2,14 +2,14 @@
 //! Federated async-graphql subgraph on port 4016.
 
 use async_graphql::{EmptySubscription, Schema};
-use kabipay_common::subgraph::{serve_subgraph, SubgraphConfig};
+use kabipay_common::subgraph::{serve_subgraph_with_startup, SubgraphConfig};
 
 use kabipay_payroll::resolvers::{MutationRoot, QueryRoot};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let schema = Schema::build(QueryRoot::default(), MutationRoot::default(), EmptySubscription);
-    serve_subgraph(
+    serve_subgraph_with_startup(
         SubgraphConfig {
             service_name: "kabipay-payroll",
             default_port: 4016,
@@ -17,6 +17,8 @@ async fn main() -> anyhow::Result<()> {
             needs_db: true,
         },
         schema,
+        kabipay_payroll::fnf::http::routes(),
+        kabipay_payroll::fnf::worker::start,
     )
     .await
 }

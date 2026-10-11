@@ -30,7 +30,7 @@ use crate::resolvers::types::{
     EmployeeEducationDto, EmployeeEvidenceReviewQueueItemDto, EmployeeIdentityProfileDto,
     EmployeePanRecordDto, EmployeeProfileAccessDto, EmployeeProfileChangeRequestDto,
     EmployeeProfileChangeReviewDetailDto, EmployeeProfileReviewQueueItemDto,
-    EmployeeWorkExperienceDto, EmploymentHistoryRecordDto, FnfSettlementDto,
+    EmployeeWorkExperienceDto, EmploymentHistoryRecordDto,
     MyGuidanceStateDto, OnboardingChecklistItemDto, OrgChartRowDto, SeparationDto,
     TenantCatalogPermissionDto,
     TenantDirectoryRoleDto, TenantDirectoryUserDto, TenantFileAttachmentDto,
@@ -1345,26 +1345,29 @@ impl QueryRoot {
         Ok(rows.into_iter().map(SeparationDto::from).collect())
     }
 
-    /// Full & final row for a separation (if HR has run approval, a DRAFT or PROCESSED row exists).
-    async fn fnf_settlement(
-        &self,
-        ctx: &Context<'_>,
-        separation_id: ID,
-    ) -> Result<Option<FnfSettlementDto>> {
-        let access = onboarding_read_access(ctx)?;
-        let tenant_id = require_tenant_id(ctx)?;
-        let sid = parse_uuid(&separation_id, "separation id")?;
-        let db = tenant_db(ctx, tenant_id).await?;
-        let employee_predicate = onboarding_employee_predicate(ctx, access)?;
-        let m = offboarding_fnf_service::get_visible_fnf_by_separation(
-            &db,
-            tenant_id,
-            sid,
-            employee_predicate,
-        )
-            .await
-            .map_err(KabiPayError::into_graphql)?;
-        Ok(m.map(FnfSettlementDto::from))
+    /// Recover an uncertain approval without creating a second financial decision.
+    async fn exit_approval_operation(
+        &self, ctx: &Context<'_>, separation_id: ID,
+    ) -> Result<Option<crate::resolvers::types::ExitApprovalOperationDto>> {
+        require_exact_all_scope(ctx, PERM_ONBOARDING_MANAGE)?;
+        let claims = require_client_claims(ctx)?;
+        let tenant = require_tenant_id(ctx)?;
+        let sid = parse_uuid(&separation_id, "separationId")?;
+        let db = tenant_db(ctx, tenant).await?;
+        let operation = crate::services::finance_operation::latest_for_separation(&db, tenant, sid)
+            .await.map_err(KabiPayError::into_graphql)?;
+        operation.map(|operation| {
+            Ok(crate::resolvers::types::ExitApprovalOperationDto {
+                id: ID(operation.id.to_string()),
+                review_id: ID(operation.review_id.to_string()),
+                state: match operation.state {
+                    kabipay_common::finance_contract::HrOperationState::Registered => "REGISTERED",
+                    kabipay_common::finance_contract::HrOperationState::Committed => "COMMITTED",
+                    kabipay_common::finance_contract::HrOperationState::Cancelled => "CANCELLED",
+                }.to_owned(),
+                can_resume: operation.actor_id == claims.sub,
+            })
+        }).transpose()
     }
 
     /// Department exit clearance items for a separation.
@@ -1762,26 +1765,6 @@ mod tests {
         ]))
     }
 
-    fn fnf_row(
-        model: &crate::entities::d0017_onboarding_offboarding::fnf_settlement::Model,
-    ) -> ProxyRow {
-        ProxyRow::new(BTreeMap::from([
-            ("id".into(), model.id.into()),
-            ("tenant_id".into(), model.tenant_id.into()),
-            ("separation_id".into(), model.separation_id.into()),
-            ("leave_encashment".into(), model.leave_encashment.into()),
-            ("gratuity_amount".into(), model.gratuity_amount.into()),
-            ("bonus_payable".into(), model.bonus_payable.into()),
-            ("recovery_amount".into(), model.recovery_amount.into()),
-            ("net_payable".into(), model.net_payable.into()),
-            ("status".into(), model.status.clone().into()),
-            ("processed_at".into(), model.processed_at.into()),
-            ("processed_by".into(), model.processed_by.into()),
-            ("created_at".into(), model.created_at.into()),
-            ("updated_at".into(), model.updated_at.into()),
-        ]))
-    }
-
     fn clearance_row(
         model: &crate::entities::d0017_onboarding_offboarding::clearance_checklist::Model,
     ) -> ProxyRow {
@@ -2147,6 +2130,11 @@ mod tests {
                 "{ separations { __typename } }".to_string(),
                 PERM_ONBOARDING_SELF,
                 false,
+            ),
+            (
+                format!("{{ exitApprovalOperation(separationId: \"{record_id}\") {{ id }} }}"),
+                PERM_ONBOARDING_MANAGE,
+                true,
             ),
             (
                 format!("{{ fnfSettlement(separationId: \"{record_id}\") {{ __typename }} }}"),
@@ -2730,7 +2718,7 @@ mod tests {
     #[tokio::test]
     async fn offboarding_parent_lookup_returns_uniform_contracts_before_child_reads() {
         use crate::entities::d0017_onboarding_offboarding::{
-            clearance_checklist, fnf_settlement, separation,
+            clearance_checklist, separation,
         };
 
         let now = Utc::now();
@@ -2751,21 +2739,6 @@ mod tests {
             created_at: now,
             updated_at: now,
         };
-        let fnf = fnf_settlement::Model {
-            id: Uuid::new_v4(),
-            tenant_id: separation.tenant_id,
-            separation_id: separation.id,
-            leave_encashment: None,
-            gratuity_amount: None,
-            bonus_payable: None,
-            recovery_amount: None,
-            net_payable: None,
-            status: "DRAFT".into(),
-            processed_at: None,
-            processed_by: None,
-            created_at: now,
-            updated_at: now,
-        };
         let clearance = clearance_checklist::Model {
             id: Uuid::new_v4(),
             tenant_id: separation.tenant_id,
@@ -2778,36 +2751,6 @@ mod tests {
             created_at: now,
             updated_at: now,
         };
-
-        let (fnf_db, fnf_statements) = proxy_database(vec![
-            vec![separation_row(&separation)],
-            vec![fnf_row(&fnf)],
-        ])
-        .await;
-        let visible_fnf = offboarding_fnf_service::get_visible_fnf_by_separation(
-            &fnf_db,
-            separation.tenant_id,
-            separation.id,
-            Some(employee_id),
-        )
-        .await
-        .expect("self-visible FNF lookup");
-        assert_eq!(visible_fnf, Some(fnf));
-        let fnf_statements = fnf_statements.lock().expect("FNF statements");
-        assert_eq!(fnf_statements.len(), 2);
-        assert_eq!(
-            fnf_statements[0]
-                .values
-                .as_ref()
-                .expect("self-visible separation bound values")
-                .0,
-            vec![
-                separation.id.into(),
-                separation.tenant_id.into(),
-                employee_id.into(),
-                1_u64.into()
-            ]
-        );
 
         let (clearance_db, clearance_statements) = proxy_database(vec![
             vec![separation_row(&separation)],
@@ -2837,28 +2780,6 @@ mod tests {
                 1_u64.into()
             ]
         );
-
-        let (denied_fnf_db, denied_fnf_statements) = proxy_database(vec![Vec::new()]).await;
-        let denied_fnf = offboarding_fnf_service::get_visible_fnf_by_separation(
-            &denied_fnf_db,
-            separation.tenant_id,
-            separation.id,
-            Some(Uuid::new_v4()),
-        )
-        .await
-        .expect("out-of-scope FNF is absent");
-        let (missing_fnf_db, _) = proxy_database(vec![Vec::new()]).await;
-        let missing_fnf = offboarding_fnf_service::get_visible_fnf_by_separation(
-            &missing_fnf_db,
-            separation.tenant_id,
-            Uuid::new_v4(),
-            Some(employee_id),
-        )
-        .await
-        .expect("missing FNF is absent");
-        assert_eq!(denied_fnf, missing_fnf);
-        assert_eq!(denied_fnf, None);
-        assert_eq!(denied_fnf_statements.lock().expect("denied FNF statements").len(), 1);
 
         let (denied_clearance_db, denied_clearance_statements) =
             proxy_database(vec![Vec::new()]).await;

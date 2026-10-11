@@ -66,6 +66,7 @@ async fn loans_are_composed_without_exposing_internal_financial_coordination() {
         "submitLoanRequest(",
         "recordLoanReceipt(",
         "setLoanPeriodOverride(",
+        "cancelLoanFunding(",
     ] {
         assert!(sdl.contains(field), "missing {field}")
     }

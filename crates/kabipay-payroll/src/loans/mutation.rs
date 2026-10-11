@@ -51,18 +51,84 @@ async fn run(
         .map_err(|error| financial_error(error.into()))?;
     Ok(result.into())
 }
-fn payment(input: &RecordLoanPaymentInput) -> Result<RecordedPayment> {
+pub(super) fn payment(input: &RecordLoanPaymentInput) -> Result<RecordedPayment> {
     Ok(RecordedPayment {
         amount: amount(&input.amount)?,
         value_date: date(&input.value_date)?,
         method: input.method.clone(),
         external_reference: input.external_reference.clone(),
         evidence_reference: input.evidence_reference.clone(),
+        resignation_exception_reason: input.resignation_exception_reason.clone(),
     })
 }
 pub struct LoanMutation;
 #[Object]
 impl LoanMutation {
+    async fn record_historical_loan_payment(
+        &self,
+        ctx: &Context<'_>,
+        input: RecordHistoricalLoanPaymentInput,
+    ) -> Result<LoanResultDto> {
+        let kind = input.kind.into();
+        let command = LoanCommand::RecordHistoricalPayment {
+            loan_id: uuid(&input.payment.loan_id)?,
+            kind,
+            payment: payment(&input.payment)?,
+            reason: input.reason,
+            reconciliation_reference: input.reconciliation_reference,
+            review_fingerprint: input.review_fingerprint,
+        };
+        if kind == kabipay_loans::HistoricalPaymentKind::Disbursement {
+            super::funding::record(
+                ctx,
+                command,
+                CommandMeta {
+                    idempotency_key: input.payment.meta.idempotency_key,
+                    expected_version: input.payment.meta.expected_version,
+                },
+            )
+            .await
+        } else {
+            run(ctx, command, input.payment.meta).await
+        }
+    }
+    async fn reconcile_loan_financials(
+        &self,
+        ctx: &Context<'_>,
+        loan_id: String,
+    ) -> Result<async_graphql::Json<serde_json::Value>> {
+        let (tx, actor) = transaction(ctx, kabipay_loans::LoanPermission::Manage).await?;
+        let loan = uuid(&loan_id)?;
+        kabipay_loans::authorize_loan_audit(&tx, &actor, loan)
+            .await
+            .map_err(financial_error)?;
+        let report = crate::services::loan_reconciliation::reconcile_account(
+            &tx,
+            kabipay_common::subgraph::require_tenant_id(ctx)?,
+            loan,
+            Some(ctx.data::<kabipay_common::context::ClientClaims>()?.sub),
+        )
+        .await
+        .map_err(KabiPayError::into_graphql)?;
+        let result = serde_json::to_value(report).map_err(|e| financial_error(e.into()))?;
+        tx.commit().await.map_err(|e| financial_error(e.into()))?;
+        Ok(async_graphql::Json(result))
+    }
+    async fn cancel_loan_funding(
+        &self,
+        ctx: &Context<'_>,
+        input: CancelLoanFundingInput,
+    ) -> Result<LoanResultDto> {
+        run(
+            ctx,
+            LoanCommand::CancelFunding {
+                loan_id: uuid(&input.loan_id)?,
+                reason: input.reason,
+            },
+            input.meta,
+        )
+        .await
+    }
     async fn retire_loan_policy(
         &self,
         ctx: &Context<'_>,
@@ -193,13 +259,27 @@ impl LoanMutation {
             loan_id: uuid(&input.loan_id)?,
             payment: payment(&input)?,
         };
-        run(ctx, command, input.meta).await
+        super::funding::record(
+            ctx,
+            command,
+            CommandMeta {
+                idempotency_key: input.meta.idempotency_key,
+                expected_version: input.meta.expected_version,
+            },
+        )
+        .await
     }
     async fn record_loan_receipt(
         &self,
         ctx: &Context<'_>,
         input: RecordLoanPaymentInput,
     ) -> Result<LoanResultDto> {
+        if input.resignation_exception_reason.is_some() {
+            return Err(KabiPayError::Validation(
+                "Funding exceptions apply only to disbursements".into(),
+            )
+            .into_graphql());
+        }
         let command = LoanCommand::RecordReceipt {
             loan_id: uuid(&input.loan_id)?,
             payment: payment(&input)?,

@@ -19,6 +19,11 @@ pub(super) fn financial_error(error: LoanModuleError) -> async_graphql::Error {
             "LOAN_REVIEW_STALE",
             "Loan information changed. Refresh and review it again.",
         ),
+        ExitReviewPending => (
+            "LOAN_EXIT_REVIEW_PENDING",
+            "HR exit approval is pending confirmation. Reconcile it before changing loan records.",
+        ),
+        ReconciliationBlocked => ("LOAN_RECONCILIATION_BLOCKED", "Loan recovery is held because financial reconciliation found an exception. HR must review the reconciliation report."),
         IdempotencyConflict => (
             "LOAN_COMMAND_CONFLICT",
             "This command key has already been used for different input.",

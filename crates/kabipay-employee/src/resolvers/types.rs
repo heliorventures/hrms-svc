@@ -13,7 +13,7 @@ use crate::entities::d0050_employee_self_service::{
     employee_education, employee_profile_change_request, employee_work_experience,
 };
 use crate::entities::d0017_onboarding_offboarding::{
-    clearance_checklist, fnf_settlement, onboarding_checklist, separation,
+    clearance_checklist, onboarding_checklist, separation,
 };
 use crate::entities::d0029_file_storage::file_storage;
 use crate::entities::d0059_file_upload_stage::file_upload_stage;
@@ -930,44 +930,6 @@ impl From<separation::Model> for SeparationDto {
 }
 
 #[derive(SimpleObject, Clone, Debug)]
-#[graphql(name = "FnfSettlement")]
-pub struct FnfSettlementDto {
-    pub id: ID,
-    pub tenant_id: ID,
-    pub separation_id: ID,
-    pub leave_encashment: Option<String>,
-    pub gratuity_amount: Option<String>,
-    pub bonus_payable: Option<String>,
-    pub recovery_amount: Option<String>,
-    pub net_payable: Option<String>,
-    pub status: String,
-    pub processed_at: Option<DateTime<Utc>>,
-    pub processed_by: Option<ID>,
-    pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
-}
-
-impl From<fnf_settlement::Model> for FnfSettlementDto {
-    fn from(m: fnf_settlement::Model) -> Self {
-        Self {
-            id: ID(m.id.to_string()),
-            tenant_id: ID(m.tenant_id.to_string()),
-            separation_id: ID(m.separation_id.to_string()),
-            leave_encashment: m.leave_encashment.map(|d| d.to_string()),
-            gratuity_amount: m.gratuity_amount.map(|d| d.to_string()),
-            bonus_payable: m.bonus_payable.map(|d| d.to_string()),
-            recovery_amount: m.recovery_amount.map(|d| d.to_string()),
-            net_payable: m.net_payable.map(|d| d.to_string()),
-            status: m.status,
-            processed_at: m.processed_at,
-            processed_by: m.processed_by.map(|u| ID(u.to_string())),
-            created_at: m.created_at,
-            updated_at: m.updated_at,
-        }
-    }
-}
-
-#[derive(SimpleObject, Clone, Debug)]
 #[graphql(name = "ClearanceChecklistItem")]
 pub struct ClearanceChecklistItemDto {
     pub id: ID,
@@ -1007,16 +969,6 @@ pub struct SubmitSeparationInput {
     pub resignation_date: Option<NaiveDate>,
     pub last_working_date: NaiveDate,
     pub reason: Option<String>,
-}
-
-#[derive(InputObject, Clone, Debug)]
-pub struct UpsertFnfSettlementInput {
-    pub separation_id: ID,
-    /// Decimal as string, e.g. "12500.50". Omit or empty to clear.
-    pub leave_encashment: Option<String>,
-    pub gratuity_amount: Option<String>,
-    pub bonus_payable: Option<String>,
-    pub recovery_amount: Option<String>,
 }
 
 #[derive(InputObject, Clone, Debug)]
@@ -1266,6 +1218,16 @@ pub struct TenantPermissionScopeDto {
     pub resource: String,
     pub action: String,
     pub scope_type: String,
+}
+
+/// Company HR recovery view of a durable approval operation; no client-supplied state.
+#[derive(SimpleObject, Clone)]
+#[graphql(name = "ExitApprovalOperation")]
+pub struct ExitApprovalOperationDto {
+    pub id: ID,
+    pub review_id: ID,
+    pub state: String,
+    pub can_resume: bool,
 }
 
 /// Dismissal state for the authenticated user's application overview.

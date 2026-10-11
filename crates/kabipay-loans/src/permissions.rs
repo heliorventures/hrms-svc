@@ -41,6 +41,7 @@ pub struct LoanActorScope {
     pub(crate) user_id: Uuid,
     pub(crate) permission: LoanPermission,
     pub(crate) scope: ScopeType,
+    pub(crate) can_correct_company_payments: bool,
 }
 impl LoanActorScope {
     pub fn from_verified_claims(
@@ -64,6 +65,11 @@ impl LoanActorScope {
             user_id: claims.sub,
             permission,
             scope,
+            can_correct_company_payments: kabipay_common::client_data_scope::data_scope_from_claims(
+                Some(claims),
+                "loan:correct",
+            )
+            .ok() == Some(ScopeType::All),
         })
     }
 }

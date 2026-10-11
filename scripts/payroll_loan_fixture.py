@@ -12,10 +12,12 @@ print('ALTER TABLE loan_test.employee ADD COLUMN imported_exit_date DATE, ADD CO
 # Real model fields, disposable defaults only. Constraints specific to payroll evidence
 # come from the actual Liquibase migrations appended below.
 for domain, names in {
+    'd0005_auth_rbac': ['user'],
     'd0012_payroll': ['payroll_cycle','payslip','payslip_component','salary_component'],
     'd0090_payroll_period_configuration': ['payroll_period_input','payslip_statement'],
     'd0011_leave': ['leave_type'],
     'd0035_payroll_arrear': ['payroll_arrear'],
+    'd0017_onboarding_offboarding': ['separation','fnf_settlement','clearance_checklist'],
 }.items():
     text = (root / f'crates/kabipay-db-entities/src/tenant/{domain}.rs').read_text(encoding='utf-8')
     for name in names:
@@ -39,4 +41,7 @@ for table in tables:
         print(f'CREATE TABLE loan_test.{table}(id UUID DEFAULT gen_random_uuid(),tenant_id UUID{extra});')
 print('CREATE TABLE loan_test.payroll_draft_calculation(tenant_id UUID,cycle_id UUID,revision INT,fingerprint TEXT,snapshot JSONB,calculated_by UUID,calculated_at TIMESTAMPTZ DEFAULT NOW(),finalized_at TIMESTAMPTZ,finalized_by UUID,acknowledgement JSONB,PRIMARY KEY(tenant_id,cycle_id));')
 print(loan_sql.migration_sql('changelog/migrations/0105_payslip_loan_evidence/payslip_loan_evidence.xml'))
+print(loan_sql.migration_sql('changelog/migrations/0106_loan_exit_coordination/loan_exit_coordination.xml'))
+print(loan_sql.migration_sql('changelog/migrations/0107_loan_reconciliation/loan_reconciliation.xml'))
+print(loan_sql.migration_sql('changelog/migrations/0108_loan_late_payments/loan_late_payments.xml'))
 print('COMMIT;')

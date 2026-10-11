@@ -5,6 +5,44 @@ use kabipay_loans::{
 };
 use serde_json::Value;
 
+#[derive(async_graphql::Enum, Copy, Clone, Eq, PartialEq)]
+pub enum LoanHistoricalPaymentKind {
+    Disbursement,
+    Receipt,
+}
+impl From<LoanHistoricalPaymentKind> for kabipay_loans::HistoricalPaymentKind {
+    fn from(value: LoanHistoricalPaymentKind) -> Self {
+        match value {
+            LoanHistoricalPaymentKind::Disbursement => Self::Disbursement,
+            LoanHistoricalPaymentKind::Receipt => Self::Receipt,
+        }
+    }
+}
+#[derive(InputObject)]
+pub struct RecordHistoricalLoanPaymentInput {
+    #[graphql(flatten)]
+    pub payment: RecordLoanPaymentInput,
+    pub kind: LoanHistoricalPaymentKind,
+    pub reason: String,
+    pub reconciliation_reference: String,
+    pub review_fingerprint: String,
+}
+
+#[derive(SimpleObject)]
+#[graphql(name = "LoanApprovalWorkflow")]
+pub struct LoanApprovalWorkflowDto {
+    pub id: String,
+    pub name: String,
+}
+impl From<kabipay_loans::LoanApprovalWorkflowView> for LoanApprovalWorkflowDto {
+    fn from(value: kabipay_loans::LoanApprovalWorkflowView) -> Self {
+        Self {
+            id: value.id.to_string(),
+            name: value.name,
+        }
+    }
+}
+
 #[derive(SimpleObject)]
 #[graphql(name = "LoanAccount")]
 pub struct LoanAccountDto {
@@ -12,6 +50,13 @@ pub struct LoanAccountDto {
     pub employee_id: String,
     pub request_id: String,
     pub loan_number: String,
+    pub employee_name: String,
+    pub employee_code: String,
+    pub purpose: String,
+    pub disbursed: String,
+    pub repaid: String,
+    pub outstanding: String,
+    pub unapplied_credit: String,
     pub approved_principal: String,
     pub currency: String,
     pub minor_units: i32,
@@ -29,6 +74,13 @@ impl From<LoanAccountView> for LoanAccountDto {
             employee_id: v.employee_id.to_string(),
             request_id: v.request_id.to_string(),
             loan_number: v.loan_number,
+            employee_name: v.employee_name,
+            employee_code: v.employee_code,
+            purpose: v.purpose,
+            disbursed: v.disbursed,
+            repaid: v.repaid,
+            outstanding: v.outstanding,
+            unapplied_credit: v.unapplied_credit,
             approved_principal: v.approved_principal,
             currency: v.currency,
             minor_units: v.minor_units,
@@ -46,6 +98,11 @@ impl From<LoanAccountView> for LoanAccountDto {
 pub struct LoanRequestDto {
     pub id: String,
     pub employee_id: String,
+    pub employee_name: String,
+    pub employee_code: String,
+    pub policy_id: String,
+    pub preferences: Json<Value>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
     pub requested_amount: String,
     pub currency: String,
     pub purpose: String,
@@ -60,6 +117,11 @@ impl From<LoanRequestView> for LoanRequestDto {
         Self {
             id: v.id.to_string(),
             employee_id: v.employee_id.to_string(),
+            employee_name: v.employee_name,
+            employee_code: v.employee_code,
+            policy_id: v.policy_id.to_string(),
+            preferences: Json(v.preferences),
+            created_at: v.created_at,
             requested_amount: v.requested_amount,
             currency: v.currency,
             purpose: v.purpose,
@@ -191,6 +253,7 @@ pub struct LoanPaymentDto {
     pub method: String,
     pub external_reference: String,
     pub unapplied_credit: String,
+    pub resignation_exception_reason: Option<String>,
 }
 impl From<LoanPaymentView> for LoanPaymentDto {
     fn from(v: LoanPaymentView) -> Self {
@@ -202,6 +265,7 @@ impl From<LoanPaymentView> for LoanPaymentDto {
             method: v.method,
             external_reference: v.external_reference,
             unapplied_credit: v.unapplied_credit,
+            resignation_exception_reason: v.resignation_exception_reason,
         }
     }
 }
@@ -228,6 +292,11 @@ impl From<LoanScheduleView> for LoanScheduleDto {
     }
 }
 connection!(LoanPaymentConnection, LoanPaymentDto, LoanPaymentView);
+connection!(
+    LoanApprovalWorkflowConnection,
+    LoanApprovalWorkflowDto,
+    kabipay_loans::LoanApprovalWorkflowView
+);
 connection!(LoanScheduleConnection, LoanScheduleDto, LoanScheduleView);
 
 #[derive(InputObject)]
@@ -294,6 +363,7 @@ pub struct RecordLoanPaymentInput {
     pub method: String,
     pub external_reference: String,
     pub evidence_reference: String,
+    pub resignation_exception_reason: Option<String>,
     pub meta: LoanCommandMetaInput,
 }
 #[derive(InputObject)]
@@ -327,6 +397,12 @@ pub struct ReverseLoanPostingInput {
 #[derive(InputObject)]
 pub struct RetireLoanPolicyInput {
     pub policy_id: String,
+    pub reason: String,
+    pub meta: LoanCommandMetaInput,
+}
+#[derive(InputObject)]
+pub struct CancelLoanFundingInput {
+    pub loan_id: String,
     pub reason: String,
     pub meta: LoanCommandMetaInput,
 }

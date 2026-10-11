@@ -59,6 +59,8 @@ pub struct RecoveryQuote {
     lines: Vec<RecoveryLine>,
     total: Decimal,
     fingerprint: String,
+    #[serde(default)]
+    fnf_limits: Option<std::collections::BTreeMap<Uuid, Decimal>>,
 }
 impl RecoveryQuote {
     pub fn input(&self) -> &RecoveryInput {
@@ -110,6 +112,7 @@ async fn authorized(
     {
         return Err(LoanModuleError::Forbidden);
     }
+    access::company(actor)?;
     access::entitled(tx, actor).await?;
     if input.source == RecoverySource::Payroll {
         kabipay_common::entitlements::Entitlements::load(tx, actor.tenant_id)
@@ -117,6 +120,11 @@ async fn authorized(
             .require("PAYROLL")?;
     }
     access::employee(tx, actor, input.employee_id).await?;
+    store::synchronize(tx, actor.tenant_id).await?;
+    if store::one(tx,"SELECT s.id FROM loan_reconciliation_status s JOIN loan_account a ON a.tenant_id=s.tenant_id AND a.id=s.id WHERE s.tenant_id=$1 AND a.employee_id=$2 AND s.blocked LIMIT 1",
+        vec![actor.tenant_id.into(),input.employee_id.into()]).await?.is_some() {
+        return Err(LoanModuleError::ReconciliationBlocked);
+    }
     input.currency.validate_amount(input.eligible_net)?;
     input.currency.validate_amount(input.available_net)?;
     if input.available_net > input.eligible_net {
@@ -134,6 +142,40 @@ pub async fn prepare_recovery_quote(
     tx: &DatabaseTransaction,
     actor: &LoanActorScope,
     input: &RecoveryInput,
+) -> LoanResult<RecoveryQuote> {
+    prepare_quote(tx, actor, input, None).await
+}
+
+/// FNF uses each HR-reviewed Loan limit; a global payout cap cannot authorize another loan.
+pub async fn prepare_fnf_recovery_quote(
+    tx: &DatabaseTransaction,
+    actor: &LoanActorScope,
+    input: &RecoveryInput,
+    limits: &std::collections::BTreeMap<Uuid, Decimal>,
+) -> LoanResult<RecoveryQuote> {
+    if input.source != RecoverySource::Fnf || limits.len() > 1000 {
+        return Err(LoanModuleError::InvalidCommand);
+    }
+    authorized(tx, actor, input).await?;
+    lock_recovery_inputs(tx, actor.tenant_id).await?;
+    for (id, amount) in limits {
+        if id.is_nil() {
+            return Err(LoanModuleError::InvalidCommand);
+        }
+        input.currency.validate_amount(*amount)?;
+        let account = store::account(tx, actor.tenant_id, *id).await?;
+        if account.employee_id != input.employee_id {
+            return Err(LoanModuleError::Forbidden);
+        }
+    }
+    prepare_quote(tx, actor, input, Some(limits)).await
+}
+
+async fn prepare_quote(
+    tx: &DatabaseTransaction,
+    actor: &LoanActorScope,
+    input: &RecoveryInput,
+    fnf_limits: Option<&std::collections::BTreeMap<Uuid, Decimal>>,
 ) -> LoanResult<RecoveryQuote> {
     authorized(tx, actor, input).await?;
     lock_recovery_inputs(tx, actor.tenant_id).await?;
@@ -176,10 +218,12 @@ pub async fn prepare_recovery_quote(
             .checked_add(due_interest)
             .ok_or(LoanModuleError::InvalidCommand)?;
         let mut schedule_version_id = None;
-        let requested = match input.source {
+        let mut requested = match input.source {
             RecoverySource::Fnf => {
                 if policy.exit_recovery.allow_fnf {
-                    payable
+                    payable.min(fnf_limits.map_or(payable, |limits| {
+                        limits.get(&loan).copied().unwrap_or(Decimal::ZERO)
+                    }))
                 } else {
                     Decimal::ZERO
                 }
@@ -214,6 +258,11 @@ pub async fn prepare_recovery_quote(
                 }
             }
         };
+        if input.source == RecoverySource::Payroll {
+            if let Some(limit) = crate::exit_servicing::payroll_limit(tx,actor.tenant_id,loan,input.source_id,input.value_date).await? {
+                requested = requested.min(limit);
+            }
+        }
         if input.source == RecoverySource::Payroll && requested > Decimal::ZERO {
             let protected = input
                 .eligible_net
@@ -344,13 +393,18 @@ pub async fn prepare_recovery_quote(
             .ok_or(LoanModuleError::InvalidCommand)?;
         lines.push(line);
     }
-    let fingerprint = crate::command_hash(&(input, revision, &lines, total))?;
+    let fingerprint = if let Some(limits) = fnf_limits {
+        crate::command_hash(&(input, revision, &lines, total, limits))?
+    } else {
+        crate::command_hash(&(input, revision, &lines, total))?
+    };
     Ok(RecoveryQuote {
         input: input.clone(),
         employee_revision: revision,
         lines,
         total,
         fingerprint,
+        fnf_limits: fnf_limits.cloned(),
     })
 }
 pub async fn validate_recovery_quote(
@@ -358,7 +412,7 @@ pub async fn validate_recovery_quote(
     actor: &LoanActorScope,
     quote: &RecoveryQuote,
 ) -> LoanResult<()> {
-    let fresh = prepare_recovery_quote(tx, actor, &quote.input).await?;
+    let fresh = prepare_quote(tx, actor, &quote.input, quote.fnf_limits.as_ref()).await?;
     if fresh.fingerprint != quote.fingerprint {
         return Err(LoanModuleError::VersionConflict);
     }

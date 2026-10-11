@@ -66,6 +66,18 @@ pub enum LoanCommand {
         loan_id: Uuid,
         payment: RecordedPayment,
     },
+    RecordHistoricalPayment {
+        loan_id: Uuid,
+        kind: HistoricalPaymentKind,
+        payment: RecordedPayment,
+        reason: String,
+        reconciliation_reference: String,
+        review_fingerprint: String,
+    },
+    CancelFunding {
+        loan_id: Uuid,
+        reason: String,
+    },
     SetDeduction {
         loan_id: Uuid,
         effective_from: NaiveDate,
@@ -97,6 +109,19 @@ pub enum RequestDecision {
     Return,
     Reject,
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum HistoricalPaymentKind {
+    Disbursement,
+    Receipt,
+}
+impl HistoricalPaymentKind {
+    pub fn permission(self) -> crate::LoanPermission {
+        match self {
+            Self::Disbursement => crate::LoanPermission::Disburse,
+            Self::Receipt => crate::LoanPermission::Repay,
+        }
+    }
+}
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RecordedPayment {
@@ -107,6 +132,9 @@ pub struct RecordedPayment {
     pub external_reference: String,
     /// An authorized document reference or reviewed external evidence, never a public URL.
     pub evidence_reference: String,
+    /// Recorded HR/Admin authority; never a bank instruction.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resignation_exception_reason: Option<String>,
 }
 impl LoanCommand {
     pub fn permission(&self) -> crate::LoanPermission {
@@ -119,7 +147,10 @@ impl LoanCommand {
             Self::DecideRequest { .. } => Approve,
             Self::RecordDisbursement { .. } => Disburse,
             Self::RecordReceipt { .. } => Repay,
-            Self::SetDeduction { .. } | Self::SetPeriodOverride { .. } => Manage,
+            Self::RecordHistoricalPayment { kind, .. } => kind.permission(),
+            Self::SetDeduction { .. }
+            | Self::SetPeriodOverride { .. }
+            | Self::CancelFunding { .. } => Manage,
             Self::ReversePosting { .. } => Correct,
         }
     }

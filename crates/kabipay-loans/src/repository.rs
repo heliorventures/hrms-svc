@@ -10,6 +10,24 @@ use sea_orm::{
 };
 use uuid::Uuid;
 
+pub(crate) async fn terms_at(
+    tx: &DatabaseTransaction,
+    tenant: Uuid,
+    loan: Uuid,
+    date: chrono::NaiveDate,
+) -> LoanResult<loan_terms_version::Model> {
+    use sea_orm::QueryOrder;
+    loan_terms_version::Entity::find()
+        .filter(loan_terms_version::Column::TenantId.eq(tenant))
+        .filter(loan_terms_version::Column::LoanId.eq(loan))
+        .filter(loan_terms_version::Column::EffectiveFrom.lte(date))
+        .order_by_desc(loan_terms_version::Column::EffectiveFrom)
+        .order_by_desc(loan_terms_version::Column::Version)
+        .one(tx)
+        .await?
+        .ok_or(LoanModuleError::NotFound)
+}
+
 pub(crate) async fn execute(
     tx: &DatabaseTransaction,
     sql: &str,
@@ -53,12 +71,7 @@ pub(crate) async fn all(
 
 /// Obtain before any employee/account/payroll locks. Shared by every financial writer.
 pub(crate) async fn synchronize(tx: &DatabaseTransaction, tenant: Uuid) -> LoanResult<()> {
-    one(
-        tx,
-        "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
-        vec![format!("financial:{tenant}").into()],
-    )
-    .await?;
+    kabipay_common::financial_lock::acquire(tx, tenant).await?;
     Ok(())
 }
 pub(crate) async fn request(

@@ -56,7 +56,8 @@ pub(crate) async fn bump_account(
     let account = store::account(tx, tenant, loan).await?;
     let funding = net_funding(tx, tenant, loan).await?;
     let (principal, interest) = store::balances(tx, tenant, loan).await?;
-    let state = if funding == account.approved_principal
+    let cancelled = account.funding_state == "CANCELLED";
+    let state = if (cancelled || funding == account.approved_principal)
         && principal == Decimal::ZERO
         && interest == Decimal::ZERO
     {
@@ -64,7 +65,9 @@ pub(crate) async fn bump_account(
     } else {
         "OPEN"
     };
-    let funding_state = if funding == Decimal::ZERO {
+    let funding_state = if cancelled {
+        "CANCELLED"
+    } else if funding == Decimal::ZERO {
         "UNFUNDED"
     } else if funding == account.approved_principal {
         "FUNDED"

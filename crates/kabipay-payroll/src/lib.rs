@@ -2,3 +2,4 @@
 pub mod resolvers;
 pub mod services;
 pub mod loans;
+pub mod fnf;

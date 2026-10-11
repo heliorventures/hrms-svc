@@ -53,6 +53,11 @@ pub(crate) async fn reverse(
         return reconciled(tx, actor, expected, original, review, reason, reference).await;
     }
     // Reversing held credit needs a separate refund/reallocation review, not erasure.
+    if original.try_get::<serde_json::Value>("", "calculation_evidence")?["classification"]
+        == "LATE_EXTERNAL_PAYMENT"
+    {
+        return Err(LoanModuleError::HistoricalReconciliationRequired);
+    }
     if source_kind=="EXTERNAL_RECEIPT" && store::one(tx,"SELECT id FROM loan_unapplied_credit WHERE tenant_id=$1 AND loan_id=$2 AND receipt_id=$3",vec![actor.tenant_id.into(),loan.into(),source.into()]).await?.is_some(){return Err(LoanModuleError::HistoricalReconciliationRequired)}
     let subsequent=store::all(tx,"SELECT p.*,p.amount::text AS amount_text,p.principal_delta::text AS principal_text,p.interest_delta::text AS interest_text,l.sequence FROM loan_posting p JOIN loan_ledger_entry l ON l.tenant_id=p.tenant_id AND l.loan_id=p.loan_id AND l.posting_id=p.id WHERE p.tenant_id=$1 AND p.loan_id=$2 AND l.sequence>$3 ORDER BY l.sequence DESC",vec![actor.tenant_id.into(),loan.into(),sequence.into()]).await?;
     if subsequent.iter().any(|row| {

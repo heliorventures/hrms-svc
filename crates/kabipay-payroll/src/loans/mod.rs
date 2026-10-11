@@ -1,5 +1,6 @@
 //! Loans owns storage. This hosting layer only translates authenticated GraphQL contracts.
 mod authorization;
+mod funding;
 mod mutation;
 mod query;
 mod types;

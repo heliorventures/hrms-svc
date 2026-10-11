@@ -42,3 +42,5 @@ reqsign = { version = "0.16.5", default-features = false, features = ["reqwest_r
 
 [dev-dependencies]
 sea-orm = { workspace = true, features = ["proxy"] }
+kabipay-loans = { path = "../kabipay-loans" }
+kabipay-loans-domain = { path = "../kabipay-loans-domain" }

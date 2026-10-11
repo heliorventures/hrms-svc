@@ -10,13 +10,35 @@ pub struct ModuleEntitlement(pub &'static str);
 /// The Payroll host contains separately entitled modules. Match actual field/type names,
 /// never aliases, document text or a client supplied module. Unknown fields keep the host gate.
 fn owning_module(host:&'static str,parent:&str,field:&str,root:bool)->&'static str {
-    const LOAN_FIELDS:&[&str]=&["myLoans","loanAccounts","myLoanRequests","loanRequestQueue","loanAccount","loanPolicies","loanPolicyVersions","loanLedger","loanPayments","loanSchedules","previewLoanReversal","publishLoanPolicy","retireLoanPolicy","saveLoanRequest","submitLoanRequest","decideLoanRequest","withdrawLoanRequest","recordLoanDisbursement","recordLoanReceipt","setLoanDeduction","setLoanPeriodOverride","reverseLoanPosting"];
+    const LOAN_FIELDS:&[&str]=&["myLoans","loanAccounts","myLoanRequests","loanRequestQueue","loanAccount","loanPolicy","previewLoanApproval","loanSchedulePreview","loanStatement","loanFinancialReconciliation","previewHistoricalLoanPayment","loanPolicies","loanPolicyVersions","loanLedger","loanPayments","loanSchedules","previewLoanReversal","publishLoanPolicy","retireLoanPolicy","saveLoanRequest","submitLoanRequest","decideLoanRequest","withdrawLoanRequest","recordLoanDisbursement","recordLoanReceipt","cancelLoanFunding","reconcileLoanFinancials","recordHistoricalLoanPayment","setLoanDeduction","setLoanPeriodOverride","reverseLoanPosting"];
     const LOAN_TYPES:&[&str]=&["LoanAccount","LoanRequest","LoanPolicy","LoanPosting","LoanPayment","LoanSchedule","LoanCommandResult","LoanCorrectionPreview","LoanPageInfo","LoanAccountConnection","LoanRequestConnection","LoanPolicyConnection","LoanPostingConnection","LoanPaymentConnection","LoanScheduleConnection"];
-    if host=="PAYROLL" && ((root && LOAN_FIELDS.contains(&field)) || (!root && LOAN_TYPES.contains(&parent))){"LOANS"}else{host}
+    let exit_field = root && matches!(field, "previewLoanExitReview" | "saveLoanExitReview" | "loanApprovalWorkflows");
+    let exit_type = !root && matches!(parent, "LoanExitReviewPreview" | "LoanExitReviewResult" | "LoanApprovalWorkflow" | "LoanApprovalWorkflowConnection");
+    let fnf_field = root && matches!(field, "fnfSettlement" | "fnfFinancialReview" | "previewFnfLoanExposure" | "financeFollowUpOwners" | "upsertFnfSettlement" | "saveFnfFinancialReview" | "finalizeFnfSettlement");
+    let fnf_type = !root && matches!(parent, "FnfSettlement" | "FnfFinancialPreparation" | "FinanceOwner" | "FinanceOwnerConnection" | "FinanceOwnerPageInfo");
+    if host == "PAYROLL" && (fnf_field || fnf_type) { return "EMPLOYEE"; }
+    if host=="PAYROLL" && (exit_field || exit_type || (root && LOAN_FIELDS.contains(&field)) || (!root && LOAN_TYPES.contains(&parent))){"LOANS"}else{host}
 }
 
 impl ExtensionFactory for ModuleEntitlement {
     fn create(&self) -> Arc<dyn Extension> { Arc::new(*self) }
+}
+
+#[cfg(test)]
+mod ownership_tests {
+    use super::owning_module;
+    #[test]
+    fn financial_host_preserves_employee_and_loan_entitlements() {
+        for field in ["fnfSettlement", "fnfFinancialReview", "upsertFnfSettlement", "saveFnfFinancialReview", "finalizeFnfSettlement"] {
+            assert_eq!(owning_module("PAYROLL", "QueryRoot", field, true), "EMPLOYEE");
+        }
+        for parent in ["FnfSettlement", "FnfFinancialPreparation"] {
+            assert_eq!(owning_module("PAYROLL", parent, "id", false), "EMPLOYEE");
+        }
+        assert_eq!(owning_module("PAYROLL", "QueryRoot", "previewLoanExitReview", true), "LOANS");
+        assert_eq!(owning_module("PAYROLL", "LoanExitReviewResult", "exposure", false), "LOANS");
+        assert_eq!(owning_module("PAYROLL", "QueryRoot", "payrollCycles", true), "PAYROLL");
+    }
 }
 
 #[async_trait::async_trait]

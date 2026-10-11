@@ -12,12 +12,13 @@ use rust_decimal::Decimal;
 use sea_orm::DatabaseTransaction;
 use uuid::Uuid;
 
-async fn validate(
+pub(crate) async fn validate(
     tx: &DatabaseTransaction,
     actor: &LoanActorScope,
     loan: Uuid,
     expected: i64,
     payment: &RecordedPayment,
+    historical: bool,
 ) -> LoanResult<(
     kabipay_db_entities::tenant::d0103_employee_loans::loan_account::Model,
     kabipay_db_entities::tenant::d0103_employee_loans::loan_terms_version::Model,
@@ -27,7 +28,11 @@ async fn validate(
     let account = store::account(tx, actor.tenant_id, loan).await?;
     lifecycle::checked_version(account.version, expected)?;
     access::employee(tx, actor, account.employee_id).await?;
-    let version = store::terms(tx, &account).await?;
+    let version = if historical {
+        store::terms_at(tx, actor.tenant_id, loan, payment.value_date).await?
+    } else {
+        store::terms(tx, &account).await?
+    };
     let terms: LoanTerms = serde_json::from_value(version.terms.clone())?;
     terms.validate()?;
     let policy = store::policy(tx, actor.tenant_id, version.policy_version_id).await?;
@@ -36,6 +41,10 @@ async fn validate(
     lifecycle::text(&payment.method, 32)?;
     lifecycle::text(&payment.external_reference, 128)?;
     lifecycle::text(&payment.evidence_reference, 500)?;
+    if let Some(reason) = &payment.resignation_exception_reason {
+        access::company(actor)?;
+        lifecycle::text(reason, 2000)?;
+    }
     terms.currency.validate_amount(payment.amount)?;
     if payment.amount <= Decimal::ZERO
         || payment.value_date < version.effective_from
@@ -43,13 +52,51 @@ async fn validate(
     {
         return Err(LoanModuleError::InvalidCommand);
     }
-    if account
-        .accrued_through
-        .is_some_and(|date| date > payment.value_date)
+    if !historical
+        && account
+            .accrued_through
+            .is_some_and(|date| date > payment.value_date)
     {
         return Err(LoanModuleError::HistoricalReconciliationRequired);
     }
     Ok((account, version, terms, rules))
+}
+
+/// Cancel only unused approval capacity. Existing principal, interest and credits remain intact.
+pub(crate) async fn cancel_funding(
+    tx: &DatabaseTransaction,
+    actor: &LoanActorScope,
+    loan: Uuid,
+    expected: i64,
+    reason: &str,
+) -> LoanResult<LoanCommandResult> {
+    access::company(actor)?;
+    lifecycle::text(reason, 2000)?;
+    let account = store::account(tx, actor.tenant_id, loan).await?;
+    access::employee(tx, actor, account.employee_id).await?;
+    lifecycle::checked_version(account.version, expected)?;
+    let funding = posting::net_funding(tx, actor.tenant_id, loan).await?;
+    if account.state != "OPEN"
+        || account.funding_state == "CANCELLED"
+        || funding >= account.approved_principal
+    {
+        return Err(LoanModuleError::InvalidCommand);
+    }
+    store::execute(
+        tx,
+        "UPDATE loan_account SET funding_state='CANCELLED' WHERE tenant_id=$1 AND id=$2",
+        vec![actor.tenant_id.into(), loan.into()],
+    )
+    .await?;
+    let version = posting::bump_account(tx, actor.tenant_id, loan).await?;
+    let updated = store::account(tx, actor.tenant_id, loan).await?;
+    Ok(lifecycle::result(
+        loan,
+        Some(loan),
+        Some(account.employee_id),
+        version,
+        &updated.state,
+    ))
 }
 pub(crate) async fn disburse(
     tx: &DatabaseTransaction,
@@ -57,10 +104,31 @@ pub(crate) async fn disburse(
     loan: Uuid,
     expected: i64,
     payment: &RecordedPayment,
+    funding_context: Option<&kabipay_common::finance_contract::FundingContext>,
 ) -> LoanResult<LoanCommandResult> {
-    let (account, version, terms, _rules) = validate(tx, actor, loan, expected, payment).await?;
+    let (account, version, terms, _rules) =
+        validate(tx, actor, loan, expected, payment, false).await?;
+    if let Some(context) = funding_context {
+        if context.employee_id != account.employee_id
+            || context.value_date != payment.value_date
+            || (context.pending_separation_id.is_some()
+                && payment.resignation_exception_reason.is_none())
+        {
+            return Err(LoanModuleError::InvalidCommand);
+        }
+    }
     if account.state != "OPEN" || account.funding_state == "CANCELLED" {
         return Err(LoanModuleError::InvalidCommand);
+    }
+    if store::one(
+        tx,
+        "SELECT id FROM loan_exit_arrangement WHERE tenant_id=$1 AND loan_id=$2 LIMIT 1",
+        vec![actor.tenant_id.into(), loan.into()],
+    )
+    .await?
+    .is_some()
+    {
+        return Err(LoanModuleError::PolicyUnavailable);
     }
     let funding = posting::net_funding(tx, actor.tenant_id, loan).await?;
     if funding
@@ -85,7 +153,7 @@ pub(crate) async fn disburse(
     // This is the carry after earned accrual, before this funding tranche.
     // Capture it even when the proportional charge rounds to zero.
     let fresh = store::account(tx, actor.tenant_id, loan).await?;
-    store::execute(tx,"INSERT INTO loan_disbursement(id,tenant_id,loan_id,amount,value_date,method,external_reference,evidence,actor_id,version) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,1)",vec![id.into(),actor.tenant_id.into(),loan.into(),payment.amount.into(),payment.value_date.into(),payment.method.clone().into(),payment.external_reference.clone().into(),serde_json::json!({"reference":payment.evidence_reference}).into(),actor.user_id.into()]).await?;
+    store::execute(tx,"INSERT INTO loan_disbursement(id,tenant_id,loan_id,amount,value_date,method,external_reference,evidence,actor_id,version) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,1)",vec![id.into(),actor.tenant_id.into(),loan.into(),payment.amount.into(),payment.value_date.into(),payment.method.clone().into(),payment.external_reference.clone().into(),serde_json::json!({"reference":payment.evidence_reference,"resignationExceptionReason":payment.resignation_exception_reason,"fundingContext":funding_context}).into(),actor.user_id.into()]).await?;
     ids.push(posting::post(tx,actor,Posting{loan,terms:version.id,kind:"DISBURSEMENT",source_kind:"EXTERNAL_DISBURSEMENT",source:id,revision:1,date:payment.value_date,amount:payment.amount,principal:payment.amount,interest:Decimal::ZERO,reversal:None,evidence:serde_json::json!({"reference":payment.external_reference,"calculatorVersion":terms.calculator_version,"carryBefore":fresh.rounding_carry})}).await?);
     if matches!(
         terms.interest,
@@ -128,7 +196,8 @@ pub(crate) async fn receipt(
     expected: i64,
     payment: &RecordedPayment,
 ) -> LoanResult<LoanCommandResult> {
-    let (account, version, terms, rules) = validate(tx, actor, loan, expected, payment).await?;
+    let (account, version, terms, rules) =
+        validate(tx, actor, loan, expected, payment, false).await?;
     let id = Uuid::new_v4();
     let mut ids = accrual::accrue(
         tx,

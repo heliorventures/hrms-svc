@@ -12,6 +12,11 @@ use uuid::Uuid;
 pub struct LoanRequestView {
     pub id: Uuid,
     pub employee_id: Uuid,
+    pub employee_name: String,
+    pub employee_code: String,
+    pub policy_id: Uuid,
+    pub preferences: serde_json::Value,
+    pub created_at: chrono::DateTime<chrono::Utc>,
     pub requested_amount: String,
     pub currency: String,
     pub purpose: String,
@@ -28,6 +33,13 @@ pub struct LoanAccountView {
     pub employee_id: Uuid,
     pub request_id: Uuid,
     pub loan_number: String,
+    pub employee_name: String,
+    pub employee_code: String,
+    pub purpose: String,
+    pub disbursed: String,
+    pub repaid: String,
+    pub outstanding: String,
+    pub unapplied_credit: String,
     pub approved_principal: String,
     pub currency: String,
     pub minor_units: i32,
@@ -74,6 +86,7 @@ pub struct LoanPaymentView {
     pub method: String,
     pub external_reference: String,
     pub unapplied_credit: String,
+    pub resignation_exception_reason: Option<String>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -91,6 +104,36 @@ pub struct LoanPage<T> {
     pub nodes: Vec<T>,
     pub end_cursor: Option<Uuid>,
     pub has_next_page: bool,
+}
+#[derive(Clone, Debug)]
+pub struct LoanApprovalWorkflowView {
+    pub id: Uuid,
+    pub name: String,
+}
+pub async fn loan_approval_workflows(
+    tx: &DatabaseTransaction,
+    actor: &LoanActorScope,
+    after: Option<Uuid>,
+    first: u32,
+) -> LoanResult<LoanPage<LoanApprovalWorkflowView>> {
+    if actor.permission != LoanPermission::Policy
+        || actor.scope != kabipay_common::context::ScopeType::All
+    {
+        return Err(LoanModuleError::Forbidden);
+    }
+    access::entitled(tx, actor).await?;
+    let count = limit(first)?;
+    let rows=store::all(tx,"SELECT w.id,w.name FROM workflow w WHERE w.tenant_id=$1 AND w.is_active AND w.entity_type='LOAN_REQUEST' AND ($2::uuid IS NULL OR w.id>$2) AND EXISTS(SELECT 1 FROM workflow_step s WHERE s.tenant_id=w.tenant_id AND s.workflow_id=w.id) AND NOT EXISTS(SELECT 1 FROM workflow_step s WHERE s.tenant_id=w.tenant_id AND s.workflow_id=w.id AND s.approver_permission IS DISTINCT FROM 'loan:approve') ORDER BY w.id LIMIT $3",vec![actor.tenant_id.into(),after.into(),(i64::from(first)+1).into()]).await?;
+    let nodes = rows
+        .into_iter()
+        .map(|r| {
+            Ok(LoanApprovalWorkflowView {
+                id: r.try_get("", "id")?,
+                name: r.try_get("", "name")?,
+            })
+        })
+        .collect::<LoanResult<Vec<_>>>()?;
+    Ok(page(nodes, count, |v| v.id))
 }
 pub(crate) fn limit(first: u32) -> LoanResult<usize> {
     if first == 0 || first > 100 {
@@ -141,6 +184,21 @@ async fn scope_ids(
         EmployeeScopeFilter::EmployeeIds(ids) => Some(ids),
     })
 }
+#[derive(Default)]
+pub struct LoanReadFilter {
+    pub search: Option<String>,
+    pub state: Option<String>,
+}
+impl LoanReadFilter {
+    fn validate(&self) -> LoanResult<()> {
+        if self.search.as_ref().is_some_and(|v| v.len() > 200)
+            || self.state.as_ref().is_some_and(|v| v.len() > 32)
+        {
+            return Err(LoanModuleError::InvalidCommand);
+        }
+        Ok(())
+    }
+}
 /// Filtering happens in SQL before pagination, not after exposing/reading other employees' rows.
 pub async fn list_accounts(
     tx: &DatabaseTransaction,
@@ -150,10 +208,31 @@ pub async fn list_accounts(
     after: Option<Uuid>,
     first: u32,
 ) -> LoanResult<LoanPage<LoanAccountView>> {
+    list_filtered_accounts(
+        tx,
+        actor,
+        self_only,
+        employee,
+        after,
+        first,
+        &LoanReadFilter::default(),
+    )
+    .await
+}
+pub async fn list_filtered_accounts(
+    tx: &DatabaseTransaction,
+    actor: &LoanActorScope,
+    self_only: bool,
+    employee: Option<Uuid>,
+    after: Option<Uuid>,
+    first: u32,
+    filter: &LoanReadFilter,
+) -> LoanResult<LoanPage<LoanAccountView>> {
+    filter.validate()?;
     readable(tx, actor).await?;
     let count = limit(first)?;
     let ids = scope_ids(tx, actor, self_only, employee).await?;
-    let rows=store::all(tx,"SELECT a.id,a.employee_id,a.request_id,a.loan_number,a.approved_principal::text AS approved_principal,a.currency,a.minor_units,a.state,a.funding_state,a.version,t.terms,COALESCE((SELECT SUM(principal_delta) FROM loan_ledger_entry l WHERE l.tenant_id=a.tenant_id AND l.loan_id=a.id),0)::text AS principal,COALESCE((SELECT SUM(interest_delta) FROM loan_ledger_entry l WHERE l.tenant_id=a.tenant_id AND l.loan_id=a.id),0)::text AS interest FROM loan_account a JOIN loan_terms_version t ON t.tenant_id=a.tenant_id AND t.loan_id=a.id AND t.id=a.current_terms_id WHERE a.tenant_id=$1 AND ($2::uuid[] IS NULL OR a.employee_id=ANY($2)) AND ($3::uuid IS NULL OR a.id>$3) ORDER BY a.id LIMIT $4",vec![actor.tenant_id.into(),ids.into(),after.into(),(i64::from(first)+1).into()]).await?;
+    let rows=store::all(tx,"SELECT e.first_name || ' ' || e.last_name AS employee_name,e.employee_code,r.purpose,COALESCE((SELECT SUM(p.amount) FROM loan_posting p WHERE p.tenant_id=a.tenant_id AND p.loan_id=a.id AND p.kind='DISBURSEMENT' AND NOT EXISTS(SELECT 1 FROM loan_posting x WHERE x.tenant_id=p.tenant_id AND x.reversal_of=p.id)),0)::text AS disbursed,COALESCE((SELECT SUM(p.amount) FROM loan_posting p WHERE p.tenant_id=a.tenant_id AND p.loan_id=a.id AND p.kind='REPAYMENT' AND NOT EXISTS(SELECT 1 FROM loan_posting x WHERE x.tenant_id=p.tenant_id AND x.reversal_of=p.id)),0)::text AS repaid,COALESCE((SELECT SUM(principal_delta+interest_delta) FROM loan_ledger_entry l WHERE l.tenant_id=a.tenant_id AND l.loan_id=a.id),0)::text AS outstanding,COALESCE((SELECT SUM(remaining_amount) FROM loan_unapplied_credit c WHERE c.tenant_id=a.tenant_id AND c.loan_id=a.id),0)::text AS unapplied_credit,a.id,a.employee_id,a.request_id,a.loan_number,a.approved_principal::text AS approved_principal,a.currency,a.minor_units,a.state,a.funding_state,a.version,t.terms,COALESCE((SELECT SUM(principal_delta) FROM loan_ledger_entry l WHERE l.tenant_id=a.tenant_id AND l.loan_id=a.id),0)::text AS principal,COALESCE((SELECT SUM(interest_delta) FROM loan_ledger_entry l WHERE l.tenant_id=a.tenant_id AND l.loan_id=a.id),0)::text AS interest FROM loan_account a JOIN employee e ON e.tenant_id=a.tenant_id AND e.id=a.employee_id JOIN loan_request r ON r.tenant_id=a.tenant_id AND r.id=a.request_id JOIN loan_terms_version t ON t.tenant_id=a.tenant_id AND t.loan_id=a.id AND t.id=a.current_terms_id WHERE a.tenant_id=$1 AND ($2::uuid[] IS NULL OR a.employee_id=ANY($2)) AND ($3::uuid IS NULL OR a.id>$3) AND ($5::text IS NULL OR strpos(lower(concat_ws(' ',a.loan_number,e.first_name,e.last_name,e.employee_code,r.purpose)),lower($5))>0) AND ($6::text IS NULL OR a.state=$6) ORDER BY a.id LIMIT $4",vec![actor.tenant_id.into(),ids.into(),after.into(),(i64::from(first)+1).into(),filter.search.clone().into(),filter.state.clone().into()]).await?;
     let nodes = rows
         .into_iter()
         .map(|row| {
@@ -162,6 +241,13 @@ pub async fn list_accounts(
                 employee_id: row.try_get("", "employee_id")?,
                 request_id: row.try_get("", "request_id")?,
                 loan_number: row.try_get("", "loan_number")?,
+                employee_name: row.try_get("", "employee_name")?,
+                employee_code: row.try_get("", "employee_code")?,
+                purpose: row.try_get("", "purpose")?,
+                disbursed: row.try_get("", "disbursed")?,
+                repaid: row.try_get("", "repaid")?,
+                outstanding: row.try_get("", "outstanding")?,
+                unapplied_credit: row.try_get("", "unapplied_credit")?,
                 approved_principal: row.try_get("", "approved_principal")?,
                 currency: row.try_get("", "currency")?,
                 minor_units: row.try_get("", "minor_units")?,
@@ -184,16 +270,42 @@ pub async fn list_requests(
     after: Option<Uuid>,
     first: u32,
 ) -> LoanResult<LoanPage<LoanRequestView>> {
+    list_filtered_requests(
+        tx,
+        actor,
+        self_only,
+        employee,
+        after,
+        first,
+        &LoanReadFilter::default(),
+    )
+    .await
+}
+pub async fn list_filtered_requests(
+    tx: &DatabaseTransaction,
+    actor: &LoanActorScope,
+    self_only: bool,
+    employee: Option<Uuid>,
+    after: Option<Uuid>,
+    first: u32,
+    filter: &LoanReadFilter,
+) -> LoanResult<LoanPage<LoanRequestView>> {
+    filter.validate()?;
     readable(tx, actor).await?;
     let count = limit(first)?;
     let ids = scope_ids(tx, actor, self_only, employee).await?;
-    let rows=store::all(tx,"SELECT r.id,r.employee_id,r.requested_amount::text AS requested_amount,r.currency,r.purpose,r.employee_notes,r.state,r.version,r.workflow_instance_id,w.current_step_id FROM loan_request r LEFT JOIN workflow_instance w ON w.tenant_id=r.tenant_id AND w.id=r.workflow_instance_id WHERE r.tenant_id=$1 AND ($2::uuid[] IS NULL OR r.employee_id=ANY($2)) AND ($3::uuid IS NULL OR r.id>$3) AND ($5::bool OR r.state<>'DRAFT') ORDER BY r.id LIMIT $4",vec![actor.tenant_id.into(),ids.into(),after.into(),(i64::from(first)+1).into(),self_only.into()]).await?;
+    let rows=store::all(tx,"SELECT e.first_name || ' ' || e.last_name AS employee_name,e.employee_code,(r.preferences->>'policyId')::uuid AS policy_id,r.preferences->'employee' AS preferences,r.created_at,r.id,r.employee_id,r.requested_amount::text AS requested_amount,r.currency,r.purpose,r.employee_notes,r.state,r.version,r.workflow_instance_id,w.current_step_id FROM loan_request r JOIN employee e ON e.tenant_id=r.tenant_id AND e.id=r.employee_id LEFT JOIN workflow_instance w ON w.tenant_id=r.tenant_id AND w.id=r.workflow_instance_id WHERE r.tenant_id=$1 AND ($2::uuid[] IS NULL OR r.employee_id=ANY($2)) AND ($3::uuid IS NULL OR r.id>$3) AND ($5::bool OR r.state<>'DRAFT') AND ($6::text IS NULL OR strpos(lower(concat_ws(' ',e.first_name,e.last_name,e.employee_code,r.purpose)),lower($6))>0) AND ($7::text IS NULL OR r.state=$7) ORDER BY r.id LIMIT $4",vec![actor.tenant_id.into(),ids.into(),after.into(),(i64::from(first)+1).into(),self_only.into(),filter.search.clone().into(),filter.state.clone().into()]).await?;
     let nodes = rows
         .into_iter()
         .map(|row| {
             Ok(LoanRequestView {
                 id: row.try_get("", "id")?,
                 employee_id: row.try_get("", "employee_id")?,
+                employee_name: row.try_get("", "employee_name")?,
+                employee_code: row.try_get("", "employee_code")?,
+                policy_id: row.try_get("", "policy_id")?,
+                preferences: row.try_get("", "preferences")?,
+                created_at: row.try_get("", "created_at")?,
                 requested_amount: row.try_get("", "requested_amount")?,
                 currency: row.try_get("", "currency")?,
                 purpose: row.try_get("", "purpose")?,
@@ -218,11 +330,19 @@ pub async fn loan_account(
     access::employee(tx, actor, account.employee_id).await?;
     let version = store::terms(tx, &account).await?;
     let (principal, interest) = store::balances(tx, actor.tenant_id, id).await?;
+    let metadata = store::one(tx, "SELECT e.first_name || ' ' || e.last_name AS employee_name,e.employee_code,r.purpose,COALESCE((SELECT SUM(p.amount) FROM loan_posting p WHERE p.tenant_id=a.tenant_id AND p.loan_id=a.id AND p.kind='DISBURSEMENT' AND NOT EXISTS(SELECT 1 FROM loan_posting x WHERE x.tenant_id=p.tenant_id AND x.reversal_of=p.id)),0)::text AS disbursed,COALESCE((SELECT SUM(p.amount) FROM loan_posting p WHERE p.tenant_id=a.tenant_id AND p.loan_id=a.id AND p.kind='REPAYMENT' AND NOT EXISTS(SELECT 1 FROM loan_posting x WHERE x.tenant_id=p.tenant_id AND x.reversal_of=p.id)),0)::text AS repaid,COALESCE((SELECT SUM(principal_delta+interest_delta) FROM loan_ledger_entry l WHERE l.tenant_id=a.tenant_id AND l.loan_id=a.id),0)::text AS outstanding,COALESCE((SELECT SUM(remaining_amount) FROM loan_unapplied_credit c WHERE c.tenant_id=a.tenant_id AND c.loan_id=a.id),0)::text AS unapplied_credit FROM loan_account a JOIN employee e ON e.tenant_id=a.tenant_id AND e.id=a.employee_id JOIN loan_request r ON r.tenant_id=a.tenant_id AND r.id=a.request_id WHERE a.tenant_id=$1 AND a.id=$2",vec![actor.tenant_id.into(),id.into()]).await?.ok_or(LoanModuleError::NotFound)?;
     Ok(LoanAccountView {
         id,
         employee_id: account.employee_id,
         request_id: account.request_id,
         loan_number: account.loan_number,
+        employee_name: metadata.try_get("", "employee_name")?,
+        employee_code: metadata.try_get("", "employee_code")?,
+        purpose: metadata.try_get("", "purpose")?,
+        disbursed: metadata.try_get("", "disbursed")?,
+        repaid: metadata.try_get("", "repaid")?,
+        outstanding: metadata.try_get("", "outstanding")?,
+        unapplied_credit: metadata.try_get("", "unapplied_credit")?,
         approved_principal: account.approved_principal.to_string(),
         currency: account.currency,
         minor_units: account.minor_units,
@@ -304,7 +424,7 @@ pub async fn loan_payments(
     let count = limit(first)?;
     let account = store::account(tx, actor.tenant_id, loan).await?;
     access::employee(tx, actor, account.employee_id).await?;
-    let nodes=store::all(tx,"WITH payments AS (SELECT id,'DISBURSEMENT'::text AS kind,amount::text AS amount,value_date,method,external_reference,'0'::text AS unapplied_credit FROM loan_disbursement WHERE tenant_id=$1 AND loan_id=$2 UNION ALL SELECT r.id,'RECEIPT',r.amount::text,r.value_date,r.method,r.external_reference,COALESCE((SELECT SUM(remaining_amount) FROM loan_unapplied_credit c WHERE c.tenant_id=r.tenant_id AND c.loan_id=r.loan_id AND c.receipt_id=r.id),0)::text FROM loan_receipt r WHERE r.tenant_id=$1 AND r.loan_id=$2) SELECT * FROM payments WHERE ($3::uuid IS NULL OR id>$3) ORDER BY id LIMIT $4",vec![actor.tenant_id.into(),loan.into(),after.into(),(i64::from(first)+1).into()]).await?.into_iter().map(|row|Ok(LoanPaymentView{id:row.try_get("","id")?,kind:row.try_get("","kind")?,amount:row.try_get("","amount")?,value_date:row.try_get("","value_date")?,method:row.try_get("","method")?,external_reference:row.try_get("","external_reference")?,unapplied_credit:row.try_get("","unapplied_credit")?})).collect::<LoanResult<Vec<_>>>()?;
+    let nodes=store::all(tx,"WITH payments AS (SELECT id,'DISBURSEMENT'::text AS kind,amount::text AS amount,value_date,method,external_reference,evidence->>'resignationExceptionReason' AS exception_reason,'0'::text AS unapplied_credit FROM loan_disbursement WHERE tenant_id=$1 AND loan_id=$2 UNION ALL SELECT r.id,'RECEIPT',r.amount::text,r.value_date,r.method,r.external_reference,NULL::text AS exception_reason,COALESCE((SELECT SUM(remaining_amount) FROM loan_unapplied_credit c WHERE c.tenant_id=r.tenant_id AND c.loan_id=r.loan_id AND c.receipt_id=r.id),0)::text FROM loan_receipt r WHERE r.tenant_id=$1 AND r.loan_id=$2) SELECT * FROM payments WHERE ($3::uuid IS NULL OR id>$3) ORDER BY id LIMIT $4",vec![actor.tenant_id.into(),loan.into(),after.into(),(i64::from(first)+1).into()]).await?.into_iter().map(|row|Ok(LoanPaymentView{id:row.try_get("","id")?,kind:row.try_get("","kind")?,amount:row.try_get("","amount")?,value_date:row.try_get("","value_date")?,method:row.try_get("","method")?,external_reference:row.try_get("","external_reference")?,unapplied_credit:row.try_get("","unapplied_credit")?,resignation_exception_reason:if actor.scope==kabipay_common::context::ScopeType::All { row.try_get("","exception_reason")? } else { None }})).collect::<LoanResult<Vec<_>>>()?;
     Ok(page(nodes, count, |v| v.id))
 }
 pub async fn loan_schedules(

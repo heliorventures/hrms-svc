@@ -273,6 +273,7 @@ impl Fixture {
             method: "EXTERNAL_BANK".into(),
             external_reference: format!("fixture-{amount}"),
             evidence_reference: "fixture-bank-evidence".into(),
+            resignation_exception_reason: None,
         }
     }
     pub async fn account(&self, loan: Uuid) -> LoanAccountView {

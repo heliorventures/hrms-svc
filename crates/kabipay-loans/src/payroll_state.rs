@@ -22,7 +22,7 @@ pub async fn payroll_loan_state(
     if !enabled
         && store::one(
             tx,
-            "SELECT id FROM loan_account WHERE tenant_id=$1 AND state='OPEN' LIMIT 1",
+            "SELECT a.id FROM loan_account a WHERE a.tenant_id=$1 AND (a.state='OPEN' OR EXISTS(SELECT 1 FROM loan_unapplied_credit c WHERE c.tenant_id=a.tenant_id AND c.loan_id=a.id AND c.remaining_amount>0)) LIMIT 1",
             vec![tenant.into()],
         )
         .await?

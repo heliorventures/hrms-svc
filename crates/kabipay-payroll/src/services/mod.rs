@@ -41,3 +41,4 @@ pub mod payroll_finalize;
 pub mod payroll_fingerprint;
 pub mod payroll_preview;
 pub mod loan_recovery;
+pub mod loan_reconciliation;

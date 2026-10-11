@@ -1,4 +1,71 @@
 include!("support/fixture.rs");
+#[path = "support/historical_payments.rs"]
+mod historical_payments;
+
+#[tokio::test]
+#[ignore = "requires disposable PostgreSQL fixture"]
+async fn account_and_request_views_report_posted_money_without_funding_an_approval() {
+    let f = Fixture::new(100000).await;
+    let loan = f.loan(InterestMethod::InterestFree).await;
+    let unfunded = f.account(loan).await;
+    assert_eq!(
+        unfunded.disbursed.parse::<Decimal>().unwrap(),
+        Decimal::ZERO
+    );
+    assert_eq!(
+        unfunded.outstanding.parse::<Decimal>().unwrap(),
+        Decimal::ZERO
+    );
+    let funded = f
+        .apply(
+            f.manager,
+            "ALL",
+            1,
+            "read-fund",
+            LoanCommand::RecordDisbursement {
+                loan_id: loan,
+                payment: f.payment(1000),
+            },
+        )
+        .await
+        .unwrap();
+    f.apply(
+        f.manager,
+        "ALL",
+        funded.version,
+        "read-receipt",
+        LoanCommand::RecordReceipt {
+            loan_id: loan,
+            payment: f.payment(200),
+        },
+    )
+    .await
+    .unwrap();
+    let tx = f.db.begin().await.unwrap();
+    let actor = f.actor(f.user, "SELF", LoanPermission::Read);
+    let accounts = list_accounts(&tx, &actor, true, None, None, 25)
+        .await
+        .unwrap();
+    let account = &accounts.nodes[0];
+    assert_eq!(
+        account.disbursed.parse::<Decimal>().unwrap(),
+        Decimal::from(1000)
+    );
+    assert_eq!(
+        account.repaid.parse::<Decimal>().unwrap(),
+        Decimal::from(200)
+    );
+    assert_eq!(
+        account.outstanding.parse::<Decimal>().unwrap(),
+        Decimal::from(800)
+    );
+    let requests = list_requests(&tx, &actor, true, None, None, 25)
+        .await
+        .unwrap();
+    assert_eq!(requests.nodes[0].policy_id, f.policy);
+    assert_eq!(requests.nodes[0].id, account.request_id);
+    tx.rollback().await.unwrap();
+}
 
 #[tokio::test]
 #[ignore = "requires disposable PostgreSQL fixture"]
@@ -1111,5 +1178,175 @@ async fn hr_can_select_a_same_day_first_recovery_without_deducting_unfunded_mone
             .total(),
         Decimal::from(500)
     );
+    tx.rollback().await.unwrap();
+}
+#[tokio::test]
+#[ignore = "requires disposable PostgreSQL fixture"]
+async fn cancelling_unused_funding_preserves_debt_and_cannot_be_undone_by_repayment() {
+    let f = Fixture::new(100000).await;
+    let request = f.request(f.user, "cancel-request").await;
+    let approval = f
+        .apply(
+            f.manager,
+            "ALL",
+            request.version,
+            "cancel-approval",
+            f.approval(request.record_id, InterestMethod::InterestFree),
+        )
+        .await
+        .unwrap();
+    let loan = approval.loan_id.unwrap();
+    let funding = f
+        .apply(
+            f.manager,
+            "ALL",
+            1,
+            "partial-funding",
+            LoanCommand::RecordDisbursement {
+                loan_id: loan,
+                payment: f.payment(1000),
+            },
+        )
+        .await
+        .unwrap();
+    let command = LoanCommand::CancelFunding {
+        loan_id: loan,
+        reason: "Employee no longer needs the unused amount".into(),
+    };
+    let cancelled = f
+        .apply(
+            f.manager,
+            "ALL",
+            funding.version,
+            "cancel-unused",
+            command.clone(),
+        )
+        .await
+        .unwrap();
+    let retry = f
+        .apply(f.manager, "ALL", funding.version, "cancel-unused", command)
+        .await
+        .unwrap();
+    assert_eq!(cancelled.record_id, retry.record_id);
+    assert!(cancelled.posting_ids.is_empty());
+    assert_eq!(
+        f.account(loan).await.principal.parse::<Decimal>().unwrap(),
+        Decimal::from(1000)
+    );
+    let rejected = f
+        .apply(
+            f.manager,
+            "ALL",
+            cancelled.version,
+            "fund-after-cancel",
+            LoanCommand::RecordDisbursement {
+                loan_id: loan,
+                payment: f.payment(100),
+            },
+        )
+        .await;
+    assert!(matches!(rejected, Err(LoanModuleError::InvalidCommand)));
+    // Cancelling the unused 9,000 releases capacity, but the funded 1,000 still counts.
+    let next_request = f.request(f.user, "after-cancel-request").await;
+    let mut next_approval = f.approval(next_request.record_id, InterestMethod::InterestFree);
+    if let LoanCommand::DecideRequest {
+        terms: Some(terms), ..
+    } = &mut next_approval
+    {
+        terms.approved_principal = Decimal::from(9000);
+    } else {
+        panic!("fixture must supply approval terms");
+    }
+    f.apply(
+        f.manager,
+        "ALL",
+        next_request.version,
+        "released-capacity",
+        next_approval,
+    )
+    .await
+    .unwrap();
+    f.apply(
+        f.manager,
+        "ALL",
+        cancelled.version,
+        "repay-cancelled",
+        LoanCommand::RecordReceipt {
+            loan_id: loan,
+            payment: f.payment(1000),
+        },
+    )
+    .await
+    .unwrap();
+    let account = f.account(loan).await;
+    assert_eq!(account.funding_state, "CANCELLED");
+    assert_eq!(account.state, "CLOSED");
+}
+
+#[tokio::test]
+#[ignore = "requires disposable PostgreSQL fixture"]
+async fn verified_pending_resignation_funding_keeps_reason_context_and_retry_identity() {
+    let f = Fixture::new(100000).await;
+    let loan = f.loan(InterestMethod::InterestFree).await;
+    let actor = f.actor(f.manager, "ALL", LoanPermission::Disburse);
+    let context = kabipay_common::finance_contract::FundingContext {
+        employee_id: f.employee,
+        value_date: f.today,
+        pending_separation_id: Some(Uuid::new_v4()),
+    };
+    let meta = CommandMeta {
+        idempotency_key: "pending-funding".into(),
+        expected_version: 1,
+    };
+    let mut payment = f.payment(1000);
+    let tx = f.db.begin().await.unwrap();
+    let missing = LoanCommand::RecordDisbursement {
+        loan_id: loan,
+        payment: payment.clone(),
+    };
+    assert!(matches!(
+        execute_with_funding_context(&tx, &actor, &meta, &missing, Some(&context)).await,
+        Err(LoanModuleError::InvalidCommand)
+    ));
+    tx.rollback().await.unwrap();
+    payment.resignation_exception_reason = Some("HR and management approved this exception".into());
+    let command = LoanCommand::RecordDisbursement {
+        loan_id: loan,
+        payment,
+    };
+    let tx = f.db.begin().await.unwrap();
+    let recorded = execute_with_funding_context(&tx, &actor, &meta, &command, Some(&context))
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    let tx = f.db.begin().await.unwrap();
+    let retry = recorded_command(&tx, &actor, &meta, &command)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(recorded.record_id, retry.record_id);
+    let evidence: serde_json::Value = tx
+        .query_one(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "SELECT evidence FROM loan_disbursement WHERE tenant_id=$1 AND id=$2",
+            [f.tenant.into(), recorded.record_id.into()],
+        ))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get("", "evidence")
+        .unwrap();
+    assert_eq!(
+        evidence["resignationExceptionReason"],
+        "HR and management approved this exception"
+    );
+    assert_eq!(
+        evidence["fundingContext"]["pendingSeparationId"],
+        context.pending_separation_id.unwrap().to_string()
+    );
+    let hr = loan_payments(&tx, &f.actor(f.manager, "ALL", LoanPermission::Read), loan, None, 25).await.unwrap();
+    assert_eq!(hr.nodes[0].resignation_exception_reason.as_deref(), Some("HR and management approved this exception"));
+    let employee = loan_payments(&tx, &f.actor(f.user, "SELF", LoanPermission::Read), loan, None, 25).await.unwrap();
+    assert!(employee.nodes[0].resignation_exception_reason.is_none());
     tx.rollback().await.unwrap();
 }

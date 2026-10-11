@@ -355,8 +355,36 @@ async fn exposure(
     terms: &LoanTerms,
     rules: &LoanPolicy,
 ) -> LoanResult<()> {
-    // Outstanding principal plus undisbursed commitments. Paid debt releases exposure.
-    let row=store::one(tx,"WITH exposure AS (SELECT a.employee_id,COALESCE((SELECT SUM(principal_delta) FROM loan_ledger_entry l WHERE l.tenant_id=a.tenant_id AND l.loan_id=a.id),0)+GREATEST(a.approved_principal-COALESCE((SELECT SUM(CASE WHEN kind='DISBURSEMENT' THEN principal_delta WHEN kind='REVERSAL' AND principal_delta<0 THEN principal_delta ELSE 0 END) FROM loan_posting p WHERE p.tenant_id=a.tenant_id AND p.loan_id=a.id),0),0) AS amount FROM loan_account a WHERE a.tenant_id=$1 AND a.state='OPEN' AND a.currency=$3) SELECT COALESCE(SUM(amount) FILTER(WHERE employee_id=$2),0)::text AS employee,COALESCE(SUM(amount),0)::text AS company FROM exposure",vec![tenant.into(),employee.into(),terms.currency.code.clone().into()]).await?.ok_or(LoanModuleError::NotFound)?;
+    // Only live commitments consume unused capacity. Cancelling funding never forgives debt.
+    let row = store::one(
+        tx,
+        r#"
+        WITH exposure AS (
+            SELECT a.employee_id,
+                COALESCE((SELECT SUM(l.principal_delta) FROM loan_ledger_entry l
+                    WHERE l.tenant_id=a.tenant_id AND l.loan_id=a.id), 0)
+                + CASE WHEN a.funding_state='CANCELLED' THEN 0 ELSE
+                    GREATEST(a.approved_principal - COALESCE((
+                        SELECT SUM(CASE
+                            WHEN p.kind='DISBURSEMENT' THEN p.principal_delta
+                            WHEN p.kind='REVERSAL' AND p.principal_delta<0 THEN p.principal_delta
+                            ELSE 0 END)
+                        FROM loan_posting p WHERE p.tenant_id=a.tenant_id AND p.loan_id=a.id
+                    ), 0), 0) END AS amount
+            FROM loan_account a
+            WHERE a.tenant_id=$1 AND a.state='OPEN' AND a.currency=$3
+        )
+        SELECT COALESCE(SUM(amount) FILTER(WHERE employee_id=$2), 0)::text AS employee,
+               COALESCE(SUM(amount), 0)::text AS company FROM exposure
+    "#,
+        vec![
+            tenant.into(),
+            employee.into(),
+            terms.currency.code.clone().into(),
+        ],
+    )
+    .await?
+    .ok_or(LoanModuleError::NotFound)?;
     let add = |value: rust_decimal::Decimal| {
         value
             .checked_add(terms.approved_principal)
