@@ -33,6 +33,29 @@ fn amount(value: &str) -> Result<Decimal> {
 }
 #[derive(serde::Deserialize)]
 struct DecimalString(#[serde(with = "kabipay_loans_domain::decimal_string")] Decimal);
+pub(super) fn deduction_command(input: &SetLoanDeductionInput) -> Result<LoanCommand> {
+    Ok(LoanCommand::SetDeduction {
+        loan_id: uuid(&input.loan_id)?,
+        effective_from: date(&input.effective_from)?,
+        first_due_date: date(&input.first_due_date)?,
+        amount: amount(&input.amount)?,
+        recovery: match input.recovery {
+            LoanRecoveryMode::Payroll => RecoveryMode::Payroll,
+            LoanRecoveryMode::External => RecoveryMode::External,
+            LoanRecoveryMode::Mixed => RecoveryMode::Mixed,
+        },
+        reason: input.reason.clone(),
+    })
+}
+pub(super) fn period_override_command(input: &SetLoanPeriodOverrideInput) -> Result<LoanCommand> {
+    Ok(LoanCommand::SetPeriodOverride {
+        loan_id: uuid(&input.loan_id)?,
+        period_start: date(&input.period_start)?,
+        amount: input.amount.as_deref().map(amount).transpose()?,
+        pause_interest: input.pause_interest,
+        reason: input.reason.clone(),
+    })
+}
 async fn run(
     ctx: &Context<'_>,
     input: LoanCommand,
@@ -291,41 +314,16 @@ impl LoanMutation {
         ctx: &Context<'_>,
         input: SetLoanDeductionInput,
     ) -> Result<LoanResultDto> {
-        run(
-            ctx,
-            LoanCommand::SetDeduction {
-                loan_id: uuid(&input.loan_id)?,
-                effective_from: date(&input.effective_from)?,
-                first_due_date: date(&input.first_due_date)?,
-                amount: amount(&input.amount)?,
-                recovery: match input.recovery {
-                    LoanRecoveryMode::Payroll => RecoveryMode::Payroll,
-                    LoanRecoveryMode::External => RecoveryMode::External,
-                    LoanRecoveryMode::Mixed => RecoveryMode::Mixed,
-                },
-                reason: input.reason,
-            },
-            input.meta,
-        )
-        .await
+        let command = deduction_command(&input)?;
+        run(ctx, command, input.meta).await
     }
     async fn set_loan_period_override(
         &self,
         ctx: &Context<'_>,
         input: SetLoanPeriodOverrideInput,
     ) -> Result<LoanResultDto> {
-        run(
-            ctx,
-            LoanCommand::SetPeriodOverride {
-                loan_id: uuid(&input.loan_id)?,
-                period_start: date(&input.period_start)?,
-                amount: input.amount.map(|value| amount(&value)).transpose()?,
-                pause_interest: input.pause_interest,
-                reason: input.reason,
-            },
-            input.meta,
-        )
-        .await
+        let command = period_override_command(&input)?;
+        run(ctx, command, input.meta).await
     }
     async fn reverse_loan_posting(
         &self,

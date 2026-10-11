@@ -1,6 +1,18 @@
 include!("support/fixture.rs");
 #[path = "support/historical_payments.rs"]
 mod historical_payments;
+#[path = "support/request_workflow.rs"]
+mod request_workflow;
+#[path = "support/schedule_review.rs"]
+mod schedule_review;
+#[path = "support/schedule_review_followup.rs"]
+mod schedule_review_followup;
+#[path = "support/continuing_schedule_review.rs"]
+mod continuing_schedule_review;
+#[path = "support/unfunded_schedule_review.rs"]
+mod unfunded_schedule_review;
+#[path = "support/arrangement_preview.rs"]
+mod arrangement_preview;
 
 #[tokio::test]
 #[ignore = "requires disposable PostgreSQL fixture"]

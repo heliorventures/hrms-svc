@@ -1,5 +1,7 @@
 //! Loan module: public contracts with private storage and caller-owned transactions.
 mod access;
+mod account_projection;
+mod arrangement_review;
 mod accrual;
 mod arrangement;
 mod audit;
@@ -26,6 +28,7 @@ mod service;
 mod workflow;
 pub use command::command_hash;
 pub use audit::*;
+pub use arrangement_review::preview_arrangement_change;
 pub use contracts::*;
 pub use exit_authorization::*;
 pub use exit_review::*;
@@ -75,6 +78,8 @@ pub enum LoanModuleError {
     PriorityConflict,
     #[error("salary cannot satisfy the configured loan recovery protection")]
     RecoveryCapacity,
+    #[error("loan repayment requires HR review: confirm contractual dates and an arrangement within the approved tenure")]
+    RepaymentReviewRequired,
     #[error("loan inputs are held for exit approval; reconcile the HR operation before retrying")]
     ExitReviewPending,
     #[error("loan recovery is held for financial reconciliation")]

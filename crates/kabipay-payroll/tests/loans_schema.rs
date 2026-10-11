@@ -32,6 +32,8 @@ async fn loan_resolvers_reject_wrong_tenant_issuer_and_missing_exact_permission_
         for operation in [
             "{ myLoans { nodes { id } } }",
             "{ loanAccount(id:\"00000000-0000-0000-0000-000000000001\") { id } }",
+            "{ previewLoanDeduction(input:{loanId:\"00000000-0000-0000-0000-000000000001\",effectiveFrom:\"2026-10-11\",firstDueDate:\"2026-11-01\",amount:\"100\",recovery:PAYROLL,reason:\"Review\",meta:{idempotencyKey:\"preview\",expectedVersion:1}}) }",
+            "{ previewLoanPeriodOverride(input:{loanId:\"00000000-0000-0000-0000-000000000001\",periodStart:\"2026-11-01\",pauseInterest:false,reason:\"Review\",meta:{idempotencyKey:\"preview\",expectedVersion:1}}) }",
         ] {
             let response = schema.execute(operation).await;
             assert_eq!(response.errors.len(), 1, "{response:?}");
@@ -60,6 +62,8 @@ async fn loans_are_composed_without_exposing_internal_financial_coordination() {
         "loanLedger(",
         "loanPolicyVersions(",
         "previewLoanReversal(",
+        "previewLoanDeduction(",
+        "previewLoanPeriodOverride(",
         "publishLoanPolicy(",
         "retireLoanPolicy(",
         "saveLoanRequest(",

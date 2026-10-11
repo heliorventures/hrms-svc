@@ -60,6 +60,10 @@ pub(super) fn financial_error(error: LoanModuleError) -> async_graphql::Error {
             "LOAN_RECOVERY_CAPACITY",
             "Salary cannot satisfy the configured recovery protection.",
         ),
+        RepaymentReviewRequired => (
+            "LOAN_REPAYMENT_REVIEW_REQUIRED",
+            "HR must review the remaining loan balance and configure repayment dates within the approved policy before payroll can proceed.",
+        ),
         Domain(_) | InvalidCommand => (
             "LOAN_INVALID_INPUT",
             "Loan input is incomplete, unsupported or outside the configured policy.",

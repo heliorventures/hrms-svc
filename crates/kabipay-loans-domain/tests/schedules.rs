@@ -137,3 +137,77 @@ fn month_end_due_dates_preserve_the_original_day_anchor() {
     assert_eq!(s.items[1].due_date, date("2027-02-28"));
     assert_eq!(s.items[2].due_date, date("2027-03-31"));
 }
+
+#[test]
+fn paused_calendar_month_only_excludes_that_month_from_accrual() {
+    let mut i = input();
+    i.accrual_start = date("2027-01-15");
+    i.first_due_date = date("2027-03-15");
+    i.principal = Decimal::from(10000);
+    i.terms.interest = InterestMethod::ReducingBalance {
+        annual_rate: Decimal::from(12),
+        convention: InterestConvention::Act365Fixed,
+    };
+    i.overrides.push(PeriodOverride {
+        period: date("2027-02-01"),
+        amount: None,
+        pause_interest: true,
+    });
+    let schedule = project_schedule(&i).unwrap();
+    // January 15-February 1 (17 days) and March 1-15 (14 days).
+    assert_eq!(schedule.items[0].interest, Decimal::new(10192, 2));
+}
+
+#[test]
+fn pause_in_due_month_preserves_interest_earned_before_that_month() {
+    let mut i = input();
+    i.accrual_start = date("2027-01-15");
+    i.first_due_date = date("2027-02-15");
+    i.principal = Decimal::from(10000);
+    i.terms.interest = InterestMethod::ReducingBalance {
+        annual_rate: Decimal::from(12),
+        convention: InterestConvention::Act365Fixed,
+    };
+    i.overrides.push(PeriodOverride {
+        period: date("2027-02-01"),
+        amount: Some(Decimal::from(5000)),
+        pause_interest: true,
+    });
+    let schedule = project_schedule(&i).unwrap();
+    assert_eq!(schedule.items[0].interest, Decimal::new(5589, 2));
+}
+
+#[test]
+fn calendar_pause_preserves_rounding_carry_until_next_active_interval() {
+    let i = AccrualInput {
+        principal: Decimal::from(10000),
+        method: InterestMethod::ReducingBalance {
+            annual_rate: Decimal::from(12),
+            convention: InterestConvention::Act365Fixed,
+        },
+        start: date("2027-01-15"),
+        end_exclusive: date("2027-03-15"),
+        carry: Decimal::new(3, 3),
+        currency: input().terms.currency,
+        rounding: RoundingRule::HalfUp,
+    };
+    let result = accrue_calendar_interest(&i, &[date("2027-02-01")]).unwrap();
+    let january = accrue_interest(&AccrualInput {
+        end_exclusive: date("2027-02-01"),
+        ..i.clone()
+    })
+    .unwrap();
+    let march = accrue_interest(&AccrualInput {
+        start: date("2027-03-01"),
+        carry: january.carry,
+        ..i
+    })
+    .unwrap();
+    assert_eq!(
+        result.posted_interest,
+        january.posted_interest + march.posted_interest
+    );
+    assert_eq!(result.carry, march.carry);
+    assert!(result.intervals[1].paused);
+    assert_eq!(result.intervals[1].posted, Decimal::ZERO);
+}

@@ -20,6 +20,72 @@ pub struct AccrualResult {
     pub posted_interest: Decimal,
     pub carry: Decimal,
 }
+
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccrualInterval {
+    pub start: NaiveDate,
+    pub end_exclusive: NaiveDate,
+    pub paused: bool,
+    pub posted: Decimal,
+}
+
+#[derive(Clone, Debug)]
+pub struct CalendarAccrual {
+    pub posted_interest: Decimal,
+    pub carry: Decimal,
+    pub intervals: Vec<AccrualInterval>,
+}
+
+/// Calendar months define pause boundaries and rounding checkpoints for both
+/// projected schedules and ledger accrual. A pause never consumes rounding carry.
+pub fn accrue_calendar_interest(
+    input: &AccrualInput,
+    paused_periods: &[NaiveDate],
+) -> Result<CalendarAccrual, LoanDomainError> {
+    if input.start > input.end_exclusive || paused_periods.iter().any(|p| p.day() != 1) {
+        return Err(LoanDomainError::InvalidTerms);
+    }
+    let mut result = CalendarAccrual {
+        posted_interest: Decimal::ZERO,
+        carry: input.carry,
+        intervals: vec![],
+    };
+    // One-time charges belong exclusively to funding.
+    if !matches!(input.method, InterestMethod::ReducingBalance { .. }) {
+        return Ok(result);
+    }
+    let mut cursor = input.start;
+    while cursor < input.end_exclusive {
+        let period = cursor.with_day(1).ok_or(LoanDomainError::InvalidTerms)?;
+        let stop = period
+            .checked_add_months(Months::new(1))
+            .ok_or(LoanDomainError::InvalidTerms)?
+            .min(input.end_exclusive);
+        let paused = paused_periods.contains(&period);
+        let posted = if paused {
+            Decimal::ZERO
+        } else {
+            let earned = accrue_interest(&AccrualInput {
+                start: cursor,
+                end_exclusive: stop,
+                carry: result.carry,
+                ..input.clone()
+            })?;
+            result.carry = earned.carry;
+            earned.posted_interest
+        };
+        result.posted_interest = add(result.posted_interest, posted)?;
+        result.intervals.push(AccrualInterval {
+            start: cursor,
+            end_exclusive: stop,
+            paused,
+            posted,
+        });
+        cursor = stop;
+    }
+    Ok(result)
+}
 pub fn accrue_interest(input: &AccrualInput) -> Result<AccrualResult, LoanDomainError> {
     input.currency.validate_amount(input.principal)?;
     input.method.validate(&input.currency)?;

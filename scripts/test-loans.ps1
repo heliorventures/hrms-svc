@@ -1,4 +1,4 @@
-param([switch]$Payroll, [switch]$Exit)
+param([switch]$Payroll, [switch]$Exit, [string]$TestFilter = '')
 $ErrorActionPreference = 'Stop'
 $serviceRoot = Split-Path $PSScriptRoot -Parent
 $databaseRoot = Join-Path (Split-Path $serviceRoot -Parent) 'hrms-database'
@@ -12,6 +12,8 @@ $containerName = 'hrms-loans-module-' + [guid]::NewGuid().ToString('N')
 $fixturePath = Join-Path ([IO.Path]::GetTempPath()) ($containerName + '.sql')
 $previousUrl = $env:LOAN_TEST_DATABASE_URL
 $created = $false
+$filterArguments = @()
+if ($TestFilter) { $filterArguments = @($TestFilter) }
 try {
     # Compile before starting the disposable database. A long link must not consume
     # fixture lifetime; compilation failure must not leave a test container running.
@@ -51,9 +53,9 @@ try {
     $env:LOAN_TEST_DATABASE_URL = "postgresql://loan_fixture:loan_fixture@127.0.0.1:$($Matches[1])/loan_phase_a"
     Push-Location $serviceRoot
     try {
-        if ($Exit) { & cargo test -p kabipay-employee --test exit_finance --offline -- --ignored --test-threads=1 }
-        elseif ($Payroll) { & cargo test -p kabipay-payroll --test loan_recovery --offline -- --ignored --test-threads=1 }
-        else { & cargo test -p kabipay-loans --test database --offline -- --ignored --test-threads=1 }
+        if ($Exit) { & cargo test -p kabipay-employee --test exit_finance --offline @filterArguments -- --ignored --test-threads=1 }
+        elseif ($Payroll) { & cargo test -p kabipay-payroll --test loan_recovery --offline @filterArguments -- --ignored --test-threads=1 }
+        else { & cargo test -p kabipay-loans --test database --offline @filterArguments -- --ignored --test-threads=1 }
         if ($LASTEXITCODE -ne 0) { throw 'Loan database tests failed' }
     }
     finally { Pop-Location }

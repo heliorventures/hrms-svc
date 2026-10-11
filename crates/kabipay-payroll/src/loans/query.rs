@@ -21,6 +21,22 @@ pub(super) fn optional_uuid(value: Option<String>) -> Result<Option<Uuid>> {
 pub struct LoanQuery;
 #[Object]
 impl LoanQuery {
+    async fn preview_loan_deduction(
+        &self,
+        ctx: &Context<'_>,
+        input: SetLoanDeductionInput,
+    ) -> Result<async_graphql::Json<serde_json::Value>> {
+        let command = super::mutation::deduction_command(&input)?;
+        preview_arrangement(ctx, input.meta.expected_version, command).await
+    }
+    async fn preview_loan_period_override(
+        &self,
+        ctx: &Context<'_>,
+        input: SetLoanPeriodOverrideInput,
+    ) -> Result<async_graphql::Json<serde_json::Value>> {
+        let command = super::mutation::period_override_command(&input)?;
+        preview_arrangement(ctx, input.meta.expected_version, command).await
+    }
     async fn preview_historical_loan_payment(
         &self,
         ctx: &Context<'_>,
@@ -94,12 +110,15 @@ impl LoanQuery {
         &self,
         ctx: &Context<'_>,
         loan_id: String,
-        first_due_date: chrono::NaiveDate,
+        first_due_date: Option<chrono::NaiveDate>,
     ) -> Result<async_graphql::Json<serde_json::Value>> {
         let (tx, actor) = transaction(ctx, LoanPermission::Read).await?;
-        let result = loans::loan_schedule_preview(&tx, &actor, uuid(&loan_id)?, first_due_date)
-            .await
-            .map_err(financial_error)?;
+        // Optional only for older clients; current screens use contractual dates.
+        let result = if let Some(first) = first_due_date {
+            loans::loan_schedule_preview(&tx, &actor, uuid(&loan_id)?, first).await
+        } else {
+            loans::current_loan_schedule_preview(&tx, &actor, uuid(&loan_id)?).await
+        }.map_err(financial_error)?;
         tx.commit().await.map_err(|e| financial_error(e.into()))?;
         Ok(async_graphql::Json(result))
     }
@@ -302,4 +321,18 @@ impl LoanQuery {
         tx.commit().await.map_err(|e| financial_error(e.into()))?;
         Ok(page.into())
     }
+}
+async fn preview_arrangement(
+    ctx: &Context<'_>,
+    expected: i64,
+    command: loans::LoanCommand,
+) -> Result<async_graphql::Json<serde_json::Value>> {
+    let (tx, actor) = transaction(ctx, LoanPermission::Manage).await?;
+    let value = loans::preview_arrangement_change(&tx, &actor, expected, &command)
+        .await
+        .map_err(financial_error)?;
+    tx.commit()
+        .await
+        .map_err(|error| financial_error(error.into()))?;
+    Ok(async_graphql::Json(value))
 }

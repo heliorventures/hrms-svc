@@ -25,6 +25,8 @@ pub struct LoanRequestView {
     pub version: i64,
     pub workflow_instance_id: Option<Uuid>,
     pub current_step_id: Option<Uuid>,
+    pub is_final_approval_step: bool,
+    pub decision_reason: Option<String>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -294,7 +296,51 @@ pub async fn list_filtered_requests(
     readable(tx, actor).await?;
     let count = limit(first)?;
     let ids = scope_ids(tx, actor, self_only, employee).await?;
-    let rows=store::all(tx,"SELECT e.first_name || ' ' || e.last_name AS employee_name,e.employee_code,(r.preferences->>'policyId')::uuid AS policy_id,r.preferences->'employee' AS preferences,r.created_at,r.id,r.employee_id,r.requested_amount::text AS requested_amount,r.currency,r.purpose,r.employee_notes,r.state,r.version,r.workflow_instance_id,w.current_step_id FROM loan_request r JOIN employee e ON e.tenant_id=r.tenant_id AND e.id=r.employee_id LEFT JOIN workflow_instance w ON w.tenant_id=r.tenant_id AND w.id=r.workflow_instance_id WHERE r.tenant_id=$1 AND ($2::uuid[] IS NULL OR r.employee_id=ANY($2)) AND ($3::uuid IS NULL OR r.id>$3) AND ($5::bool OR r.state<>'DRAFT') AND ($6::text IS NULL OR strpos(lower(concat_ws(' ',e.first_name,e.last_name,e.employee_code,r.purpose)),lower($6))>0) AND ($7::text IS NULL OR r.state=$7) ORDER BY r.id LIMIT $4",vec![actor.tenant_id.into(),ids.into(),after.into(),(i64::from(first)+1).into(),self_only.into(),filter.search.clone().into(),filter.state.clone().into()]).await?;
+    // Match workflow::decide's next-step rule in the same read snapshot as the
+    // request version. This is presentation metadata; writes still check authority.
+    let rows = store::all(
+        tx,
+        r#"SELECT e.first_name || ' ' || e.last_name AS employee_name,
+            e.employee_code, (r.preferences->>'policyId')::uuid AS policy_id,
+            r.preferences->'employee' AS preferences, r.created_at, r.id,
+            r.employee_id, r.requested_amount::text AS requested_amount,
+            r.currency, r.purpose, r.employee_notes, r.state, r.version,
+            r.workflow_instance_id, w.current_step_id,
+            r.management_notes AS decision_reason,
+            EXISTS (
+                SELECT 1 FROM workflow_step s
+                WHERE s.tenant_id=r.tenant_id AND s.workflow_id=w.workflow_id
+                  AND s.id=w.current_step_id AND w.status='IN_PROGRESS'
+                  AND r.state IN ('SUBMITTED','UNDER_REVIEW')
+                  AND NOT EXISTS (
+                      SELECT 1 FROM workflow_step next_step
+                      WHERE next_step.tenant_id=s.tenant_id
+                        AND next_step.workflow_id=s.workflow_id
+                        AND next_step.sequence_order>s.sequence_order
+                  )
+            ) AS is_final_approval_step
+        FROM loan_request r
+        JOIN employee e ON e.tenant_id=r.tenant_id AND e.id=r.employee_id
+        LEFT JOIN workflow_instance w ON w.tenant_id=r.tenant_id
+            AND w.id=r.workflow_instance_id AND w.entity_type='LOAN_REQUEST'
+            AND w.entity_id=r.id
+        WHERE r.tenant_id=$1 AND ($2::uuid[] IS NULL OR r.employee_id=ANY($2))
+            AND ($3::uuid IS NULL OR r.id>$3) AND ($5::bool OR r.state<>'DRAFT')
+            AND ($6::text IS NULL OR strpos(lower(concat_ws(' ',e.first_name,
+                e.last_name,e.employee_code,r.purpose)),lower($6))>0)
+            AND ($7::text IS NULL OR r.state=$7)
+        ORDER BY r.id LIMIT $4"#,
+        vec![
+            actor.tenant_id.into(),
+            ids.into(),
+            after.into(),
+            (i64::from(first) + 1).into(),
+            self_only.into(),
+            filter.search.clone().into(),
+            filter.state.clone().into(),
+        ],
+    )
+    .await?;
     let nodes = rows
         .into_iter()
         .map(|row| {
@@ -314,6 +360,8 @@ pub async fn list_filtered_requests(
                 version: row.try_get("", "version")?,
                 workflow_instance_id: row.try_get("", "workflow_instance_id")?,
                 current_step_id: row.try_get("", "current_step_id")?,
+                is_final_approval_step: row.try_get("", "is_final_approval_step")?,
+                decision_reason: row.try_get("", "decision_reason")?,
             })
         })
         .collect::<LoanResult<Vec<_>>>()?;

@@ -44,4 +44,5 @@ print(loan_sql.migration_sql('changelog/migrations/0105_payslip_loan_evidence/pa
 print(loan_sql.migration_sql('changelog/migrations/0106_loan_exit_coordination/loan_exit_coordination.xml'))
 print(loan_sql.migration_sql('changelog/migrations/0107_loan_reconciliation/loan_reconciliation.xml'))
 print(loan_sql.migration_sql('changelog/migrations/0108_loan_late_payments/loan_late_payments.xml'))
+print(loan_sql.migration_sql('changelog/migrations/0109_loan_schedule_anchor/loan_schedule_anchor.xml'))
 print('COMMIT;')

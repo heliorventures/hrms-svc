@@ -229,12 +229,16 @@ async fn prepare_quote(
                 }
             }
             RecoverySource::Payroll => {
-                let schedule=store::one(tx,"SELECT s.id,s.monthly_amount::text AS amount,s.recovery_mode FROM loan_schedule_version s WHERE s.tenant_id=$1 AND s.loan_id=$2 AND s.effective_from<=$3 ORDER BY s.version DESC LIMIT 1",vec![actor.tenant_id.into(),loan.into(),input.value_date.into()]).await?;
+                let schedule=store::one(tx,"SELECT s.id,s.monthly_amount::text AS amount,s.recovery_mode,COALESCE(s.first_due_date,(SELECT MIN(i.due_date) FROM loan_schedule_item i WHERE i.tenant_id=s.tenant_id AND i.loan_id=s.loan_id AND i.schedule_version_id=s.id)) AS first_due_date FROM loan_schedule_version s WHERE s.tenant_id=$1 AND s.loan_id=$2 AND s.effective_from<=$3 ORDER BY s.version DESC LIMIT 1",vec![actor.tenant_id.into(),loan.into(),input.value_date.into()]).await?;
                 if let Some(schedule) = schedule {
                     let mode: String = schedule.try_get("", "recovery_mode")?;
                     let schedule_id: Uuid = schedule.try_get("", "id")?;
                     schedule_version_id = Some(schedule_id);
-                    let due=store::one(tx,"SELECT id FROM loan_schedule_item WHERE tenant_id=$1 AND loan_id=$2 AND schedule_version_id=$3 AND date_trunc('month',due_date)::date=$4 AND due_date<=$5 LIMIT 1",vec![actor.tenant_id.into(),loan.into(),schedule_id.into(),input.period_start.into(),input.value_date.into()]).await?.is_some();
+                    let due = if mode == "EXTERNAL" || payable.is_zero() { false } else {
+                        let first = schedule.try_get::<Option<NaiveDate>>("", "first_due_date")?
+                            .ok_or(LoanModuleError::RepaymentReviewRequired)?;
+                        recurring_due(first, input.period_start, input.value_date, terms.max_instalments)?
+                    };
                     if mode == "EXTERNAL" || !due {
                         Decimal::ZERO
                     } else {
@@ -486,4 +490,15 @@ pub async fn post_fnf_recoveries(
     input: &PostRecoveriesInput<'_>,
 ) -> LoanResult<PostingResult> {
     post(tx, input, RecoverySource::Fnf).await
+}
+
+/// Contractual recurrence survives exhausted forecast rows; only an explicitly
+/// reviewed arrangement may restart its approved tenure.
+fn recurring_due(first: NaiveDate, period: NaiveDate, value_date: NaiveDate, maximum: u32) -> LoanResult<bool> {
+    let months = (period.year() - first.year()) * 12 + period.month() as i32 - first.month() as i32;
+    if months < 0 { return Ok(false); }
+    let months = u32::try_from(months).map_err(|_| LoanModuleError::InvalidCommand)?;
+    if months >= maximum { return Err(LoanModuleError::RepaymentReviewRequired); }
+    Ok(first.checked_add_months(chrono::Months::new(months))
+        .ok_or(LoanModuleError::InvalidCommand)? <= value_date)
 }

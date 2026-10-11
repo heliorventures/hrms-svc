@@ -1,10 +1,10 @@
 use crate::{
-    access, lifecycle, posting, repository as store, LoanActorScope, LoanCommandResult,
+    lifecycle, posting, repository as store, LoanActorScope, LoanCommand, LoanCommandResult,
     LoanModuleError, LoanResult,
 };
-use chrono::{Datelike, NaiveDate};
+use chrono::NaiveDate;
 use kabipay_loans_domain::{
-    accrue_interest, project_schedule, AccrualInput, InterestMethod, LoanPolicy, LoanTerms,
+    accrue_interest, project_schedule, AccrualInput, InterestMethod, LoanSchedule, LoanTerms,
     PeriodOverride, RecoveryMode, ScheduleInput,
 };
 use rust_decimal::Decimal;
@@ -88,6 +88,24 @@ async fn persist(
         first_due_date: first,
         overrides: overrides(tx, actor.tenant_id, loan).await?,
     })?;
+    persist_schedule(
+        tx, actor, loan, terms_id, terms, from, first, schedule, reason,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn persist_schedule(
+    tx: &DatabaseTransaction,
+    actor: &LoanActorScope,
+    loan: Uuid,
+    terms_id: Uuid,
+    terms: &LoanTerms,
+    from: NaiveDate,
+    first: NaiveDate,
+    schedule: LoanSchedule,
+    reason: &str,
+) -> LoanResult<()> {
     let row=store::one(tx,"SELECT COALESCE(MAX(version),0)+1 AS version FROM loan_schedule_version WHERE tenant_id=$1 AND loan_id=$2",vec![actor.tenant_id.into(),loan.into()]).await?.ok_or(LoanModuleError::NotFound)?;
     let version: i64 = row.try_get("", "version")?;
     let id = Uuid::new_v4();
@@ -96,7 +114,7 @@ async fn persist(
         RecoveryMode::External => "EXTERNAL",
         RecoveryMode::Mixed => "MIXED",
     };
-    store::execute(tx,"INSERT INTO loan_schedule_version(id,tenant_id,loan_id,terms_version_id,version,effective_from,monthly_amount,recovery_mode,reason,actor_id) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)",vec![id.into(),actor.tenant_id.into(),loan.into(),terms_id.into(),version.into(),from.into(),terms.monthly_amount.into(),recovery.into(),reason.into(),actor.user_id.into()]).await?;
+    store::execute(tx,"INSERT INTO loan_schedule_version(id,tenant_id,loan_id,terms_version_id,version,effective_from,monthly_amount,recovery_mode,reason,actor_id,first_due_date) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)",vec![id.into(),actor.tenant_id.into(),loan.into(),terms_id.into(),version.into(),from.into(),terms.monthly_amount.into(),recovery.into(),reason.into(),actor.user_id.into(),first.into()]).await?;
     for item in schedule.items {
         store::execute(tx,"INSERT INTO loan_schedule_item(id,tenant_id,loan_id,schedule_version_id,due_date,principal,interest,total) VALUES($1,$2,$3,$4,$5,$6,$7,$8)",vec![Uuid::new_v4().into(),actor.tenant_id.into(),loan.into(),id.into(),item.due_date.into(),item.principal.into(),item.interest.into(),item.total.into()]).await?;
     }
@@ -114,51 +132,42 @@ pub(crate) async fn deduction(
     recovery: RecoveryMode,
     reason: &str,
 ) -> LoanResult<LoanCommandResult> {
-    lifecycle::text(reason, 2000)?;
-    let account = store::account(tx, actor.tenant_id, loan).await?;
-    lifecycle::checked_version(account.version, expected)?;
-    access::employee(tx, actor, account.employee_id).await?;
-    if account.state != "OPEN"
-        || from < lifecycle::today(tx, actor.tenant_id).await?
-        || first < from
-    {
-        return Err(LoanModuleError::InvalidCommand);
-    }
-    let version = store::terms(tx, &account).await?;
-    let mut terms: LoanTerms = serde_json::from_value(version.terms)?;
-    terms.monthly_amount = amount;
-    terms.recovery = recovery;
-    let policy = store::policy(tx, actor.tenant_id, version.policy_version_id).await?;
-    let rules: LoanPolicy = serde_json::from_value(policy.rules)?;
-    rules.validate_terms(&terms)?;
-    let (principal, interest) = store::balances(tx, actor.tenant_id, loan).await?;
-    let projected = crate::accrual::calculate(
-        tx,
-        actor.tenant_id,
-        loan,
-        &terms,
-        principal,
-        account.accrued_through,
-        from,
-        account.rounding_carry,
-    )
-    .await?;
-    persist(
+    let command = LoanCommand::SetDeduction {
+        loan_id: loan,
+        effective_from: from,
+        first_due_date: first,
+        amount,
+        recovery,
+        reason: reason.into(),
+    };
+    let change = crate::arrangement_review::validate_change(tx, actor, expected, &command).await?;
+    let proposed = crate::projection::DatedArrangement {
+        effective_from: from,
+        first_due_date: first,
+        monthly_amount: amount,
+        recovery,
+    };
+    let mut projected =
+        crate::projection::calculate_account(tx, actor, loan, Some(proposed), None).await?;
+    // Earlier projected payments inform the new arrangement's balance, but belong
+    // to their existing immutable schedule version.
+    projected
+        .schedule
+        .items
+        .retain(|item| item.due_date >= from);
+    persist_schedule(
         tx,
         actor,
         loan,
-        version.id,
-        &terms,
+        change.terms_id,
+        &change.terms,
         from,
         first,
-        principal,
-        interest
-            .checked_add(projected.amount)
-            .ok_or(LoanModuleError::InvalidCommand)?,
-        projected.carry,
+        projected.schedule,
         reason,
     )
     .await?;
+    let account = change.account;
     let version = posting::bump_account(tx, actor.tenant_id, loan).await?;
     Ok(lifecycle::result(
         loan,
@@ -179,44 +188,28 @@ pub(crate) async fn period(
     pause: bool,
     reason: &str,
 ) -> LoanResult<LoanCommandResult> {
-    lifecycle::text(reason, 2000)?;
-    let account = store::account(tx, actor.tenant_id, loan).await?;
-    lifecycle::checked_version(account.version, expected)?;
-    access::employee(tx, actor, account.employee_id).await?;
-    let today = lifecycle::today(tx, actor.tenant_id).await?;
-    if start.day() != 1
-        || start < today.with_day(1).ok_or(LoanModuleError::InvalidCommand)?
-        || account.state != "OPEN"
-    {
-        return Err(LoanModuleError::HistoricalReconciliationRequired);
-    }
-    let previous=store::one(tx,"SELECT accrual_treatment FROM loan_period_override WHERE tenant_id=$1 AND loan_id=$2 AND period_start=$3",vec![actor.tenant_id.into(),loan.into(),start.into()]).await?;
-    let was_paused = previous
-        .map(|row| row.try_get::<String>("", "accrual_treatment"))
-        .transpose()?
-        .is_some_and(|value| value == "PAUSE");
-    if pause != was_paused && account.accrued_through.is_some_and(|date| date > start) {
-        return Err(LoanModuleError::HistoricalReconciliationRequired);
-    }
-    let terms_version = store::terms(tx, &account).await?;
-    let terms: LoanTerms = serde_json::from_value(terms_version.terms)?;
-    let policy = store::policy(tx, actor.tenant_id, terms_version.policy_version_id).await?;
-    let rules: LoanPolicy = serde_json::from_value(policy.rules)?;
-    rules.validate_terms(&terms)?;
-    if amount.is_some() && !rules.recovery.allow_overrides
-        || amount.is_none() && !rules.recovery.allow_skips
-        || pause && !rules.recovery.allow_accrual_pause
-    {
-        return Err(LoanModuleError::Forbidden);
-    }
-    if let Some(amount) = amount {
-        terms.currency.validate_amount(amount)?;
-        if amount <= Decimal::ZERO {
-            return Err(LoanModuleError::InvalidCommand);
-        }
-    }
-    // A posted salary recovery freezes the period's recovery decision.
-    if store::one(tx,"SELECT id FROM loan_posting WHERE tenant_id=$1 AND loan_id=$2 AND source_kind='PAYROLL' AND calculation_evidence->>'periodStart'=$3::date::text LIMIT 1",vec![actor.tenant_id.into(),loan.into(),start.into()]).await?.is_some(){return Err(LoanModuleError::VersionConflict)}
+    let command = LoanCommand::SetPeriodOverride {
+        loan_id: loan,
+        period_start: start,
+        amount,
+        pause_interest: pause,
+        reason: reason.into(),
+    };
+    let change = crate::arrangement_review::validate_change(tx, actor, expected, &command).await?;
+    crate::projection::project_account(
+        tx,
+        actor,
+        loan,
+        None,
+        None,
+        Some(PeriodOverride {
+            period: start,
+            amount,
+            pause_interest: pause,
+        }),
+    )
+    .await?;
+    let account = change.account;
     store::execute(tx,"INSERT INTO loan_period_override(id,tenant_id,loan_id,period_start,action,amount,accrual_treatment,reason,actor_id,version) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,1) ON CONFLICT(tenant_id,loan_id,period_start) DO UPDATE SET action=EXCLUDED.action,amount=EXCLUDED.amount,accrual_treatment=EXCLUDED.accrual_treatment,reason=EXCLUDED.reason,actor_id=EXCLUDED.actor_id,version=loan_period_override.version+1",vec![Uuid::new_v4().into(),actor.tenant_id.into(),loan.into(),start.into(),if amount.is_some(){"AMOUNT"}else{"SKIP"}.into(),amount.into(),if pause{"PAUSE"}else{"CONTINUE"}.into(),reason.into(),actor.user_id.into()]).await?;
     let version = posting::bump_account(tx, actor.tenant_id, loan).await?;
     Ok(lifecycle::result(

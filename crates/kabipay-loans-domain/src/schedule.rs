@@ -1,5 +1,5 @@
 use crate::{
-    accrue_interest, allocate_repayment,
+    accrue_calendar_interest, allocate_repayment,
     money::{add, sub},
     AccrualInput, AllocationInput, InterestMethod, LoanDomainError, LoanTerms,
 };
@@ -66,6 +66,12 @@ pub fn project_schedule(input: &ScheduleInput) -> Result<LoanSchedule, LoanDomai
         (input.principal, input.due_interest, input.carry);
     let mut start = input.accrual_start;
     let mut items = Vec::new();
+    let paused_periods = input
+        .overrides
+        .iter()
+        .filter(|o| o.pause_interest)
+        .map(|o| o.period)
+        .collect::<Vec<_>>();
     for n in 0..input.terms.max_instalments {
         if principal.is_zero() && interest.is_zero() {
             break;
@@ -77,20 +83,21 @@ pub fn project_schedule(input: &ScheduleInput) -> Result<LoanSchedule, LoanDomai
         let period = due_date.with_day(1).ok_or(LoanDomainError::InvalidTerms)?;
         let override_ = input.overrides.iter().find(|o| o.period == period);
         let monthly = override_.map_or(Some(input.terms.monthly_amount), |o| o.amount);
-        if !override_.is_some_and(|o| o.pause_interest)
-            && matches!(input.terms.interest, InterestMethod::ReducingBalance { .. })
-        {
+        if matches!(input.terms.interest, InterestMethod::ReducingBalance { .. }) {
             let method = input.terms.interest.clone();
             // One-time charges were recognized at funding; never assess them again on due dates.
-            let accrual = accrue_interest(&AccrualInput {
-                principal,
-                method,
-                start,
-                end_exclusive: due_date,
-                carry,
-                currency: input.terms.currency.clone(),
-                rounding: input.terms.rounding,
-            })?;
+            let accrual = accrue_calendar_interest(
+                &AccrualInput {
+                    principal,
+                    method,
+                    start,
+                    end_exclusive: due_date,
+                    carry,
+                    currency: input.terms.currency.clone(),
+                    rounding: input.terms.rounding,
+                },
+                &paused_periods,
+            )?;
             interest = add(interest, accrual.posted_interest)?;
             carry = accrual.carry;
         }

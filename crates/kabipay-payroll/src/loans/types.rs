@@ -111,6 +111,8 @@ pub struct LoanRequestDto {
     pub version: i64,
     pub workflow_instance_id: Option<String>,
     pub current_step_id: Option<String>,
+    pub is_final_approval_step: bool,
+    pub decision_reason: Option<String>,
 }
 impl From<LoanRequestView> for LoanRequestDto {
     fn from(v: LoanRequestView) -> Self {
@@ -130,6 +132,8 @@ impl From<LoanRequestView> for LoanRequestDto {
             version: v.version,
             workflow_instance_id: v.workflow_instance_id.map(|id| id.to_string()),
             current_step_id: v.current_step_id.map(|id| id.to_string()),
+            is_final_approval_step: v.is_final_approval_step,
+            decision_reason: v.decision_reason,
         }
     }
 }

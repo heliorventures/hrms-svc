@@ -2,8 +2,8 @@ use crate::{
     posting::{self, Posting},
     repository as store, LoanActorScope, LoanModuleError, LoanResult,
 };
-use chrono::{Datelike, Months, NaiveDate};
-use kabipay_loans_domain::{accrue_interest, AccrualInput, InterestMethod, LoanTerms};
+use chrono::NaiveDate;
+use kabipay_loans_domain::{accrue_calendar_interest, AccrualInput, LoanTerms};
 use rust_decimal::Decimal;
 use sea_orm::DatabaseTransaction;
 use uuid::Uuid;
@@ -28,43 +28,28 @@ pub(crate) async fn calculate(
     if start.is_some_and(|date| date > end) {
         return Err(LoanModuleError::HistoricalReconciliationRequired);
     }
-    let mut interest = Decimal::ZERO;
-    let mut carry_after = carry;
-    let mut intervals = vec![];
-    if let (InterestMethod::ReducingBalance { .. }, Some(mut cursor)) = (&terms.interest, start) {
-        while cursor < end {
-            let period = cursor.with_day(1).ok_or(LoanModuleError::InvalidCommand)?;
-            let next = period
-                .checked_add_months(Months::new(1))
-                .ok_or(LoanModuleError::InvalidCommand)?
-                .min(end);
-            let pause=store::one(tx,"SELECT accrual_treatment FROM loan_period_override WHERE tenant_id=$1 AND loan_id=$2 AND period_start=$3",vec![tenant.into(),loan.into(),period.into()]).await?.map(|row|row.try_get::<String>("","accrual_treatment")).transpose()?.is_some_and(|value|value=="PAUSE");
-            let earned = if pause {
-                Decimal::ZERO
-            } else {
-                let result = accrue_interest(&AccrualInput {
-                    principal,
-                    method: terms.interest.clone(),
-                    start: cursor,
-                    end_exclusive: next,
-                    carry: carry_after,
-                    currency: terms.currency.clone(),
-                    rounding: terms.rounding,
-                })?;
-                carry_after = result.carry;
-                result.posted_interest
-            };
-            interest = interest
-                .checked_add(earned)
-                .ok_or(LoanModuleError::InvalidCommand)?;
-            intervals.push(serde_json::json!({"start":cursor,"endExclusive":next,"paused":pause,"posted":earned}));
-            cursor = next;
-        }
-    }
+    let pauses = crate::arrangement::overrides(tx, tenant, loan)
+        .await?
+        .into_iter()
+        .filter(|value| value.pause_interest)
+        .map(|value| value.period)
+        .collect::<Vec<_>>();
+    let earned = accrue_calendar_interest(
+        &AccrualInput {
+            principal,
+            method: terms.interest.clone(),
+            start: start.unwrap_or(end),
+            end_exclusive: end,
+            carry,
+            currency: terms.currency.clone(),
+            rounding: terms.rounding,
+        },
+        &pauses,
+    )?;
     Ok(EarnedInterest {
-        amount: interest,
-        carry: carry_after,
-        evidence: serde_json::json!({"calculatorVersion":terms.calculator_version,"principal":principal,"carryBefore":carry,"carryAfter":carry_after,"intervals":intervals}),
+        amount: earned.posted_interest,
+        carry: earned.carry,
+        evidence: serde_json::json!({"calculatorVersion":terms.calculator_version,"principal":principal,"carryBefore":carry,"carryAfter":earned.carry,"intervals":earned.intervals}),
     })
 }
 // Posting binds the interval to both its immutable terms and originating source revision.
