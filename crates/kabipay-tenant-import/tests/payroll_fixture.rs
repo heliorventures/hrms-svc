@@ -2,6 +2,27 @@
 use kabipay_payroll::services::{payroll_period_input, payroll_service, payslip_presentation};
 use sea_orm::{ConnectOptions, ConnectionTrait, Database, DbBackend, Statement, TransactionTrait};
 use uuid::Uuid;
+
+fn payroll_claims(tenant: Uuid, actor: Uuid) -> kabipay_common::context::ClientClaims {
+    let permission = kabipay_common::context::PERM_PAYROLL_MANAGE;
+    kabipay_common::context::ClientClaims {
+        sub: actor,
+        iss: kabipay_common::context::CLIENT_JWT_ISSUER.into(),
+        exp: 0,
+        iat: 0,
+        tenant_id: tenant,
+        email: String::new(),
+        employee_id: None,
+        must_change_password: false,
+        roles: vec!["PAYROLL_MANAGER".into()],
+        permissions: vec![permission.into()],
+        permission_scopes: std::collections::HashMap::from([(
+            permission.into(),
+            "ALL".into(),
+        )]),
+        resource_scopes: Default::default(),
+    }
+}
 #[path = "fixtures/release_regressions.rs"]
 mod release_regressions;
 #[path = "fixtures/tax_projection_acceptance.rs"]
@@ -416,9 +437,10 @@ async fn reviewed_run(
 ) -> kabipay_common::KabiPayResult<kabipay_payroll::services::payroll_finalize::PayrollFinalization>
 {
     use kabipay_payroll::services::{payroll_draft, payroll_finalize};
-    let first = payroll_draft::calculate_payroll_cycle(db, tenant, actor, cycle, None).await?;
+    let claims = payroll_claims(tenant, actor);
+    let first = payroll_draft::calculate_payroll_cycle(db, tenant, &claims, cycle, None).await?;
     let mut draft =
-        payroll_draft::calculate_payroll_cycle(db, tenant, actor, cycle, Some(first.revision))
+        payroll_draft::calculate_payroll_cycle(db, tenant, &claims, cycle, Some(first.revision))
             .await?;
     assert_eq!(draft.revision, first.revision + 1);
     let count = db
@@ -468,7 +490,7 @@ async fn reviewed_run(
         payroll_finalize::finalize_payroll_cycle(
             db,
             tenant,
-            actor,
+            &claims,
             cycle,
             draft.revision,
             &draft.fingerprint,
@@ -478,14 +500,14 @@ async fn reviewed_run(
         .is_err(),
         "a declaration edit invalidates the reviewed draft"
     );
-    draft = payroll_draft::calculate_payroll_cycle(db, tenant, actor, cycle, Some(draft.revision))
+    draft = payroll_draft::calculate_payroll_cycle(db, tenant, &claims, cycle, Some(draft.revision))
         .await?;
     db.execute_unprepared("CREATE FUNCTION fixture_fail_statement() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'fixture rollback'; END $$; CREATE TRIGGER fixture_fail_statement BEFORE INSERT ON payslip_statement FOR EACH ROW EXECUTE FUNCTION fixture_fail_statement()").await?;
     assert!(
         payroll_finalize::finalize_payroll_cycle(
             db,
             tenant,
-            actor,
+            &claims,
             cycle,
             draft.revision,
             &draft.fingerprint,
@@ -523,7 +545,7 @@ async fn reviewed_run(
     payroll_period_input::save(
         &editor,
         tenant,
-        actor,
+        &claims,
         employee,
         serde_json::from_value(input.input).unwrap(),
         None,
@@ -533,7 +555,7 @@ async fn reviewed_run(
     let finalize = payroll_finalize::finalize_payroll_cycle(
         db,
         tenant,
-        actor,
+        &claims,
         cycle,
         draft.revision,
         &draft.fingerprint,
@@ -552,7 +574,7 @@ async fn reviewed_run(
         payroll_finalize::finalize_payroll_cycle(
             db,
             tenant,
-            actor,
+            &claims,
             cycle,
             draft.revision,
             &draft.fingerprint,
@@ -565,7 +587,7 @@ async fn reviewed_run(
         "exactly one concurrent finalizer succeeds"
     );
     assert!(
-        payroll_draft::calculate_payroll_cycle(db, tenant, actor, cycle, Some(draft.revision))
+        payroll_draft::calculate_payroll_cycle(db, tenant, &claims, cycle, Some(draft.revision))
             .await
             .is_err()
     );
