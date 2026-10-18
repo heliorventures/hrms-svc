@@ -545,7 +545,7 @@ async fn reviewed_run(
     payroll_period_input::save(
         &editor,
         tenant,
-        &claims,
+        actor,
         employee,
         serde_json::from_value(input.input).unwrap(),
         None,

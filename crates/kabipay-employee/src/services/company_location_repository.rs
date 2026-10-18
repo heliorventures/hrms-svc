@@ -52,7 +52,7 @@ pub async fn list(
             .replace('%', "\\%")
             .replace('_', "\\_");
         query = query.filter(sea_orm::sea_query::Expr::cust_with_values(
-            "name ILIKE ? ESCAPE '\\'",
+            "name ILIKE $1 ESCAPE '\\'",
             [format!("%{escaped}%")],
         ));
     }
@@ -119,7 +119,7 @@ pub async fn save_location(
         .filter(location::Column::TenantId.eq(tenant))
         .filter(location::Column::IsDeleted.eq(false))
         .filter(sea_orm::sea_query::Expr::cust_with_values(
-            "lower(regexp_replace(btrim(name), '\\s+', ' ', 'g')) = lower(?)",
+            "lower(regexp_replace(btrim(name), '\\s+', ' ', 'g')) = lower($1)",
             [name.clone()],
         ))
         .all(&txn)
