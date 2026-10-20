@@ -35,7 +35,7 @@ pub use exit_review::*;
 pub use exit_servicing::confirm_fnf_arrangements;
 pub use inputs::*;
 pub use historical_payment::{preview_historical_payment, HistoricalPaymentPreview};
-pub use payroll_state::{payroll_loan_state, PayrollLoanState};
+pub use payroll_state::{payroll_loan_state,payroll_loan_state_with_actor, PayrollLoanState};
 pub use permissions::*;
 pub use read::*;
 pub use projection::*;

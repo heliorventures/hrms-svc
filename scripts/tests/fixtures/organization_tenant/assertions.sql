@@ -1,0 +1,38 @@
+SET search_path=source_acceptance,public;
+INSERT INTO organization_membership_installation(tenant_id,membership_id,organization_id,status,desired_status,version,configuration_hash) VALUES('10000000-0000-0000-0000-000000000001','f0000000-0000-0000-0000-000000000001','20000000-0000-0000-0000-000000000001','ACTIVE','ACTIVE',1,repeat('a',64));
+INSERT INTO organization_fact_bootstrap(tenant_id,organization_id) VALUES('10000000-0000-0000-0000-000000000001','20000000-0000-0000-0000-000000000001');
+INSERT INTO employee(id,tenant_id,first_name,last_name,employee_code,status) VALUES('30000000-0000-0000-0000-000000000001','10000000-0000-0000-0000-000000000001','Synthetic','Employee','S001','ACTIVE');
+INSERT INTO leave_request(id,tenant_id,employee_id,status,reason) VALUES('40000000-0000-0000-0000-000000000001','10000000-0000-0000-0000-000000000001','30000000-0000-0000-0000-000000000001','PENDING','PRIVATE_MEDICAL_REASON');
+INSERT INTO timesheet_entry(id,tenant_id,employee_id,work_date,hours_worked,status) VALUES('50000000-0000-0000-0000-000000000001','10000000-0000-0000-0000-000000000001','30000000-0000-0000-0000-000000000001','2026-10-18',8,'PENDING');
+UPDATE timesheet_entry SET status='APPROVED' WHERE id='50000000-0000-0000-0000-000000000001';
+UPDATE timesheet_entry SET work_date='2026-10-19',hours_worked=6 WHERE id='50000000-0000-0000-0000-000000000001';
+DELETE FROM timesheet_entry WHERE id='50000000-0000-0000-0000-000000000001';
+INSERT INTO continuous_feedback(id,tenant_id,reviewee_employee_id,created_by_user_id,comments) VALUES('60000000-0000-0000-0000-000000000001','10000000-0000-0000-0000-000000000001','30000000-0000-0000-0000-000000000001','70000000-0000-0000-0000-000000000001','PRIVATE_REVIEW_BODY');
+INSERT INTO workflow_instance(id,tenant_id,entity_id,entity_type,status,current_step_id) VALUES('80000000-0000-0000-0000-000000000001','10000000-0000-0000-0000-000000000001','40000000-0000-0000-0000-000000000001','LEAVE_REQUEST','IN_PROGRESS','90000000-0000-0000-0000-000000000001');
+UPDATE workflow_instance SET current_step_id='90000000-0000-0000-0000-000000000002' WHERE id='80000000-0000-0000-0000-000000000001';
+DO $test$
+DECLARE n BIGINT;
+BEGIN
+ SELECT count(*) INTO n FROM company_event_outbox WHERE event_type='timesheet.changed';
+ IF n<>4 THEN RAISE EXCEPTION 'Expected four versioned timesheet facts, found %',n; END IF;
+ IF NOT EXISTS(SELECT 1 FROM company_event_outbox WHERE aggregate_type='timesheet_entry' AND aggregate_version=2 AND event_envelope->'payload'->>'approved_seconds'='28800') THEN RAISE EXCEPTION 'Approved quantity incorrect'; END IF;
+ IF NOT EXISTS(SELECT 1 FROM company_event_outbox WHERE aggregate_type='timesheet_entry' AND aggregate_version=3 AND event_envelope->'payload'->>'work_date'='2026-10-19' AND event_envelope->'payload'->>'logged_seconds'='21600') THEN RAISE EXCEPTION 'Correction fact incorrect'; END IF;
+ IF NOT EXISTS(SELECT 1 FROM company_event_outbox WHERE aggregate_type='timesheet_entry' AND aggregate_version=4 AND event_envelope->>'deleted'='true' AND event_envelope->'payload'->>'logged_seconds'='0') THEN RAISE EXCEPTION 'Tombstone incorrect'; END IF;
+ IF EXISTS(SELECT 1 FROM company_event_outbox WHERE event_envelope::TEXT LIKE '%PRIVATE_%') THEN RAISE EXCEPTION 'Private domain fields leaked'; END IF;
+ IF NOT EXISTS(SELECT 1 FROM organization_resource_version WHERE resource_type='employee' AND version=2) THEN RAISE EXCEPTION 'Standalone feedback did not advance employee version'; END IF;
+ IF NOT EXISTS(SELECT 1 FROM organization_resource_version WHERE resource_type='leave_request' AND version=3) THEN RAISE EXCEPTION 'Intermediate local workflow did not advance resource version'; END IF;
+ IF EXISTS(SELECT 1 FROM company_event_outbox WHERE event_envelope->>'source_tenant_id'<>source_tenant_id::TEXT OR event_envelope->>'event_id'<>id::TEXT OR event_envelope->>'aggregate_version'<>aggregate_version::TEXT) THEN RAISE EXCEPTION 'Outbox envelope metadata mismatch'; END IF;
+ IF EXISTS(SELECT 1 FROM company_event_outbox WHERE event_envelope->'actor'->>'kind' IS NULL) THEN RAISE EXCEPTION 'New source facts must identify known local/remote/system attribution'; END IF;
+ IF NOT EXISTS(SELECT 1 FROM company_event_outbox WHERE aggregate_type='employee' AND aggregate_version=2 AND event_envelope->'actor'->>'kind'='local_user' AND event_envelope->'actor'->>'local_user_id'='70000000-0000-0000-0000-000000000001') THEN RAISE EXCEPTION 'Actual local feedback actor was not retained'; END IF;
+END $test$;
+BEGIN;
+SELECT set_config('kabipay.organization_actor','{"kind":"organization_principal","principal_id":"a1000000-0000-0000-0000-000000000001","display_name":"Synthetic remote manager","identity_version":1,"source_tenant_id":"a2000000-0000-0000-0000-000000000001","source_user_id":"a3000000-0000-0000-0000-000000000001","authority_kind":"management_assignment","authority_id":"a4000000-0000-0000-0000-000000000001","authority_version":1,"command_id":"a5000000-0000-0000-0000-000000000001"}',true);
+UPDATE employee SET first_name='Synthetic remote action' WHERE id='30000000-0000-0000-0000-000000000001';
+DO $test$ BEGIN IF NOT EXISTS(SELECT 1 FROM company_event_outbox WHERE event_envelope->'actor'->>'kind'='organization_principal' AND event_envelope->'actor'->>'command_id'='a5000000-0000-0000-0000-000000000001') THEN RAISE EXCEPTION 'Verified transaction actor was not copied before source mutation';END IF;END $test$;
+ROLLBACK;
+DO $test$ BEGIN IF NULLIF(current_setting('kabipay.organization_actor',true),'') IS NOT NULL THEN RAISE EXCEPTION 'Remote actor context escaped its transaction';END IF;END $test$;
+BEGIN;
+INSERT INTO timesheet_entry(id,tenant_id,employee_id,work_date,hours_worked,status) VALUES('50000000-0000-0000-0000-000000000002','10000000-0000-0000-0000-000000000001','30000000-0000-0000-0000-000000000001','2026-10-19',1,'DRAFT');
+ROLLBACK;
+DO $test$ BEGIN IF EXISTS(SELECT 1 FROM company_event_outbox WHERE aggregate_id='50000000-0000-0000-0000-000000000002') THEN RAISE EXCEPTION 'Outbox fact survived rolled-back domain write';END IF;END $test$;
+SELECT 'source_migration_facts_passed' AS result,count(*) AS canonical_events FROM company_event_outbox;

@@ -21,9 +21,8 @@ use kabipay_db_entities::tenant::d0011_leave::{
 use kabipay_db_entities::tenant::d0025_workflow::{
     workflow, workflow_action, workflow_instance, workflow_step,
 };
-use kabipay_db_entities::tenant::d0027_communication_audit::{audit_log, notification};
+use kabipay_db_entities::tenant::d0027_communication_audit::notification;
 use kabipay_db_entities::tenant::d0029_file_storage::file_storage;
-use kabipay_db_entities::tenant::d0030_outbox_events::outbox_event;
 use rust_decimal::Decimal;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseConnection, DbBackend, EntityTrait,
@@ -881,7 +880,6 @@ mod supporting_document_tests {
 }
 
 /// New outbox rows start here until a consumer marks them processed (Gap G — M6).
-const OUTBOX_STATUS_PENDING: &str = "PENDING";
 
 /// Matches `workflow.entity_type` / `workflow_instance.entity_type` for leave (seed + M8).
 const WF_ENTITY_LEAVE: &str = "LEAVE_REQUEST";
@@ -1073,14 +1071,14 @@ async fn finalize_leave_approval(
     txn: &impl ConnectionTrait,
     tenant_id: Uuid,
     model: &leave_request::Model,
-    approver_user_id: Uuid,
+    approver_user_id: Option<Uuid>,
     now: chrono::DateTime<Utc>,
     request_id: Uuid,
 ) -> KabiPayResult<()> {
     let mut am_req: leave_request::ActiveModel = model.clone().into();
     am_req.status = Set(STATUS_APPROVED.into());
     am_req.rejection_reason = Set(None);
-    am_req.approved_by = Set(Some(approver_user_id));
+    am_req.approved_by = Set(approver_user_id);
     am_req.updated_at = Set(now);
     am_req.update(txn).await?;
 
@@ -1101,21 +1099,19 @@ async fn finalize_leave_approval(
         "is_half_day": out.is_half_day,
         "status": out.status,
     });
-    let ob = outbox_event::ActiveModel {
-        id: Set(Uuid::new_v4()),
-        tenant_id: Set(tenant_id),
-        aggregate_type: Set("leave_request".into()),
-        aggregate_id: Set(request_id),
-        event_type: Set("leave_request.approved".into()),
-        payload: Set(payload),
-        status: Set(OUTBOX_STATUS_PENDING.into()),
-        retry_count: Set(0),
-        last_error: Set(None),
-        created_at: Set(now),
-        processed_at: Set(None),
-        claimed_at: Set(None),
-    };
-    ob.insert(txn).await?;
+    kabipay_common::private_webhooks::enqueue_webhooks(
+        txn,
+        kabipay_common::private_webhooks::LegacyWebhookEvent {
+            id: Uuid::new_v4(),
+            tenant_id: tenant_id,
+            aggregate_type: "leave_request".into(),
+            aggregate_id: request_id,
+            event_type: "leave_request.approved".into(),
+            payload: payload,
+            created_at: now,
+        },
+    )
+    .await?;
     Ok(())
 }
 
@@ -1124,7 +1120,7 @@ async fn finalize_leave_approval(
 ///
 /// When **`workflow_instance_id`** is set (**M8**), records **`workflow_action`**, advances
 /// **`workflow_instance.current_step_id`** until the last step; only the **final** step
-/// performs balance movement and emits **`outbox_event`** (same as M6).
+/// performs balance movement and emits destination delivery intents in the same transaction.
 pub async fn approve_leave_request(
     db: &DatabaseConnection,
     tenant_id: Uuid,
@@ -1278,7 +1274,7 @@ pub async fn approve_leave_request(
         &txn,
         tenant_id,
         &model,
-        actor_user_id,
+        Some(actor_user_id),
         now,
         request_id,
     )
@@ -1299,6 +1295,55 @@ pub async fn approve_leave_request(
     )
     .await;
     Ok(out)
+}
+
+/// The organization boundary owns the transaction and supplies independently
+/// verified live authority. Business workflow and balance helpers are shared with
+/// local decisions; foreign principals never become tenant users/employees.
+pub async fn decide_organization_leave(
+    txn:&sea_orm::DatabaseTransaction,
+    authority:&kabipay_organization_tenant::VerifiedRuntimeAuthorization,
+    request_id:Uuid,
+    business_date:NaiveDate,
+    input:kabipay_organization_tenant::WorkflowDecision,
+)->KabiPayResult<()> {
+    use kabipay_organization_tenant::{Decision,assert_workflow_actor,unavailable};
+    let tenant_id=authority.tenant_id;
+    let model=leave_request::Entity::find_by_id(request_id)
+        .filter(leave_request::Column::TenantId.eq(tenant_id))
+        .filter(leave_request::Column::IsDeleted.eq(false))
+        .filter(leave_request::Column::Status.eq(STATUS_PENDING))
+        .lock_exclusive().one(txn).await?.ok_or_else(pending_leave_decision_unavailable)?;
+    if authority.employee_id!=Some(model.employee_id){return Err(unavailable());}
+    super::leave_working_dates::validate_saved_request_dates(txn,tenant_id,&model).await?;
+    let (instance,step)=lock_current_leave_workflow(txn,tenant_id,&model,input.expected_workflow_step_id).await?;
+    assert_workflow_actor(txn,authority,model.employee_id,step.approver_type.as_deref(),step.approver_permission.as_deref()).await?;
+    let now=Utc::now();
+    let approved=matches!(input.decision,Decision::Approve);
+    let action=workflow_action::ActiveModel {
+        id:Set(Uuid::new_v4()),tenant_id:Set(tenant_id),instance_id:Set(instance.id),workflow_step_id:Set(step.id),performed_by:Set(authority.local_user_id()),
+        action:Set(if approved {WF_ACTION_APPROVE}else{WF_ACTION_REJECT}.into()),remarks:Set(input.rejection_reason.clone()),acted_at:Set(now),created_at:Set(now),updated_at:Set(now),
+    }.insert(txn).await?;
+    txn.execute(kabipay_organization_tenant::statement("INSERT INTO organization_business_actor(tenant_id,resource_type,resource_id,principal_id,command_id,action) VALUES($1,'workflow_action',$2,$3,$4,$5)",vec![tenant_id.into(),action.id.into(),authority.principal_id.into(),authority.command_id().into(),action.action.into()])).await?;
+    let next=if approved {workflow_step::Entity::find().filter(workflow_step::Column::TenantId.eq(tenant_id)).filter(workflow_step::Column::WorkflowId.eq(instance.workflow_id)).filter(workflow_step::Column::SequenceOrder.gt(step.sequence_order)).order_by_asc(workflow_step::Column::SequenceOrder).lock_exclusive().one(txn).await?}else{None};
+    let mut active:workflow_instance::ActiveModel=instance.into();
+    if let Some(next)=next {
+        active.current_step_id=Set(Some(next.id));active.updated_at=Set(now);active.update(txn).await?;
+        // Workflow progress is part of the versioned leave resource even when
+        // the request remains pending for the next approver.
+        let mut request:leave_request::ActiveModel=model.into();request.updated_at=Set(now);request.update(txn).await?;
+        return Ok(());
+    }
+    active.status=Set(if approved {WF_STATUS_COMPLETED}else{WF_STATUS_REJECTED}.into());active.current_step_id=Set(None);active.completed_at=Set(Some(now));active.updated_at=Set(now);active.update(txn).await?;
+    if model.uses_comp_off {
+        crate::services::comp_off::finalize_leave_allocations(txn,tenant_id,model.id,business_date,approved).await?;
+    } else if request_uses_leave_balance(txn,tenant_id,&model).await? {
+        move_locked_leave_balance(txn,LeaveBalanceKey{tenant_id,employee_id:model.employee_id,leave_type_id:model.leave_type_id,year:model.from_date.year()},if approved {BalanceMovement::Approve(model.days_requested)}else{BalanceMovement::Release(model.days_requested)},now).await?;
+    }
+    if approved {finalize_leave_approval(txn,tenant_id,&model,authority.local_user_id(),now,request_id).await?;}else{
+        let mut request:leave_request::ActiveModel=model.into();request.status=Set(STATUS_REJECTED.into());request.rejection_reason=Set(input.rejection_reason);request.approved_by=Set(None);request.updated_at=Set(now);request.update(txn).await?;
+    }
+    Ok(())
 }
 
 /// Reject a PENDING request, release the balance hold, and optionally record a reason.
@@ -1599,19 +1644,27 @@ pub async fn cancel_approved_comp_off_leave(
     active.approved_by = Set(None);
     active.updated_at = Set(now);
     let out = active.update(&txn).await?;
-    audit_log::ActiveModel {
-        id: Set(Uuid::new_v4()),
-        tenant_id: Set(tenant_id),
-        user_id: Set(Some(actor_user_id)),
-        entity_type: Set("LEAVE_REQUEST".into()),
-        entity_id: Set(Some(request_id)),
-        action: Set("CANCEL_APPROVED_COMP_OFF_LEAVE".into()),
-        before_state: Set(Some(serde_json::json!({"status": "APPROVED", "daysRequested": out.days_requested}))),
-        after_state: Set(Some(serde_json::json!({"status": "CANCELLED", "daysRequested": out.days_requested}))),
-        ip_address: Set(None),
-        user_agent: Set(None),
-        created_at: Set(now),
-    }.insert(&txn).await?;
+    kabipay_common::private_events::append_audit(
+        &txn,
+        &kabipay_common::private_events::AuditRecordInput {
+            id: Uuid::new_v4(),
+            tenant_id: tenant_id,
+            user_id: Some(actor_user_id),
+            entity_type: "LEAVE_REQUEST".into(),
+            entity_id: Some(request_id),
+            action: "CANCEL_APPROVED_COMP_OFF_LEAVE".into(),
+            before_state: Some(
+                serde_json::json!({"status": "APPROVED", "daysRequested": out.days_requested}),
+            ),
+            after_state: Some(
+                serde_json::json!({"status": "CANCELLED", "daysRequested": out.days_requested}),
+            ),
+            ip_address: None,
+            user_agent: None,
+            created_at: now,
+        },
+    )
+    .await?;
     txn.commit().await?;
     leave_notify_employee(db, tenant_id, out.employee_id, "Approved comp-off leave cancelled", "HR cancelled your approved future comp-off leave.").await;
     Ok(out)

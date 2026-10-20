@@ -151,13 +151,17 @@ mod tests {
         assert!(normalized.contains("child.tenant_id = $1"));
         assert!(normalized.contains("child.is_deleted = FALSE"));
         assert!(normalized.contains("child.status IN ($3, $4)"));
+        assert!(normalized.contains("LEFT JOIN management_assignment AS canonical_manager"));
+        assert!(normalized.contains("CASE WHEN canonical_manager.id IS NOT NULL THEN canonical_manager.manager_employee_id ELSE child.reporting_manager_id END"));
+        assert!(normalized.contains("canonical_manager.effective_from <= clock_timestamp()"));
+        assert!(normalized.contains("canonical_manager.effective_to > clock_timestamp()"));
         assert!(normalized.contains("NOT child.id = ANY(team.traversal_path)"));
         assert!(normalized.contains("SELECT DISTINCT employee_id AS id FROM team"));
         assert!(!normalized.contains("first_name"));
         assert!(!normalized.contains("last_name"));
         assert!(!normalized.contains("SELECT *"));
         assert_eq!(statement.values.as_ref().expect("bound values").0.len(), 4);
-        assert!(!normalized.contains("'ACTIVE'"));
+        assert!(!normalized.contains("child.status IN ('ACTIVE'"));
         assert!(!normalized.contains("'PROBATION'"));
     }
 
@@ -270,7 +274,14 @@ fn recursive_team_employee_ids_statement(
                UNION ALL
                SELECT child.id, team.traversal_path || child.id
                FROM employee AS child
-               INNER JOIN team ON child.reporting_manager_id = team.employee_id
+               LEFT JOIN management_assignment AS canonical_manager
+                 ON canonical_manager.tenant_id = child.tenant_id
+                AND canonical_manager.subject_employee_id = child.id
+                AND canonical_manager.relationship_type = 'PRIMARY'
+                AND canonical_manager.status = 'ACTIVE'
+                AND canonical_manager.effective_from <= clock_timestamp()
+                AND (canonical_manager.effective_to IS NULL OR canonical_manager.effective_to > clock_timestamp())
+               INNER JOIN team ON CASE WHEN canonical_manager.id IS NOT NULL THEN canonical_manager.manager_employee_id ELSE child.reporting_manager_id END = team.employee_id
                WHERE child.tenant_id = $1
                  AND child.is_deleted = FALSE
                  AND child.status IN ($3, $4)

@@ -27,6 +27,7 @@ struct SubscriptionAccess {
 #[derive(Clone, Debug)]
 pub struct Entitlements {
     tenant_id: Uuid,
+    currency: Option<String>,
     today: NaiveDate,
     modules: HashMap<String, ModuleAccess>,
     dependencies: HashMap<Uuid, Vec<Uuid>>,
@@ -63,12 +64,14 @@ impl Entitlements {
             dependencies.entry(row.try_get("", "module_id")?).or_default()
                 .push(row.try_get("", "depends_on_module_id")?);
         }
-        Ok(Self { tenant_id, today, modules, dependencies })
+        Ok(Self { tenant_id, currency:tenant.currency, today, modules, dependencies })
     }
 
     pub fn require(&self, code: &str) -> KabiPayResult<()> {
         if self.allows(code) { Ok(()) } else { Err(KabiPayError::ModuleNotSubscribed(code.into())) }
     }
+    pub fn currency(&self)->Option<&str> {self.currency.as_deref()}
+    pub fn business_date(&self)->NaiveDate {self.today}
 
     pub fn allows(&self, code: &str) -> bool {
         self.modules.get(code).is_some_and(|module| self.allows_module(module, &mut HashSet::new()))

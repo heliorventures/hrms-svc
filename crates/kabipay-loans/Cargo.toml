@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 [dependencies]
+kabipay-organization-tenant = {path="../kabipay-organization-tenant"}
 kabipay-loans-domain = { path = "../kabipay-loans-domain" }
 kabipay-common.workspace = true
 kabipay-db-entities.workspace = true

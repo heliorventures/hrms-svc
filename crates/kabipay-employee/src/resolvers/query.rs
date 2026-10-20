@@ -1112,10 +1112,13 @@ impl QueryRoot {
         } else {
             resolve_viewer_employee(ctx, &db, tenant_id).await?
         };
-        let models = employee_service::list_for_org_chart(&db, tenant_id, limit, scope, viewer)
+        let mut models = employee_service::list_for_org_chart(&db, tenant_id, limit, scope, viewer)
             .await
             .map_err(KabiPayError::into_graphql)?;
 
+        let manager_ids:Vec<Uuid>=models.iter().map(|m|m.id).collect();
+        let canonical=crate::services::reporting_display::current_managers(&db,tenant_id,&manager_ids).await.map_err(KabiPayError::into_graphql)?;
+        for model in &mut models {if let Some(manager)=canonical.get(&model.id){model.reporting_manager_id=manager.local_employee_id;}}
         let mut dept_ids: Vec<Uuid> = models.iter().filter_map(|e| e.department_id).collect();
         dept_ids.sort_unstable();
         dept_ids.dedup();
@@ -1481,8 +1484,13 @@ impl QueryRoot {
 async fn enrich_directory_entries(
     db: &DatabaseConnection,
     tenant_id: Uuid,
-    rows: Vec<crate::entities::d0007_employee_core::employee::Model>,
+    mut rows: Vec<crate::entities::d0007_employee_core::employee::Model>,
 ) -> Result<Vec<EmployeeDirectoryEntryDto>> {
+    if rows.is_empty(){return Ok(vec![]);}
+    let ids:Vec<Uuid>=rows.iter().map(|r|r.id).collect();
+    let organization_managed=crate::services::reporting_display::organization_managed(db,tenant_id).await.map_err(KabiPayError::into_graphql)?;
+    let canonical=crate::services::reporting_display::current_managers(db,tenant_id,&ids).await.map_err(KabiPayError::into_graphql)?;
+    for row in &mut rows {if let Some(manager)=canonical.get(&row.id){row.reporting_manager_id=manager.local_employee_id;}}
     let mut department_ids: Vec<Uuid> = rows.iter().filter_map(|row| row.department_id).collect();
     department_ids.sort_unstable();
     department_ids.dedup();
@@ -1509,12 +1517,16 @@ async fn enrich_directory_entries(
     Ok(rows
         .into_iter()
         .map(|row| {
-            EmployeeDirectoryEntryDto::from_model(
+            let id=row.id;
+            let mut dto=EmployeeDirectoryEntryDto::from_model(
                 row,
                 &department_map,
                 &designation_map,
                 &manager_map,
-            )
+            );
+            dto.reporting_manager_organization_managed=organization_managed;
+            if let Some(manager)=canonical.get(&id){dto.reporting_manager_name=Some(manager.display_name.clone());dto.reporting_manager_principal_id=Some(ID(manager.principal_id.to_string()));dto.reporting_manager_tenant_id=Some(ID(manager.tenant_id.to_string()));dto.reporting_manager_organization_managed=true;}
+            dto
         })
         .collect())
 }
@@ -1556,8 +1568,9 @@ async fn resolve_employee_dto(ctx: &Context<'_>, id: ID) -> Result<Option<Employ
 pub(crate) async fn enrich_employee_dtos(
     db: &DatabaseConnection,
     tenant_id: Uuid,
-    dtos: Vec<EmployeeDto>,
+    mut dtos: Vec<EmployeeDto>,
 ) -> Result<Vec<EmployeeDto>> {
+    if dtos.is_empty(){return Ok(vec![]);}
     fn push_uuid(ids: &mut Vec<Uuid>, id: &Option<ID>) {
         if let Some(u) = id.as_ref().and_then(|raw| Uuid::parse_str(raw.as_str()).ok()) {
             ids.push(u);
@@ -1568,6 +1581,10 @@ pub(crate) async fn enrich_employee_dtos(
         ids.dedup();
     }
 
+    let employee_ids:Vec<Uuid>=dtos.iter().filter_map(|d|Uuid::parse_str(d.id.as_str()).ok()).collect();
+    let organization_managed=crate::services::reporting_display::organization_managed(db,tenant_id).await.map_err(KabiPayError::into_graphql)?;
+    let canonical=crate::services::reporting_display::current_managers(db,tenant_id,&employee_ids).await.map_err(KabiPayError::into_graphql)?;
+    for dto in &mut dtos {dto.reporting_manager_organization_managed=organization_managed;if let Some(manager)=Uuid::parse_str(dto.id.as_str()).ok().and_then(|id|canonical.get(&id)){dto.reporting_manager_id=manager.local_employee_id.map(|id|ID(id.to_string()));}}
     let mut dept_ids = Vec::new();
     let mut desig_ids = Vec::new();
     let mut user_ids = Vec::new();
@@ -1610,7 +1627,9 @@ pub(crate) async fn enrich_employee_dtos(
         .map(|mut d| {
             d.location_name = d.location_id.as_ref().and_then(|id|Uuid::parse_str(id.as_str()).ok()).and_then(|id|location_map.get(&id).cloned());
             d.location_assignment_effective_from = Uuid::parse_str(d.id.as_str()).ok().and_then(|id|assignments.iter().find(|row|row.employee_id == id).map(|row|row.effective_from));
-            d.with_reference_labels(&dept_map, &desig_map, &user_map, &mgr_map)
+            d=d.with_reference_labels(&dept_map, &desig_map, &user_map, &mgr_map);
+            if let Some(manager)=Uuid::parse_str(d.id.as_str()).ok().and_then(|id|canonical.get(&id)){d.reporting_manager_name=Some(manager.display_name.clone());d.reporting_manager_principal_id=Some(ID(manager.principal_id.to_string()));d.reporting_manager_tenant_id=Some(ID(manager.tenant_id.to_string()));d.reporting_manager_organization_managed=true;}
+            d
         })
         .collect())
 }
@@ -1650,10 +1669,14 @@ mod tests {
     #[async_trait::async_trait]
     impl ProxyDatabaseTrait for QueueProxy {
         async fn query(&self, statement: Statement) -> std::result::Result<Vec<ProxyRow>, DbErr> {
+            let ownership=statement.sql.starts_with("SELECT organization_reporting_owned");
+            let installed_managers=statement.sql.starts_with("SELECT a.subject_employee_id,a.manager_employee_id,a.manager_principal_id");
             self.statements
                 .lock()
                 .expect("query statement recorder lock")
                 .push(statement);
+            if ownership {return Ok(vec![ProxyRow::new(BTreeMap::from([("managed".into(),false.into())]))]);}
+            if installed_managers {return Ok(vec![]);}
             Ok(self
                 .query_results
                 .lock()
@@ -1808,6 +1831,11 @@ mod tests {
 
     async fn execute_query(claims: ClientClaims, query: &str) -> async_graphql::Response {
         let tenant_id = claims.tenant_id;
+        // FNF moved to the actual Payroll merged root; keep its cross-service
+        // authorization regression against its production owner.
+        if query.contains("fnfSettlement(") {
+            return Schema::build(kabipay_payroll::resolvers::QueryRoot::default(),EmptyMutation,EmptySubscription).data(TenantId(tenant_id)).data(claims).finish().execute(Request::new(query)).await;
+        }
         Schema::build(QueryRoot, EmptyMutation, EmptySubscription)
             .data(TenantId(tenant_id))
             .data(claims)

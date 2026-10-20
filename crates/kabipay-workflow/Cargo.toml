@@ -29,3 +29,8 @@ tracing-subscriber.workspace = true
 thiserror.workspace = true
 anyhow.workspace = true
 dotenvy.workspace = true
+kabipay-organization-tenant = {path="../kabipay-organization-tenant"}
+kabipay-organization-protocol = {path="../kabipay-organization-protocol"}
+
+[dev-dependencies]
+sea-orm = {workspace=true,features=["proxy"]}

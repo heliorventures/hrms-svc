@@ -265,8 +265,19 @@ async fn load_eligible_employees(
                   AND employee_user.tenant_id = e.tenant_id
                   AND employee_user.is_active = TRUE
                   AND employee_user.is_deleted = FALSE
+            LEFT JOIN LATERAL (
+                   SELECT a.id, a.manager_employee_id
+                     FROM management_assignment a
+                    WHERE a.tenant_id=e.tenant_id AND a.subject_employee_id=e.id
+                      AND a.relationship_type='PRIMARY' AND a.status='ACTIVE'
+                      AND a.effective_from<=clock_timestamp()
+                      AND (a.effective_to IS NULL OR a.effective_to>clock_timestamp())
+                    LIMIT 1
+                 ) canonical_manager ON TRUE
             LEFT JOIN employee manager
-                   ON manager.id = e.reporting_manager_id
+                   ON manager.id = CASE WHEN canonical_manager.id IS NOT NULL
+                                        THEN canonical_manager.manager_employee_id
+                                        ELSE e.reporting_manager_id END
                   AND manager.tenant_id = e.tenant_id
                   AND UPPER(TRIM(manager.status)) IN ('ACTIVE','PROBATION','ON_LEAVE')
                   AND manager.is_deleted = FALSE

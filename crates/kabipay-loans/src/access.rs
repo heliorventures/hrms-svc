@@ -8,6 +8,11 @@ use sea_orm::DatabaseTransaction;
 use uuid::Uuid;
 
 pub(crate) async fn entitled(tx: &DatabaseTransaction, actor: &LoanActorScope) -> LoanResult<()> {
+    if let Some(entitlements)=actor.organization_entitlements.as_ref() {
+        entitlements.require_tenant(actor.tenant_id)?;
+        entitlements.require("LOANS")?;
+        return Ok(());
+    }
     Entitlements::load(tx, actor.tenant_id)
         .await?
         .require("LOANS")?;

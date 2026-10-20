@@ -38,7 +38,9 @@ impl LoanPermission {
 #[derive(Clone, Debug)]
 pub struct LoanActorScope {
     pub(crate) tenant_id: Uuid,
-    pub(crate) user_id: Uuid,
+    pub(crate) user_id: Option<Uuid>,
+    pub(crate) principal_id: Option<Uuid>,
+    pub(crate) organization_entitlements: Option<kabipay_common::entitlements::Entitlements>,
     pub(crate) permission: LoanPermission,
     pub(crate) scope: ScopeType,
     pub(crate) can_correct_company_payments: bool,
@@ -62,7 +64,9 @@ impl LoanActorScope {
         )?;
         Ok(Self {
             tenant_id: tenant,
-            user_id: claims.sub,
+            user_id: Some(claims.sub),
+            principal_id: None,
+            organization_entitlements: None,
             permission,
             scope,
             can_correct_company_payments: kabipay_common::client_data_scope::data_scope_from_claims(
@@ -71,6 +75,27 @@ impl LoanActorScope {
             )
             .ok() == Some(ScopeType::All),
         })
+    }
+    /// Only the source runtime can construct this unforgeable proof after live
+    /// company authorization and its local installation fence are checked.
+    pub fn from_verified_organization_payroll(
+        proof: &kabipay_organization_tenant::VerifiedPayrollAuthority<'_>,
+    ) -> Self {
+        Self {
+            tenant_id: proof.tenant_id(),
+            user_id: proof.local_user_id(),
+            principal_id: proof
+                .local_user_id()
+                .is_none()
+                .then(|| proof.principal_id()),
+            organization_entitlements: Some(proof.entitlements().clone()),
+            permission: LoanPermission::PayrollRecovery,
+            scope: ScopeType::All,
+            can_correct_company_payments: false,
+        }
+    }
+    pub(crate) fn local_user(&self) -> LoanResult<Uuid> {
+        self.user_id.ok_or(LoanModuleError::Forbidden)
     }
 }
 #[cfg(test)]

@@ -1,0 +1,13 @@
+const test=require('node:test');
+const assert=require('node:assert/strict');
+const fs=require('node:fs');
+const path=require('node:path');
+const base=path.resolve(__dirname,'../..');
+const producers=[
+'kabipay-common/src/working_calendar/writes.rs','kabipay-attendance/src/services/attendance_day/repository.rs','kabipay-attendance/src/services/attendance_day_runtime.rs','kabipay-employee/src/services/profile_change_service.rs','kabipay-employee/src/services/profile_record_service.rs','kabipay-leave/src/services/leave_service.rs','kabipay-notification/src/services/automation_settings.rs','kabipay-survey/src/services/survey_lifecycle.rs'];
+test('retired audit writers only use transactional private audit port',()=>{for(const file of producers){const s=fs.readFileSync(path.join(base,'crates',file),'utf8');assert.doesNotMatch(s,/audit_log::ActiveModel|INSERT INTO audit_log/,file);assert.match(s,/append_audit/,file);}});
+test('survey execution depends on local lifecycle state and history has no legacy entity reads',()=>{const s=fs.readFileSync(path.join(base,'crates/kabipay-survey/src/services/survey_lifecycle.rs'),'utf8');assert.doesNotMatch(s,/audit_log::/);assert.match(s,/private_survey_execution_state/);assert.match(s,/read_configured_audit_history/);});
+test('history reader uses signed fixed HTTPS and full pending framing',()=>{const file=path.join(base,'crates/kabipay-common/src/private_events/history_client.rs');assert.ok(fs.existsSync(file),'history client missing');const s=fs.readFileSync(file,'utf8');for(const required of ['kabipay-private-history-request-v1','kabipay-private-history-response-v1','decrypt_frames','private_legacy_export','no_proxy','redirect','coverage_sha256'])assert.ok(s.includes(required),required);assert.doesNotMatch(s,/LIMIT 4096/);});
+test('audit append checks source tenant actor in the same write statement',()=>{const s=fs.readFileSync(path.join(base,'crates/kabipay-common/src/private_events/mod.rs'),'utf8');assert.ok(s.includes('u.id=$4 AND u.tenant_id=$2'));assert.ok(s.includes('input.user_id.into()'));});
+test('new audit source timestamps preserve PostgreSQL microsecond precision',()=>{const s=fs.readFileSync(path.join(base,'crates/kabipay-common/src/private_events/mod.rs'),'utf8');assert.ok(s.includes('from_timestamp_micros(input.created_at.timestamp_micros())'),'audit canonicalization missing');});
+test('accepted initial archives remain readable after destructive gate expiry',()=>{const s=fs.readFileSync(path.join(base,'crates/kabipay-common/src/private_events/history_client.rs'),'utf8');assert.ok(!s.includes('e.expires_at>clock_timestamp()'),'runtime history must not expire immutable archive acceptance');assert.ok(s.includes('e.reader_switch_complete'));});

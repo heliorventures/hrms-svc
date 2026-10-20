@@ -106,22 +106,14 @@ pub async fn offboard_approved_separation_in_transaction(
         "employee_id": employee_id,
         "offboarded_at": processed_at,
     });
-    txn.execute(Statement::from_sql_and_values(
-        DbBackend::Postgres,
-        r#"INSERT INTO outbox_event
-           (id, tenant_id, aggregate_type, aggregate_id, event_type, payload, status,
-            retry_count, last_error, created_at, processed_at, claimed_at)
-           VALUES ($1, $2, 'separation', $3, 'employee.offboarded', $4, 'PENDING',
-                   0, NULL, $5, NULL, NULL)"#,
-        vec![
-            event_id.into(),
-            tenant_id.into(),
-            separation_id.into(),
-            payload.into(),
-            processed_at.into(),
-        ],
-    ))
-    .await?;
+    txn.execute(Statement::from_sql_and_values(DbBackend::Postgres,
+        "INSERT INTO private_domain_receipt(tenant_id,id,event_type,aggregate_type,aggregate_id,occurred_at,source_hash) VALUES($1,$2,'employee.offboarded','separation',$3,$4,$5)",
+        [tenant_id.into(),event_id.into(),separation_id.into(),processed_at.into(),crate::private_events::crypto::source_hash(&serde_json::to_vec(&payload)?).into()],
+    )).await?;
+    crate::private_webhooks::enqueue_webhooks(txn, crate::private_webhooks::LegacyWebhookEvent {
+        id: event_id, tenant_id, aggregate_type: "separation".into(), aggregate_id: separation_id,
+        event_type: "employee.offboarded".into(), payload, created_at: processed_at,
+    }).await?;
 
     Ok(true)
 }

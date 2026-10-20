@@ -209,7 +209,7 @@ pub mod continuous_feedback {
         pub visibility: String,
         pub observation_date: NaiveDate,
         pub comments: String,
-        pub created_by_user_id: Uuid,
+        pub created_by_user_id: Option<Uuid>,
         pub created_at: DateTimeUtc,
     }
 

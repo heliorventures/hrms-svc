@@ -16,7 +16,6 @@ use kabipay_db_entities::tenant::d0025_workflow::{
 };
 use kabipay_db_entities::tenant::d0033_travel_request::travel_request;
 use kabipay_db_entities::tenant::d0027_communication_audit::notification;
-use kabipay_db_entities::tenant::d0030_outbox_events::outbox_event;
 use rust_decimal::Decimal;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseConnection, DatabaseTransaction,
@@ -560,10 +559,8 @@ async fn sum_month_claimed_for_category(
     Ok(rows.iter().map(|e| e.amount).sum())
 }
 
-/// Matches **`outbox_event.status`** (`PENDING` until worker processes — **M7**).
-const OUTBOX_STATUS_PENDING: &str = "PENDING";
-
-/// Financial sign-off: **APPROVED** / **PARTIAL_APPROVED**, **`approved_amount`**, **`PENDING_PAYMENT`**, and outbox enqueue (**M33**).
+/// Financial sign-off: **APPROVED** / **PARTIAL_APPROVED**, **`approved_amount`**,
+/// **`PENDING_PAYMENT`**, and transactional private webhook intent publication (**M33**).
 async fn finalize_expense_approval(
     txn: &impl ConnectionTrait,
     tenant_id: Uuid,
@@ -629,21 +626,19 @@ async fn finalize_expense_approval(
         "payment_status": out.payment_status,
         "title": out.title,
     });
-    let ob = outbox_event::ActiveModel {
-        id: Set(Uuid::new_v4()),
-        tenant_id: Set(tenant_id),
-        aggregate_type: Set("expense".into()),
-        aggregate_id: Set(expense_id),
-        event_type: Set("expense.approved".into()),
-        payload: Set(payload.into()),
-        status: Set(OUTBOX_STATUS_PENDING.into()),
-        retry_count: Set(0),
-        last_error: Set(None),
-        created_at: Set(now),
-        processed_at: Set(None),
-        claimed_at: Set(None),
-    };
-    ob.insert(txn).await.map_err(KabiPayError::from)?;
+    kabipay_common::private_webhooks::enqueue_webhooks(
+        txn,
+        kabipay_common::private_webhooks::LegacyWebhookEvent {
+            id: Uuid::new_v4(),
+            tenant_id: tenant_id,
+            aggregate_type: "expense".into(),
+            aggregate_id: expense_id,
+            event_type: "expense.approved".into(),
+            payload: payload.into(),
+            created_at: now,
+        },
+    )
+    .await?;
     Ok(out)
 }
 

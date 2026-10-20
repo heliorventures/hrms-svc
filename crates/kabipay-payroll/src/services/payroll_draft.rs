@@ -83,10 +83,13 @@ pub async fn cycle<C: ConnectionTrait>(
             id: id.to_string(),
         })
 }
-pub async fn find<C: ConnectionTrait>(
+pub async fn find<C:ConnectionTrait>(db:&C,tenant:Uuid,id:Uuid)->KabiPayResult<Option<PayrollDraft>> {find_with_date(db,tenant,id,None).await}
+
+pub(crate) async fn find_with_date<C: ConnectionTrait>(
     db: &C,
     tenant: Uuid,
     id: Uuid,
+    current_date:Option<chrono::NaiveDate>,
 ) -> KabiPayResult<Option<PayrollDraft>> {
     let row = db
         .query_one(Statement::from_sql_and_values(
@@ -103,32 +106,37 @@ pub async fn find<C: ConnectionTrait>(
         .transpose()?;
     if let Some(draft) = &mut draft {
         let cycle = cycle(db, tenant, id).await?;
-        super::payroll_payment_date::refresh(db, &cycle, draft).await?;
+        if current_date.is_some(){super::payroll_payment_date::refresh_with_date(db, &cycle, draft,current_date).await?;}else{super::payroll_payment_date::refresh(db,&cycle,draft).await?;}
     }
     Ok(draft)
 }
-pub async fn calculate_payroll_cycle(
-    db: &DatabaseConnection,
+pub async fn calculate_payroll_cycle(db:&DatabaseConnection,tenant:Uuid,claims:&kabipay_common::context::ClientClaims,id:Uuid,expected_revision:Option<i32>)->KabiPayResult<PayrollDraft> {
+ let actor=super::payroll_actor::PayrollActor::local(claims,tenant)?;
+ let txn=db.begin().await?;
+ let draft=calculate_in_transaction(&txn,tenant,&actor,id,expected_revision).await?;
+ txn.commit().await?;Ok(draft)
+}
+
+pub async fn calculate_in_transaction(
+    txn: &sea_orm::DatabaseTransaction,
     tenant: Uuid,
-    claims: &kabipay_common::context::ClientClaims,
+    actor: &super::payroll_actor::PayrollActor,
     id: Uuid,
     expected_revision: Option<i32>,
 ) -> KabiPayResult<PayrollDraft> {
-    super::loan_recovery::actor(claims, tenant)?;
-    let actor = claims.sub;
-    let txn = db.begin().await?;
-    super::loan_recovery::lock(&txn, tenant).await?;
-    super::payroll_fingerprint::lock_inputs(&txn).await?;
-    let cycle = cycle(&txn, tenant, id).await?;
+    if actor.tenant!=tenant {return Err(KabiPayError::Unauthorised);}
+    super::loan_recovery::lock(txn, tenant).await?;
+    super::payroll_fingerprint::lock_inputs(txn).await?;
+    let cycle = cycle(txn, tenant, id).await?;
     ensure_draft(&cycle.status)?;
-    let prior = find(&txn, tenant, id).await?;
+    let prior = find_with_date(txn, tenant, id,actor.business_date).await?;
     let revision = next_revision(prior.map(|d| d.revision), expected_revision)?;
-    let mut employees = super::payroll_preview::employees(&txn, tenant, actor, &cycle).await?;
+    let mut employees = super::payroll_preview::employees_with_actor(txn, tenant, actor.local_user, actor.principal, &cycle).await?;
     for entry in &mut employees {
         if let Some(prepared) = &mut entry.prepared {
-            if let Err(error) = super::loan_recovery::prepare(
-                &txn,
-                claims,
+            if let Err(error) = super::loan_recovery::prepare_with_actor(
+                txn,
+                &actor.loans,
                 &cycle,
                 revision,
                 entry.employee_id,
@@ -145,18 +153,17 @@ pub async fn calculate_payroll_cycle(
     let mut draft = PayrollDraft {
         cycle_id: id,
         revision,
-        fingerprint: super::loan_recovery::fingerprint(&txn, tenant).await?,
+        fingerprint: super::loan_recovery::fingerprint_with_actor(txn, tenant, &actor.loans).await?,
         employees,
         can_finalize: false,
         finalization_block_reason: None,
     };
-    super::payroll_payment_date::refresh(&txn, &cycle, &mut draft).await?;
+    super::payroll_payment_date::refresh_with_date(txn, &cycle, &mut draft,actor.business_date).await?;
     let value = serde_json::to_value(&draft)
         .map_err(|_| KabiPayError::Internal("payroll review serialization failed".into()))?;
     txn.execute(Statement::from_sql_and_values(DbBackend::Postgres,
-        "INSERT INTO payroll_draft_calculation(tenant_id,cycle_id,revision,fingerprint,snapshot,calculated_by) VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT(tenant_id,cycle_id) DO UPDATE SET revision=excluded.revision,fingerprint=excluded.fingerprint,snapshot=excluded.snapshot,calculated_by=excluded.calculated_by,calculated_at=NOW()",
-        [tenant.into(),id.into(),revision.into(),draft.fingerprint.clone().into(),value.into(),actor.into()])).await?;
-    txn.commit().await?;
+        "INSERT INTO payroll_draft_calculation(tenant_id,cycle_id,revision,fingerprint,snapshot,calculated_by,calculated_by_principal_id) VALUES($1,$2,$3,$4,$5,$6,$7) ON CONFLICT(tenant_id,cycle_id) DO UPDATE SET revision=excluded.revision,fingerprint=excluded.fingerprint,snapshot=excluded.snapshot,calculated_by=excluded.calculated_by,calculated_by_principal_id=excluded.calculated_by_principal_id,calculated_at=NOW()",
+        [tenant.into(),id.into(),revision.into(),draft.fingerprint.clone().into(),value.into(),actor.local_user.into(),actor.principal.into()])).await?;
     Ok(draft)
 }
 
@@ -207,3 +214,7 @@ pub async fn set_payment_date(
     tx.commit().await?;
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "payroll_draft_date_tests.rs"]
+mod date_tests;

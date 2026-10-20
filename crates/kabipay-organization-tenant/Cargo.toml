@@ -1,0 +1,22 @@
+[package]
+name = "kabipay-organization-tenant"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+[dependencies]
+kabipay-common.workspace = true
+kabipay-organization-domain = {path="../kabipay-organization-domain"}
+async-graphql.workspace = true
+kabipay-organization-protocol = {path="../kabipay-organization-protocol"}
+kabipay-organization-security = {path="../kabipay-organization-security"}
+sea-orm.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+axum.workspace = true
+tokio.workspace = true
+base64.workspace = true
+reqwest = {version="0.12",default-features=false,features=["rustls-tls","json"]}

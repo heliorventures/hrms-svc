@@ -42,6 +42,8 @@ struct Fixture {
     permissions: Vec<String>,
     permission_scopes: HashMap<String, String>,
     manager_employee_id: Option<Uuid>,
+    installed_manager:Option<Option<Uuid>>,
+    canonical_primary_manager:Option<Option<Uuid>>,
     is_excluded: bool,
     acknowledgement: Arc<Mutex<Option<(chrono::DateTime<Utc>, Option<String>)>>>,
     missing_goal_weight: bool,
@@ -60,7 +62,7 @@ impl Fixture {
             fail_goal_write: false, initial_goals_approved: false,
             claim_employee_id: Some(Uuid::new_v4()), permissions: vec!["performance:manage".into()],
             permission_scopes: HashMap::from([("performance:manage".into(), "ALL".into())]),
-            manager_employee_id: None, is_excluded: false, acknowledgement: Arc::default(),
+            manager_employee_id: None, installed_manager:None, canonical_primary_manager:None, is_excluded: false, acknowledgement: Arc::default(),
             missing_goal_weight: false, dependent: None,
             pending_acknowledgements: 0, include_acknowledgement: true, participant_cycle_after_lock: None,
         }
@@ -161,6 +163,7 @@ impl Fixture {
         values.insert("cycle_end_date".into(), Utc::now().date_naive().into());
         values.insert("cycle_stage".into(), self.stage_after_lock.into());
         values.insert("status".into(), "ACKNOWLEDGED".into());
+        values.insert("response_revision".into(), 1_i32.into());
         values.insert("self_submitted_at".into(), Option::<chrono::DateTime<Utc>>::None.into());
         values.insert("manager_submitted_at".into(), Option::<chrono::DateTime<Utc>>::None.into());
         values.insert("acknowledged_at".into(), acknowledgement.map(|(at, _)| at).into());
@@ -190,6 +193,20 @@ impl ProxyDatabaseTrait for Fixture {
     async fn query(&self, statement: Statement) -> Result<Vec<ProxyRow>, DbErr> {
         let sql = statement.to_string();
         self.record(&sql);
+        if sql.starts_with("SELECT manager_employee_id FROM management_assignment") {return Ok(self.canonical_primary_manager.map(|manager|vec![ProxyRow::new(BTreeMap::from([("manager_employee_id".into(),manager.into())]))]).unwrap_or_default());}
+        if sql.starts_with("SELECT a.manager_employee_id FROM management_assignment a") {
+            return Ok(self.installed_manager.map(|manager|vec![ProxyRow::new(BTreeMap::from([("manager_employee_id".into(),manager.into())]))]).unwrap_or_default());
+        }
+        if sql.starts_with("SELECT c.current_stage,c.performance_program_id AS program_id") && sql.contains("FOR UPDATE OF c") {
+            return Ok(vec![ProxyRow::new(BTreeMap::from([("current_stage".into(),self.stage_after_lock.into()),("program_id".into(),Some(self.id).into()),("include_calibration".into(),false.into()),("include_acknowledgement".into(),self.include_acknowledgement.into()),("goal_weight_required".into(),Decimal::ONE_HUNDRED.into()),("current_due_date".into(),Option::<chrono::NaiveDate>::None.into())]))]);
+        }
+        if sql.starts_with("SELECT count(*) AS participant_count FROM performance_participant") {
+            return Ok(vec![ProxyRow::new(BTreeMap::from([("participant_count".into(),1_i64.into())]))]);
+        }
+        if sql.starts_with("SELECT count(*) AS missing FROM performance_participant") {
+            let missing=if sql.contains("acknowledged_at IS NULL") {i64::try_from(self.pending_acknowledgements).unwrap()}else if sql.contains("NOT EXISTS") {i64::from(!self.initial_goals_approved)}else{0};
+            return Ok(vec![ProxyRow::new(BTreeMap::from([("missing".into(),missing.into())]))]);
+        }
         if sql.contains("FROM performance_participant p") && sql.contains("JOIN review_cycle c") {
             return Ok(vec![self.review_summary()]);
         }
@@ -515,7 +532,8 @@ async fn acknowledgement_stage_cannot_close_until_every_active_employee_acknowle
     pending.stage_after_lock = "EMPLOYEE_ACKNOWLEDGEMENT";
     pending.pending_acknowledgements = 1;
     let response = pending.run(ADVANCE).await;
-    assert!(response.errors.iter().any(|error| error.message.contains("acknowledgement(s) are still pending")), "{:?}", response.errors);
+    assert!(response.errors.iter().any(|error| error.message.contains("unresolved prerequisites")), "{:?}", response.errors);
+    assert!(pending.events().iter().any(|event|event.starts_with("INSERT INTO performance_admin_exception") && event.contains("ACKNOWLEDGEMENT_PENDING")));
     assert!(!pending.events().iter().any(|event| event.starts_with("UPDATE review_cycle")));
 
     let mut complete = Fixture::new();
@@ -680,4 +698,41 @@ async fn postgresql_feedback_insert_cannot_outlive_a_locked_goal_deletion() {
         (Ok(()), Err(_)) => panic!("PostgreSQL lock proof passed but schema cleanup exceeded {:?}", POSTGRES_LOCK_PROOF_TIMEOUT),
         (Err(proof_error), Err(_)) => panic!("PostgreSQL lock proof failed: {proof_error}; schema cleanup exceeded {:?}", POSTGRES_LOCK_PROOF_TIMEOUT),
     }
+}
+
+#[tokio::test]
+async fn installed_foreign_manager_removes_previous_local_reviewer_authority() {
+    let mut fixture = Fixture::new().assigned_manager();
+    fixture.installed_manager = Some(None);
+    let response=fixture.run("mutation { proposePerformanceGoal(input: { participantId: \"$PARTICIPANT\", title: \"Deliver\", weightage: \"100\" }) { status } }").await;
+    assert!(
+        !response.errors.is_empty(),
+        "foreign installed reviewer must prevent legacy local reviewer authority"
+    );
+    assert!(!fixture
+        .events()
+        .iter()
+        .any(|e| e.starts_with("INSERT INTO \"goal\"")));
+}
+
+#[tokio::test]
+async fn foreign_primary_without_evaluate_capability_still_removes_legacy_reviewer() {
+    let mut fixture=Fixture::new().assigned_manager();
+    fixture.canonical_primary_manager=Some(None);
+    let response=fixture.run(PROPOSE).await;
+    assert!(!response.errors.is_empty(),"canonical reporting replacement must not leave legacy review authority");
+    assert!(!fixture.events().iter().any(|e|e.starts_with("INSERT INTO \"goal\"")));
+}
+
+#[tokio::test]
+async fn ended_or_expired_canonical_manager_uses_real_legacy_authority() {
+    let mut fixture=Fixture::new().assigned_manager();
+    let legacy=Uuid::new_v4();
+    fixture.canonical_primary_manager=Some(Some(legacy));
+    let denied=fixture.run(PROPOSE).await;
+    assert!(!denied.errors.is_empty(),"ended manager snapshot must not retain authority");
+    assert!(fixture.events().iter().any(|s|s.contains("UNION ALL SELECT e.reporting_manager_id") && s.contains("organization_reporting_owned")));
+    fixture.claim_employee_id=Some(legacy);
+    let allowed=fixture.run(PROPOSE).await;
+    assert!(allowed.errors.is_empty(),"actual legacy manager must regain authority: {:?}",allowed.errors);
 }

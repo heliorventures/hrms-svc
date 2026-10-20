@@ -149,6 +149,19 @@ pub async fn set_clearance_cleared(
     cleared: bool,
     user_id: Uuid,
 ) -> KabiPayResult<clearance_checklist::Model> {
+    use sea_orm::TransactionTrait;
+    let tx=db.begin().await?;
+    let result=set_clearance_in_transaction(&tx,tenant_id,clearance_id,cleared,Some(user_id),None).await?;
+    tx.commit().await?;
+    Ok(result)
+}
+
+pub(crate) async fn set_clearance_in_transaction(
+    db:&sea_orm::DatabaseTransaction,tenant_id:Uuid,clearance_id:Uuid,cleared:bool,
+    user_id:Option<Uuid>,principal_id:Option<Uuid>,
+)->KabiPayResult<clearance_checklist::Model>{
+    use kabipay_organization_tenant::statement;
+    if user_id.is_some()==principal_id.is_some(){return Err(KabiPayError::Forbidden("Exactly one verified clearance actor is required".into()));}
     let row = clearance_checklist::Entity::find_by_id(clearance_id)
         .filter(clearance_checklist::Column::TenantId.eq(tenant_id))
         .one(db)
@@ -159,18 +172,7 @@ pub async fn set_clearance_cleared(
             id: clearance_id.to_string(),
         })?;
     let cid = row.id;
-    let now = Utc::now();
-    let mut am: clearance_checklist::ActiveModel = row.into();
-    am.is_cleared = Set(cleared);
-    if cleared {
-        am.cleared_by = Set(Some(user_id));
-        am.cleared_at = Set(Some(now));
-    } else {
-        am.cleared_by = Set(None);
-        am.cleared_at = Set(None);
-    }
-    am.updated_at = Set(now);
-    am.update(db).await.map_err(KabiPayError::from)?;
+    db.execute(statement("UPDATE clearance_checklist SET is_cleared=$3,cleared_by=CASE WHEN $3 THEN $4::uuid ELSE NULL END,cleared_by_principal_id=CASE WHEN $3 THEN $5::uuid ELSE NULL END,cleared_at=CASE WHEN $3 THEN now() ELSE NULL END,updated_at=now() WHERE tenant_id=$1 AND id=$2",vec![tenant_id.into(),cid.into(),cleared.into(),user_id.into(),principal_id.into()])).await?;
     clearance_checklist::Entity::find_by_id(cid)
         .one(db)
         .await?

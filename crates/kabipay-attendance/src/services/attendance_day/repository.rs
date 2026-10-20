@@ -326,10 +326,11 @@ pub async fn schedule_policy(
     insert_version(db, tenant_id, &version, now).await?;
     state.versions = proposed;
     state.revision = revision;
-    db.execute(sql(
-        "INSERT INTO audit_log (id, tenant_id, user_id, entity_type, entity_id, action, before_state, after_state, created_at) VALUES ($1, $2, $3, 'ATTENDANCE_DAY_POLICY', $2, 'SCHEDULE', $4, $5, $6)",
-        vec![Uuid::new_v4().into(), tenant_id.into(), claims.sub.into(), before.into(),
-            audit_state(&state).into(), now.into()],
-    )).await?;
+    kabipay_common::private_events::append_audit(db, &kabipay_common::private_events::AuditRecordInput {
+        id: Uuid::new_v4(), tenant_id, user_id: Some(claims.sub),
+        entity_type: "ATTENDANCE_DAY_POLICY".into(), entity_id: Some(tenant_id), action: "SCHEDULE".into(),
+        before_state: Some(before), after_state: Some(audit_state(&state)),
+        ip_address: None, user_agent: None, created_at: now,
+    }).await?;
     Ok(state)
 }

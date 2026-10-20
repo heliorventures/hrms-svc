@@ -175,7 +175,7 @@ impl AdministrationMutationRoot {
                 return Err(KabiPayError::Forbidden("Feedback goal does not belong to this participant".into()).into_graphql());
             }
         }
-        let row = continuous_feedback::ActiveModel { id:Set(Uuid::new_v4()),tenant_id:Set(tenant_id),review_cycle_id:Set(Some(participant.review_cycle_id)),goal_id:Set(goal_id),reviewer_employee_id:Set(claims.employee_id),reviewee_employee_id:Set(participant.employee_id),visibility:Set("HR_ONLY".into()),observation_date:Set(input.observation_date),comments:Set(comments),created_by_user_id:Set(claims.sub),created_at:Set(chrono::Utc::now()) }.insert(&db).await.map_err(KabiPayError::from).map_err(KabiPayError::into_graphql)?; Ok(row.into())
+        let row = continuous_feedback::ActiveModel { id:Set(Uuid::new_v4()),tenant_id:Set(tenant_id),review_cycle_id:Set(Some(participant.review_cycle_id)),goal_id:Set(goal_id),reviewer_employee_id:Set(claims.employee_id),reviewee_employee_id:Set(participant.employee_id),visibility:Set("HR_ONLY".into()),observation_date:Set(input.observation_date),comments:Set(comments),created_by_user_id:Set(Some(claims.sub)),created_at:Set(chrono::Utc::now()) }.insert(&db).await.map_err(KabiPayError::from).map_err(KabiPayError::into_graphql)?; Ok(row.into())
     }
 
     async fn save_performance_kpi_target(&self, ctx: &Context<'_>, input: SavePerformanceKpiTargetInput) -> Result<PerformanceGoalKpiDto> {

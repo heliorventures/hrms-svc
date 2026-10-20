@@ -115,9 +115,7 @@ async fn authorized(
     access::company(actor)?;
     access::entitled(tx, actor).await?;
     if input.source == RecoverySource::Payroll {
-        kabipay_common::entitlements::Entitlements::load(tx, actor.tenant_id)
-            .await?
-            .require("PAYROLL")?;
+        if let Some(entitlements)=actor.organization_entitlements.as_ref() {entitlements.require_tenant(actor.tenant_id)?;entitlements.require("PAYROLL")?;}else{kabipay_common::entitlements::Entitlements::load(tx, actor.tenant_id).await?.require("PAYROLL")?;}
     }
     access::employee(tx, actor, input.employee_id).await?;
     store::synchronize(tx, actor.tenant_id).await?;
@@ -466,7 +464,7 @@ async fn post(
         );
         ids.push(posting::post(tx,actor,Posting{loan:line.loan_id,terms:line.terms_version_id,kind:"REPAYMENT",source_kind:kind,source:quote.input.source_id,revision:quote.input.source_revision,date:quote.input.value_date,amount,principal:-line.principal,interest:-line.interest,reversal:None,evidence:serde_json::json!({"quoteFingerprint":quote.fingerprint,"employeeRevision":quote.employee_revision,"calculatorVersion":terms.calculator_version,"periodStart":quote.input.period_start})}).await?);
         posting::bump_account(tx, actor.tenant_id, line.loan_id).await?;
-        store::execute(tx,"INSERT INTO loan_audit_event(id,tenant_id,loan_id,employee_id,actor_id,action,before_version,after_version,reason,\"references\") VALUES($1,$2,$3,$4,$5,$6,$7,$8,NULL,$9)",vec![Uuid::new_v4().into(),actor.tenant_id.into(),line.loan_id.into(),quote.input.employee_id.into(),actor.user_id.into(),format!("{kind}_RECOVERY").into(),line.account_version.into(),line.account_version.checked_add(1).ok_or(LoanModuleError::InvalidCommand)?.into(),serde_json::json!({"sourceId":quote.input.source_id,"quoteFingerprint":quote.fingerprint}).into()]).await?;
+        store::execute(tx,"INSERT INTO loan_audit_event(id,tenant_id,loan_id,employee_id,actor_id,action,before_version,after_version,reason,\"references\",actor_principal_id) VALUES($1,$2,$3,$4,$5,$6,$7,$8,NULL,$9,$10)",vec![Uuid::new_v4().into(),actor.tenant_id.into(),line.loan_id.into(),quote.input.employee_id.into(),actor.user_id.into(),format!("{kind}_RECOVERY").into(),line.account_version.into(),line.account_version.checked_add(1).ok_or(LoanModuleError::InvalidCommand)?.into(),serde_json::json!({"sourceId":quote.input.source_id,"quoteFingerprint":quote.fingerprint}).into(),actor.principal_id.into()]).await?;
     }
     let revision = if ids.is_empty() {
         quote.employee_revision

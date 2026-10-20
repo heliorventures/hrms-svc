@@ -1,4 +1,4 @@
-﻿[package]
+[package]
 name = "kabipay-attendance"
 version = "0.1.0"
 edition.workspace = true
@@ -11,6 +11,8 @@ name = "kabipay-attendance"
 path = "src/main.rs"
 
 [dependencies]
+kabipay-organization-tenant = {path="../kabipay-organization-tenant"}
+kabipay-organization-protocol = {path="../kabipay-organization-protocol"}
 kabipay-common.workspace = true
 kabipay-db-entities.workspace = true
 async-graphql.workspace = true

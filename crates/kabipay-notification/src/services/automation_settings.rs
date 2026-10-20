@@ -3,7 +3,6 @@
 use chrono::{NaiveTime, Utc};
 use kabipay_common::{KabiPayError, KabiPayResult};
 use kabipay_db_entities::tenant::{
-    d0027_communication_audit::audit_log,
     d0074_automated_employee_notifications::{
         employee_celebration_preference, notification_automation_setting,
     },
@@ -207,27 +206,28 @@ pub async fn save_automation_settings(
     }
     .map_err(KabiPayError::from)?;
 
-    audit_log::ActiveModel {
-        id: Set(Uuid::new_v4()),
-        tenant_id: Set(tenant_id),
-        user_id: Set(Some(actor_user_id)),
-        entity_type: Set("notification_automation_setting".into()),
-        entity_id: Set(Some(saved.id)),
-        action: Set("NOTIFICATION_AUTOMATION_UPDATED".into()),
-        before_state: Set(None),
-        after_state: Set(Some(serde_json::json!({
-            "birthdayEnabled": saved.birthday_enabled,
-            "workAnniversaryEnabled": saved.work_anniversary_enabled,
-            "companySharingEnabled": saved.company_sharing_enabled,
-            "deliveryLocalTime": saved.delivery_local_time.to_string(),
-        }))),
-        ip_address: Set(None),
-        user_agent: Set(None),
-        created_at: Set(now),
-    }
-    .insert(&txn)
-    .await
-    .map_err(KabiPayError::from)?;
+    kabipay_common::private_events::append_audit(
+        &txn,
+        &kabipay_common::private_events::AuditRecordInput {
+            id: Uuid::new_v4(),
+            tenant_id: tenant_id,
+            user_id: Some(actor_user_id),
+            entity_type: "notification_automation_setting".into(),
+            entity_id: Some(saved.id),
+            action: "NOTIFICATION_AUTOMATION_UPDATED".into(),
+            before_state: None,
+            after_state: Some(serde_json::json!({
+                "birthdayEnabled": saved.birthday_enabled,
+                "workAnniversaryEnabled": saved.work_anniversary_enabled,
+                "companySharingEnabled": saved.company_sharing_enabled,
+                "deliveryLocalTime": saved.delivery_local_time.to_string(),
+            })),
+            ip_address: None,
+            user_agent: None,
+            created_at: now,
+        },
+    )
+    .await?;
     txn.commit().await.map_err(KabiPayError::from)?;
     Ok(saved.into())
 }
@@ -284,25 +284,26 @@ pub async fn save_celebration_preferences(
     }
     .map_err(KabiPayError::from)?;
 
-    audit_log::ActiveModel {
-        id: Set(Uuid::new_v4()),
-        tenant_id: Set(tenant_id),
-        user_id: Set(Some(actor_user_id)),
-        entity_type: Set("employee_celebration_preference".into()),
-        entity_id: Set(Some(saved.id)),
-        action: Set("CELEBRATION_CONSENT_UPDATED".into()),
-        before_state: Set(None),
-        after_state: Set(Some(serde_json::json!({
-            "shareBirthday": saved.share_birthday,
-            "shareWorkAnniversary": saved.share_work_anniversary,
-        }))),
-        ip_address: Set(None),
-        user_agent: Set(None),
-        created_at: Set(now),
-    }
-    .insert(&txn)
-    .await
-    .map_err(KabiPayError::from)?;
+    kabipay_common::private_events::append_audit(
+        &txn,
+        &kabipay_common::private_events::AuditRecordInput {
+            id: Uuid::new_v4(),
+            tenant_id: tenant_id,
+            user_id: Some(actor_user_id),
+            entity_type: "employee_celebration_preference".into(),
+            entity_id: Some(saved.id),
+            action: "CELEBRATION_CONSENT_UPDATED".into(),
+            before_state: None,
+            after_state: Some(serde_json::json!({
+                "shareBirthday": saved.share_birthday,
+                "shareWorkAnniversary": saved.share_work_anniversary,
+            })),
+            ip_address: None,
+            user_agent: None,
+            created_at: now,
+        },
+    )
+    .await?;
     txn.commit().await.map_err(KabiPayError::from)?;
     Ok(saved.into())
 }

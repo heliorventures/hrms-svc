@@ -1,0 +1,2 @@
+import test from 'node:test';import assert from 'node:assert/strict';import {parseCdcJson} from '../src/cdc-json.mjs';
+test('CDC LSN bytes remain exact beyond JavaScript safe integer range',()=>{const r=parseCdcJson('{"source":{"lsn":9007199254740993},"offset":{"lsn_commit":18446744073709551615},"ordinary":3}');assert.equal(r.source.lsn,'9007199254740993');assert.equal(r.offset.lsn_commit,'18446744073709551615');assert.equal(r.ordinary,3);assert.throws(()=>parseCdcJson('{"lsn":9.5}'));});

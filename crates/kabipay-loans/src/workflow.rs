@@ -102,7 +102,7 @@ pub(crate) async fn decide(
         .await?
         .ok_or(LoanModuleError::VersionConflict)?;
     let authority = WorkflowApprovalAuthority {
-        actor_user_id: actor.user_id,
+        actor_user_id: actor.local_user()?,
         actor_employee: access::viewer(tx, actor).await?,
         scope: actor.scope,
         permission: "loan:approve",
@@ -127,7 +127,7 @@ pub(crate) async fn decide(
         tenant_id: Set(actor.tenant_id),
         instance_id: Set(instance_id),
         workflow_step_id: Set(step_id),
-        performed_by: Set(Some(actor.user_id)),
+        performed_by: Set(Some(actor.local_user()?)),
         action: Set(action.into()),
         remarks: Set(Some(reason.into())),
         acted_at: Set(now),

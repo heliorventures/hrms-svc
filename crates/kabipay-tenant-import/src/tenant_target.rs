@@ -28,6 +28,9 @@ pub async fn resolve(
     options: &ImportOptions,
 ) -> Result<VerifiedTenantTarget> {
     options.validate()?;
+    let cache = TenantDbCache::from_env()?;
+    cache.require_tenant(options.tenant_id)?;
+    cache.validate_binding_registration(ops).await?;
     if package.tenant_code != options.tenant_code {
         bail!("TENANT_CODE_DISAGREES");
     }
@@ -58,7 +61,7 @@ pub async fn resolve(
         bail!("TARGET_MAPPING_DISAGREES");
     }
     let handle =
-        resolve_required_tenant_handle(options.tenant_id, ops, &TenantDbCache::new(), fallback)
+        resolve_required_tenant_handle(options.tenant_id, ops, &cache, fallback)
             .await?;
     let expected_host = options
         .connection_host

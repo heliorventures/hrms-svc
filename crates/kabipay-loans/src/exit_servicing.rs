@@ -43,7 +43,7 @@ pub async fn confirm_fnf_arrangements(
     crate::access::company(actor)?;
     crate::access::employee(tx,actor,employee).await?;
     store::synchronize(tx,actor.tenant_id).await?;
-    record(tx,actor.tenant_id,employee,separation,"FNF",fnf,actor.user_id,last_working,settlement,decision).await
+    record(tx,actor.tenant_id,employee,separation,"FNF",fnf,actor.local_user()?,last_working,settlement,decision).await
 }
 
 pub(crate) async fn payroll_limit(

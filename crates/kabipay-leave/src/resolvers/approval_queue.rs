@@ -170,7 +170,7 @@ async fn batch_actionable_steps(
         .map(|row| row.employee_id)
         .chain(std::iter::once(actor.employee_id))
         .collect();
-    let employees: HashMap<_, _> = employee::Entity::find()
+    let mut employees: HashMap<_, _> = employee::Entity::find()
         .filter(employee::Column::TenantId.eq(tenant_id))
         .filter(employee::Column::IsDeleted.eq(false))
         .filter(employee::Column::Id.is_in(ids))
@@ -184,6 +184,7 @@ async fn batch_actionable_steps(
     }) {
         return Ok(HashMap::new());
     }
+    kabipay_common::canonical_reporting::apply_managers(db,tenant_id,&mut employees).await?;
     let manager_ids: HashSet<_> = employees
         .values()
         .filter_map(|row| row.reporting_manager_id)

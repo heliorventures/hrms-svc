@@ -345,7 +345,8 @@ impl MutationRoot {
                 .await
                 .map_err(KabiPayError::into_graphql)?
         };
-        Ok(EmployeeDto::from(m))
+        let mut enriched=enrich_employee_dtos(&db,tenant_id,vec![EmployeeDto::from(m)]).await?;
+        enriched.pop().ok_or_else(||KabiPayError::Internal("Employee presentation unavailable".into()).into_graphql())
     }
 
     async fn provision_employee_login(
@@ -373,7 +374,8 @@ impl MutationRoot {
         )
         .await
         .map_err(KabiPayError::into_graphql)?;
-        Ok(EmployeeDto::from(m))
+        let mut enriched=enrich_employee_dtos(&db,tenant_id,vec![EmployeeDto::from(m)]).await?;
+        enriched.pop().ok_or_else(||KabiPayError::Internal("Employee presentation unavailable".into()).into_graphql())
     }
 
     async fn reset_employee_password(
@@ -418,10 +420,11 @@ impl MutationRoot {
             user_id: opt_uuid(&input.user_id, "userId")?,
             linked_user_email: input.linked_user_email,
         };
-        let m = employee_service::update(&db, tenant_id, eid, patch)
+        let m = employee_service::update_for_actor(&db, tenant_id, eid, patch, ctx.data_opt::<ClientClaims>().map(|c|c.sub))
             .await
             .map_err(KabiPayError::into_graphql)?;
-        Ok(EmployeeDto::from(m))
+        let mut enriched=enrich_employee_dtos(&db,tenant_id,vec![EmployeeDto::from(m)]).await?;
+        enriched.pop().ok_or_else(||KabiPayError::Internal("Employee presentation unavailable".into()).into_graphql())
     }
 
     /// HR: set or update monthly salary for an employee (`employment_history`), effective from a date.
@@ -1549,7 +1552,7 @@ impl MutationRoot {
         for id in permission_ids {
             pids.push(parse_uuid(&id, "permissionId")?);
         }
-        rbac_admin_service::set_role_permissions(&db, tenant_id, rid, pids)
+        rbac_admin_service::set_role_permissions_for_actor(&db, tenant_id, rid, pids, Some(require_client_claims(ctx)?.sub))
             .await
             .map_err(KabiPayError::into_graphql)?;
         Ok(true)
@@ -1570,7 +1573,7 @@ impl MutationRoot {
         for id in role_ids {
             rids.push(parse_uuid(&id, "roleId")?);
         }
-        rbac_admin_service::set_user_roles(&db, tenant_id, uid, rids)
+        rbac_admin_service::set_user_roles_for_actor(&db, tenant_id, uid, rids, Some(require_client_claims(ctx)?.sub))
             .await
             .map_err(KabiPayError::into_graphql)?;
         Ok(true)
@@ -1591,7 +1594,7 @@ impl MutationRoot {
             .into_iter()
             .map(|s| (s.resource, s.action, s.scope_type))
             .collect();
-        rbac_admin_service::set_role_permission_scopes(&db, tenant_id, rid, tuples)
+        rbac_admin_service::set_role_permission_scopes_for_actor(&db, tenant_id, rid, tuples, Some(require_client_claims(ctx)?.sub))
             .await
             .map_err(KabiPayError::into_graphql)?;
         Ok(true)

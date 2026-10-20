@@ -219,6 +219,9 @@ pub async fn set_role_permissions(
     role_id: Uuid,
     permission_ids: Vec<Uuid>,
 ) -> KabiPayResult<()> {
+    set_role_permissions_for_actor(db,tenant_id,role_id,permission_ids,None).await
+}
+pub async fn set_role_permissions_for_actor(db:&DatabaseConnection,tenant_id:Uuid,role_id:Uuid,permission_ids:Vec<Uuid>,actor:Option<Uuid>)->KabiPayResult<()> {
     ensure_role_in_tenant(db, tenant_id, role_id).await?;
     let unique: Vec<Uuid> = permission_ids.into_iter().collect::<HashSet<_>>().into_iter().collect();
     for pid in &unique {
@@ -229,6 +232,7 @@ pub async fn set_role_permissions(
     }
 
     let txn = db.begin().await?;
+    let before=begin_role_authority_change(&txn,tenant_id,actor).await?;
     role_permission::Entity::delete_many()
         .filter(role_permission::Column::RoleId.eq(role_id))
         .exec(&txn)
@@ -243,6 +247,7 @@ pub async fn set_role_permissions(
         .insert(&txn)
         .await?;
     }
+    finish_role_authority_change(&txn,tenant_id,actor,before).await?;
     txn.commit().await?;
     Ok(())
 }
@@ -253,8 +258,12 @@ pub async fn set_user_roles(
     user_id: Uuid,
     role_ids: Vec<Uuid>,
 ) -> KabiPayResult<()> {
+    set_user_roles_for_actor(db,tenant_id,user_id,role_ids,None).await
+}
+pub async fn set_user_roles_for_actor(db: &DatabaseConnection, tenant_id: Uuid, user_id: Uuid, role_ids: Vec<Uuid>, actor: Option<Uuid>) -> KabiPayResult<()> {
     require_nonempty_role_assignment(&role_ids)?;
     let txn = db.begin().await?;
+    guard_account_change(&txn,tenant_id,user_id,actor==Some(user_id),Some(&role_ids),None).await?;
     let replacement = replace_user_roles_in_transaction(&txn, tenant_id, user_id, &role_ids).await;
     if let Err(error) = replacement {
         txn.rollback().await?;
@@ -264,7 +273,7 @@ pub async fn set_user_roles(
     Ok(())
 }
 
-async fn replace_user_roles_in_transaction(
+pub(crate) async fn replace_user_roles_in_transaction(
     txn: &DatabaseTransaction,
     tenant_id: Uuid,
     user_id: Uuid,
@@ -303,14 +312,80 @@ async fn replace_user_roles_in_transaction(
     Ok(())
 }
 
+/// Serialize account authority changes and preserve an effective local administrator.
+pub(crate) async fn guard_account_change(
+    txn: &DatabaseTransaction, tenant: Uuid, target: Uuid, same_actor: bool,
+    replacement_roles: Option<&[Uuid]>, active: Option<bool>,
+) -> KabiPayResult<()> {
+    use kabipay_organization_tenant::statement;
+    txn.execute(statement("SELECT pg_advisory_xact_lock(hashtextextended($1,0))", vec![format!("company-account-admin:{tenant}").into()])).await?;
+    let row = txn.query_one(statement("SELECT EXISTS(SELECT 1 FROM user_role ur JOIN role r ON r.id=ur.role_id AND r.tenant_id=$1 AND NOT r.is_deleted JOIN role_permission rp ON rp.role_id=r.id JOIN permission p ON p.id=rp.permission_id AND p.resource='role' AND p.action='manage' JOIN permission_scope ps ON ps.role_id=r.id AND ps.tenant_id=$1 AND ps.resource='role' AND ps.action='manage' AND ps.scope_type='ALL' WHERE ur.user_id=$2) AS admin", vec![tenant.into(), target.into()])).await?.ok_or_else(|| KabiPayError::Internal("Account authority unavailable".into()))?;
+    let was_admin: bool = row.try_get("", "admin")?;
+    let retains_admin = if let Some(roles) = replacement_roles {
+        txn.query_one(statement("SELECT EXISTS(SELECT 1 FROM role r JOIN role_permission rp ON rp.role_id=r.id JOIN permission p ON p.id=rp.permission_id AND p.resource='role' AND p.action='manage' JOIN permission_scope ps ON ps.role_id=r.id AND ps.tenant_id=$1 AND ps.resource='role' AND ps.action='manage' AND ps.scope_type='ALL' WHERE r.tenant_id=$1 AND NOT r.is_deleted AND r.id IN (SELECT value::uuid FROM jsonb_array_elements_text($2::jsonb))) AS admin", vec![tenant.into(), serde_json::json!(roles).into()])).await?.ok_or_else(|| KabiPayError::Internal("Account roles unavailable".into()))?.try_get::<bool>("", "admin")?
+    } else { was_admin };
+    enforce_self_admin_guard(was_admin, retains_admin && active != Some(false), same_actor)?;
+    if was_admin && (!retains_admin || active == Some(false)) {
+        let count = txn.query_one(statement("SELECT count(DISTINCT u.id) AS n FROM \"user\" u JOIN user_role ur ON ur.user_id=u.id JOIN role r ON r.id=ur.role_id AND r.tenant_id=$1 AND NOT r.is_deleted JOIN role_permission rp ON rp.role_id=r.id JOIN permission p ON p.id=rp.permission_id AND p.resource='role' AND p.action='manage' JOIN permission_scope ps ON ps.role_id=r.id AND ps.tenant_id=$1 AND ps.resource='role' AND ps.action='manage' AND ps.scope_type='ALL' WHERE u.tenant_id=$1 AND u.id<>$2 AND u.is_active AND NOT u.is_deleted AND NOT u.must_change_password AND (SELECT count(*)=0 OR (count(*)=1 AND bool_and(NOT e.is_deleted AND e.status IN ('ACTIVE','PROBATION','ON_LEAVE'))) FROM employee e WHERE e.tenant_id=$1 AND e.user_id=u.id)", vec![tenant.into(),target.into()])).await?.ok_or_else(||KabiPayError::Internal("Administrator count unavailable".into()))?.try_get::<i64>("","n")?;
+        if count == 0 { return Err(KabiPayError::Forbidden("The last active company administrator cannot be removed or disabled".into())); }
+    }
+    Ok(())
+}
+
+pub(crate) fn enforce_self_admin_guard(was_admin: bool, retains_admin: bool, same_actor: bool) -> KabiPayResult<()> {
+    if same_actor && was_admin && !retains_admin { return Err(KabiPayError::Forbidden("An administrator cannot remove their own administration access".into())); }
+    Ok(())
+}
+
+/// Account edits share tenant validation and session invalidation independently of transport.
+pub(crate) async fn update_account_in_transaction(tx: &DatabaseTransaction,tenant:Uuid,id:Uuid,username:Option<String>,email:Option<String>)->KabiPayResult<()> {
+    use kabipay_organization_tenant::{statement,unavailable};
+    if let Some(value)=&username {if value.trim().is_empty() || value.len()>200{return Err(KabiPayError::Validation("Invalid username".into()));}}
+    if let Some(value)=&email {if !value.is_empty() && (!value.contains('@') || value.len()>254){return Err(KabiPayError::Validation("Invalid email".into()));}}
+    let username=username.as_deref().map(super::employee_service::normalize_username).transpose()?;
+    let email=email.map(|value|super::employee_service::normalize_email(Some(value)).unwrap_or_default());
+    let result=tx.execute(statement("UPDATE \"user\" SET username=COALESCE($3,username),email=CASE WHEN $4::text IS NULL THEN email ELSE NULLIF($4,'') END,updated_at=now() WHERE tenant_id=$1 AND id=$2 AND NOT is_deleted",vec![tenant.into(),id.into(),username.into(),email.into()])).await.map_err(super::employee_service::map_employee_db_error)?;
+    if result.rows_affected()!=1{return Err(unavailable());}
+    user_session::Entity::delete_many().filter(user_session::Column::UserId.eq(id)).exec(tx).await?;
+    Ok(())
+}
+
+pub(crate) async fn set_account_access_in_transaction(tx:&DatabaseTransaction,tenant:Uuid,id:Uuid,active:bool,same_actor:bool)->KabiPayResult<()> {
+    use kabipay_organization_tenant::{statement,unavailable};
+    guard_account_change(tx,tenant,id,same_actor,None,Some(active)).await?;
+    if active {
+        require_user_active_tenant_role(tx,tenant,id).await?;
+        if tx.query_one(statement("SELECT 1 AS n WHERE NOT (SELECT count(*)=0 OR (count(*)=1 AND bool_and(NOT is_deleted AND status IN ('ACTIVE','PROBATION','ON_LEAVE'))) FROM employee WHERE tenant_id=$1 AND user_id=$2)",vec![tenant.into(),id.into()])).await?.is_some(){return Err(KabiPayError::Validation("Employment status does not permit account activation".into()));}
+    }
+    let result=tx.execute(statement("UPDATE \"user\" SET is_active=$3,updated_at=now() WHERE tenant_id=$1 AND id=$2 AND NOT is_deleted",vec![tenant.into(),id.into(),active.into()])).await?;
+    if result.rows_affected()!=1{return Err(unavailable());}
+    user_session::Entity::delete_many().filter(user_session::Column::UserId.eq(id)).exec(tx).await?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod administration_guard_tests {
+    use super::*;
+    #[test]
+    fn self_admin_removal_is_denied_but_preserved_admin_is_allowed() {
+        assert!(enforce_self_admin_guard(true,false,true).is_err());
+        assert!(enforce_self_admin_guard(true,true,true).is_ok());
+        assert!(enforce_self_admin_guard(true,false,false).is_ok());
+    }
+}
+
 pub async fn set_role_permission_scopes(
     db: &DatabaseConnection,
     tenant_id: Uuid,
     role_id: Uuid,
     scopes: Vec<(String, String, String)>,
 ) -> KabiPayResult<()> {
+    set_role_permission_scopes_for_actor(db,tenant_id,role_id,scopes,None).await
+}
+pub async fn set_role_permission_scopes_for_actor(db:&DatabaseConnection,tenant_id:Uuid,role_id:Uuid,scopes:Vec<(String,String,String)>,actor:Option<Uuid>)->KabiPayResult<()> {
     ensure_role_in_tenant(db, tenant_id, role_id).await?;
     let txn = db.begin().await?;
+    let before=begin_role_authority_change(&txn,tenant_id,actor).await?;
     permission_scope::Entity::delete_many()
         .filter(permission_scope::Column::TenantId.eq(tenant_id))
         .filter(permission_scope::Column::RoleId.eq(role_id))
@@ -331,8 +406,24 @@ pub async fn set_role_permission_scopes(
         .insert(&txn)
         .await?;
     }
+    finish_role_authority_change(&txn,tenant_id,actor,before).await?;
     txn.commit().await?;
     Ok(())
+}
+
+async fn admin_authority_state(tx:&DatabaseTransaction,tenant:Uuid,actor:Option<Uuid>)->KabiPayResult<(i64,bool)> {
+    let row=tx.query_one(kabipay_organization_tenant::statement("SELECT count(DISTINCT u.id) AS n,COALESCE(bool_or(u.id=$2),false) AS own FROM \"user\" u JOIN user_role ur ON ur.user_id=u.id JOIN role r ON r.id=ur.role_id AND r.tenant_id=$1 AND NOT r.is_deleted JOIN role_permission rp ON rp.role_id=r.id JOIN permission p ON p.id=rp.permission_id AND p.resource='role' AND p.action='manage' JOIN permission_scope ps ON ps.role_id=r.id AND ps.tenant_id=$1 AND ps.resource='role' AND ps.action='manage' AND ps.scope_type='ALL' WHERE u.tenant_id=$1 AND u.is_active AND NOT u.is_deleted AND NOT u.must_change_password AND (SELECT count(*)=0 OR (count(*)=1 AND bool_and(NOT e.is_deleted AND e.status IN ('ACTIVE','PROBATION','ON_LEAVE'))) FROM employee e WHERE e.tenant_id=$1 AND e.user_id=u.id)",vec![tenant.into(),actor.into()])).await?.ok_or_else(||KabiPayError::Internal("Administrator authority unavailable".into()))?;
+    Ok((row.try_get("","n")?,row.try_get("","own")?))
+}
+
+async fn begin_role_authority_change(tx:&DatabaseTransaction,tenant:Uuid,actor:Option<Uuid>)->KabiPayResult<(i64,bool)> {
+    tx.execute(kabipay_organization_tenant::statement("SELECT pg_advisory_xact_lock(hashtextextended($1,0))",vec![format!("company-account-admin:{tenant}").into()])).await?;
+    admin_authority_state(tx,tenant,actor).await
+}
+async fn finish_role_authority_change(tx:&DatabaseTransaction,tenant:Uuid,actor:Option<Uuid>,before:(i64,bool))->KabiPayResult<()> {
+    let after=admin_authority_state(tx,tenant,actor).await?;
+    if before.0>0 && after.0==0{return Err(KabiPayError::Forbidden("Role configuration cannot remove the last active company administrator".into()));}
+    enforce_self_admin_guard(before.1,after.1,actor.is_some())
 }
 
 #[cfg(test)]
@@ -359,6 +450,11 @@ mod role_lifecycle_tests {
                 .lock()
                 .expect("event recorder")
                 .push(format!("QUERY {statement}"));
+            // Existing lifecycle fixtures represent an ordinary employee role.
+            // Administration authority itself is exercised by dedicated source/PG cases.
+            if statement.sql.contains(" AS admin") {
+                return Ok(vec![ProxyRow::new(BTreeMap::from([("admin".into(), false.into())]))]);
+            }
             self.query_results
                 .lock()
                 .expect("query script")

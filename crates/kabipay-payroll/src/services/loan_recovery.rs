@@ -111,16 +111,21 @@ pub async fn fingerprint(tx: &DatabaseTransaction, tenant: Uuid) -> KabiPayResul
         .map_err(financial_error)
 }
 
-pub async fn prepare(
+pub async fn fingerprint_with_actor(tx:&DatabaseTransaction,tenant:Uuid,actor:&LoanActorScope)->KabiPayResult<String> {
+ let payroll=super::payroll_fingerprint::fingerprint(tx,tenant).await?;
+ let loans=kabipay_loans::payroll_loan_state_with_actor(tx,actor).await.map_err(financial_error)?;
+ kabipay_loans::command_hash(&("payroll-with-loans-v1",payroll,loans.fingerprint)).map_err(financial_error)
+}
+
+pub async fn prepare_with_actor(
     tx: &DatabaseTransaction,
-    claims: &ClientClaims,
+    actor: &LoanActorScope,
     cycle: &payroll_cycle::Model,
     revision: i32,
     employee: Uuid,
     prepared: &mut PreparedEmployeePayroll,
 ) -> KabiPayResult<()> {
-    let actor = actor(claims, cycle.tenant_id)?;
-    let state = kabipay_loans::payroll_loan_state(tx, cycle.tenant_id)
+    let state = kabipay_loans::payroll_loan_state_with_actor(tx, actor)
         .await
         .map_err(financial_error)?;
     if !state.enabled {
@@ -218,12 +223,11 @@ pub(crate) fn validate_calculation(
     Ok(())
 }
 
-pub async fn post(
+pub async fn post_with_actor(
     tx: &DatabaseTransaction,
-    claims: &ClientClaims,
+    actor: &LoanActorScope,
     reviewed: &ReviewedLoanRecovery,
 ) -> KabiPayResult<PayslipLoanSnapshot> {
-    let actor = actor(claims, claims.tenant_id)?;
     let quote = &reviewed.quote;
     let posted = kabipay_loans::post_payroll_recoveries(
         tx,
@@ -319,4 +323,11 @@ pub fn apply_recovery(value: &mut CalculatedPeriod, recovery: Decimal) -> KabiPa
     value.remaining_payable = remaining;
     value.loan_recovery = recovery;
     Ok(())
+}
+
+pub async fn prepare(tx:&DatabaseTransaction,claims:&ClientClaims,cycle:&payroll_cycle::Model,revision:i32,employee:Uuid,prepared:&mut PreparedEmployeePayroll)->KabiPayResult<()> {
+ let actor=actor(claims,cycle.tenant_id)?; prepare_with_actor(tx,&actor,cycle,revision,employee,prepared).await
+}
+pub async fn post(tx:&DatabaseTransaction,claims:&ClientClaims,reviewed:&ReviewedLoanRecovery)->KabiPayResult<PayslipLoanSnapshot> {
+ let actor=actor(claims,claims.tenant_id)?; post_with_actor(tx,&actor,reviewed).await
 }

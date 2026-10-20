@@ -18,6 +18,19 @@ pub async fn payroll_loan_state(
         return Err(LoanModuleError::Forbidden);
     }
     let enabled = Entitlements::load(tx, tenant).await?.allows("LOANS");
+    check_disabled(tx,tenant,enabled).await?;
+    let config = store::one(
+        tx,
+        "SELECT currency FROM kabipay_ops.tenant WHERE id=$1",
+        vec![tenant.into()],
+    )
+    .await?
+    .ok_or(LoanModuleError::PolicyUnavailable)?;
+    let currency: Option<String> = config.try_get("", "currency")?;
+    state(tx,tenant,enabled,currency).await
+}
+
+async fn check_disabled(tx:&DatabaseTransaction,tenant:Uuid,enabled:bool)->LoanResult<()> {
     // Disabling a product must not make an existing loan disappear from payroll review.
     if !enabled
         && store::one(
@@ -30,14 +43,10 @@ pub async fn payroll_loan_state(
     {
         return Err(LoanModuleError::PolicyUnavailable);
     }
-    let config = store::one(
-        tx,
-        "SELECT currency FROM kabipay_ops.tenant WHERE id=$1",
-        vec![tenant.into()],
-    )
-    .await?
-    .ok_or(LoanModuleError::PolicyUnavailable)?;
-    let currency: Option<String> = config.try_get("", "currency")?;
+    Ok(())
+}
+
+async fn state(tx:&DatabaseTransaction,tenant:Uuid,enabled:bool,currency:Option<String>)->LoanResult<PayrollLoanState> {
     let rows=store::all(tx,"SELECT employee_id,revision FROM loan_employee_state WHERE tenant_id=$1 ORDER BY employee_id",vec![tenant.into()]).await?;
     let revisions: Vec<(Uuid, i64)> = rows
         .iter()
@@ -54,4 +63,15 @@ pub async fn payroll_loan_state(
         currency,
         fingerprint,
     })
+}
+
+/// The foreign payroll path uses only the private current source-runtime proof;
+/// company loan rows remain in their separate source database.
+pub async fn payroll_loan_state_with_actor(tx:&DatabaseTransaction,actor:&crate::LoanActorScope)->LoanResult<PayrollLoanState> {
+ if let Some(entitlements)=actor.organization_entitlements.as_ref() {
+  entitlements.require_tenant(actor.tenant_id)?;
+  let enabled=entitlements.allows("LOANS");
+  check_disabled(tx,actor.tenant_id,enabled).await?;
+  state(tx,actor.tenant_id,enabled,entitlements.currency().map(str::to_owned)).await
+ }else{payroll_loan_state(tx,actor.tenant_id).await}
 }

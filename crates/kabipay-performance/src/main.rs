@@ -2,13 +2,13 @@
 //! Federated async-graphql subgraph on port 4021.
 
 use async_graphql::{EmptySubscription, Schema};
-use kabipay_common::subgraph::{serve_subgraph, SubgraphConfig};
+use kabipay_common::subgraph::{serve_subgraph_with_routes, SubgraphConfig};
 use kabipay_performance::resolvers::{MutationRoot, QueryRoot};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let schema = Schema::build(QueryRoot::default(), MutationRoot::default(), EmptySubscription);
-    serve_subgraph(
+    serve_subgraph_with_routes(
         SubgraphConfig {
             service_name: "kabipay-performance",
             default_port: 4021,
@@ -16,6 +16,7 @@ async fn main() -> anyhow::Result<()> {
             needs_db: true,
         },
         schema,
+        kabipay_organization_tenant::routes(kabipay_performance::organization::PerformanceAdapter),
     )
     .await
 }

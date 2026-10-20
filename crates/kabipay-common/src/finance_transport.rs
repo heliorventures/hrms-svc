@@ -50,10 +50,8 @@ pub async fn send(
             "Finance request is too large".into(),
         ));
     }
-    let client = reqwest::Client::builder()
+    let client = crate::organization_http::client_builder(Duration::from_secs(10))?
         .connect_timeout(Duration::from_secs(3))
-        .timeout(Duration::from_secs(10))
-        .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|_| unavailable())?;
     let mut response = client

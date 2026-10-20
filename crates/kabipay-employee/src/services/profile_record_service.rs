@@ -11,8 +11,7 @@ use std::collections::HashMap;
 
 use crate::entities::d0008_document_system::employee_document;
 use crate::entities::d0007_employee_core::employee;
-use kabipay_db_entities::tenant::d0027_communication_audit::{audit_log, notification};
-use kabipay_db_entities::tenant::d0030_outbox_events::outbox_event;
+use kabipay_db_entities::tenant::d0027_communication_audit::notification;
 use crate::entities::d0050_employee_self_service::{
     employee_education, employee_education_document, employee_work_experience,
     employee_work_experience_document,
@@ -41,33 +40,34 @@ async fn record_review_decision<C: ConnectionTrait>(
 ) -> KabiPayResult<()> {
     let status = if approved { "VERIFIED" } else { "REJECTED" };
     let action = if approved { "approved" } else { "rejected" };
-    audit_log::ActiveModel {
-        id: Set(Uuid::new_v4()),
-        tenant_id: Set(tenant_id),
-        user_id: Set(Some(reviewer_user_id)),
-        entity_type: Set(entity_type.into()),
-        entity_id: Set(Some(record_id)),
-        action: Set(action.into()),
-        before_state: Set(Some(serde_json::json!({"verificationStatus": "PENDING"}))),
-        after_state: Set(Some(serde_json::json!({"verificationStatus": status, "employeeId": employee_id}))),
-        ip_address: Set(None),
-        user_agent: Set(None),
-        created_at: Set(now),
-    }.insert(conn).await?;
-    outbox_event::ActiveModel {
-        id: Set(Uuid::new_v4()),
-        tenant_id: Set(tenant_id),
-        aggregate_type: Set(entity_type.into()),
-        aggregate_id: Set(record_id),
-        event_type: Set(format!("{entity_type}.{action}")),
-        payload: Set(serde_json::json!({"schema_version": 1, "record_id": record_id, "employee_id": employee_id, "status": status, "reviewer_user_id": reviewer_user_id})),
-        status: Set("PENDING".into()),
-        retry_count: Set(0),
-        last_error: Set(None),
-        created_at: Set(now),
-        processed_at: Set(None),
-        claimed_at: Set(None),
-    }.insert(conn).await?;
+    kabipay_common::private_events::append_audit(
+        conn,
+        &kabipay_common::private_events::AuditRecordInput {
+            id: Uuid::new_v4(),
+            tenant_id: tenant_id,
+            user_id: Some(reviewer_user_id),
+            entity_type: entity_type.into(),
+            entity_id: Some(record_id),
+            action: action.into(),
+            before_state: Some(serde_json::json!({"verificationStatus": "PENDING"})),
+            after_state: Some(
+                serde_json::json!({"verificationStatus": status, "employeeId": employee_id}),
+            ),
+            ip_address: None,
+            user_agent: None,
+            created_at: now,
+        },
+    )
+    .await?;
+    kabipay_common::private_webhooks::enqueue_webhooks(conn, kabipay_common::private_webhooks::LegacyWebhookEvent {
+id: Uuid::new_v4(),
+tenant_id: tenant_id,
+aggregate_type: entity_type.into(),
+aggregate_id: record_id,
+event_type: format!("{entity_type}.{action}"),
+payload: serde_json::json!({"schema_version": 1, "record_id": record_id, "employee_id": employee_id, "status": status, "reviewer_user_id": reviewer_user_id}),
+created_at: now,
+}).await?;
     if let Some(user_id) = employee::Entity::find_by_id(employee_id)
         .filter(employee::Column::TenantId.eq(tenant_id))
         .filter(employee::Column::IsDeleted.eq(false))

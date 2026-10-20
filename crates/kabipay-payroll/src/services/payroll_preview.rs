@@ -34,10 +34,11 @@ fn period_eligibility(
     ("ELIGIBLE", None)
 }
 
-pub async fn employees<C: ConnectionTrait + Send + Sync>(
+pub async fn employees_with_actor<C: ConnectionTrait + Send + Sync>(
     db: &C,
     tenant: Uuid,
-    actor: Uuid,
+    actor: Option<Uuid>,
+    principal: Option<Uuid>,
     cycle: &payroll_cycle::Model,
 ) -> KabiPayResult<Vec<DraftEmployee>> {
     let rows = db.query_all(Statement::from_sql_and_values(DbBackend::Postgres,
@@ -67,7 +68,7 @@ pub async fn employees<C: ConnectionTrait + Send + Sync>(
             });
             continue;
         }
-        let outcome = prepare_employee(db, tenant, actor, employee, cycle).await;
+        let outcome = prepare_employee(db, tenant, actor, principal, employee, cycle).await;
         results.push(match outcome {
             Ok(prepared) => DraftEmployee {
                 employee_id: employee,
@@ -129,7 +130,8 @@ pub(crate) fn review_reason(error: KabiPayError) -> String {
 async fn prepare_employee<C: ConnectionTrait + Send + Sync>(
     db: &C,
     tenant: Uuid,
-    actor: Uuid,
+    actor: Option<Uuid>,
+    principal: Option<Uuid>,
     employee: Uuid,
     cycle: &payroll_cycle::Model,
 ) -> KabiPayResult<super::automatic_payroll::PreparedEmployeePayroll> {
@@ -142,10 +144,11 @@ async fn prepare_employee<C: ConnectionTrait + Send + Sync>(
     };
     let period = if input.automatic.is_some() {
         input.ready = true;
-        super::payroll_period_input::save(
+        super::payroll_period_input::save_with_actor(
             db,
             tenant,
             actor,
+            principal,
             employee,
             input.clone(),
             None,
@@ -172,3 +175,5 @@ async fn prepare_employee<C: ConnectionTrait + Send + Sync>(
     super::imported_lwp::validate(db, tenant, employee, &prepared.input, false).await?;
     Ok(prepared)
 }
+
+pub async fn employees<C:ConnectionTrait+Send+Sync>(db:&C,tenant:Uuid,actor:Uuid,cycle:&payroll_cycle::Model)->KabiPayResult<Vec<DraftEmployee>> { employees_with_actor(db,tenant,Some(actor),None,cycle).await }

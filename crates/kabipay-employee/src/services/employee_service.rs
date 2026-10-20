@@ -24,6 +24,13 @@ use uuid::Uuid;
 use crate::entities::d0007_employee_core::employee;
 use crate::services::rbac_admin_service;
 
+async fn assert_local_reporting_ownership<C:ConnectionTrait>(db:&C, tenant:Uuid)->KabiPayResult<()> {
+    let row=db.query_one(sea_orm::Statement::from_sql_and_values(sea_orm::DbBackend::Postgres,
+        "SELECT 1 AS n WHERE organization_reporting_owned($1)",vec![tenant.into()])).await?;
+    if row.is_some() {return Err(KabiPayError::BusinessRule{code:"ORGANIZATION_REPORTING_MANAGED",message:"Organization workspace manages reporting relationships".into()});}
+    Ok(())
+}
+
 fn employee_conflict_for_constraint(constraint: &str) -> Option<KabiPayError> {
     let (code, message) = match constraint {
         "uq_user_tenant_email" => (
@@ -47,7 +54,7 @@ fn employee_conflict_for_constraint(constraint: &str) -> Option<KabiPayError> {
     })
 }
 
-fn map_employee_db_error(error: sea_orm::DbErr) -> KabiPayError {
+pub(crate) fn map_employee_db_error(error: sea_orm::DbErr) -> KabiPayError {
     constraint_name(&error)
         .and_then(employee_conflict_for_constraint)
         .unwrap_or(KabiPayError::Database(error))
@@ -864,7 +871,7 @@ pub struct NewLoginAccount {
     pub role_ids: Vec<Uuid>,
 }
 
-fn normalize_username(raw: &str) -> KabiPayResult<String> {
+pub(crate) fn normalize_username(raw: &str) -> KabiPayResult<String> {
     let username = raw.trim().to_lowercase();
     if username.is_empty() {
         return Err(KabiPayError::Validation("username is required".into()));
@@ -872,7 +879,7 @@ fn normalize_username(raw: &str) -> KabiPayResult<String> {
     Ok(username)
 }
 
-fn normalize_email(raw: Option<String>) -> Option<String> {
+pub(crate) fn normalize_email(raw: Option<String>) -> Option<String> {
     raw.and_then(|value| {
         let trimmed = value.trim().to_lowercase();
         if trimmed.is_empty() {
@@ -908,6 +915,12 @@ async fn insert_login_user<C: ConnectionTrait>(
     validated_role_ids: Vec<Uuid>,
     employee_status: &str,
 ) -> KabiPayResult<Uuid> {
+    insert_login_user_with_id(db, tenant_id, Uuid::new_v4(), account, validated_role_ids, employee_status).await
+}
+pub(crate) async fn insert_login_user_with_id<C: ConnectionTrait>(
+    db: &C, tenant_id: Uuid, id: Uuid, account: NewLoginAccount,
+    validated_role_ids: Vec<Uuid>, employee_status: &str,
+) -> KabiPayResult<Uuid> {
     let username = normalize_username(&account.username)?;
     let email = normalize_email(account.email);
     let password_hash = account.password_hash;
@@ -938,7 +951,6 @@ async fn insert_login_user<C: ConnectionTrait>(
         }
     }
 
-    let id = Uuid::new_v4();
     let now = Utc::now();
     user::ActiveModel {
         id: Set(id),
@@ -967,9 +979,13 @@ async fn insert_login_user<C: ConnectionTrait>(
 pub async fn create<C: ConnectionTrait>(
     db: &C,
     tenant_id: Uuid,
-    mut data: NewEmployee,
+    data: NewEmployee,
 ) -> KabiPayResult<employee::Model> {
+    create_with_id(db, tenant_id, Uuid::new_v4(), data).await
+}
+pub async fn create_with_id<C: ConnectionTrait>(db: &C, tenant_id: Uuid, id: Uuid, mut data: NewEmployee) -> KabiPayResult<employee::Model> {
     data.status = canonical_employment_status(&data.status)?.to_owned();
+    validate_org_assignment(db,tenant_id,data.department_id,data.designation_id).await?;
     ensure_linked_user_role_integrity(db, tenant_id, data.user_id, &data.status).await?;
     if employee::Entity::find()
         .filter(employee::Column::TenantId.eq(tenant_id))
@@ -984,8 +1000,8 @@ pub async fn create<C: ConnectionTrait>(
         });
     }
 
-    let id = Uuid::new_v4();
     if let Some(mgr) = data.reporting_manager_id {
+        assert_local_reporting_ownership(db,tenant_id).await?;
         assert_valid_reporting_manager(db, tenant_id, id, mgr).await?;
     }
     let linked_user_id = data.user_id;
@@ -1188,28 +1204,40 @@ pub async fn reset_linked_user_password(
     Ok(())
 }
 
-pub async fn update(
-    db: &DatabaseConnection,
-    tenant_id: Uuid,
-    employee_id: Uuid,
-    mut patch: EmployeePatch,
-) -> KabiPayResult<employee::Model> {
+pub async fn update(db: &DatabaseConnection, tenant_id: Uuid, employee_id: Uuid, patch: EmployeePatch) -> KabiPayResult<employee::Model> {
+    update_for_actor(db,tenant_id,employee_id,patch,None).await
+}
+pub async fn update_for_actor(db: &DatabaseConnection, tenant_id: Uuid, employee_id: Uuid, patch: EmployeePatch, actor: Option<Uuid>) -> KabiPayResult<employee::Model> {
+    if let Some(status) = &patch.status { canonical_employment_status(status)?; }
+    let txn = db.begin().await?;
+    let result = update_in_transaction(&txn, tenant_id, employee_id, patch, &actor.into_iter().collect::<Vec<_>>()).await?;
+    txn.commit().await?;
+    Ok(result)
+}
+pub async fn update_in_transaction(txn: &sea_orm::DatabaseTransaction, tenant_id: Uuid, employee_id: Uuid, mut patch: EmployeePatch, actor_target_user_ids: &[Uuid]) -> KabiPayResult<employee::Model> {
     if let Some(status) = patch.status.as_mut() {
         *status = canonical_employment_status(status)?.to_owned();
     }
-    let txn = db.begin().await?;
-    let existing = find_by_id(&txn, tenant_id, employee_id)
+    validate_org_assignment(txn,tenant_id,patch.department_id,patch.designation_id).await?;
+    txn.execute(kabipay_organization_tenant::statement("SELECT pg_advisory_xact_lock(hashtextextended($1,0))",vec![format!("company-account-admin:{tenant_id}").into()])).await?;
+    let existing = find_by_id(txn, tenant_id, employee_id)
         .await?
         .ok_or_else(|| KabiPayError::NotFound {
             entity: "employee",
             id: employee_id.to_string(),
         })?;
+    if patch.status.as_deref().is_some_and(|s| !employee_status_allows_login(s)) {
+        if let Some(user) = existing.user_id { rbac_admin_service::guard_account_change(txn,tenant_id,user,actor_target_user_ids.contains(&user),None,Some(false)).await?; }
+    }
     let previous_status = existing.status.clone();
     let mut final_user_id = existing.user_id;
     if let Some(v) = patch.user_id {
         final_user_id = Some(v);
     }
 
+    if let Some(manager)=patch.reporting_manager_id {
+        if manager != existing.reporting_manager_id {assert_local_reporting_ownership(txn,tenant_id).await?;}
+    }
     let mut final_status = existing.status.clone();
     let mut am: employee::ActiveModel = existing.into();
     if let Some(v) = patch.first_name {
@@ -1230,7 +1258,7 @@ pub async fn update(
                 am.reporting_manager_id = Set(None);
             }
             Some(mgr) => {
-                assert_valid_reporting_manager(&txn, tenant_id, employee_id, mgr).await?;
+                assert_valid_reporting_manager(txn, tenant_id, employee_id, mgr).await?;
                 am.reporting_manager_id = Set(Some(mgr));
             }
         }
@@ -1245,23 +1273,31 @@ pub async fn update(
     let linked_user_email = patch.linked_user_email;
     am.user_id = Set(final_user_id);
     am.updated_at = Set(Utc::now());
-    am.update(&txn).await?;
+    am.update(txn).await?;
     if let Some(email) = linked_user_email {
-        update_linked_user_email(&txn, tenant_id, final_user_id, Some(email)).await?;
+        update_linked_user_email(txn, tenant_id, final_user_id, Some(email)).await?;
     }
     sync_linked_user_status(
-        &txn,
+        txn,
         tenant_id,
         final_user_id,
         Some(&previous_status),
         &final_status,
     )
     .await?;
-    let updated = find_by_id(&txn, tenant_id, employee_id)
+    let updated = find_by_id(txn, tenant_id, employee_id)
         .await?
         .ok_or_else(|| KabiPayError::Internal("updated employee not found".into()))?;
-    txn.commit().await?;
     Ok(updated)
+}
+
+async fn validate_org_assignment<C:ConnectionTrait>(db:&C,tenant:Uuid,department:Option<Uuid>,designation:Option<Uuid>)->KabiPayResult<()> {
+    for (table,id) in [("department",department),("designation",designation)] {
+        if let Some(id)=id {
+            if db.query_one(kabipay_organization_tenant::statement(&format!("SELECT id FROM {table} WHERE tenant_id=$1 AND id=$2 AND NOT is_deleted FOR SHARE"),vec![tenant.into(),id.into()])).await?.is_none(){return Err(KabiPayError::NotFound{entity:table,id:id.to_string()});}
+        }
+    }
+    Ok(())
 }
 
 /// Demographics + emergency contact (self-service or HR). Does not change org assignment.

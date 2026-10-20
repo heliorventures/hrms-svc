@@ -28,15 +28,17 @@ pub async fn find<C: ConnectionTrait>(
 
 /// Caller owns the transaction. Reserve the write lock before checking cycle status;
 /// finalization's input-table lock must wait for this whole edit (or finish first).
-pub async fn save<C: ConnectionTrait + Send + Sync>(
+pub async fn save_with_actor<C: ConnectionTrait + Send + Sync>(
     db: &C,
     tenant: Uuid,
-    actor: Uuid,
+    actor: Option<Uuid>,
+    principal: Option<Uuid>,
     employee: Uuid,
     input: PeriodInput,
     source_ref: Option<serde_json::Value>,
     expected_revision: Option<i32>,
 ) -> KabiPayResult<payroll_period_input::Model> {
+    if actor.is_some() == principal.is_some() {return Err(KabiPayError::Unauthorised);}
     db.execute(Statement::from_string(
         DbBackend::Postgres,
         "LOCK TABLE payroll_period_input IN ROW EXCLUSIVE MODE",
@@ -115,6 +117,7 @@ pub async fn save<C: ConnectionTrait + Send + Sync>(
         ),
         revision: Set(revision),
         updated_by: Set(actor),
+        updated_by_principal_id: Set(principal),
         created_at: Set(created),
         updated_at: Set(now),
     };
@@ -124,8 +127,8 @@ pub async fn save<C: ConnectionTrait + Send + Sync>(
         model.insert(db).await?
     };
     db.execute(Statement::from_sql_and_values(DbBackend::Postgres,
-        "INSERT INTO payroll_period_input_audit(tenant_id,period_input_id,revision,input,changed_by) VALUES($1,$2,$3,$4,$5)",
-        [tenant.into(),id.into(),revision.into(),value.into(),actor.into()])).await?;
+        "INSERT INTO payroll_period_input_audit(tenant_id,period_input_id,revision,input,changed_by,changed_by_principal_id) VALUES($1,$2,$3,$4,$5,$6)",
+        [tenant.into(),id.into(),revision.into(),value.into(),actor.into(),principal.into()])).await?;
     db.execute(Statement::from_sql_and_values(DbBackend::Postgres,
         "DELETE FROM payroll_period_adjustment WHERE tenant_id=$1 AND employee_id=$2 AND year=$3 AND month=$4",
         [tenant.into(),employee.into(),input.year.into(),input.month.into()])).await?;
@@ -145,8 +148,12 @@ pub async fn save<C: ConnectionTrait + Send + Sync>(
         let item_ready =
             amount.is_zero() || item.reason.as_deref().is_some_and(|s| !s.trim().is_empty());
         db.execute(Statement::from_sql_and_values(DbBackend::Postgres,
-            "INSERT INTO payroll_period_adjustment(tenant_id,employee_id,year,month,code,amount,reason,ready,updated_by) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)",
-            [tenant.into(),employee.into(),input.year.into(),input.month.into(),item.code.into(),amount.into(),item.reason.into(),item_ready.into(),actor.into()])).await?;
+            "INSERT INTO payroll_period_adjustment(tenant_id,employee_id,year,month,code,amount,reason,ready,updated_by,updated_by_principal_id) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)",
+            [tenant.into(),employee.into(),input.year.into(),input.month.into(),item.code.into(),amount.into(),item.reason.into(),item_ready.into(),actor.into(),principal.into()])).await?;
     }
     Ok(result)
+}
+
+pub async fn save<C:ConnectionTrait+Send+Sync>(db:&C,tenant:Uuid,actor:Uuid,employee:Uuid,input:PeriodInput,source_ref:Option<serde_json::Value>,expected_revision:Option<i32>)->KabiPayResult<payroll_period_input::Model> {
+ save_with_actor(db,tenant,Some(actor),None,employee,input,source_ref,expected_revision).await
 }

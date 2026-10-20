@@ -17,8 +17,11 @@ async fn main() -> anyhow::Result<()> {
             needs_db: true,
         },
         schema,
-        kabipay_payroll::fnf::http::routes(),
-        kabipay_payroll::fnf::worker::start,
+        kabipay_payroll::fnf::http::routes().merge(kabipay_organization_tenant::routes(kabipay_payroll::organization::PayrollAdapter)),
+        |schema| {
+            kabipay_payroll::fnf::worker::start(schema.clone());
+            kabipay_payroll::organization_job_worker::start(schema);
+        },
     )
     .await
 }

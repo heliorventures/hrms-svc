@@ -1,7 +1,6 @@
 use crate::KabiPayResult;
 use chrono::Utc;
-use kabipay_db_entities::tenant::d0027_communication_audit::audit_log;
-use sea_orm::{ActiveModelTrait, ConnectionTrait, DbBackend, Set, Statement};
+use sea_orm::{ConnectionTrait, DbBackend, Statement};
 use uuid::Uuid;
 
 /// All calendar/location writers take this transaction lock before row locks.
@@ -35,20 +34,22 @@ pub async fn audit_calendar<C: ConnectionTrait>(
     before: Option<serde_json::Value>,
     after: Option<serde_json::Value>,
 ) -> KabiPayResult<()> {
-    audit_log::ActiveModel {
-        id: Set(Uuid::new_v4()),
-        tenant_id: Set(tenant),
-        user_id: Set(Some(actor)),
-        entity_type: Set(entity.into()),
-        entity_id: Set(Some(id)),
-        action: Set(action.into()),
-        before_state: Set(before),
-        after_state: Set(after),
-        ip_address: Set(None),
-        user_agent: Set(None),
-        created_at: Set(Utc::now()),
-    }
-    .insert(txn)
+    crate::private_events::append_audit(
+        txn,
+        &crate::private_events::AuditRecordInput {
+            id: Uuid::new_v4(),
+            tenant_id: tenant,
+            user_id: Some(actor),
+            entity_type: entity.into(),
+            entity_id: Some(id),
+            action: action.into(),
+            before_state: before,
+            after_state: after,
+            ip_address: None,
+            user_agent: None,
+            created_at: Utc::now(),
+        },
+    )
     .await?;
     Ok(())
 }

@@ -57,29 +57,3 @@ pub mod notification {
     #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
     pub enum Relation {}
 }
-
-pub mod audit_log {
-    use crate::tenant::prelude::*;
-
-    #[derive(Clone, Debug, PartialEq, DeriveEntityModel)]
-    #[sea_orm(table_name = "audit_log")]
-    pub struct Model {
-        #[sea_orm(primary_key, auto_increment = false)]
-        pub id: Uuid,
-        pub tenant_id: Uuid,
-        pub user_id: Option<Uuid>,
-        pub entity_type: String,
-        pub entity_id: Option<Uuid>,
-        pub action: String,
-        pub before_state: Option<Json>,
-        pub after_state: Option<Json>,
-        pub ip_address: Option<String>,
-        pub user_agent: Option<String>,
-        pub created_at: DateTimeUtc,
-    }
-
-    impl ActiveModelBehavior for ActiveModel {}
-
-    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
-    pub enum Relation {}
-}

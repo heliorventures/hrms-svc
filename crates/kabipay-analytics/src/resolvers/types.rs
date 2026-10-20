@@ -7,7 +7,7 @@ use sea_orm::prelude::Json;
 use crate::entities::d0024_analytics::{
     dashboard, dashboard_widget, report_definition, report_schedule, workforce_snapshot,
 };
-use crate::entities::d0030_outbox_events::outbox_event;
+use crate::services::analytics_service::{OutboxHistoryRow, WebhookHistoryRow};
 
 fn opt_json_str(v: &Option<Json>) -> Option<String> {
     v.as_ref().and_then(|j| serde_json::to_string(j).ok())
@@ -172,12 +172,12 @@ pub struct OutboxEventDto {
     pub last_error: Option<String>,
     pub created_at: DateTime<Utc>,
     pub processed_at: Option<DateTime<Utc>>,
-    /// Present while the outbox worker holds the row (`PROCESSING`).
+    /// Present while a source delivery adapter holds an active destination lease.
     pub claimed_at: Option<DateTime<Utc>>,
 }
 
-impl From<outbox_event::Model> for OutboxEventDto {
-    fn from(m: outbox_event::Model) -> Self {
+impl From<OutboxHistoryRow> for OutboxEventDto {
+    fn from(m: OutboxHistoryRow) -> Self {
         let payload_json = serde_json::to_string(&m.payload).unwrap_or_else(|_| "{}".to_string());
         Self {
             id: ID(m.id.to_string()),
@@ -289,12 +289,8 @@ pub struct WebhookDeliveryLogDto {
     pub created_at: DateTime<Utc>,
 }
 
-impl From<kabipay_db_entities::tenant::d0026_integrations::webhook_delivery_log::Model>
-    for WebhookDeliveryLogDto
-{
-    fn from(
-        m: kabipay_db_entities::tenant::d0026_integrations::webhook_delivery_log::Model,
-    ) -> Self {
+impl From<WebhookHistoryRow> for WebhookDeliveryLogDto {
+    fn from(m: WebhookHistoryRow) -> Self {
         Self {
             id: ID(m.id.to_string()),
             webhook_subscription_id: ID(m.webhook_subscription_id.to_string()),
@@ -324,10 +320,8 @@ pub struct AuditLogDto {
     pub created_at: DateTime<Utc>,
 }
 
-impl From<kabipay_db_entities::tenant::d0027_communication_audit::audit_log::Model>
-    for AuditLogDto
-{
-    fn from(m: kabipay_db_entities::tenant::d0027_communication_audit::audit_log::Model) -> Self {
+impl From<kabipay_common::private_events::AuditRecordInput> for AuditLogDto {
+    fn from(m: kabipay_common::private_events::AuditRecordInput) -> Self {
         Self {
             id: ID(m.id.to_string()),
             user_id: m.user_id.map(|u| ID(u.to_string())),

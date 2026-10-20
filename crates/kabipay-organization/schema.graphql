@@ -1,0 +1,207 @@
+type ChangeResult {
+	id: UUID!
+	status: String!
+	version: Int!
+	organizationVersion: Int!
+}
+
+type CommandOutcome {
+	commandId: UUID!
+	resourceId: UUID!
+	status: String!
+	resourceVersion: Int!
+	result: JSON!
+}
+
+"""
+Implement the DateTime<Utc> scalar
+
+The input/output is a string in RFC3339 format.
+"""
+scalar DateTime
+
+enum EmployeeScope {
+	SELF_ONLY
+	TEAM
+	DEPARTMENT
+	ALL
+}
+
+"""
+A scalar that can represent any JSON value.
+"""
+scalar JSON
+
+type MutationRoot {
+	registerOrganizationIdentity: UUID!
+	revokeMyOrganizationIdentity(expectedLinkVersion: Int!): UUID!
+	inviteOrganizationCompany(organizationId: UUID!, expectedVersion: Int!, tenantId: UUID!): ChangeResult!
+	acceptOrganizationCompany(organizationId: UUID!, expectedVersion: Int!, membershipId: UUID!, expectedMembershipVersion: Int!): ChangeResult!
+	suspendOrganizationCompany(organizationId: UUID!, expectedVersion: Int!, membershipId: UUID!, expectedMembershipVersion: Int!): ChangeResult!
+	resumeOrganizationCompany(organizationId: UUID!, expectedVersion: Int!, membershipId: UUID!, expectedMembershipVersion: Int!): ChangeResult!
+	beginOrganizationCompanyDetach(organizationId: UUID!, expectedVersion: Int!, membershipId: UUID!, expectedMembershipVersion: Int!): ChangeResult!
+	createOrganizationRole(organizationId: UUID!, expectedVersion: Int!, name: String!, capabilities: [RoleCapability!]!): ChangeResult!
+	replaceOrganizationRoleCapabilities(organizationId: UUID!, expectedVersion: Int!, roleId: UUID!, expectedRoleVersion: Int!, capabilities: [RoleCapability!]!): ChangeResult!
+	grantOrganizationRole(organizationId: UUID!, expectedVersion: Int!, principalId: UUID!, roleId: UUID!, companyMembershipIds: [UUID!]!): ChangeResult!
+	revokeOrganizationRoleBinding(organizationId: UUID!, expectedVersion: Int!, bindingId: UUID!, expectedBindingVersion: Int!): ChangeResult!
+	cancelPendingOrganizationCommand(commandId: UUID!): CommandOutcome!
+	installOrganizationMembership(organizationId: UUID!, membershipId: UUID!, expectedVersion: Int!, commandId: UUID!): CommandOutcome!
+	executeOrganizationCommand(organizationId: UUID!, membershipId: UUID!, command: OrganizationCommandInput!): CommandOutcome!
+	installOrganizationGrant(organizationId: UUID!, membershipId: UUID!, bindingId: UUID!, expectedVersion: Int!, commandId: UUID!): CommandOutcome!
+	syncOrganizationDirectory(organizationId: UUID!, membershipId: UUID!, after: UUID, first: Int): OrganizationDocumentPage!
+	proposeOrganizationRelationship(organizationId: UUID!, expectedGraphVersion: Int!, subjectEmploymentRefId: UUID!, managerEmploymentRefId: UUID!, relationshipType: String!, effectiveFrom: DateTime!, effectiveTo: DateTime, capabilities: [String!]!): JSON!
+	changeOrganizationRelationshipManager(organizationId: UUID!, assignmentId: UUID!, expectedVersion: Int!, expectedGraphVersion: Int!, managerEmploymentRefId: UUID!): JSON!
+	endOrganizationRelationship(organizationId: UUID!, assignmentId: UUID!, expectedVersion: Int!, expectedGraphVersion: Int!): JSON!
+	installOrganizationRelationship(organizationId: UUID!, membershipId: UUID!, assignmentId: UUID!, expectedVersion: Int!, commandId: UUID!): CommandOutcome!
+}
+
+"""
+ISO 8601 calendar date without timezone.
+Format: %Y-%m-%d
+
+# Examples
+
+* `1994-11-13`
+* `2000-02-24`
+"""
+scalar NaiveDate
+
+type Organization {
+	id: UUID!
+	name: String!
+	status: String!
+	version: Int!
+}
+
+input OrganizationCommandInput {
+	commandId: UUID!
+	resourceId: UUID!
+	expectedVersion: Int!
+	operation: OrganizationOperation!
+	payload: JSON!
+}
+
+type OrganizationCompany {
+	membershipId: UUID!
+	tenantId: UUID!
+	name: String!
+	status: String!
+	version: Int!
+	capabilities: [String!]!
+	runtimeStatus: String!
+	installedVersion: Int
+	directorySyncStatus: String!
+}
+
+enum OrganizationConfigurationKind {
+	COMPANIES
+	ROLES
+	BINDINGS
+}
+
+type OrganizationConfigurationPage {
+	schemaVersion: Int!
+	items: JSON!
+	nextCursor: UUID
+	organizationVersion: Int!
+}
+
+type OrganizationDocumentPage {
+	schemaVersion: Int!
+	items: JSON!
+	endCursor: UUID
+	hasNextPage: Boolean!
+	graphVersion: Int!
+}
+
+type OrganizationIdentity {
+	principalId: UUID!
+	loginLinkId: UUID!
+	loginLinkVersion: Int!
+}
+
+enum OrganizationOperation {
+	INSTALL_MEMBERSHIP
+	INSTALL_GRANT
+	DIRECTORY
+	INSTALL_RELATIONSHIP
+	LEAVE_DETAIL
+	LEAVE_DECISION
+	FEEDBACK_CREATE
+	REVIEW_DETAIL
+	REVIEW_SUBMIT
+	TIMESHEET_DETAIL
+	TIMESHEET_DECISION
+	PAYROLL_LIST
+	PAYROLL_DRAFT
+	PAYROLL_FINALIZE
+	READ_RECEIPT
+	CANCEL_COMMAND
+}
+
+type OrganizationWorkspace {
+	id: UUID!
+	name: String!
+	version: Int!
+	canManage: Boolean!
+	canDelegate: Boolean!
+	canApprove: Boolean!
+	canReview: Boolean!
+	canReport: Boolean!
+	canHistory: Boolean!
+	canPayroll: Boolean!
+}
+
+type QueryRoot {
+	myOrganizations: [Organization!]!
+	myOrganizationIdentity: OrganizationIdentity!
+	organizationCapabilityCatalog: [String!]!
+	organizationConfiguration(organizationId: UUID!, kind: OrganizationConfigurationKind!, after: UUID, first: Int): OrganizationConfigurationPage!
+	organizationAuditHistory(organizationId: UUID!, from: DateTime!, to: DateTime!, after: UUID, first: Int): JSON!
+	organizationPendingCommands(organizationId: UUID!, membershipId: UUID, after: UUID, first: Int): OrganizationDocumentPage!
+	organizationWorkspaces: [OrganizationWorkspace!]!
+	organizationCompanies(organizationId: UUID!): [OrganizationCompany!]!
+	organizationInvitations: OrganizationDocumentPage!
+	organizationDirectory(organizationId: UUID!, membershipId: UUID!, after: UUID, first: Int): OrganizationDocumentPage!
+	organizationRelationships(organizationId: UUID!, after: UUID, first: Int): OrganizationDocumentPage!
+	organizationApprovals(organizationId: UUID!, membershipId: UUID, after: UUID, first: Int): OrganizationDocumentPage!
+	organizationTeam(organizationId: UUID!, membershipId: UUID, after: UUID, first: Int): OrganizationDocumentPage!
+	organizationResource(organizationId: UUID!, membershipId: UUID!, operation: OrganizationOperation!, resourceId: UUID!, expectedVersion: Int!, payload: JSON): CommandOutcome!
+	organizationCommandStatus(commandId: UUID!): CommandOutcome!
+	organizationProgress(organizationId: UUID!, membershipIds: [UUID!], from: NaiveDate!, to: NaiveDate!): JSON!
+	organizationHistory(organizationId: UUID!, membershipIds: [UUID!], from: DateTime!, to: DateTime!, after: UUID, first: Int): OrganizationDocumentPage!
+}
+
+input RoleCapability {
+	code: String!
+	employeeScope: EmployeeScope!
+}
+
+"""
+A UUID is a unique 128-bit number, stored as 16 octets. UUIDs are parsed as
+Strings within GraphQL. UUIDs are used to assign unique identifiers to
+entities without requiring a central allocating authority.
+
+# References
+
+* [Wikipedia: Universally Unique Identifier](http://en.wikipedia.org/wiki/Universally_unique_identifier)
+* [RFC4122: A Universally Unique Identifier (UUID) URN Namespace](http://tools.ietf.org/html/rfc4122)
+"""
+scalar UUID
+
+"""
+Directs the executor to include this field or fragment only when the `if` argument is true.
+"""
+directive @include(if: Boolean!) on FIELD | FRAGMENT_SPREAD | INLINE_FRAGMENT
+"""
+Directs the executor to skip this field or fragment when the `if` argument is true.
+"""
+directive @skip(if: Boolean!) on FIELD | FRAGMENT_SPREAD | INLINE_FRAGMENT
+"""
+Provides a scalar specification URL for specifying the behavior of custom scalar types.
+"""
+directive @specifiedBy(url: String!) on SCALAR
+schema {
+	query: QueryRoot
+	mutation: MutationRoot
+}

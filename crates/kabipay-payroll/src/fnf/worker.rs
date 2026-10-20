@@ -81,8 +81,12 @@ async fn sweep(schema: &PayrollSchema) -> KabiPayResult<()> {
     })?;
     let mut page = 0;
     loop {
-        let rows = tenant_database::Entity::find()
-            .filter(tenant_database::Column::IsActive.eq(true))
+        let mut query = tenant_database::Entity::find()
+            .filter(tenant_database::Column::IsActive.eq(true));
+        if let Some(tenant_id) = cache.bound_tenant_id() {
+            query = query.filter(tenant_database::Column::TenantId.eq(tenant_id));
+        }
+        let rows = query
             .order_by_asc(tenant_database::Column::Id)
             .offset(page * 100)
             .limit(100)

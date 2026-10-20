@@ -12,11 +12,13 @@ struct Fixture { rows: Mutex<VecDeque<Vec<ProxyRow>>>, statements: Arc<Mutex<Vec
 #[async_trait::async_trait]
 impl ProxyDatabaseTrait for Fixture {
     async fn query(&self, s: Statement) -> Result<Vec<ProxyRow>, DbErr> {
+        let generation=s.sql.contains("FROM private_source_cutover");
         self.statements.lock().unwrap().push(s);
+        if generation {return Ok(vec![ProxyRow::new(BTreeMap::from([("producer_generation".into(),1i64.into())]))]);}
         Ok(self.rows.lock().unwrap().pop_front().expect("unexpected SQL query"))
     }
     async fn execute(&self, s: Statement) -> Result<ProxyExecResult, DbErr> {
-        let fail = self.fail_audit && s.sql.starts_with("INSERT INTO audit_log");
+        let fail = self.fail_audit && s.sql.starts_with("WITH audit_actor");
         self.statements.lock().unwrap().push(s);
         if fail { return Err(DbErr::Custom("audit unavailable".into())); }
         Ok(ProxyExecResult { last_insert_id: 0, rows_affected: 1 })
@@ -26,6 +28,13 @@ async fn db(rows: Vec<Vec<ProxyRow>>) -> (sea_orm::DatabaseConnection, Arc<Mutex
     db_with_audit_failure(rows, false).await
 }
 async fn db_with_audit_failure(rows: Vec<Vec<ProxyRow>>, fail_audit: bool) -> (sea_orm::DatabaseConnection, Arc<Mutex<Vec<Statement>>>) {
+    static CONFIG:std::sync::Once=std::sync::Once::new();
+    CONFIG.call_once(|| {
+        let path=std::env::temp_dir().join(format!("policy-private-{}.json",Uuid::new_v4()));
+        let tenant=Uuid::from_u128(2);
+        std::fs::write(&path,format!(r#"{{"schema_version":1,"keys":[{{"tenant_id":"{tenant}","purpose":"audit","key_id":"test-v1","key_b64":"BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc=","active":true}}]}}"#)).unwrap();
+        std::env::set_var("KABIPAY_PRIVATE_EVENT_KEYS_FILE",path);
+    });
     let statements = Arc::new(Mutex::new(Vec::new()));
     let db = Database::connect_proxy(DbBackend::Postgres, Arc::new(Box::new(Fixture { rows: Mutex::new(rows.into()), statements: statements.clone(), fail_audit }))).await.unwrap();
     (db, statements)
@@ -80,7 +89,7 @@ async fn attendance_day_bootstrap_interleaving_keeps_one_consistent_read_snapsho
     // 03:00 local Sep12 belongs to Sep11 under BOTH consistent snapshots:
     // missing profile/no attendance (fresh default) and committed 05:00 profile.
     for initially_committed in [false, true] {
-        let tenant = Uuid::new_v4();
+        let tenant = Uuid::from_u128(2);
         let statements = Arc::new(Mutex::new(Vec::new()));
         let db = Database::connect_proxy(DbBackend::Postgres, Arc::new(Box::new(
             BootstrapInterleaving {
@@ -105,7 +114,7 @@ async fn attendance_day_bootstrap_interleaving_keeps_one_consistent_read_snapsho
 #[tokio::test]
 async fn attendance_day_missing_profile_reads_are_write_free_and_legacy_aware() {
     for (has_attendance, boundary, expected_start) in [(true, 0, "2026-09-10T18:30:00Z"), (false, 300, "2026-09-10T23:30:00Z")] {
-        let tenant = Uuid::new_v4();
+        let tenant = Uuid::from_u128(2);
         let (db, statements) = db(vec![missing_profile_snapshot(has_attendance)]).await;
         let policy = policy(&db, tenant, clock(), utc("2026-09-11T10:00:00Z")).await.unwrap();
         assert!(!policy.initialized);
@@ -133,7 +142,7 @@ fn frozen(tenant: Uuid) -> Vec<ProxyRow> {
 }
 #[tokio::test]
 async fn attendance_day_frozen_history_ignores_later_timezone() {
-    let tenant = Uuid::new_v4();
+    let tenant = Uuid::from_u128(2);
     let (db, statements) = db(vec![frozen(tenant)]).await;
     let w = window_for_date(&db, tenant, TenantBusinessClock::from_name("America/New_York").unwrap(), date("2026-09-11"), utc("2026-10-01T10:00:00Z")).await.unwrap();
     assert_eq!(w.starts_at, utc("2026-09-10T23:30:00Z"));
@@ -142,7 +151,7 @@ async fn attendance_day_frozen_history_ignores_later_timezone() {
 }
 #[tokio::test]
 async fn attendance_day_freeze_existing_window_is_idempotent_and_locks_tenant() {
-    let tenant = Uuid::new_v4();
+    let tenant = Uuid::from_u128(2);
     let (db, statements) = db(vec![frozen(tenant)]).await;
     let tx = db.begin().await.unwrap();
     let w = ensure_window(&tx, tenant, clock(), date("2026-09-11"), utc("2026-09-11T10:00:00Z")).await.unwrap();
@@ -162,7 +171,7 @@ fn command(revision: i64, effective: &str) -> SchedulePolicyCommand {
 
 #[tokio::test]
 async fn attendance_day_preview_validates_authority_revision_and_exact_transition_without_writes() {
-    let tenant = Uuid::new_v4();
+    let tenant = Uuid::from_u128(2);
     let (denied_db, denied_statements) = db(vec![]).await;
     let denied = preview_policy(&denied_db, tenant, clock(), &claims(tenant, "SELF"), command(7, "2026-09-12"), utc("2026-09-11T10:00:00Z")).await;
     assert!(matches!(denied, Err(kabipay_common::KabiPayError::Forbidden(_))));
@@ -216,7 +225,7 @@ async fn attendance_day_preview_schedule_agreement_preserves_bootstrap_and_repla
         (AgreementFixture::PendingLegacy, "2026-09-13", "2026-09-12T18:30:00Z", "2026-09-14T00:30:00Z", Some("2026-09-12")),
         (AgreementFixture::PendingCustom, "2026-09-14", "2026-09-13T23:30:00Z", "2026-09-15T00:30:00Z", None),
     ] {
-        let tenant = Uuid::new_v4();
+        let tenant = Uuid::from_u128(2);
         let now = utc("2026-09-11T10:00:00Z");
         let cmd = command(fixture.revision(), effective);
         let (preview_db, read_statements) = db(vec![fixture.snapshot(), vec![]]).await;
@@ -237,7 +246,7 @@ async fn attendance_day_preview_schedule_agreement_preserves_bootstrap_and_repla
         assert!(read_statements.lock().unwrap().iter().all(|s| s.sql.starts_with("SELECT")));
         let statements = write_statements.lock().unwrap();
         assert!(statements[0].sql.contains("pg_advisory_xact_lock"));
-        assert!(statements.iter().any(|s| s.sql.starts_with("INSERT INTO audit_log")));
+        assert!(statements.iter().any(|s| s.sql.starts_with("WITH audit_actor")));
     }
 }
 
@@ -250,7 +259,7 @@ async fn attendance_day_preview_schedule_agreement_rejects_stale_active_and_affe
         (AgreementFixture::PendingCustom, "2026-09-14", "2026-09-13"),
     ] {
         for rejection in ["revision", "active", "frozen"] {
-            let tenant = Uuid::new_v4();
+            let tenant = Uuid::from_u128(2);
             let mut cmd = command(fixture.revision(), effective);
             if rejection == "revision" { cmd.expected_revision -= 1; }
             if rejection == "active" { cmd.effective_work_date = date("2026-09-11"); }
@@ -282,7 +291,7 @@ async fn attendance_day_preview_schedule_agreement_rejects_stale_active_and_affe
 
 #[tokio::test]
 async fn attendance_day_preview_schedule_agreement_rejects_exhausted_revision() {
-    let tenant = Uuid::new_v4();
+    let tenant = Uuid::from_u128(2);
     for schedule in [false, true] {
         let (db, _) = db(vec![policy_rows_at_revision(&[("0001-01-01", 300)], None, i64::MAX), vec![]]).await;
         let now = utc("2026-09-11T10:00:00Z");
@@ -298,7 +307,7 @@ async fn attendance_day_preview_schedule_agreement_rejects_exhausted_revision() 
 }
 #[tokio::test]
 async fn attendance_day_policy_rejects_unauthorized_and_foreign_tenants_before_sql() {
-    let tenant = Uuid::new_v4();
+    let tenant = Uuid::from_u128(2);
     for claimant in [claims(tenant, "TEAM"), claims(Uuid::new_v4(), "ALL")] {
         let (db, statements) = db(vec![]).await;
         let tx = db.begin().await.unwrap();
@@ -310,7 +319,7 @@ async fn attendance_day_policy_rejects_unauthorized_and_foreign_tenants_before_s
 #[tokio::test]
 async fn attendance_day_policy_stale_revision_and_active_day_rejected_without_writes() {
     for cmd in [command(6, "2026-09-12"), command(7, "2026-09-11"), command(7, "2026-09-10")] {
-        let tenant = Uuid::new_v4();
+        let tenant = Uuid::from_u128(2);
         let (db, statements) = db(vec![policy_rows(&[("0001-01-01", 300)], None)]).await;
         let tx = db.begin().await.unwrap();
         let err = schedule_policy(&tx, tenant, clock(), &claims(tenant, "ALL"), cmd.clone(), utc("2026-09-11T10:00:00Z")).await.unwrap_err();
@@ -321,7 +330,7 @@ async fn attendance_day_policy_stale_revision_and_active_day_rejected_without_wr
 }
 #[tokio::test]
 async fn attendance_day_policy_frozen_future_rejects_replacement() {
-    let tenant = Uuid::new_v4();
+    let tenant = Uuid::from_u128(2);
     let (db, statements) = db(vec![policy_rows(&[("0001-01-01", 300), ("2026-09-13", 240)], None), vec![ProxyRow::new(BTreeMap::from([("work_date".into(), date("2026-09-13").into())]))]]).await;
     let tx = db.begin().await.unwrap();
     let err = schedule_policy(&tx, tenant, clock(), &claims(tenant, "ALL"), command(7, "2026-09-12"), utc("2026-09-11T10:00:00Z")).await.unwrap_err();
@@ -330,7 +339,7 @@ async fn attendance_day_policy_frozen_future_rejects_replacement() {
 }
 #[tokio::test]
 async fn attendance_day_policy_replacement_audits_and_preserves_history() {
-    let tenant = Uuid::new_v4();
+    let tenant = Uuid::from_u128(2);
     let claimant = claims(tenant, "ALL");
     let (db, statements) = db(vec![policy_rows(&[("0001-01-01", 300), ("2026-09-13", 240)], None), vec![]]).await;
     let tx = db.begin().await.unwrap();
@@ -343,9 +352,13 @@ async fn attendance_day_policy_replacement_audits_and_preserves_history() {
     let sql = statements.lock().unwrap();
     assert!(sql.iter().all(|s| s.to_string().contains(&tenant.to_string())));
     assert!(!sql.iter().any(|s| s.sql.starts_with("DELETE")));
-    let audit = sql.iter().find(|s| s.sql.starts_with("INSERT INTO audit_log")).expect("same-transaction policy audit");
-    assert!(audit.to_string().contains(&claimant.sub.to_string()));
-    assert!(audit.to_string().contains("before_state") && audit.to_string().contains("after_state"));
+    let audit = sql.iter().find(|s| s.sql.starts_with("WITH audit_actor")).expect("same-transaction policy audit");
+    let sea_orm::Value::Json(Some(frames))=&audit.values.as_ref().unwrap().0[0] else {panic!("encrypted frames required")};
+    let frames:Vec<kabipay_common::private_events::crypto::Envelope>=serde_json::from_value((**frames).clone()).unwrap();
+    let raw=kabipay_common::private_events::configured_keyring().unwrap().decrypt_frames(&frames,tenant,"audit").unwrap();
+    let record:kabipay_common::private_events::AuditRecordInput=serde_json::from_slice(&raw).unwrap();
+    assert_eq!(record.user_id,Some(claimant.sub));
+    assert!(record.before_state.is_some() && record.after_state.is_some());
 }
 #[tokio::test]
 async fn attendance_day_initialization_preserves_legacy_active_day_and_freezes_explicit_transition() {
@@ -353,7 +366,7 @@ async fn attendance_day_initialization_preserves_legacy_active_day_and_freezes_e
         ("2026-09-11", "2026-09-10T18:30:00Z", "2026-09-11T18:30:00Z"),
         ("2026-09-12", "2026-09-11T18:30:00Z", "2026-09-12T23:30:00Z")
     ] {
-        let tenant = Uuid::new_v4();
+        let tenant = Uuid::from_u128(2);
         let (db, statements) = db(vec![vec![], missing_profile_snapshot(true), vec![]]).await;
         let tx = db.begin().await.unwrap();
         let result = ensure_window(&tx, tenant, clock(), date(work_date), utc("2026-09-11T10:00:00Z")).await.unwrap();
@@ -368,7 +381,7 @@ async fn attendance_day_initialization_preserves_legacy_active_day_and_freezes_e
 }
 #[tokio::test]
 async fn attendance_day_initialization_fresh_tenant_uses_five_without_conversion() {
-    let tenant = Uuid::new_v4();
+    let tenant = Uuid::from_u128(2);
     let (db, statements) = db(vec![vec![], missing_profile_snapshot(false), vec![]]).await;
     let tx = db.begin().await.unwrap();
     let result = ensure_window(&tx, tenant, clock(), date("2026-09-11"), utc("2026-09-11T10:00:00Z")).await.unwrap();
@@ -378,7 +391,7 @@ async fn attendance_day_initialization_fresh_tenant_uses_five_without_conversion
 }
 #[tokio::test]
 async fn attendance_day_current_read_uses_frozen_interval_and_exclusive_end_query() {
-    let tenant = Uuid::new_v4();
+    let tenant = Uuid::from_u128(2);
     let (db, statements) = db(vec![frozen(tenant)]).await;
     let now = utc("2026-09-11T23:29:59Z");
     let result = current_window(&db, tenant, clock(), now).await.unwrap();
@@ -390,7 +403,7 @@ async fn attendance_day_current_read_uses_frozen_interval_and_exclusive_end_quer
 }
 #[tokio::test]
 async fn attendance_day_current_read_after_end_resolves_next_window_without_writes() {
-    let tenant = Uuid::new_v4();
+    let tenant = Uuid::from_u128(2);
     let (db, statements) = db(vec![vec![], policy_rows(&[("0001-01-01", 300)], None)]).await;
     let result = current_window(&db, tenant, clock(), utc("2026-09-11T23:30:00Z")).await.unwrap();
     assert_eq!(result.work_date, date("2026-09-12"));
@@ -399,7 +412,7 @@ async fn attendance_day_current_read_after_end_resolves_next_window_without_writ
 }
 #[tokio::test]
 async fn attendance_day_policy_audit_failure_propagates_for_transaction_rollback() {
-    let tenant = Uuid::new_v4();
+    let tenant = Uuid::from_u128(2);
     let (db, _) = db_with_audit_failure(vec![policy_rows(&[("0001-01-01", 300)], None), vec![]], true).await;
     let tx = db.begin().await.unwrap();
     let err = schedule_policy(&tx, tenant, clock(), &claims(tenant, "ALL"), command(7, "2026-09-12"), utc("2026-09-11T10:00:00Z")).await.unwrap_err();
@@ -408,7 +421,7 @@ async fn attendance_day_policy_audit_failure_propagates_for_transaction_rollback
 }
 #[tokio::test]
 async fn attendance_day_pending_legacy_activation_can_be_delayed_without_moving_original_anchor() {
-    let tenant = Uuid::new_v4();
+    let tenant = Uuid::from_u128(2);
     let (db, _) = db(vec![policy_rows(&[("0001-01-01", 0), ("2026-09-12", 300)], Some(date("2026-09-12"))), vec![]]).await;
     let tx = db.begin().await.unwrap();
     let result = schedule_policy(&tx, tenant, clock(), &claims(tenant, "ALL"), command(7, "2026-09-13"), utc("2026-09-11T10:00:00Z")).await.unwrap();

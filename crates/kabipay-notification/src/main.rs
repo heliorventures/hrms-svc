@@ -28,8 +28,9 @@ use kabipay_notification::{
 async fn main()->anyhow::Result<()>{
     kabipay_common::load_dotenv();
     kabipay_common::telemetry::init_tracing("kabipay-notification");
+    let cache=TenantDbCache::from_env()?;
     let ops=connect_ops_db(&ops_dsn_from_env()).await?;
-    let cache=TenantDbCache::new();
+    cache.validate_binding_registration(&ops).await?;
     let fallback=tenant_db_config_from_env();
     let schema=Arc::new(Schema::build(QueryRoot,MutationRoot,EmptySubscription).extension(kabipay_common::entitlement_graphql::ModuleEntitlement("EMPLOYEE")).enable_federation().data(ops.clone()).data(cache.clone()).data(fallback.clone()).finish());
     let media=Arc::new(MediaState{

@@ -34,16 +34,22 @@ impl Fixture {
             .set_schema_search_path(format!("{schema},public"))
             .sqlx_logging(false);
         let db = Database::connect(options).await.unwrap();
-        // Match 0006-003-create-location, 0027-003-create-audit-log and the
-        // 0097 normalized active-name index, including the real audit user FK.
+        // Match location, normalized active-name uniqueness, and private transactional audit publication.
         db.execute_unprepared(include_str!("support/company_locations.sql"))
             .await
             .unwrap();
         let fixture = Self {
             db,
-            tenant: Uuid::new_v4(),
+            tenant: Uuid::from_u128(2),
             actor: Uuid::new_v4(),
         };
+        static CONFIG:std::sync::Once=std::sync::Once::new();
+        CONFIG.call_once(|| {
+            let path=std::env::temp_dir().join(format!("location-private-{}.json",Uuid::new_v4()));
+            std::fs::write(&path,format!(r#"{{"schema_version":1,"keys":[{{"tenant_id":"{}","purpose":"audit","key_id":"test-v1","key_b64":"BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc=","active":true}}]}}"#,fixture.tenant)).unwrap();
+            std::env::set_var("KABIPAY_PRIVATE_EVENT_KEYS_FILE",path);
+        });
+        fixture.sql("INSERT INTO private_source_cutover VALUES($1,1)",vec![fixture.tenant.into()]).await;
         fixture
             .sql(
                 "INSERT INTO \"user\"(id,tenant_id) VALUES($1,$2)",
@@ -66,11 +72,13 @@ impl Fixture {
     }
 
     async fn count(&self, table: &str) -> i64 {
-        assert!(matches!(table, "location" | "audit_log"));
+        assert!(matches!(table, "location" | "audit_frames"));
         self.db
             .query_one(Statement::from_sql_and_values(
                 DbBackend::Postgres,
-                format!("SELECT count(*) AS amount FROM {table} WHERE tenant_id=$1"),
+                if table=="audit_frames" {
+                    "SELECT count(*) AS amount FROM company_event_outbox WHERE source_tenant_id=$1 AND event_stream='audit'".into()
+                } else {format!("SELECT count(*) AS amount FROM {table} WHERE tenant_id=$1")},
                 [self.tenant.into()],
             ))
             .await
@@ -105,7 +113,7 @@ async fn company_location_create_update_and_audit_round_trip() {
     assert_eq!(created.city.as_deref(), Some("Pune"));
     assert_eq!(created.state.as_deref(), Some("Maharashtra"));
     assert_eq!(created.country.as_deref(), Some("India"));
-    assert_eq!(f.count("audit_log").await, 1);
+    assert_eq!(f.count("audit_frames").await, 1);
     let mut update = f.command("  Pune   Office  ");
     update.id = Some(created.id);
     update.expected_updated_at = Some(created.updated_at);
@@ -122,7 +130,7 @@ async fn company_location_create_update_and_audit_round_trip() {
         Err(kabipay_common::KabiPayError::Validation(_))
     ));
     assert_eq!(f.count("location").await, 1);
-    assert_eq!(f.count("audit_log").await, 2);
+    assert_eq!(f.count("audit_frames").await, 2);
 }
 
 #[tokio::test]
@@ -182,17 +190,16 @@ async fn company_location_duplicate_names_and_audit_failure_roll_back() {
         Err(kabipay_common::KabiPayError::Validation(_))
     ));
     assert_eq!(f.count("location").await, 1);
-    assert_eq!(f.count("audit_log").await, 1);
-    let invalid_actor =
-        locations::save_location(&f.db, f.tenant, Uuid::new_v4(), f.command("Mumbai")).await;
+    assert_eq!(f.count("audit_frames").await, 1);
+    let unavailable_audit = locations::save_location(&f.db, f.tenant, Uuid::new_v4(), f.command("Mumbai")).await;
     assert!(matches!(
-        invalid_actor,
-        Err(kabipay_common::KabiPayError::Database(_))
+        unavailable_audit,
+        Err(kabipay_common::KabiPayError::Conflict(_))
     ));
     assert_eq!(
         f.count("location").await,
         1,
         "failed audit must roll back the location"
     );
-    assert_eq!(f.count("audit_log").await, 1);
+    assert_eq!(f.count("audit_frames").await, 1);
 }

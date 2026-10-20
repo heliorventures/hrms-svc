@@ -16,6 +16,8 @@ name = "kabipay-auth-hash"
 path = "src/bin/hash_password.rs"
 
 [dependencies]
+kabipay-organization-security = { path = "../kabipay-organization-security" }
+kabipay-organization-protocol = { path = "../kabipay-organization-protocol" }
 kabipay-common.workspace = true
 kabipay-db-entities.workspace = true
 axum.workspace = true

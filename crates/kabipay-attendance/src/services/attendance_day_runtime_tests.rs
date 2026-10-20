@@ -21,6 +21,13 @@ fn value_uuid(value: &Value) -> Uuid { match value { Value::Uuid(Some(v)) => **v
 fn value_text(value: &Value) -> Option<&str> { match value { Value::String(Some(v)) => Some(v), _ => None } }
 impl Fixture {
     fn new(advance_on_lock: bool) -> Self {
+        static CONFIG: std::sync::Once=std::sync::Once::new();
+        CONFIG.call_once(|| {
+            let path=std::env::temp_dir().join(format!("attendance-private-{}.json",Uuid::new_v4()));
+            let tenant=Uuid::from_u128(2);
+            std::fs::write(&path,format!(r#"{{"schema_version":1,"keys":[{{"tenant_id":"{tenant}","purpose":"audit","key_id":"test-v1","key_b64":"BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc=","active":true}}]}}"#)).unwrap();
+            std::env::set_var("KABIPAY_PRIVATE_EVENT_KEYS_FILE",path);
+        });
         Self { rows: Mutex::new(vec![fields(row())]), statements: Mutex::new(vec![]),
             now: Mutex::new(utc("2026-09-11T23:29:59Z")), advance_on_lock, fail_audit: false, correct_on_lock: false }
     }
@@ -30,6 +37,7 @@ impl ProxyDatabaseTrait for Fixture {
     async fn query(&self, statement: Statement) -> Result<Vec<ProxyRow>, DbErr> {
         let sql = statement.to_string();
         self.statements.lock().unwrap().push(statement.clone());
+        if sql.contains("FROM private_source_cutover") {return Ok(vec![ProxyRow::new(BTreeMap::from([("producer_generation".into(),1i64.into())]))]);}
         if sql.contains("attendance_punch_policy") { return Ok(vec![]); }
         if sql.starts_with("SELECT work_date, starts_at") {
             let date: NaiveDate = if sql.contains("2026-09-12") || sql.contains("2026-09-11 23:30:00") {
@@ -96,7 +104,7 @@ impl ProxyDatabaseTrait for Fixture {
                 row.insert("status".into(), "INCOMPLETE".into());
                 row.insert("regularization_status".into(), "MISSED_PUNCH_OUT".into());
             }
-        } else if sql.starts_with("INSERT INTO audit_log") {
+        } else if sql.starts_with("WITH audit_actor") {
             if self.fail_audit { return Err(DbErr::Custom("audit unavailable".into())); }
         } else { return Err(DbErr::Custom(format!("unexpected execution: {sql}"))); }
         Ok(ProxyExecResult { last_insert_id: 0, rows_affected: 1 })
@@ -133,7 +141,7 @@ async fn attendance_day_punch_resamples_after_locks_expires_original_and_opens_n
     let statements = fixture.statements.lock().unwrap();
     let locks: Vec<_> = statements.iter().filter(|s| s.sql.contains("pg_advisory_xact_lock")).collect();
     assert!(locks[0].to_string().contains("attendance-day-policy:"));
-    assert!(statements.iter().any(|s| s.sql.contains("INSERT INTO audit_log")));
+    assert!(statements.iter().any(|s| s.sql.contains("WITH audit_actor")));
 }
 
 #[tokio::test]
@@ -154,7 +162,7 @@ async fn attendance_day_worker_retires_once_and_preserves_a_correction_seen_afte
         if corrected { assert_eq!(rows[0]["check_out_at"], utc("2026-09-11T22:30:00Z").into()); }
         else { assert!(matches!(rows[0]["check_out_at"], Value::ChronoDateTimeUtc(None))); }
         let statements = fixture.statements.lock().unwrap();
-        assert_eq!(statements.iter().filter(|s| s.sql.starts_with("INSERT INTO audit_log")).count(), if corrected { 0 } else { 1 });
+        assert_eq!(statements.iter().filter(|s| s.sql.starts_with("WITH audit_actor")).count(), if corrected { 0 } else { 1 });
     }
 }
 

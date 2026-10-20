@@ -86,7 +86,7 @@ async fn control_plane_load_is_tenant_scoped_and_fail_closed() {
 
 fn snapshot(core: bool) -> Entitlements {
     Entitlements {
-        tenant_id: Uuid::new_v4(), today: NaiveDate::from_ymd_opt(2026, 10, 20).unwrap(),
+        tenant_id: Uuid::new_v4(), currency:Some("INR".into()), today: NaiveDate::from_ymd_opt(2026, 10, 20).unwrap(),
         modules: HashMap::from([("LEAVE".into(), ModuleAccess {
             id: Uuid::new_v4(), active: true, core, disabled: false,
             subscription: None,

@@ -11,6 +11,7 @@
 //! Every service depends on this crate via `kabipay-common = { workspace = true }`.
 
 pub mod client_data_scope;
+pub mod canonical_reporting;
 pub mod context;
 pub mod db;
 pub mod db_constraint;
@@ -27,12 +28,15 @@ pub mod financial_lock;
 pub mod funding_exception;
 pub mod ids;
 pub mod jwt;
+pub mod client_jwt;
 pub mod middleware;
 pub mod object_store_config;
+pub mod organization_http;
 pub mod pagination;
 pub mod password;
 pub mod private_file_cleanup;
 pub mod private_file_reader;
+pub mod private_events;
 pub mod subgraph;
 pub mod telemetry;
 pub mod tenant_business_clock;
@@ -112,4 +116,5 @@ mod tests {
 }
 
 pub mod effective_version;
+pub mod private_webhooks;
 pub mod salary_breakup;

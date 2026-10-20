@@ -196,12 +196,16 @@ async fn process_tenant(
 async fn main() -> anyhow::Result<()> {
     load_dotenv();
     let options = parse_options()?;
+    let cache = TenantDbCache::from_env()?;
+    if let Some(tenant_id) = options.tenant_id {
+        cache.require_tenant(tenant_id)?;
+    }
     let ops_db = connect_ops_db(&ops_dsn_from_env()).await?;
+    cache.validate_binding_registration(&ops_db).await?;
     let fallback: TenantDbConfig = tenant_db_config_from_env();
-    let cache = TenantDbCache::new();
     let mut query = tenant_database::Entity::find()
         .filter(tenant_database::Column::IsActive.eq(true));
-    if let Some(tenant_id) = options.tenant_id {
+    if let Some(tenant_id) = options.tenant_id.or(cache.bound_tenant_id()) {
         query = query.filter(tenant_database::Column::TenantId.eq(tenant_id));
     }
     let tenants = query.all(&ops_db).await?;

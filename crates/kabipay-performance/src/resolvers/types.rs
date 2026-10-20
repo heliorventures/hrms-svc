@@ -9,7 +9,7 @@ use kabipay_db_entities::tenant::d0075_performance_appraisal_lifecycle::{
     performance_program,
 };
 
-#[derive(SimpleObject, Clone, Debug)]
+#[derive(SimpleObject, Clone, Debug, serde::Serialize)]
 #[graphql(name = "ReviewCycle")]
 pub struct ReviewCycleDto {
     pub id: ID,
@@ -39,7 +39,7 @@ impl From<review_cycle::Model> for ReviewCycleDto {
     }
 }
 
-#[derive(SimpleObject, Clone, Debug)]
+#[derive(SimpleObject, Clone, Debug, serde::Serialize)]
 #[graphql(name = "Goal")]
 pub struct GoalDto {
     pub id: ID,
@@ -67,7 +67,7 @@ impl From<goal::Model> for GoalDto {
     }
 }
 
-#[derive(SimpleObject, Clone, Debug)]
+#[derive(SimpleObject, Clone, Debug, serde::Serialize)]
 #[graphql(name = "PerformanceProgram")]
 pub struct PerformanceProgramDto {
     pub id: ID,
@@ -101,7 +101,7 @@ impl From<performance_program::Model> for PerformanceProgramDto {
     }
 }
 
-#[derive(SimpleObject, Clone, Debug)]
+#[derive(SimpleObject, Clone, Debug, serde::Serialize)]
 #[graphql(name = "AppraisalQuestionOption")]
 pub struct AppraisalQuestionOptionDto {
     pub id: ID,
@@ -121,7 +121,7 @@ impl From<appraisal_question_option::Model> for AppraisalQuestionOptionDto {
     }
 }
 
-#[derive(SimpleObject, Clone, Debug)]
+#[derive(SimpleObject, Clone, Debug, serde::Serialize)]
 #[graphql(name = "AppraisalQuestion")]
 pub struct AppraisalQuestionDto {
     pub id: ID,
@@ -156,7 +156,7 @@ impl AppraisalQuestionDto {
     }
 }
 
-#[derive(SimpleObject, Clone, Debug)]
+#[derive(SimpleObject, Clone, Debug, serde::Serialize)]
 #[graphql(name = "AppraisalSection")]
 pub struct AppraisalSectionDto {
     pub id: ID,
@@ -181,7 +181,7 @@ impl AppraisalSectionDto {
     }
 }
 
-#[derive(SimpleObject, Clone, Debug)]
+#[derive(SimpleObject, Clone, Debug, serde::Serialize)]
 #[graphql(name = "AppraisalTemplate")]
 pub struct AppraisalTemplateDto {
     pub id: ID,
@@ -207,7 +207,7 @@ impl AppraisalTemplateDto {
     }
 }
 
-#[derive(SimpleObject, Clone, Debug)]
+#[derive(SimpleObject, Clone, Debug, serde::Serialize)]
 #[graphql(name = "PerformanceReviewSummary")]
 pub struct PerformanceReviewSummaryDto {
     pub id: ID,
@@ -230,7 +230,7 @@ pub struct PerformanceReviewSummaryDto {
     pub performance_band: Option<String>,
 }
 
-#[derive(SimpleObject, Clone, Debug)]
+#[derive(SimpleObject, Clone, Debug, serde::Serialize)]
 #[graphql(name = "AppraisalAnswer")]
 pub struct AppraisalAnswerDto {
     pub question_id: ID,
@@ -265,7 +265,7 @@ impl From<appraisal_answer::Model> for AppraisalAnswerDto {
     }
 }
 
-#[derive(SimpleObject, Clone, Debug)]
+#[derive(SimpleObject, Clone, Debug, serde::Serialize)]
 #[graphql(name = "PerformanceFeedback")]
 pub struct PerformanceFeedbackDto {
     pub id: ID,
@@ -289,7 +289,7 @@ impl From<continuous_feedback::Model> for PerformanceFeedbackDto {
     }
 }
 
-#[derive(SimpleObject, Clone, Debug)]
+#[derive(SimpleObject, Clone, Debug, serde::Serialize)]
 #[graphql(name = "PerformanceReviewDetail")]
 pub struct PerformanceReviewDetailDto {
     pub review: PerformanceReviewSummaryDto,

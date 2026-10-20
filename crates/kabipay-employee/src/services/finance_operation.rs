@@ -160,9 +160,18 @@ pub async fn record_terminal(
             "Exit approval operation has already resolved".into(),
         ));
     }
-    db.execute(Statement::from_sql_and_values(DbBackend::Postgres,
-        "INSERT INTO employee_finance_outbox(id,tenant_id,operation_id,event_type,payload) VALUES($1,$2,$3,$4,$5) ON CONFLICT(tenant_id,operation_id,event_type) DO NOTHING",
-        [Uuid::new_v4().into(),tenant.into(),operation.id.into(),event.into(),serde_json::json!({"operationId":operation.id,"separationId":operation.separation_id,"reviewId":operation.review_id,"authorizationId":authorization,"payloadHash":operation.payload_hash}).into()])).await?;
+    kabipay_common::private_events::enqueue_delivery(db,
+        &kabipay_common::private_events::types::DeliveryIntentInput {
+            id: operation.id,
+            tenant_id: tenant,
+            destination_id: super::private_delivery::PAYROLL_DESTINATION,
+            destination_version: 1,
+            source_kind: if state == HrOperationState::Committed { "finance_confirmation" } else { "finance_cancellation" }.into(),
+            resource_id: operation.id,
+            event_type: event.into(),
+            payload: serde_json::json!({"operationId":operation.id}),
+            occurred_at: chrono::Utc::now(),
+        }).await?;
     Ok(())
 }
 

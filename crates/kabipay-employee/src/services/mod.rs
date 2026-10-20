@@ -29,12 +29,17 @@ pub mod profile_record_service;
 pub mod rbac_admin_service;
 pub mod separation_service;
 pub mod finance_operation;
+pub mod private_delivery;
+pub mod private_ownership;
+mod private_egress_policy;
+mod private_delivery_policy;
 pub mod funding_context;
 pub mod exit_approval;
-pub mod finance_outbox;
 pub mod prejoining;
 #[cfg(test)]
 mod prejoining_tests;
 pub mod company_location_service;
 pub mod company_location_repository;
 pub mod company_location_assignment_reader;
+
+pub mod reporting_display;

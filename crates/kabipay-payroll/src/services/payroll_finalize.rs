@@ -18,30 +18,35 @@ pub struct PayrollFinalization {
     pub payslips: usize,
 }
 
-pub async fn finalize_payroll_cycle(
-    db: &DatabaseConnection,
+pub async fn finalize_payroll_cycle(db:&DatabaseConnection,tenant:Uuid,claims:&kabipay_common::context::ClientClaims,id:Uuid,revision:i32,fingerprint:&str,acknowledgement:FinalizeAcknowledgement)->KabiPayResult<PayrollFinalization> {
+ let actor=super::payroll_actor::PayrollActor::local(claims,tenant)?;
+ let txn=db.begin().await?;
+ let result=finalize_in_transaction(&txn,tenant,&actor,id,revision,fingerprint,acknowledgement).await?;
+ txn.commit().await?;Ok(result)
+}
+
+pub async fn finalize_in_transaction(
+    txn: &sea_orm::DatabaseTransaction,
     tenant: Uuid,
-    claims: &kabipay_common::context::ClientClaims,
+    actor: &super::payroll_actor::PayrollActor,
     id: Uuid,
     revision: i32,
     fingerprint: &str,
     acknowledgement: FinalizeAcknowledgement,
 ) -> KabiPayResult<PayrollFinalization> {
-    super::loan_recovery::actor(claims, tenant)?;
-    let actor = claims.sub;
-    let txn = db.begin().await?;
-    super::loan_recovery::lock(&txn, tenant).await?;
-    super::payroll_fingerprint::lock_inputs(&txn).await?;
-    let cycle = payroll_draft::cycle(&txn, tenant, id).await?;
+    if actor.tenant!=tenant {return Err(KabiPayError::Unauthorised);}
+    super::loan_recovery::lock(txn, tenant).await?;
+    super::payroll_fingerprint::lock_inputs(txn).await?;
+    let cycle = payroll_draft::cycle(txn, tenant, id).await?;
     payroll_draft::ensure_draft(&cycle.status)?;
-    let draft = payroll_draft::find(&txn, tenant, id)
+    let draft = payroll_draft::find_with_date(txn, tenant, id,actor.business_date)
         .await?
         .ok_or_else(|| {
             KabiPayError::Validation("Calculate and review payroll before finalizing".into())
         })?;
     if draft.revision != revision
         || draft.fingerprint != fingerprint
-        || super::loan_recovery::fingerprint(&txn, tenant).await? != fingerprint
+        || super::loan_recovery::fingerprint_with_actor(txn, tenant, &actor.loans).await? != fingerprint
     {
         return Err(KabiPayError::Validation(
             "Payroll inputs changed; recalculate and review the new draft".into(),
@@ -82,7 +87,7 @@ pub async fn finalize_payroll_cycle(
         ));
     }
     let mut payslips = 0;
-    let loan_state = kabipay_loans::payroll_loan_state(&txn, tenant)
+    let loan_state = kabipay_loans::payroll_loan_state_with_actor(txn, &actor.loans)
         .await
         .map_err(|_| {
             KabiPayError::Validation("Review Loans configuration before finalizing payroll".into())
@@ -99,17 +104,17 @@ pub async fn finalize_payroll_cycle(
             loan_state.enabled,
         )?;
         let loan_snapshot = match &prepared.loan_recovery {
-            Some(reviewed) => Some(super::loan_recovery::post(&txn, claims, reviewed).await?),
+            Some(reviewed) => Some(super::loan_recovery::post_with_actor(txn, &actor.loans, reviewed).await?),
             None => None,
         };
         let employee = employee::Entity::find()
             .filter(employee::Column::TenantId.eq(tenant))
             .filter(employee::Column::Id.eq(entry.employee_id))
-            .one(&txn)
+            .one(txn)
             .await?
             .ok_or_else(|| KabiPayError::Validation("Reviewed employee no longer exists".into()))?;
         let payslip = super::imported_payroll::persist_reviewed(
-            &txn,
+            txn,
             tenant,
             id,
             &employee,
@@ -119,19 +124,18 @@ pub async fn finalize_payroll_cycle(
         )
         .await?;
         if let Some(snapshot) = &loan_snapshot {
-            super::loan_recovery::persist(&txn, tenant, payslip, snapshot).await?;
+            super::loan_recovery::persist(txn, tenant, payslip, snapshot).await?;
         }
         payslips += 1;
     }
     txn.execute(Statement::from_sql_and_values(DbBackend::Postgres,
-        "UPDATE payroll_cycle SET status='PROCESSED',processed_by=$3,processed_at=NOW(),updated_at=NOW() WHERE tenant_id=$1 AND id=$2 AND status='DRAFT'",
-        [tenant.into(),id.into(),actor.into()])).await?;
+        "UPDATE payroll_cycle SET status='PROCESSED',processed_by=$3,processed_by_principal_id=$4,processed_at=NOW(),updated_at=NOW() WHERE tenant_id=$1 AND id=$2 AND status='DRAFT'",
+        [tenant.into(),id.into(),actor.local_user.into(),actor.principal.into()])).await?;
     let ack = serde_json::to_value(&acknowledgement)
         .map_err(|_| KabiPayError::Internal("acknowledgement serialization failed".into()))?;
     txn.execute(Statement::from_sql_and_values(DbBackend::Postgres,
-        "UPDATE payroll_draft_calculation SET finalized_at=NOW(),finalized_by=$3,acknowledgement=$4 WHERE tenant_id=$1 AND cycle_id=$2",
-        [tenant.into(),id.into(),actor.into(),ack.into()])).await?;
-    txn.commit().await?;
+        "UPDATE payroll_draft_calculation SET finalized_at=NOW(),finalized_by=$3,finalized_by_principal_id=$5,acknowledgement=$4 WHERE tenant_id=$1 AND cycle_id=$2",
+        [tenant.into(),id.into(),actor.local_user.into(),ack.into(),actor.principal.into()])).await?;
     Ok(PayrollFinalization {
         cycle_id: id,
         revision,

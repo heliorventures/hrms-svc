@@ -14,7 +14,8 @@ pub mod payroll_period_input {
         pub ready: bool,
         pub source_ref: Option<Json>,
         pub revision: i32,
-        pub updated_by: Uuid,
+        pub updated_by: Option<Uuid>,
+        pub updated_by_principal_id: Option<Uuid>,
         pub created_at: DateTimeUtc,
         pub updated_at: DateTimeUtc,
     }
@@ -74,7 +75,7 @@ pub mod payroll_period_adjustment {
         pub amount: Decimal,
         pub reason: Option<String>,
         pub ready: bool,
-        pub updated_by: Uuid,
+        pub updated_by: Option<Uuid>,
         pub created_at: DateTimeUtc,
         pub updated_at: DateTimeUtc,
     }

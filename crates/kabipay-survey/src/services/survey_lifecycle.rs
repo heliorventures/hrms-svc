@@ -2,8 +2,8 @@
 
 use chrono::{DateTime, Utc};
 use kabipay_common::{KabiPayError, KabiPayResult};
-use kabipay_db_entities::tenant::{d0027_communication_audit::audit_log, d0076_anonymous_surveys::survey};
-use sea_orm::{ColumnTrait, ConnectionTrait, DatabaseConnection, EntityTrait, QueryFilter, QueryOrder, QuerySelect, Set, TransactionTrait};
+use kabipay_db_entities::tenant::d0076_anonymous_surveys::survey;
+use sea_orm::{ColumnTrait, ConnectionTrait, DatabaseConnection, EntityTrait, QueryFilter, QueryOrder, QuerySelect, DbBackend, Statement, TransactionTrait};
 use uuid::Uuid;
 
 use crate::resolvers::types::SurveyManagementEventDto;
@@ -81,26 +81,43 @@ fn due_action(status: &str, opens_at: Option<DateTime<Utc>>, closes_at: Option<D
 
 /// Append static management metadata in the caller's transaction. No arbitrary payload is accepted.
 pub async fn record_management_event<C: ConnectionTrait>(db: &C, tenant_id: Uuid, survey_id: Uuid, actor: Option<Uuid>, action: ManagementAction, occurred_at: DateTime<Utc>) -> KabiPayResult<()> {
-    audit_log::Entity::insert(audit_log::ActiveModel {
-        id: Set(Uuid::new_v4()), tenant_id: Set(tenant_id), user_id: Set(actor),
-        entity_type: Set("SURVEY".into()), entity_id: Set(Some(survey_id)), action: Set(action.code().into()),
-        before_state: Set(None), after_state: Set(None), ip_address: Set(None), user_agent: Set(None), created_at: Set(occurred_at),
-    }).exec_without_returning(db).await?;
+    let id = Uuid::new_v4();
+    kabipay_common::private_events::append_audit(db, &kabipay_common::private_events::AuditRecordInput {
+        id, tenant_id, user_id: actor, entity_type: "SURVEY".into(), entity_id: Some(survey_id),
+        action: action.code().into(), before_state: None, after_state: None,
+        ip_address: None, user_agent: None, created_at: occurred_at,
+    }).await?;
+    if matches!(action, ManagementAction::Opened | ManagementAction::ManuallyOpened | ManagementAction::AutomaticallyClosed | ManagementAction::TransitionFailed) {
+        let opened_at = matches!(action, ManagementAction::Opened | ManagementAction::ManuallyOpened).then_some(occurred_at);
+        db.execute(Statement::from_sql_and_values(DbBackend::Postgres,
+            "INSERT INTO private_survey_execution_state(tenant_id,survey_id,opened_at,last_transition_action,last_transition_at,last_transition_id) VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT(tenant_id,survey_id) DO UPDATE SET opened_at=LEAST(private_survey_execution_state.opened_at,EXCLUDED.opened_at),last_transition_action=CASE WHEN private_survey_execution_state.last_transition_at IS NULL OR (EXCLUDED.last_transition_at,EXCLUDED.last_transition_id)>(private_survey_execution_state.last_transition_at,private_survey_execution_state.last_transition_id) THEN EXCLUDED.last_transition_action ELSE private_survey_execution_state.last_transition_action END,last_transition_at=GREATEST(private_survey_execution_state.last_transition_at,EXCLUDED.last_transition_at),last_transition_id=CASE WHEN private_survey_execution_state.last_transition_at IS NULL OR (EXCLUDED.last_transition_at,EXCLUDED.last_transition_id)>(private_survey_execution_state.last_transition_at,private_survey_execution_state.last_transition_id) THEN EXCLUDED.last_transition_id ELSE private_survey_execution_state.last_transition_id END",
+            [tenant_id.into(),survey_id.into(),opened_at.into(),action.code().into(),occurred_at.into(),id.into()],
+        )).await?;
+    }
     Ok(())
 }
 
-fn management_events(tenant_id: Uuid, survey_id: Uuid) -> sea_orm::Select<audit_log::Entity> {
-    audit_log::Entity::find().filter(audit_log::Column::TenantId.eq(tenant_id))
-        .filter(audit_log::Column::EntityType.eq("SURVEY")).filter(audit_log::Column::EntityId.eq(survey_id))
+async fn execution_state<C: ConnectionTrait>(db: &C, tenant_id: Uuid, survey_id: Uuid) -> KabiPayResult<(bool, Option<String>)> {
+    let row = db.query_one(Statement::from_sql_and_values(DbBackend::Postgres,
+        "SELECT opened_at IS NOT NULL AS opened,last_transition_action FROM private_survey_execution_state WHERE tenant_id=$1 AND survey_id=$2",
+        [tenant_id.into(),survey_id.into()],
+    )).await?;
+    match row {
+        Some(row) => Ok((row.try_get("", "opened")?,row.try_get("", "last_transition_action")?)),
+        None => Ok((false,None)),
+    }
 }
 
 /// Load safe management history only after the resolver has enforced manage=ALL.
-pub async fn load_management_events<C: ConnectionTrait>(db: &C, tenant_id: Uuid, survey_id: Uuid) -> KabiPayResult<Vec<SurveyManagementEventDto>> {
+pub async fn load_management_events<C: ConnectionTrait + TransactionTrait>(db: &C, tenant_id: Uuid, survey_id: Uuid) -> KabiPayResult<Vec<SurveyManagementEventDto>> {
     survey::Entity::find_by_id(survey_id).filter(survey::Column::TenantId.eq(tenant_id)).one(db).await?
         .ok_or_else(|| KabiPayError::NotFound { entity: "survey", id: survey_id.to_string() })?;
-    let rows = management_events(tenant_id, survey_id)
-        .filter(audit_log::Column::Action.is_in(["SURVEY_SAVED", "SURVEY_PUBLISHED", "SURVEY_OPENED", "SURVEY_MANUALLY_OPENED", "SURVEY_MANUALLY_CLOSED", "SURVEY_AUTOMATICALLY_CLOSED", "SURVEY_TRANSITION_FAILED"]))
-        .order_by_desc(audit_log::Column::CreatedAt).order_by_desc(audit_log::Column::Id).limit(100).all(db).await?;
+    let filter = kabipay_common::private_events::AuditHistoryFilter {
+        tenant_id, entity_type: Some("SURVEY".into()), entity_id: Some(survey_id),
+        actions: [ManagementAction::Saved,ManagementAction::Published,ManagementAction::Opened,ManagementAction::ManuallyOpened,ManagementAction::ManuallyClosed,ManagementAction::AutomaticallyClosed,ManagementAction::TransitionFailed].into_iter().map(|a|a.code().into()).collect(),
+        since: None, until: None, offset: 0, limit: 100,
+    };
+    let rows = kabipay_common::private_events::history_client::read_configured_audit_history(db,&filter).await?;
     Ok(rows.into_iter().filter_map(|row| ManagementAction::from_code(&row.action).map(|action| SurveyManagementEventDto {
         action: action.code().into(), occurred_at: row.created_at, message: action.message().into(),
     })).collect())
@@ -112,8 +129,7 @@ pub(crate) async fn process_survey_with_clock<F: FnOnce() -> DateTime<Utc>>(db: 
     let now = clock();
     let Some(row) = row else { txn.commit().await?; return Ok(None); };
     if row.status != "PUBLISHED" { txn.commit().await?; return Ok(None); }
-    let opened = management_events(tenant_id, survey_id).filter(audit_log::Column::Action.is_in(["SURVEY_OPENED", "SURVEY_MANUALLY_OPENED"]))
-        .select_only().column(audit_log::Column::Action).into_tuple::<String>().one(&txn).await?.is_some();
+    let (opened, _) = execution_state(&txn,tenant_id,survey_id).await?;
     let action = due_action(&row.status, row.opens_at, row.closes_at, opened, now);
     if let Some(action) = action {
         if action == ManagementAction::AutomaticallyClosed {
@@ -134,10 +150,7 @@ pub(crate) async fn record_transition_failure(db: &DatabaseConnection, tenant_id
     let txn = db.begin().await?;
     let row = survey::Entity::find_by_id(survey_id).filter(survey::Column::TenantId.eq(tenant_id)).lock_exclusive().one(&txn).await?;
     if row.is_some_and(|row| row.status == "PUBLISHED") {
-        let latest = management_events(tenant_id, survey_id)
-            .filter(audit_log::Column::Action.is_in(["SURVEY_OPENED", "SURVEY_MANUALLY_OPENED", "SURVEY_AUTOMATICALLY_CLOSED", "SURVEY_TRANSITION_FAILED"]))
-            .order_by_desc(audit_log::Column::CreatedAt).order_by_desc(audit_log::Column::Id)
-            .select_only().column(audit_log::Column::Action).into_tuple::<String>().one(&txn).await?;
+        let (_,latest) = execution_state(&txn,tenant_id,survey_id).await?;
         if latest.as_deref() != Some("SURVEY_TRANSITION_FAILED") {
             record_management_event(&txn, tenant_id, survey_id, None, ManagementAction::TransitionFailed, Utc::now()).await?;
         }

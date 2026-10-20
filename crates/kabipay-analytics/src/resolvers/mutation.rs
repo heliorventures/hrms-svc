@@ -21,7 +21,7 @@ fn parse_uuid(id: &ID, field: &'static str) -> Result<Uuid> {
 
 #[Object]
 impl MutationRoot {
-    /// Send a **FAILED** or **PROCESSING** outbox row back to **PENDING** (same RBAC as `outboxEvents`).
+    /// Authorize replay of failed destinations. Active or uncertain outcomes require reconciliation.
     async fn requeue_outbox_event(&self, ctx: &Context<'_>, id: ID) -> Result<OutboxEventDto> {
         let claims = require_client_claims(ctx)?;
         if !claims.can_manage_employee_directory() {
@@ -33,9 +33,19 @@ impl MutationRoot {
         let tenant_id = require_tenant_id(ctx)?;
         let db = tenant_db(ctx, tenant_id).await?;
         let oid = parse_uuid(&id, "id")?;
-        let m = analytics_service::requeue_outbox_event(&db, tenant_id, oid)
-            .await
+        let state = ctx.data::<kabipay_common::entitlements::Entitlements>()?;
+        state
+            .require_tenant(tenant_id)
             .map_err(KabiPayError::into_graphql)?;
+        let m = analytics_service::requeue_outbox_event(
+            &db,
+            tenant_id,
+            oid,
+            claims.sub,
+            state.outbox_aggregates(),
+        )
+        .await
+        .map_err(KabiPayError::into_graphql)?;
         Ok(OutboxEventDto::from(m))
     }
 

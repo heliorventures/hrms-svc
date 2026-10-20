@@ -18,7 +18,7 @@ use crate::db::{
     TenantDbConfig,
 };
 use crate::error::{KabiPayError, KabiPayResult};
-use crate::jwt::{decode_client_jwt, decode_operator_jwt, extract_bearer, jwt_secret_from_env};
+use crate::jwt::{decode_operator_jwt, extract_bearer, jwt_secret_from_env};
 use crate::telemetry::init_tracing;
 use async_graphql::{Context, ObjectType, Schema, SubscriptionType};
 use async_graphql_axum::{GraphQLRequest, GraphQLResponse};
@@ -317,6 +317,10 @@ where
 {
     crate::env_file::load_dotenv();
     init_tracing(cfg.service_name);
+    let cache = TenantDbCache::from_env()?;
+    if cfg.service_name == "kabipay-ops" && cache.bound_tenant_id().is_some() {
+        anyhow::bail!("the ops service cannot use a company database binding");
+    }
 
     let schema_builder = match crate::entitlements::service_module(cfg.service_name)? {
         Some(code) => schema_builder.extension(crate::entitlement_graphql::ModuleEntitlement(code)),
@@ -336,14 +340,15 @@ where
                 cfg.service_name
             )
         })?;
+        cache.validate_binding_registration(&ops_db).await?;
         schema_builder
             .enable_federation()
             .data(ops_db)
-            .data(TenantDbCache::new())
+            .data(cache)
             .data(tenant_db_config_from_env())
             .finish()
     } else {
-        schema_builder.enable_federation().finish()
+        schema_builder.enable_federation().data(cache).finish()
     };
 
     let state: Arc<Schema<Q, M, S>> = Arc::new(schema);
@@ -386,7 +391,10 @@ where
         request_id: request_id_from_headers(&headers)?,
     };
     req = req.data(hints);
-    match extract_request_identity(&headers)? {
+    let identity = extract_request_identity(&headers)?;
+    validate_bound_identity(schema.data::<TenantDbCache>(), &identity)
+        .map_err(|error| (error.http_status(), error.to_string()))?;
+    match identity {
         RequestIdentity::Client { tenant_id, claims } => {
             req = req.data(TenantId(tenant_id));
             if let Some(c) = claims {
@@ -492,6 +500,29 @@ enum RequestIdentity {
     None,
 }
 
+fn validate_bound_identity(
+    cache: Option<&TenantDbCache>,
+    identity: &RequestIdentity,
+) -> KabiPayResult<()> {
+    let Some(cache) = cache.filter(|cache| cache.bound_tenant_id().is_some()) else {
+        return Ok(());
+    };
+    match identity {
+        RequestIdentity::Client {
+            tenant_id,
+            claims: Some(claims),
+        } if claims.tenant_id == *tenant_id => cache.require_tenant(*tenant_id),
+        RequestIdentity::Operator(_) => Err(KabiPayError::Forbidden(
+            "operator access is not enabled on a company runtime".into(),
+        )),
+        _ => Err(KabiPayError::Unauthorised),
+    }
+}
+
+#[cfg(test)]
+#[path = "subgraph_bound_tests.rs"]
+mod bound_security_tests;
+
 /// Resolve who is calling the subgraph.
 ///
 /// 1. `Authorization: Bearer <jwt>` — `kabipay-client` → tenant + optional claims;
@@ -513,7 +544,7 @@ fn extract_request_identity(headers: &HeaderMap) -> Result<RequestIdentity, (Sta
             )
         })?;
         let secret = jwt_secret_from_env();
-        if let Ok(claims) = decode_client_jwt(token, &secret) {
+        if let Ok(claims) = crate::client_jwt::verify_client_token(token, &secret) {
             return Ok(RequestIdentity::Client {
                 tenant_id: claims.tenant_id,
                 claims: Some(claims),

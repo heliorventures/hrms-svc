@@ -18,9 +18,9 @@ END;
 $$ LANGUAGE plpgsql;
 CREATE TRIGGER trg_location_updated_at BEFORE UPDATE ON location
     FOR EACH ROW EXECUTE FUNCTION kabipay_ops.set_updated_at();
-CREATE TABLE audit_log (
-    id UUID PRIMARY KEY,tenant_id UUID NOT NULL,user_id UUID REFERENCES "user"(id) ON DELETE SET NULL,
-    entity_type VARCHAR(100) NOT NULL,entity_id UUID,action VARCHAR(100) NOT NULL,
-    before_state JSONB,after_state JSONB,ip_address VARCHAR(45),user_agent TEXT,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+CREATE TABLE private_source_cutover(tenant_id uuid PRIMARY KEY,producer_generation bigint NOT NULL);
+CREATE TABLE company_event_outbox(
+ id uuid PRIMARY KEY,source_tenant_id uuid NOT NULL,organization_id uuid,event_type text,
+ aggregate_type text,aggregate_id uuid,aggregate_version bigint,event_envelope jsonb NOT NULL,
+ event_stream text,created_at timestamptz
 );

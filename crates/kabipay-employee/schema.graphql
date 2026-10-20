@@ -1,3 +1,10 @@
+input AssignEmployeeLocationInput {
+	employeeId: ID!
+	locationId: ID
+	effectiveDate: NaiveDate!
+	expectedRevision: Int!
+}
+
 type ClearanceChecklistItem {
 	id: ID!
 	tenantId: ID!
@@ -25,6 +32,27 @@ type CompanyDocument {
 	uploadedByUserId: ID
 	createdAt: DateTime!
 	updatedAt: DateTime!
+}
+
+type CompanyLocation {
+	id: ID!
+	name: String!
+	address: String
+	city: String
+	state: String
+	country: String
+	active: Boolean!
+	updatedAt: DateTime!
+}
+
+type CompanyLocationOption {
+	id: ID!
+	name: String!
+}
+
+type CompanyLocationPage {
+	nodes: [CompanyLocation!]!
+	pageInfo: PageInfo!
 }
 
 input ConfirmPrejoiningInput {
@@ -123,6 +151,9 @@ type Employee {
 	dateOfJoining: NaiveDate!
 	departmentId: ID
 	designationId: ID
+	locationId: ID
+	locationName: String
+	locationAssignmentEffectiveFrom: NaiveDate
 	reportingManagerId: ID
 	userId: ID
 	dateOfBirth: NaiveDate
@@ -150,6 +181,9 @@ type Employee {
 	"""
 	linkedUserUsername: String
 	reportingManagerName: String
+	reportingManagerPrincipalId: ID
+	reportingManagerTenantId: ID
+	reportingManagerOrganizationManaged: Boolean!
 	createdAt: DateTime!
 	updatedAt: DateTime!
 }
@@ -180,6 +214,9 @@ type EmployeeDirectoryEntry {
 	designationTitle: String
 	reportingManagerId: ID
 	reportingManagerName: String
+	reportingManagerPrincipalId: ID
+	reportingManagerTenantId: ID
+	reportingManagerOrganizationManaged: Boolean!
 	employmentType: String
 	dateOfJoining: NaiveDate!
 	status: String!
@@ -253,6 +290,15 @@ type EmployeeEvidenceReviewQueueItem {
 type EmployeeIdentityProfile {
 	pan: EmployeePanRecord
 	aadhaar: EmployeeAadhaarRecord
+}
+
+type EmployeeLocationAssignment {
+	employeeId: ID!
+	locationId: ID
+	locationName: String
+	effectiveFrom: NaiveDate
+	revision: Int!
+	businessDate: NaiveDate!
 }
 
 input EmployeeLoginAccountInput {
@@ -343,20 +389,14 @@ type EmploymentHistoryRecord {
 	updatedAt: DateTime!
 }
 
-type FnfSettlement {
+"""
+Company HR recovery view of a durable approval operation; no client-supplied state.
+"""
+type ExitApprovalOperation {
 	id: ID!
-	tenantId: ID!
-	separationId: ID!
-	leaveEncashment: String
-	gratuityAmount: String
-	bonusPayable: String
-	recoveryAmount: String
-	netPayable: String
-	status: String!
-	processedAt: DateTime
-	processedBy: ID
-	createdAt: DateTime!
-	updatedAt: DateTime!
+	reviewId: ID!
+	state: String!
+	canResume: Boolean!
 }
 
 """
@@ -365,7 +405,13 @@ A scalar that can represent any JSON value.
 scalar JSON
 
 type MutationRoot {
-	setEmployeeUanNumber(input: SetEmployeeUanNumberInput!): String
+	saveCompanyLocation(input: SaveCompanyLocationInput!): CompanyLocation!
+	retireCompanyLocation(id: ID!, expectedUpdatedAt: DateTime!): CompanyLocation!
+	assignEmployeeLocation(input: AssignEmployeeLocationInput!): EmployeeLocationAssignment!
+	"""
+	Idempotently dismiss the overview for the authenticated user.
+	"""
+	dismissMyApplicationOverview: MyGuidanceState!
 	savePrejoiningConfig(config: JSON!): JSON!
 	invitePrejoining(email: String!, sendEmail: Boolean!): PrejoiningInvitation!
 	reissuePrejoining(id: ID!, revision: Int!, sendEmail: Boolean!): PrejoiningInvitation!
@@ -429,6 +475,14 @@ type MutationRoot {
 	uploadEmployeeWorkExperienceEvidence(workExperienceId: ID!, input: UploadEmployeeDocumentInput!): EmployeeWorkExperience!
 	resolveEmployeeWorkExperience(workExperienceId: ID!, approved: Boolean!, rejectionReason: String): EmployeeWorkExperience!
 	"""
+	Employee managers may save or explicitly clear the payroll identifier in their data scope.
+	"""
+	setEmployeeUanNumber(input: SetEmployeeUanNumberInput!): String
+	"""
+	Employee managers may save or explicitly clear the ESIC identifier in their data scope.
+	"""
+	setEmployeeEsicNumber(input: SetEmployeeEsicNumberInput!): String
+	"""
 	Upsert the primary bank row (self or **`employee:write`**).
 	"""
 	upsertEmployeePrimaryBank(input: UpsertEmployeePrimaryBankInput!): EmployeeBankAccount!
@@ -456,19 +510,15 @@ type MutationRoot {
 	"""
 	Approve a pending separation (HR / directory roles — same gate as `createEmployee`).
 	"""
-	approveSeparation(separationId: ID!): Separation!
+	approveSeparation(separationId: ID!, financeReviewId: ID): Separation!
+	"""
+	Reject a pending separation (HR / directory roles).
+	"""
+	cancelExitApproval(operationId: ID!): Boolean!
 	"""
 	Reject a pending separation (HR / directory roles).
 	"""
 	rejectSeparation(separationId: ID!): Separation!
-	"""
-	HR: fill FNF component amounts (while status is DRAFT). Net payable is recalculated.
-	"""
-	upsertFnfSettlement(input: UpsertFnfSettlementInput!): FnfSettlement!
-	"""
-	HR: mark FNF as PROCESSED (no further amount edits).
-	"""
-	finalizeFnfSettlement(separationId: ID!): FnfSettlement!
 	"""
 	HR: create DRAFT FNF + default clearance for an `APPROVED` separation (e.g. legacy row before auto-seed).
 	"""
@@ -489,6 +539,13 @@ type MutationRoot {
 	Replace `permission_scope` rows for a role (list-filter scopes).
 	"""
 	setRolePermissionScopes(roleId: ID!, scopes: [PermissionScopeAssignmentInput!]!): Boolean!
+}
+
+"""
+Dismissal state for the authenticated user's application overview.
+"""
+type MyGuidanceState {
+	overviewDismissedAt: DateTime
 }
 
 """
@@ -524,6 +581,23 @@ type OrgChartRow {
 	reportingManagerId: ID
 	departmentName: String
 	designationTitle: String
+}
+
+type PageInfo {
+	totalCount: Int!
+	totalPages: Int!
+	currentPage: Int!
+	perPage: Int!
+	hasNextPage: Boolean!
+	hasPrevPage: Boolean!
+}
+
+"""
+Page + per_page input. Clamp with `clamp()` before use.
+"""
+input PageInput {
+	page: Int! = 1
+	perPage: Int! = 25
 }
 
 input PermissionScopeAssignmentInput {
@@ -574,7 +648,9 @@ input ProvisionEmployeeLoginInput {
 }
 
 type QueryRoot {
-	employeeUanNumber(employeeId: ID!): String
+	companyLocations(page: PageInput, search: String, activeOnly: Boolean! = true): CompanyLocationPage!
+	companyLocationOptions(search: String, limit: Int! = 50): [CompanyLocationOption!]!
+	employeeLocationAssignment(employeeId: ID!): EmployeeLocationAssignment!
 	prejoiningConversionOptions(managerSearch: String, managerOffset: Int): JSON!
 	prejoiningConfig: JSON!
 	prejoiningFieldCatalog: JSON!
@@ -583,6 +659,10 @@ type QueryRoot {
 	prejoiningCandidate(id: ID!): PrejoiningCandidate
 	prejoiningDocument(candidateId: ID!, documentId: ID!): PrejoiningDocumentContent!
 	prejoiningCandidatesCsv(status: String): String!
+	"""
+	Dismissal state for the authenticated user's application overview.
+	"""
+	myGuidanceState: MyGuidanceState!
 	"""
 	Liveness probe for this federated subgraph. Always returns `ok`.
 	"""
@@ -631,6 +711,14 @@ type QueryRoot {
 	"""
 	employees(limit: Int! = 20): [Employee!]!
 	"""
+	Employee UAN is payroll-sensitive and never part of directory results.
+	"""
+	employeeUanNumber(employeeId: ID!): String
+	"""
+	Employee ESIC is payroll-sensitive and never part of directory results.
+	"""
+	employeeEsicNumber(employeeId: ID!): String
+	"""
 	Salary-bearing employment history, newest first.
 	
 	Access is limited to exact `payroll:read=SELF` for the JWT-linked employee or
@@ -654,6 +742,10 @@ type QueryRoot {
 	Primary bank account for payroll (masked account number in API).
 	"""
 	employeePrimaryBank(employeeId: ID!): EmployeeBankAccount
+	"""
+	Imported nullable fields use the existing employee-target authorization.
+	"""
+	employeeImportedProfile(employeeId: ID!): JSON!
 	"""
 	Masked PAN / Aadhaar primary rows for the employee profile.
 	"""
@@ -692,9 +784,9 @@ type QueryRoot {
 	"""
 	separations(limit: Int! = 100): [Separation!]!
 	"""
-	Full & final row for a separation (if HR has run approval, a DRAFT or PROCESSED row exists).
+	Recover an uncertain approval without creating a second financial decision.
 	"""
-	fnfSettlement(separationId: ID!): FnfSettlement
+	exitApprovalOperation(separationId: ID!): ExitApprovalOperation
 	"""
 	Department exit clearance items for a separation.
 	"""
@@ -732,6 +824,16 @@ input ResetEmployeePasswordInput {
 	newPassword: String!
 }
 
+input SaveCompanyLocationInput {
+	id: ID
+	expectedUpdatedAt: DateTime
+	name: String!
+	address: String
+	city: String
+	state: String
+	country: String
+}
+
 type Separation {
 	id: ID!
 	tenantId: ID!
@@ -755,6 +857,22 @@ input SetEmployeeCompensationInput {
 	monthlySalary: String!
 	effectiveFrom: NaiveDate!
 	changeReason: String
+}
+
+input SetEmployeeEsicNumberInput {
+	employeeId: ID!
+	"""
+	Exactly 10 digits, or an empty string to explicitly clear the stored number.
+	"""
+	esicNumber: String!
+}
+
+input SetEmployeeUanNumberInput {
+	employeeId: ID!
+	"""
+	Exactly 12 digits, or an empty string to explicitly clear the stored number.
+	"""
+	uanNumber: String!
 }
 
 type StagedCompanyDocumentUpload {
@@ -830,11 +948,6 @@ type TenantPermissionScopeAssignment {
 	resource: String!
 	action: String!
 	scopeType: String!
-}
-
-input SetEmployeeUanNumberInput {
-	employeeId: ID!
-	uanNumber: String!
 }
 
 input UpdateEmployeeInput {
@@ -971,17 +1084,6 @@ input UpsertEmployeeWorkExperienceInput {
 	endDate: NaiveDate
 	isCurrent: Boolean!
 	description: String
-}
-
-input UpsertFnfSettlementInput {
-	separationId: ID!
-	"""
-	Decimal as string, e.g. "12500.50". Omit or empty to clear.
-	"""
-	leaveEncashment: String
-	gratuityAmount: String
-	bonusPayable: String
-	recoveryAmount: String
 }
 
 """

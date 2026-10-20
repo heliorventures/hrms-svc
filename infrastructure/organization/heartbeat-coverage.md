@@ -1,0 +1,9 @@
+# Source capture coverage
+
+Source-owned capture markers and all-partition barriers are implemented. The source timer uses only its fixed company database; it does not put source credentials into a shared consumer. [Independent lifecycle](independent-lifecycle.md) documents bootstrap/accepted-range and current epoch gates.
+
+Each company-specific raw marker binding identifies tenant, organization IDs, source database/schema, topic prefix, exact connector, company topic, expected partitions and the trusted read-only proxy URL. The production URL is exactly https://capture-connect-<tenant UUID>:8443/. A marker/event never supplies a management endpoint. The coordinator confirms persisted Connect lsn AND lsn_commit before barrier fanout, then revalidates current membership/epoch. Every required consumer role/partition must acknowledge a current covering barrier. Worker uptime or an idle topic cannot establish source freshness.
+
+Recognized inactive/older membership markers are terminal historical acknowledgements without contacting retired Connect or publishing current barriers. Unknown/future epochs are durably metadata-only quarantined. Source/backend failures retry without claiming fresh coverage. Distinguish these gates from independent consumer READY checkpoints.
+
+Current unit/two-endpoint checks and all six refreshed acceptance fixtures pass, including real Debezium, persisted Connect offsets, six covering barriers, independent consumer roles and membership epochs. A separate two-company PostgreSQL16.15 TLS/CDC rehearsal confirms the production checkpoint helper through each private capture proxy. These synthetic checks do not prove production source/WAL monitoring, certificate/ACL rollout, failover/restore or all-company reconciliation; those remain explicit acceptance gates.

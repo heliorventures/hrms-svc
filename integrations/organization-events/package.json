@@ -1,0 +1,27 @@
+{
+  "name": "@kabipay/organization-events",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "start": "node src/worker.mjs",
+    "start:control": "node src/control-worker.mjs",
+    "start:capture": "node src/capture-worker.mjs",
+    "start:archive": "node src/archive-server.mjs",
+    "source:export": "node src/source-export-cli.mjs",
+    "cleanup:outbox": "node src/cleanup-cli.mjs",
+    "start:private": "node src/private/worker.mjs",
+    "start:private-history": "node src/private/query-server.mjs",
+    "start:delivery-history": "node src/private/delivery-query-server.mjs",
+    "private:legacy": "node src/private/legacy-cli.mjs",
+    "private:capture": "node src/private/capture-cli.mjs",
+    "test": "node --test test/*.test.mjs"
+  },
+  "dependencies": {
+    "kafkajs": "2.2.4",
+    "pg": "8.23.1"
+  }
+}

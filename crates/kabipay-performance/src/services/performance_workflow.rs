@@ -268,7 +268,7 @@ impl From<ReviewSummaryRow> for PerformanceReviewSummaryDto {
 const REVIEW_SUMMARY_SQL: &str = r#"
 SELECT p.id, p.review_cycle_id, p.employee_id,
        BTRIM(CONCAT(e.first_name, ' ', e.last_name)) AS employee_name,
-       p.manager_employee_id,
+       CASE WHEN cm.id IS NOT NULL THEN cm.manager_employee_id WHEN pm.id IS NOT NULL THEN pm.manager_employee_id ELSE p.manager_employee_id END AS manager_employee_id,
        CASE WHEN m.id IS NULL THEN NULL ELSE BTRIM(CONCAT(m.first_name, ' ', m.last_name)) END AS manager_name,
        p.appraisal_template_id, c.name AS cycle_name,
        c.start_date AS cycle_start_date, c.end_date AS cycle_end_date,
@@ -277,7 +277,9 @@ SELECT p.id, p.review_cycle_id, p.employee_id,
 FROM performance_participant p
 JOIN review_cycle c ON c.id = p.review_cycle_id AND c.tenant_id = p.tenant_id
 JOIN employee e ON e.id = p.employee_id AND e.tenant_id = p.tenant_id
-LEFT JOIN employee m ON m.id = p.manager_employee_id AND m.tenant_id = p.tenant_id
+LEFT JOIN LATERAL (SELECT a.id,a.manager_employee_id FROM management_assignment a WHERE a.tenant_id=p.tenant_id AND a.subject_employee_id=p.employee_id AND a.status='ACTIVE' AND a.relationship_type IN ('PRIMARY','REVIEWER') AND a.effective_from<=clock_timestamp() AND (a.effective_to IS NULL OR a.effective_to>clock_timestamp()) AND EXISTS(SELECT 1 FROM assignment_capability cap WHERE cap.tenant_id=a.tenant_id AND cap.assignment_id=a.id AND cap.capability_code='performance:evaluate') ORDER BY CASE WHEN a.relationship_type='PRIMARY' THEN 0 ELSE 1 END,a.graph_version DESC,a.id LIMIT 1) cm ON TRUE
+LEFT JOIN LATERAL (SELECT a.id,a.manager_employee_id FROM management_assignment a WHERE a.tenant_id=p.tenant_id AND a.subject_employee_id=p.employee_id AND a.status='ACTIVE' AND a.relationship_type='PRIMARY' AND a.effective_from<=clock_timestamp() AND (a.effective_to IS NULL OR a.effective_to>clock_timestamp()) LIMIT 1) pm ON TRUE
+LEFT JOIN employee m ON m.id = CASE WHEN cm.id IS NOT NULL THEN cm.manager_employee_id WHEN pm.id IS NOT NULL THEN pm.manager_employee_id ELSE p.manager_employee_id END AND m.tenant_id = p.tenant_id
 WHERE p.tenant_id = $1 AND p.is_excluded = FALSE
 "#;
 
@@ -294,7 +296,7 @@ pub async fn list_reviews_for_manager(
     tenant_id: Uuid,
     manager_employee_id: Uuid,
 ) -> KabiPayResult<Vec<PerformanceReviewSummaryDto>> {
-    review_summaries(db, format!("{REVIEW_SUMMARY_SQL} AND p.manager_employee_id = $2 ORDER BY c.start_date DESC, employee_name"), vec![tenant_id.into(), manager_employee_id.into()]).await
+    review_summaries(db, format!("{REVIEW_SUMMARY_SQL} AND CASE WHEN cm.id IS NOT NULL THEN cm.manager_employee_id WHEN pm.id IS NOT NULL THEN pm.manager_employee_id ELSE p.manager_employee_id END = $2 ORDER BY c.start_date DESC, employee_name"), vec![tenant_id.into(), manager_employee_id.into()]).await
 }
 
 pub async fn list_all_reviews(
@@ -304,8 +306,8 @@ pub async fn list_all_reviews(
     review_summaries(db, format!("{REVIEW_SUMMARY_SQL} ORDER BY c.start_date DESC, employee_name"), vec![tenant_id.into()]).await
 }
 
-async fn review_summaries(
-    db: &DatabaseConnection,
+async fn review_summaries<C: ConnectionTrait>(
+    db: &C,
     sql: String,
     values: Vec<sea_orm::Value>,
 ) -> KabiPayResult<Vec<PerformanceReviewSummaryDto>> {
@@ -325,18 +327,20 @@ pub async fn load_participant(
     tenant_id: Uuid,
     participant_id: Uuid,
 ) -> KabiPayResult<performance_participant::Model> {
-    performance_participant::Entity::find_by_id(participant_id)
+    let mut participant=performance_participant::Entity::find_by_id(participant_id)
         .filter(performance_participant::Column::TenantId.eq(tenant_id))
         .one(db)
         .await?
         .ok_or_else(|| KabiPayError::NotFound {
             entity: "performance review",
             id: participant_id.to_string(),
-        })
+        })?;
+    super::performance_management::apply_installed_manager(db,tenant_id,&mut participant).await?;
+    Ok(participant)
 }
 
-pub async fn load_review_detail(
-    db: &DatabaseConnection,
+pub async fn load_review_detail<C: ConnectionTrait>(
+    db: &C,
     tenant_id: Uuid,
     participant: performance_participant::Model,
 ) -> KabiPayResult<PerformanceReviewDetailDto> {

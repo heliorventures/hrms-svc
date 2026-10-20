@@ -10,7 +10,7 @@
 
 use crate::context::{ClientClaims, ClientContext, OperatorClaims, OperatorContext, ScopeType};
 use crate::error::KabiPayError;
-use crate::jwt::{decode_client_jwt, decode_operator_jwt, extract_bearer};
+use crate::jwt::{decode_operator_jwt, extract_bearer};
 use axum::{
     extract::{Request, State},
     http::{header, HeaderMap},
@@ -86,5 +86,5 @@ fn extract_client_claims(
         .and_then(|v| v.to_str().ok())
         .ok_or(KabiPayError::Unauthorised)?;
     let token = extract_bearer(auth)?;
-    decode_client_jwt(token, cfg.client_jwt_secret.as_ref())
+    crate::client_jwt::verify_client_token(token, cfg.client_jwt_secret.as_ref())
 }

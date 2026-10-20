@@ -8,6 +8,178 @@ use uuid::Uuid;
 #[allow(dead_code)]
 mod fixture;
 
+static PRIVATE_ENVIRONMENT: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+#[tokio::test]
+#[ignore = "requires disposable PostgreSQL fixture with forward0125"]
+async fn source_adapter_status_and_fence_reject_tampering_and_never_repeat_terminal_egress() {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+    use hmac::{Hmac, Mac};
+    use kabipay_employee::services::private_delivery::{
+        self, DeliveryRequest, SignedDeliveryRequest,
+    };
+    use sha2::Sha256;
+    let (f, _private) = private_fixture().await;
+    let row = separation(&f).await;
+    let claims = f.claims(f.manager, "ALL", LoanPermission::FnfRecovery);
+    let operation = finance_operation::register(&f.db, f.tenant, &claims, &row, Uuid::new_v4())
+        .await
+        .unwrap();
+    let tx = f.db.begin().await.unwrap();
+    finance_operation::record_terminal(
+        &tx,
+        f.tenant,
+        &operation,
+        HrOperationState::Cancelled,
+        None,
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+    let receipt=f.db.query_one(Statement::from_sql_and_values(DbBackend::Postgres,
+        "SELECT intent_hash FROM private_delivery_receipt WHERE tenant_id=$1 AND intent_id=$2 AND destination_id=$3",
+        [f.tenant.into(),operation.id.into(),private_delivery::PAYROLL_DESTINATION.into()])).await.unwrap().unwrap();
+    let request = DeliveryRequest {
+        version: 1,
+        tenant_id: f.tenant,
+        intent_id: operation.id,
+        destination_id: private_delivery::PAYROLL_DESTINATION,
+        source_generation: 1,
+        destination_version: 1,
+        intent_hash: receipt.try_get("", "intent_hash").unwrap(),
+        lease_generation: 0,
+        request_id: Uuid::new_v4(),
+        issued_at: chrono::Utc::now().timestamp(),
+    };
+    let signed = |request: DeliveryRequest| {
+        let mut mac = Hmac::<Sha256>::new_from_slice(&[7; 32]).unwrap();
+        mac.update(b"kabipay-private-delivery-request-v1\0");
+        mac.update(&serde_json::to_vec(&request).unwrap());
+        SignedDeliveryRequest {
+            request,
+            signature: URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes()),
+        }
+    };
+    let pending = private_delivery::execute(&f.db, &f.db, &signed(request.clone()))
+        .await
+        .unwrap();
+    assert_eq!(pending.response.status, "PENDING");
+    assert_eq!(pending.response.lease_generation, 0);
+    let mut wrong = request.clone();
+    wrong.intent_hash = "f".repeat(64);
+    assert!(private_delivery::execute(&f.db, &f.db, &signed(wrong))
+        .await
+        .is_err());
+    let mut wrong = request.clone();
+    wrong.lease_generation = 2;
+    assert!(private_delivery::execute(&f.db, &f.db, &signed(wrong))
+        .await
+        .is_err());
+    let mut attempt = request.clone();
+    attempt.lease_generation = 1;
+    // Explicit source HTTPS policy rejects the configured HTTP fixture before transport.
+    let result = private_delivery::execute(&f.db, &f.db, &signed(attempt.clone()))
+        .await
+        .unwrap();
+    assert_eq!(result.response.status, "PERMANENT");
+    assert_eq!(result.response.outcome_code, "finance_https_required");
+    let repeated = private_delivery::execute(&f.db, &f.db, &signed(attempt))
+        .await
+        .unwrap();
+    assert_eq!(repeated.response.lease_generation, 1);
+    assert_eq!(repeated.response.status, "PERMANENT");
+    let mut verifier = Hmac::<Sha256>::new_from_slice(&[7; 32]).unwrap();
+    verifier.update(b"kabipay-private-delivery-response-v1\0");
+    verifier.update(&serde_json::to_vec(&repeated.response).unwrap());
+    verifier
+        .verify_slice(&URL_SAFE_NO_PAD.decode(&repeated.signature).unwrap())
+        .unwrap();
+    fixture::sql(
+        &f.db,
+        "UPDATE private_source_cutover SET producer_generation=2 WHERE tenant_id=$1",
+        vec![f.tenant.into()],
+    )
+    .await;
+    assert!(private_delivery::execute(&f.db, &f.db, &signed(request))
+        .await
+        .is_err());
+    assert_eq!(
+        finance_operation::find(&f.db, f.tenant, operation.id, false)
+            .await
+            .unwrap()
+            .unwrap()
+            .state,
+        HrOperationState::Cancelled
+    );
+}
+struct PrivateEnvironment {
+    prior: Vec<(&'static str, Option<std::ffi::OsString>)>,
+    files: Vec<std::path::PathBuf>,
+    _lock: tokio::sync::MutexGuard<'static, ()>,
+}
+impl Drop for PrivateEnvironment {
+    fn drop(&mut self) {
+        for (name, value) in &self.prior {
+            match value {
+                Some(value) => std::env::set_var(name, value),
+                None => std::env::remove_var(name),
+            }
+        }
+        for path in &self.files {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+async fn private_fixture() -> (fixture::Fixture, PrivateEnvironment) {
+    let lock = PRIVATE_ENVIRONMENT.lock().await;
+    let f = fixture::Fixture::new(100000).await;
+    // The disposable fixture must include forward0125; never create substitute production DDL here.
+    fixture::sql(
+        &f.db,
+        "INSERT INTO private_source_cutover(tenant_id) VALUES($1)",
+        vec![f.tenant.into()],
+    )
+    .await;
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    let secret = STANDARD.encode([7u8; 32]);
+    let keys = std::env::temp_dir().join(format!("finance-private-keys-{}.json", f.tenant));
+    let adapter = std::env::temp_dir().join(format!("finance-private-adapter-{}.json", f.tenant));
+    std::fs::write(&keys,serde_json::to_vec(&serde_json::json!({"schema_version":1,"keys":[
+        {"tenant_id":f.tenant,"purpose":"audit","key_id":"test","key_b64":secret,"active":true},
+        {"tenant_id":f.tenant,"purpose":"delivery","key_id":"test","key_b64":secret,"active":true}]})).unwrap()).unwrap();
+    std::fs::write(&adapter,serde_json::to_vec(&serde_json::json!({"schema_version":1,"bindings":[
+        {"tenant_id":f.tenant,"source_generation":1,"key_b64":secret,"allowed_webhook_hosts":[],"webhook_keys":[]}]})).unwrap()).unwrap();
+    let settings = [
+        (
+            "KABIPAY_PRIVATE_EVENT_KEYS_FILE",
+            keys.as_os_str().to_owned(),
+        ),
+        (
+            "KABIPAY_PRIVATE_DELIVERY_ADAPTER_FILE",
+            adapter.as_os_str().to_owned(),
+        ),
+        (
+            "KABIPAY_FINANCE_PAYROLL_URL",
+            std::ffi::OsString::from("http://127.0.0.1:1"),
+        ),
+    ];
+    let prior = settings
+        .iter()
+        .map(|(name, _)| (*name, std::env::var_os(name)))
+        .collect();
+    for (name, value) in settings {
+        std::env::set_var(name, value);
+    }
+    (
+        f,
+        PrivateEnvironment {
+            prior,
+            files: vec![keys, adapter],
+            _lock: lock,
+        },
+    )
+}
+
 async fn separation(
     f: &fixture::Fixture,
 ) -> kabipay_db_entities::tenant::d0017_onboarding_offboarding::separation::Model {
@@ -25,10 +197,10 @@ async fn separation(
 }
 
 async fn count(f: &fixture::Fixture, table: &str, operation: Uuid) -> i64 {
-    assert!(matches!(table, "employee_finance_outbox"));
+    assert!(matches!(table, "private_delivery_receipt"));
     f.db.query_one(Statement::from_sql_and_values(
         DbBackend::Postgres,
-        format!("SELECT COUNT(*) AS amount FROM {table} WHERE tenant_id=$1 AND operation_id=$2"),
+        format!("SELECT COUNT(*) AS amount FROM {table} WHERE tenant_id=$1 AND resource_id=$2"),
         [f.tenant.into(), operation.into()],
     ))
     .await
@@ -43,7 +215,7 @@ async fn count(f: &fixture::Fixture, table: &str, operation: Uuid) -> i64 {
 async fn funding_status_is_scoped_and_submission_serializes_with_disbursement() {
     use kabipay_common::{financial_lock, tenant_business_clock::TenantBusinessClock};
     use kabipay_employee::services::funding_context;
-    let f = fixture::Fixture::new(100000).await;
+    let (f, _private) = private_fixture().await;
     let clock = TenantBusinessClock::from_name("UTC").unwrap();
     let tx = f.db.begin().await.unwrap();
     financial_lock::acquire(&tx, f.tenant).await.unwrap();
@@ -118,7 +290,7 @@ async fn funding_status_is_scoped_and_submission_serializes_with_disbursement() 
 #[tokio::test]
 #[ignore = "requires disposable PostgreSQL fixture"]
 async fn hr_registration_is_scoped_idempotent_and_cancellation_is_durable() {
-    let f = fixture::Fixture::new(100000).await;
+    let (f, _private) = private_fixture().await;
     let row = separation(&f).await;
     let claims = f.claims(f.manager, "ALL", LoanPermission::FnfRecovery);
     let review = Uuid::new_v4();
@@ -168,7 +340,7 @@ async fn hr_registration_is_scoped_idempotent_and_cancellation_is_durable() {
             .state,
         HrOperationState::Cancelled
     );
-    assert_eq!(count(&f, "employee_finance_outbox", operation.id).await, 1);
+    assert_eq!(count(&f, "private_delivery_receipt", operation.id).await, 1);
     assert_eq!(
         offboarding_fnf_service::get_separation_tenant(&f.db, f.tenant, row.id)
             .await
@@ -182,7 +354,7 @@ async fn hr_registration_is_scoped_idempotent_and_cancellation_is_durable() {
 #[tokio::test]
 #[ignore = "requires disposable PostgreSQL fixture"]
 async fn terminal_hr_outcome_and_private_event_rollback_and_commit_together() {
-    let f = fixture::Fixture::new(100000).await;
+    let (f, _private) = private_fixture().await;
     let row = separation(&f).await;
     let claims = f.claims(f.manager, "ALL", LoanPermission::FnfRecovery);
     let operation = finance_operation::register(&f.db, f.tenant, &claims, &row, Uuid::new_v4())
@@ -215,7 +387,7 @@ async fn terminal_hr_outcome_and_private_event_rollback_and_commit_together() {
             .state,
         HrOperationState::Registered
     );
-    assert_eq!(count(&f, "employee_finance_outbox", operation.id).await, 0);
+    assert_eq!(count(&f, "private_delivery_receipt", operation.id).await, 0);
     assert_eq!(
         offboarding_fnf_service::get_separation_tenant(&f.db, f.tenant, row.id)
             .await
@@ -250,7 +422,7 @@ async fn terminal_hr_outcome_and_private_event_rollback_and_commit_together() {
             .authorization_id,
         Some(authorization)
     );
-    assert_eq!(count(&f, "employee_finance_outbox", operation.id).await, 1);
+    assert_eq!(count(&f, "private_delivery_receipt", operation.id).await, 1);
     let row = offboarding_fnf_service::get_separation_tenant(&f.db, f.tenant, row.id)
         .await
         .unwrap()
@@ -262,123 +434,4 @@ async fn terminal_hr_outcome_and_private_event_rollback_and_commit_together() {
             .id,
         operation.id
     );
-}
-
-struct Environment(Vec<(&'static str, Option<std::ffi::OsString>)>);
-impl Environment {
-    fn set(values: &[(&'static str, String)]) -> Self {
-        let prior = values
-            .iter()
-            .map(|(key, _)| (*key, std::env::var_os(key)))
-            .collect();
-        for (key, value) in values {
-            std::env::set_var(key, value);
-        }
-        Self(prior)
-    }
-}
-impl Drop for Environment {
-    fn drop(&mut self) {
-        for (key, value) in &self.0 {
-            match value {
-                Some(value) => std::env::set_var(key, value),
-                None => std::env::remove_var(key),
-            }
-        }
-    }
-}
-
-#[tokio::test]
-#[ignore = "requires disposable PostgreSQL fixture"]
-async fn private_delivery_retries_authenticated_confirmation_without_repeating_hr_outcome() {
-    use axum::{extract::State, http::StatusCode, routing::post, Json, Router};
-    use kabipay_common::finance_contract::{self, SignedFinanceMessage};
-    use std::sync::{
-        atomic::{AtomicUsize, Ordering},
-        Arc,
-    };
-    const SECRET: &str = "isolated-fixture-private-finance-key-32-bytes";
-    let f = fixture::Fixture::new(100000).await;
-    let row = separation(&f).await;
-    let claims = f.claims(f.manager, "ALL", LoanPermission::FnfRecovery);
-    let operation = finance_operation::register(&f.db, f.tenant, &claims, &row, Uuid::new_v4())
-        .await
-        .unwrap();
-    let tx = f.db.begin().await.unwrap();
-    finance_operation::record_terminal(
-        &tx,
-        f.tenant,
-        &operation,
-        HrOperationState::Committed,
-        Some(Uuid::new_v4()),
-    )
-    .await
-    .unwrap();
-    tx.commit().await.unwrap();
-    let attempts = Arc::new(AtomicUsize::new(0));
-    let endpoint = |State(counter): State<Arc<AtomicUsize>>,
-                    Json(envelope): Json<SignedFinanceMessage>| async move {
-        let message = finance_contract::verify_message(
-            &envelope,
-            SECRET.as_bytes(),
-            finance_contract::ServiceCaller::Payroll,
-            chrono::Utc::now().timestamp(),
-        )
-        .unwrap();
-        if counter.fetch_add(1, Ordering::SeqCst) == 0 {
-            return Err(StatusCode::SERVICE_UNAVAILABLE);
-        }
-        Ok(Json(
-            finance_contract::signed_response(
-                message,
-                serde_json::json!({"operationId":message.input["operationId"],"state":"CONFIRMED"}),
-                chrono::Utc::now().timestamp(),
-                SECRET.as_bytes(),
-            )
-            .unwrap(),
-        ))
-    };
-    let app = Router::new()
-        .route("/internal/finance", post(endpoint))
-        .with_state(attempts.clone());
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = listener.local_addr().unwrap();
-    let server = tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
-    });
-    let _environment = Environment::set(&[
-        ("KABIPAY_FINANCE_PAYROLL_URL", format!("http://{address}")),
-        ("KABIPAY_FINANCE_SERVICE_SECRET", SECRET.into()),
-    ]);
-    assert_eq!(
-        kabipay_employee::services::finance_outbox::deliver_due(&f.db, f.tenant)
-            .await
-            .unwrap(),
-        0
-    );
-    assert_eq!(attempts.load(Ordering::SeqCst), 1);
-    fixture::sql(&f.db,"UPDATE employee_finance_outbox SET available_at=NOW() WHERE tenant_id=$1 AND operation_id=$2",vec![f.tenant.into(),operation.id.into()]).await;
-    assert_eq!(
-        kabipay_employee::services::finance_outbox::deliver_due(&f.db, f.tenant)
-            .await
-            .unwrap(),
-        1
-    );
-    assert_eq!(
-        kabipay_employee::services::finance_outbox::deliver_due(&f.db, f.tenant)
-            .await
-            .unwrap(),
-        0
-    );
-    assert_eq!(attempts.load(Ordering::SeqCst), 2);
-    assert_eq!(count(&f, "employee_finance_outbox", operation.id).await, 1);
-    assert_eq!(
-        finance_operation::find(&f.db, f.tenant, operation.id, false)
-            .await
-            .unwrap()
-            .unwrap()
-            .state,
-        HrOperationState::Committed
-    );
-    server.abort();
 }

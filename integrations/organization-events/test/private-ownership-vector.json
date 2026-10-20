@@ -1,0 +1,47 @@
+{
+  "schema_version": 1,
+  "description": "Synthetic Node/Rust ownership proof vectors. Never production credentials.",
+  "key_b64": "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc=",
+  "request": {
+    "request": {
+      "version": 1,
+      "tenant_id": "00000000-0000-4000-8000-000000000001",
+      "intent_id": "00000000-0000-4000-8000-000000000002",
+      "destination_id": "00000000-0000-4000-8000-000000000003",
+      "source_generation": 1,
+      "destination_version": 1,
+      "intent_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "broker_owner_id": "00000000-0000-4000-8000-000000000004",
+      "topic": "organization.delivery.work.00000000-0000-4000-8000-000000000001",
+      "partition_id": 0,
+      "kafka_offset": "9223372036854775800",
+      "request_id": "00000000-0000-4000-8000-000000000005",
+      "issued_at": 100
+    },
+    "signature": "mts1NPc-6iiJLOo80WmHlfA6H2O6rSma3mdKoMXpPUs"
+  },
+  "request_json": "{\"version\":1,\"tenant_id\":\"00000000-0000-4000-8000-000000000001\",\"intent_id\":\"00000000-0000-4000-8000-000000000002\",\"destination_id\":\"00000000-0000-4000-8000-000000000003\",\"source_generation\":1,\"destination_version\":1,\"intent_hash\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"broker_owner_id\":\"00000000-0000-4000-8000-000000000004\",\"topic\":\"organization.delivery.work.00000000-0000-4000-8000-000000000001\",\"partition_id\":0,\"kafka_offset\":\"9223372036854775800\",\"request_id\":\"00000000-0000-4000-8000-000000000005\",\"issued_at\":100}",
+  "response": {
+    "response": {
+      "version": 1,
+      "tenant_id": "00000000-0000-4000-8000-000000000001",
+      "intent_id": "00000000-0000-4000-8000-000000000002",
+      "destination_id": "00000000-0000-4000-8000-000000000003",
+      "source_generation": 1,
+      "destination_version": 1,
+      "intent_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "broker_owner_id": "00000000-0000-4000-8000-000000000004",
+      "topic": "organization.delivery.work.00000000-0000-4000-8000-000000000001",
+      "partition_id": 0,
+      "kafka_offset": "9223372036854775800",
+      "request_id": "00000000-0000-4000-8000-000000000005",
+      "issued_at": 100,
+      "receipt_sha256": "231cde47495f047b1620a0dbc51a493865ef11078d0f458567b01b25c0ba5b35",
+      "accepted_at": 100,
+      "already_owned": false
+    },
+    "signature": "i4Pcj3reeLGOx58g_psuN0odQQN6lDgSjVhpTJlik6U"
+  },
+  "response_json": "{\"version\":1,\"tenant_id\":\"00000000-0000-4000-8000-000000000001\",\"intent_id\":\"00000000-0000-4000-8000-000000000002\",\"destination_id\":\"00000000-0000-4000-8000-000000000003\",\"source_generation\":1,\"destination_version\":1,\"intent_hash\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"broker_owner_id\":\"00000000-0000-4000-8000-000000000004\",\"topic\":\"organization.delivery.work.00000000-0000-4000-8000-000000000001\",\"partition_id\":0,\"kafka_offset\":\"9223372036854775800\",\"request_id\":\"00000000-0000-4000-8000-000000000005\",\"issued_at\":100,\"receipt_sha256\":\"231cde47495f047b1620a0dbc51a493865ef11078d0f458567b01b25c0ba5b35\",\"accepted_at\":100,\"already_owned\":false}",
+  "receipt_sha256": "231cde47495f047b1620a0dbc51a493865ef11078d0f458567b01b25c0ba5b35"
+}

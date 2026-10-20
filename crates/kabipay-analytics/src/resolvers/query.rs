@@ -360,7 +360,7 @@ impl QueryRoot {
             .collect())
     }
 
-    /// **HR / directory admins only** — inspect transactional outbox rows (e.g. after leave approval).
+    /// **HR / directory admins only** — inspect original delivery events and current destination outcomes.
     async fn outbox_events(
         &self,
         ctx: &Context<'_>,
@@ -458,7 +458,7 @@ impl QueryRoot {
         Ok(rows.into_iter().map(WebhookSubscriptionDto::from).collect())
     }
 
-    /// **HR / directory admins only** — webhook POST attempts (**`webhook_delivery_log`**), newest first.
+    /// **HR / directory admins only** — archived webhook logs and protected delivery attempts, newest first.
     async fn webhook_delivery_logs(
         &self,
         ctx: &Context<'_>,

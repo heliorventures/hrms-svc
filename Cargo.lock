@@ -1773,6 +1773,8 @@ dependencies = [
  "ipnet",
  "kabipay-common",
  "kabipay-db-entities",
+ "kabipay-organization-protocol",
+ "kabipay-organization-tenant",
  "rust_decimal",
  "sea-orm",
  "serde",
@@ -1798,6 +1800,8 @@ dependencies = [
  "jsonwebtoken",
  "kabipay-common",
  "kabipay-db-entities",
+ "kabipay-organization-protocol",
+ "kabipay-organization-security",
  "rand 0.8.6",
  "sea-orm",
  "serde",
@@ -1841,6 +1845,7 @@ dependencies = [
 name = "kabipay-common"
 version = "0.1.0"
 dependencies = [
+ "aes-gcm",
  "anyhow",
  "argon2",
  "async-graphql",
@@ -1921,10 +1926,17 @@ dependencies = [
  "base64",
  "chrono",
  "hmac",
+ "kabipay-auth",
  "kabipay-common",
  "kabipay-db-entities",
+ "kabipay-leave",
  "kabipay-loans",
  "kabipay-loans-domain",
+ "kabipay-organization-protocol",
+ "kabipay-organization-security",
+ "kabipay-organization-tenant",
+ "kabipay-payroll",
+ "kabipay-workflow",
  "opendal",
  "rand 0.8.6",
  "reqsign",
@@ -2006,6 +2018,8 @@ dependencies = [
  "dotenvy",
  "kabipay-common",
  "kabipay-db-entities",
+ "kabipay-organization-protocol",
+ "kabipay-organization-tenant",
  "rust_decimal",
  "sea-orm",
  "serde",
@@ -2052,6 +2066,7 @@ dependencies = [
  "kabipay-common",
  "kabipay-db-entities",
  "kabipay-loans-domain",
+ "kabipay-organization-tenant",
  "rust_decimal",
  "sea-orm",
  "serde",
@@ -2130,27 +2145,83 @@ dependencies = [
 ]
 
 [[package]]
-name = "kabipay-outbox-worker"
+name = "kabipay-organization"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-graphql",
+ "async-graphql-axum",
+ "axum",
+ "base64",
  "chrono",
- "hex",
- "hmac",
- "kabipay-attendance",
  "kabipay-common",
- "kabipay-db-entities",
- "kabipay-notification",
- "kabipay-performance",
- "kabipay-survey",
+ "kabipay-organization-domain",
+ "kabipay-organization-protocol",
+ "kabipay-organization-security",
  "reqwest",
  "sea-orm",
  "serde",
  "serde_json",
- "sha2",
  "tokio",
  "tracing",
- "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
+name = "kabipay-organization-domain"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "uuid",
+]
+
+[[package]]
+name = "kabipay-organization-protocol"
+version = "0.1.0"
+dependencies = [
+ "async-graphql",
+ "chrono",
+ "kabipay-organization-security",
+ "serde",
+ "serde_json",
+ "uuid",
+]
+
+[[package]]
+name = "kabipay-organization-security"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "hex",
+ "jsonwebtoken",
+ "kabipay-organization-domain",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 1.0.69",
+ "uuid",
+]
+
+[[package]]
+name = "kabipay-organization-tenant"
+version = "0.1.0"
+dependencies = [
+ "async-graphql",
+ "axum",
+ "base64",
+ "chrono",
+ "kabipay-common",
+ "kabipay-organization-domain",
+ "kabipay-organization-protocol",
+ "kabipay-organization-security",
+ "reqwest",
+ "sea-orm",
+ "serde",
+ "serde_json",
+ "tokio",
  "uuid",
 ]
 
@@ -2169,6 +2240,8 @@ dependencies = [
  "kabipay-db-entities",
  "kabipay-loans",
  "kabipay-loans-domain",
+ "kabipay-organization-protocol",
+ "kabipay-organization-tenant",
  "kabipay-tax",
  "rust_decimal",
  "sea-orm",
@@ -2196,6 +2269,8 @@ dependencies = [
  "dotenvy",
  "kabipay-common",
  "kabipay-db-entities",
+ "kabipay-organization-protocol",
+ "kabipay-organization-tenant",
  "rust_decimal",
  "sea-orm",
  "serde",
@@ -2334,6 +2409,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "kabipay-tenant-maintenance"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "kabipay-attendance",
+ "kabipay-common",
+ "kabipay-db-entities",
+ "kabipay-notification",
+ "kabipay-performance",
+ "kabipay-survey",
+ "sea-orm",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "kabipay-workflow"
 version = "0.1.0"
 dependencies = [
@@ -2345,6 +2440,8 @@ dependencies = [
  "dotenvy",
  "kabipay-common",
  "kabipay-db-entities",
+ "kabipay-organization-protocol",
+ "kabipay-organization-tenant",
  "sea-orm",
  "serde",
  "serde_json",

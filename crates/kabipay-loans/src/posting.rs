@@ -30,7 +30,7 @@ pub(crate) async fn post(
         .checked_add(1)
         .ok_or(LoanModuleError::InvalidCommand)?;
     let id = Uuid::new_v4();
-    store::execute(tx,"INSERT INTO loan_posting(id,tenant_id,loan_id,kind,source_kind,source_id,source_revision,value_date,amount,principal_delta,interest_delta,terms_version_id,reversal_of,calculation_evidence,actor_id) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)",vec![id.into(),actor.tenant_id.into(),input.loan.into(),input.kind.into(),input.source_kind.into(),input.source.into(),input.revision.into(),input.date.into(),input.amount.into(),input.principal.into(),input.interest.into(),input.terms.into(),input.reversal.into(),input.evidence.into(),actor.user_id.into()]).await?;
+    store::execute(tx,"INSERT INTO loan_posting(id,tenant_id,loan_id,kind,source_kind,source_id,source_revision,value_date,amount,principal_delta,interest_delta,terms_version_id,reversal_of,calculation_evidence,actor_id,actor_principal_id) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)",vec![id.into(),actor.tenant_id.into(),input.loan.into(),input.kind.into(),input.source_kind.into(),input.source.into(),input.revision.into(),input.date.into(),input.amount.into(),input.principal.into(),input.interest.into(),input.terms.into(),input.reversal.into(),input.evidence.into(),actor.user_id.into(),actor.principal_id.into()]).await?;
     store::execute(tx,"INSERT INTO loan_ledger_entry(id,tenant_id,loan_id,posting_id,sequence,principal_delta,interest_delta) VALUES($1,$2,$3,$4,$5,$6,$7)",vec![Uuid::new_v4().into(),actor.tenant_id.into(),input.loan.into(),id.into(),sequence.into(),input.principal.into(),input.interest.into()]).await?;
     if input.kind == "REPAYMENT"
         || (input.kind == "REVERSAL"

@@ -73,6 +73,9 @@ pub struct EmployeeDto {
     pub linked_user_username: Option<String>,
     #[graphql(name = "reportingManagerName")]
     pub reporting_manager_name: Option<String>,
+    pub reporting_manager_principal_id: Option<ID>,
+    pub reporting_manager_tenant_id: Option<ID>,
+    pub reporting_manager_organization_managed: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -88,6 +91,9 @@ pub struct EmployeeDirectoryEntryDto {
     pub designation_title: Option<String>,
     pub reporting_manager_id: Option<ID>,
     pub reporting_manager_name: Option<String>,
+    pub reporting_manager_principal_id: Option<ID>,
+    pub reporting_manager_tenant_id: Option<ID>,
+    pub reporting_manager_organization_managed: bool,
     pub employment_type: Option<String>,
     pub date_of_joining: NaiveDate,
     pub status: String,
@@ -137,6 +143,9 @@ impl EmployeeDirectoryEntryDto {
             reporting_manager_name: model
                 .reporting_manager_id
                 .and_then(|id| manager_map.get(&id).cloned()),
+            reporting_manager_principal_id:None,
+            reporting_manager_tenant_id:None,
+            reporting_manager_organization_managed:false,
             employment_type: model.employment_type,
             date_of_joining: model.date_of_joining,
             status: model.status,
@@ -1117,6 +1126,9 @@ impl From<employee::Model> for EmployeeDto {
             linked_user_email: None,
             linked_user_username: None,
             reporting_manager_name: None,
+            reporting_manager_principal_id:None,
+            reporting_manager_tenant_id:None,
+            reporting_manager_organization_managed:false,
             created_at: m.created_at,
             updated_at: m.updated_at,
         }

@@ -148,7 +148,7 @@ pub async fn authorize_exit_approval(
     input: &RegisteredHrApproval,
 ) -> LoanResult<ExitAuthorization> {
     if actor.permission != LoanPermission::FnfRecovery
-        || input.actor_id != actor.user_id
+        || Some(input.actor_id) != actor.user_id
         || input.operation_id.is_nil()
         || input.payload_hash.len() != 64
     {
@@ -162,7 +162,7 @@ pub async fn authorize_exit_approval(
             || existing.review_id != input.review_id
             || existing.employee_id != input.employee_id
             || existing.separation_id != input.separation_id
-            || existing.actor_id != actor.user_id
+            || Some(existing.actor_id) != actor.user_id
         {
             return Err(LoanModuleError::IdempotencyConflict);
         }

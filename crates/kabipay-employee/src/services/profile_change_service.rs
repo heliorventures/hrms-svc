@@ -7,8 +7,7 @@ use kabipay_db_entities::tenant::d0007_employee_core::{
 };
 use kabipay_db_entities::tenant::d0008_document_system::employee_document;
 use kabipay_db_entities::tenant::d0005_auth_rbac::{permission, role_permission, user, user_role};
-use kabipay_db_entities::tenant::d0027_communication_audit::{audit_log, notification};
-use kabipay_db_entities::tenant::d0030_outbox_events::outbox_event;
+use kabipay_db_entities::tenant::d0027_communication_audit::notification;
 use kabipay_db_entities::tenant::d0050_employee_self_service::employee_profile_change_request;
 use sea_orm::{
     ActiveModelTrait, ActiveValue::Set, ColumnTrait, ConnectionTrait, DatabaseConnection,
@@ -25,7 +24,6 @@ pub const REQUEST_LEGAL: &str = "LEGAL_NAME_OR_DOB";
 pub const REQUEST_PAN: &str = "PAN";
 pub const REQUEST_AADHAAR: &str = "AADHAAR";
 pub const REQUEST_BANK: &str = "BANK_ACCOUNT";
-const OUTBOX_PENDING: &str = "PENDING";
 
 async fn insert_audit_and_outbox<C: ConnectionTrait>(
     conn: &C,
@@ -39,48 +37,47 @@ async fn insert_audit_and_outbox<C: ConnectionTrait>(
     after_status: &str,
     now: chrono::DateTime<Utc>,
 ) -> KabiPayResult<()> {
-    audit_log::ActiveModel {
-        id: Set(Uuid::new_v4()),
-        tenant_id: Set(tenant_id),
-        user_id: Set(Some(actor_user_id)),
-        entity_type: Set("employee_profile_change_request".into()),
-        entity_id: Set(Some(request_id)),
-        action: Set(action.into()),
-        before_state: Set(before_status.map(|status| serde_json::json!({"status": status}))),
-        after_state: Set(Some(serde_json::json!({
-            "status": after_status,
-            "requestType": request_type,
-            "employeeId": employee_id,
-        }))),
-        ip_address: Set(None),
-        user_agent: Set(None),
-        created_at: Set(now),
-    }
-    .insert(conn)
+    kabipay_common::private_events::append_audit(
+        conn,
+        &kabipay_common::private_events::AuditRecordInput {
+            id: Uuid::new_v4(),
+            tenant_id: tenant_id,
+            user_id: Some(actor_user_id),
+            entity_type: "employee_profile_change_request".into(),
+            entity_id: Some(request_id),
+            action: action.into(),
+            before_state: before_status.map(|status| serde_json::json!({"status": status})),
+            after_state: Some(serde_json::json!({
+                "status": after_status,
+                "requestType": request_type,
+                "employeeId": employee_id,
+            })),
+            ip_address: None,
+            user_agent: None,
+            created_at: now,
+        },
+    )
     .await?;
 
-    outbox_event::ActiveModel {
-        id: Set(Uuid::new_v4()),
-        tenant_id: Set(tenant_id),
-        aggregate_type: Set("employee_profile_change_request".into()),
-        aggregate_id: Set(request_id),
-        event_type: Set(format!("employee_profile_change_request.{action}")),
-        payload: Set(serde_json::json!({
-            "schema_version": 1,
-            "request_id": request_id,
-            "employee_id": employee_id,
-            "request_type": request_type,
-            "status": after_status,
-            "actor_user_id": actor_user_id,
-        })),
-        status: Set(OUTBOX_PENDING.into()),
-        retry_count: Set(0),
-        last_error: Set(None),
-        created_at: Set(now),
-        processed_at: Set(None),
-        claimed_at: Set(None),
-    }
-    .insert(conn)
+    kabipay_common::private_webhooks::enqueue_webhooks(
+        conn,
+        kabipay_common::private_webhooks::LegacyWebhookEvent {
+            id: Uuid::new_v4(),
+            tenant_id: tenant_id,
+            aggregate_type: "employee_profile_change_request".into(),
+            aggregate_id: request_id,
+            event_type: format!("employee_profile_change_request.{action}"),
+            payload: serde_json::json!({
+                "schema_version": 1,
+                "request_id": request_id,
+                "employee_id": employee_id,
+                "request_type": request_type,
+                "status": after_status,
+                "actor_user_id": actor_user_id,
+            }),
+            created_at: now,
+        },
+    )
     .await?;
     Ok(())
 }

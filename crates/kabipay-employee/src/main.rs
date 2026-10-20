@@ -25,7 +25,8 @@ use tower_http::{cors::CorsLayer, trace::TraceLayer};
 use kabipay_employee::{resolvers, services};
 mod http_prejoining;
 mod http_finance;
-mod finance_worker;
+mod http_private_delivery;
+mod http_organization;
 
 use resolvers::{MutationRoot, QueryRoot};
 
@@ -56,9 +57,10 @@ async fn main() -> anyhow::Result<()> {
         .and_then(|v| v.parse().ok())
         .unwrap_or(4013);
 
+    let cache = TenantDbCache::from_env()?;
     let dsn = ops_dsn_from_env();
     let ops = connect_ops_db(&dsn).await?;
-    let cache = TenantDbCache::new();
+    cache.validate_binding_registration(&ops).await?;
     let fallback = tenant_db_config_from_env();
     let file_root = document_file_service::local_file_root();
     let _ = tokio::fs::create_dir_all(&file_root).await;
@@ -80,10 +82,12 @@ async fn main() -> anyhow::Result<()> {
         fallback,
     });
 
-    tokio::spawn(finance_worker::run(st.clone()));
+    tokio::spawn(http_organization::bootstrap_worker(st.clone()));
     let app = Router::new()
+        .merge(http_organization::routes())
         .merge(http_prejoining::routes())
         .merge(http_finance::routes())
+        .merge(http_private_delivery::routes())
         .route("/healthz", get(|| async { "ok" }))
         .route("/graphql", get(graphql_playground).post(employee_graphql))
         .route("/files/employee-document", get(employee_file_download))

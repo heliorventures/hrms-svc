@@ -158,7 +158,8 @@ async fn assert_is_reporting_manager_user(
     authority: &WorkflowApprovalAuthority,
     subject_employee_id: Uuid,
 ) -> KabiPayResult<()> {
-    let subject = load_subject_employee(conn, tenant_id, subject_employee_id).await?;
+    let mut subject = load_subject_employee(conn, tenant_id, subject_employee_id).await?;
+    subject.reporting_manager_id=crate::canonical_reporting::manager(conn,tenant_id,subject.id,subject.reporting_manager_id).await?;
     let manager_employee_id = subject.reporting_manager_id.ok_or_else(|| {
         KabiPayError::Validation(
             "employee has no reporting manager; assign a manager before this workflow step can be completed"

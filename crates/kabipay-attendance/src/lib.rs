@@ -18,3 +18,7 @@ pub mod attendance_management {
         SegmentTimes,
     };
 }
+
+
+
+pub mod organization;

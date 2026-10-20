@@ -63,7 +63,7 @@ pub(crate) fn parse_decimal(value: &str, field: &str) -> Result<Decimal> {
     })
 }
 
-fn require_expected_revision(actual: i32, expected: Option<i32>) -> Result<()> {
+pub(crate) fn require_expected_revision(actual: i32, expected: Option<i32>) -> Result<()> {
     if expected == Some(actual) || (expected.is_none() && actual == 1) {
         Ok(())
     } else {
@@ -73,7 +73,7 @@ fn require_expected_revision(actual: i32, expected: Option<i32>) -> Result<()> {
     }
 }
 
-fn require_appraisal_submission_state(
+pub(crate) fn require_appraisal_submission_state(
     participant: &performance_participant::Model,
     locked_cycle_id: Uuid,
     manager_submission: bool,
@@ -176,7 +176,8 @@ pub(crate) async fn locked_goal_context(
         .ok_or_else(|| KabiPayError::NotFound { entity: "performance review", id: participant_id.to_string() }.into_graphql())?;
     let stage = performance_workflow::locked_cycle_stage(txn, tenant_id, cycle_id).await
         .map_err(KabiPayError::into_graphql)?;
-    let participant = locked_goal_participant(txn, tenant_id, participant_id).await?;
+    let mut participant = locked_goal_participant(txn, tenant_id, participant_id).await?;
+    crate::services::performance_management::apply_installed_manager(txn,tenant_id,&mut participant).await.map_err(KabiPayError::into_graphql)?;
     if participant.review_cycle_id != cycle_id {
         return Err(KabiPayError::Conflict(
             "Performance review changed while acquiring its cycle lock; retry the request".into(),
@@ -973,7 +974,7 @@ impl MutationRoot {
             id: Set(Uuid::new_v4()), tenant_id: Set(tenant_id), review_cycle_id: Set(Some(participant.review_cycle_id)),
             goal_id: Set(goal_id), reviewer_employee_id: Set(claims.employee_id), reviewee_employee_id: Set(participant.employee_id),
             visibility: Set("EMPLOYEE_VISIBLE".into()), observation_date: Set(input.observation_date),
-            comments: Set(comments), created_by_user_id: Set(claims.sub), created_at: Set(chrono::Utc::now()),
+            comments: Set(comments), created_by_user_id: Set(Some(claims.sub)), created_at: Set(chrono::Utc::now()),
         }.insert(&db).await.map(Into::into).map_err(KabiPayError::from).map_err(KabiPayError::into_graphql)
     }
 
@@ -1061,11 +1062,12 @@ impl MutationRoot {
         let txn = db.begin().await.map_err(KabiPayError::from).map_err(KabiPayError::into_graphql)?;
         let cycle_id = performance_participant::Entity::find_by_id(participant_id).filter(performance_participant::Column::TenantId.eq(tenant_id)).one(&txn).await.map_err(KabiPayError::from).map_err(KabiPayError::into_graphql)?.ok_or_else(|| KabiPayError::NotFound { entity: "performance review", id: participant_id.to_string() }.into_graphql())?.review_cycle_id;
         let stage = performance_workflow::locked_cycle_stage(&txn, tenant_id, cycle_id).await.map_err(KabiPayError::into_graphql)?;
-        let participant = performance_participant::Entity::find_by_id(participant_id)
+        let mut participant = performance_participant::Entity::find_by_id(participant_id)
             .filter(performance_participant::Column::TenantId.eq(tenant_id))
             .lock_exclusive()
             .one(&txn).await.map_err(KabiPayError::from).map_err(KabiPayError::into_graphql)?
             .ok_or_else(|| KabiPayError::NotFound { entity: "performance review", id: participant_id.to_string() }.into_graphql())?;
+        crate::services::performance_management::apply_installed_manager(&txn,tenant_id,&mut participant).await.map_err(KabiPayError::into_graphql)?;
         require_appraisal_submission_state(&participant, cycle_id, true)?;
         require_expected_revision(participant.response_revision, expected_revision)?;
         if !claims.can_manage_performance_programs()
@@ -1144,12 +1146,12 @@ impl MutationRoot {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum AnswerRole {
+pub(crate) enum AnswerRole {
     Employee,
     Manager,
 }
 
-async fn save_appraisal_answers<C>(
+pub(crate) async fn save_appraisal_answers<C>(
     db: &C,
     tenant_id: Uuid,
     participant: &performance_participant::Model,

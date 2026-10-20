@@ -3,6 +3,7 @@ pub mod component_display;
 pub mod imported_lwp;
 pub mod imported_payroll;
 pub mod payroll_period_input;
+pub mod payroll_actor;
 pub mod payroll_rules;
 #[cfg(test)]
 mod payroll_run_lock_tests;

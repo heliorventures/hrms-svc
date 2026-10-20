@@ -4,15 +4,15 @@
 //! types so every subgraph's middleware can decode tokens without reaching
 //! into this crate.
 //!
-//! One shared HS256 secret for both planes (plane isolation is enforced by
-//! the `iss` claim + separate middleware).
+//! Operator tokens retain their existing key configuration. Client RSA mode
+//! confines signing to a bound Auth process and distributes public keys only.
 
 use chrono::{Duration, Utc};
 use kabipay_common::{
     context::{ClientClaims, OperatorClaims, CLIENT_JWT_ISSUER, OPERATOR_JWT_ISSUER},
     error::KabiPayResult,
     jwt::{
-        decode_client_jwt, decode_operator_jwt, encode_client_jwt, encode_operator_jwt,
+        decode_operator_jwt, encode_operator_jwt,
         jwt_secret_from_env,
     },
 };
@@ -111,7 +111,7 @@ impl JwtConfig {
             permission_scopes,
             resource_scopes,
         };
-        encode_client_jwt(&claims, &self.secret)
+        kabipay_common::client_jwt::issue_client_token(&claims, &self.secret)
     }
 
     /// Decode either plane's token. Tries ops first then client; returns
@@ -126,7 +126,7 @@ impl JwtConfig {
                 exp: c.exp,
             });
         }
-        let c = decode_client_jwt(token, &self.secret)?;
+        let c = kabipay_common::client_jwt::verify_client_token(token, &self.secret)?;
         Ok(DecodedToken {
             subject: c.sub,
             issuer: c.iss,

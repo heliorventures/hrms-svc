@@ -28,30 +28,6 @@ pub mod employee_exit_operation {
     pub enum Relation {}
 }
 
-pub mod employee_finance_outbox {
-    use crate::tenant::prelude::*;
-
-    #[derive(Clone, Debug, PartialEq, DeriveEntityModel)]
-    #[sea_orm(table_name = "employee_finance_outbox")]
-    pub struct Model {
-        #[sea_orm(primary_key, auto_increment = false)]
-        pub id: Uuid,
-        pub tenant_id: Uuid,
-        pub operation_id: Uuid,
-        pub event_type: String,
-        pub payload: Json,
-        pub attempts: i32,
-        pub available_at: DateTimeUtc,
-        pub delivered_at: Option<DateTimeUtc>,
-        pub last_error: Option<String>,
-    }
-
-    impl ActiveModelBehavior for ActiveModel {}
-
-    #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
-    pub enum Relation {}
-}
-
 pub mod loan_exit_review {
     use crate::tenant::prelude::*;
 

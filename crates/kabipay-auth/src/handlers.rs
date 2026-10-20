@@ -32,7 +32,7 @@ use chrono::{Duration, Utc};
 use kabipay_common::{
     db::resolve_required_tenant_db,
     error::{KabiPayError, KabiPayResult},
-    jwt::{decode_client_jwt, extract_bearer},
+    jwt::{extract_bearer},
     tenant_business_clock::TenantBusinessClock,
 };
 use kabipay_db_entities::{
@@ -431,7 +431,7 @@ pub async fn client_change_password(
         .and_then(|h| h.to_str().ok())
         .ok_or(KabiPayError::Unauthorised)?;
     let token = extract_bearer(auth_header)?;
-    let claims = decode_client_jwt(token, &state.jwt.secret)?;
+    let claims = kabipay_common::client_jwt::verify_client_token(token, &state.jwt.secret)?;
     let tenant_id = claims.tenant_id;
     let user_id = claims.sub;
 

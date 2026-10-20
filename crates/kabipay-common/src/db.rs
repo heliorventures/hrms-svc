@@ -27,6 +27,9 @@ use std::sync::Arc;
 use std::time::Duration;
 use uuid::Uuid;
 
+mod bound;
+pub use bound::BoundTenantDatabase;
+
 fn pool_max_connections(fallback: u32) -> u32 {
     std::env::var("KABIPAY_DB_POOL_MAX")
         .ok()
@@ -78,8 +81,8 @@ pub struct TenantDbHandle {
     pub schema_name: String,
     pub db_host: String,
     pub db_name: String,
-    /// `true` when the handle was built from a real ops row; `false` when
-    /// the scaffold fallback (`tenant_<hex[:8]>`) had to be used.
+    /// `true` when selected through an ops row; `false` for an immutable
+    /// company binding or the legacy scaffold fallback (`tenant_<hex[:8]>`).
     pub from_ops_row: bool,
 }
 
@@ -88,6 +91,8 @@ pub struct TenantDbHandle {
 #[derive(Clone, Default)]
 pub struct TenantDbCache {
     inner: Arc<DashMap<Uuid, TenantDbHandle>>,
+    binding: Option<Arc<BoundTenantDatabase>>,
+    bound_initialization: Arc<tokio::sync::Mutex<()>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -161,6 +166,16 @@ fn tenant_search_path_sql(schema_name: &str) -> String {
 }
 
 async fn connect_tenant_pool(url: &str, schema_name: &str) -> KabiPayResult<DatabaseConnection> {
+    let pg_opts = url
+        .parse::<sqlx::postgres::PgConnectOptions>()
+        .map_err(|e| KabiPayError::Internal(format!("invalid tenant DB URL: {e}")))?;
+    connect_tenant_pool_with_options(pg_opts, schema_name).await
+}
+
+async fn connect_tenant_pool_with_options(
+    pg_opts: sqlx::postgres::PgConnectOptions,
+    schema_name: &str,
+) -> KabiPayResult<DatabaseConnection> {
     if schema_name.is_empty() {
         return Err(KabiPayError::Internal(
             "tenant schema_name is empty (cannot set search_path)".into(),
@@ -169,10 +184,7 @@ async fn connect_tenant_pool(url: &str, schema_name: &str) -> KabiPayResult<Data
 
     let sql_arc = Arc::new(tenant_search_path_sql(schema_name));
 
-    let pg_opts = url
-        .parse::<sqlx::postgres::PgConnectOptions>()
-        .map_err(|e| KabiPayError::Internal(format!("invalid tenant DB URL: {e}")))?
-        .disable_statement_logging();
+    let pg_opts = pg_opts.disable_statement_logging();
 
     let pool = PgPoolOptions::new()
         .max_connections(tenant_pool_max_connections())
@@ -213,7 +225,8 @@ async fn connect_tenant_pool(url: &str, schema_name: &str) -> KabiPayResult<Data
 
 /// Resolve (or create) a pooled SeaORM connection for a tenant.
 ///
-/// Strategy:
+/// A fixed company binding takes precedence and rejects other company IDs.
+/// Otherwise the legacy strategy is:
 /// 1. Return the cached handle if present.
 /// 2. Look up `kabipay_ops.tenant_database` for an active row matching
 ///    `tenant_id`. When found, build the connection against that row's
@@ -293,6 +306,9 @@ async fn resolve_tenant_handle_with_policy(
     fallback_cfg: &TenantDbConfig,
     policy: MissingTenantDbPolicy,
 ) -> KabiPayResult<TenantDbHandle> {
+    if cache.binding.is_some() {
+        return cache.resolve_bound(tenant_id).await;
+    }
     if policy == MissingTenantDbPolicy::DerivedFallback {
         if let Some(handle) = cache.inner.get(&tenant_id) {
             return Ok(handle.clone());

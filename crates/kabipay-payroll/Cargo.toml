@@ -1,4 +1,4 @@
-﻿[package]
+[package]
 name = "kabipay-payroll"
 version = "0.1.0"
 edition.workspace = true
@@ -11,6 +11,8 @@ name = "kabipay-payroll"
 path = "src/main.rs"
 
 [dependencies]
+kabipay-organization-tenant = {path="../kabipay-organization-tenant"}
+kabipay-organization-protocol = {path="../kabipay-organization-protocol"}
 kabipay-loans = { path = "../kabipay-loans" }
 kabipay-loans-domain = { path = "../kabipay-loans-domain" }
 kabipay-tax = { path = "../kabipay-tax" }

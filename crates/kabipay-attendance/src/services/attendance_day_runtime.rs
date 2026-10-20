@@ -88,12 +88,13 @@ pub(crate) async fn expire_employee(
             vec![tenant_id.into(), employee_id.into(), row.id.into(), now.into()],
         )).await?;
         if result.rows_affected() != 1 { continue; }
-        txn.execute(Statement::from_sql_and_values(DbBackend::Postgres,
-            "INSERT INTO audit_log (id, tenant_id, entity_type, entity_id, action, before_state, after_state, created_at) VALUES ($1, $2, 'ATTENDANCE', $3, 'EXPIRE', $4, $5, $6)",
-            vec![Uuid::new_v4().into(), tenant_id.into(), row.id.into(),
-                serde_json::json!({"status":"OPEN","regularization_status":prior_reason}).into(),
-                serde_json::json!({"status":"INCOMPLETE","reason":"MISSED_PUNCH_OUT","work_date":row.work_date,"ends_at":window.ends_at}).into(), now.into()],
-        )).await?;
+        kabipay_common::private_events::append_audit(txn, &kabipay_common::private_events::AuditRecordInput {
+            id: Uuid::new_v4(), tenant_id, user_id: None,
+            entity_type: "ATTENDANCE".into(), entity_id: Some(row.id), action: "EXPIRE".into(),
+            before_state: Some(serde_json::json!({"status":"OPEN","regularization_status":prior_reason})),
+            after_state: Some(serde_json::json!({"status":"INCOMPLETE","reason":"MISSED_PUNCH_OUT","work_date":row.work_date,"ends_at":window.ends_at})),
+            ip_address: None, user_agent: None, created_at: now,
+        }).await?;
         expired += 1;
     }
     Ok(expired)

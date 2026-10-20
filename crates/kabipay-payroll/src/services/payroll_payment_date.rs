@@ -27,7 +27,20 @@ pub(crate) async fn refresh<C: ConnectionTrait>(
     cycle: &payroll_cycle::Model,
     draft: &mut PayrollDraft,
 ) -> KabiPayResult<()> {
+    refresh_with_date(db, cycle, draft, None).await
+}
+
+pub(crate) async fn refresh_with_date<C: ConnectionTrait>(
+    db: &C,
+    cycle: &payroll_cycle::Model,
+    draft: &mut PayrollDraft,
+    current_date: Option<NaiveDate>,
+) -> KabiPayResult<()> {
     let reason = if let Some(date) = cycle.payment_date {
+        if let Some(today) = current_date {
+            apply_readiness(draft, &cycle.status, date_reason(date, today));
+            return Ok(());
+        }
         let row = db
             .query_one(Statement::from_sql_and_values(
                 DbBackend::Postgres,
@@ -125,5 +138,41 @@ mod tests {
         value.employees.clear();
         apply_readiness(&mut value, "DRAFT", None);
         assert!(!value.can_finalize);
+    }
+    #[tokio::test]
+    async fn current_verified_company_date_needs_no_ops_tables_in_source_database() {
+        let mut value = draft("READY");
+        let now = chrono::Utc::now();
+        let cycle = payroll_cycle::Model {
+            id: Uuid::new_v4(),
+            tenant_id: Uuid::new_v4(),
+            name: "Synthetic".into(),
+            month: 10,
+            year: 2026,
+            status: "DRAFT".into(),
+            payment_date: Some(date("2026-10-10")),
+            processed_by: None,
+            processed_at: None,
+            created_at: now,
+            updated_at: now,
+        };
+        refresh_with_date(
+            &sea_orm::DatabaseConnection::Disconnected,
+            &cycle,
+            &mut value,
+            Some(date("2026-10-09")),
+        )
+        .await
+        .unwrap();
+        assert!(!value.can_finalize);
+        refresh_with_date(
+            &sea_orm::DatabaseConnection::Disconnected,
+            &cycle,
+            &mut value,
+            Some(date("2026-10-10")),
+        )
+        .await
+        .unwrap();
+        assert!(value.can_finalize);
     }
 }

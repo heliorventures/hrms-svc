@@ -4,10 +4,9 @@
 //!   - `kabipay-ops`    → operator plane
 //!   - `kabipay-client` → tenant plane
 //!
-//! Both planes share a single signing secret (`KABIPAY_JWT_SECRET`) because
-//! the `iss` claim (and separate middleware) already enforces plane
-//! isolation. Using one secret simplifies key rotation and avoids the
-//! foot-gun of an operator token being accepted by a client subgraph.
+//! These explicit-secret primitives support legacy deployments and fixtures.
+//! Production client callers use `client_jwt`, which supports verification-only
+//! company-bound RSA keys. Organization company runtimes require RSA mode.
 
 use crate::context::{ClientClaims, OperatorClaims, CLIENT_JWT_ISSUER, OPERATOR_JWT_ISSUER};
 use crate::error::{KabiPayError, KabiPayResult};

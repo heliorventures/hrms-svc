@@ -1,0 +1,17 @@
+{
+ "id":"00000000-0000-4000-8000-000000000010",
+ "organization_id":"00000000-0000-4000-8000-000000000001",
+ "source_tenant_id":"00000000-0000-4000-8000-000000000002",
+ "resource_type":"leave_request",
+ "resource_id":"00000000-0000-4000-8000-000000000003",
+ "employee_id":"00000000-0000-4000-8000-000000000004",
+ "employee_display_name":"Synthetic employee",
+ "status":"PENDING",
+ "summary":"Leave request",
+ "source_version":2,
+ "deleted":false,
+ "occurred_at":"2026-10-19T00:00:00Z",
+ "projected_at":"2026-10-19T00:00:01Z",
+ "watermark":{"topic":"organization.company.00000000-0000-4000-8000-000000000002","partition_id":0,"kafka_offset":12,"state":"READY","detail_code":null},
+ "progress_row":{"source_tenant_id":"00000000-0000-4000-8000-000000000002","work_date":"2026-10-18","logged_seconds":"1800","approved_seconds":"1800"}
+}
