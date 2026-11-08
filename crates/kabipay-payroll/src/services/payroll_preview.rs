@@ -119,7 +119,7 @@ mod tests {
     }
 }
 
-fn review_reason(error: KabiPayError) -> String {
+pub(crate) fn review_reason(error: KabiPayError) -> String {
     match error {
         KabiPayError::Validation(message) | KabiPayError::Conflict(message) => message,
         _ => "Unable to calculate this employee. Check configuration and contact support if the issue continues.".into(),

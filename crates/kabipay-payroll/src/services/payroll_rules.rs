@@ -55,6 +55,8 @@ pub struct PeriodInput {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CalculatedPeriod {
+    #[serde(default, with = "rust_decimal::serde::str")]
+    pub loan_recovery: Decimal,
     #[serde(with = "rust_decimal::serde::str")]
     pub gross: Decimal,
     #[serde(with = "rust_decimal::serde::str")]
@@ -248,6 +250,7 @@ pub fn calculate_period(input: &PeriodInput) -> KabiPayResult<CalculatedPeriod> 
         })
         .collect::<KabiPayResult<BTreeMap<_, _>>>()?;
     Ok(CalculatedPeriod {
+        loan_recovery: Decimal::ZERO,
         gross,
         incentive,
         total_deductions: total,
@@ -268,6 +271,8 @@ pub fn calculate_period(input: &PeriodInput) -> KabiPayResult<CalculatedPeriod> 
 
 pub fn valid_additional_code(code: &str) -> bool {
     !code.is_empty()
+        && code != "LOAN"
+        && !code.starts_with("LOAN_")
         && code.len() <= 64
         && code.as_bytes()[0].is_ascii_uppercase()
         && code

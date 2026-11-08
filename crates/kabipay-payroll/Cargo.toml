@@ -11,6 +11,8 @@ name = "kabipay-payroll"
 path = "src/main.rs"
 
 [dependencies]
+kabipay-loans = { path = "../kabipay-loans" }
+kabipay-loans-domain = { path = "../kabipay-loans-domain" }
 kabipay-tax = { path = "../kabipay-tax" }
 kabipay-common.workspace = true
 kabipay-db-entities.workspace = true

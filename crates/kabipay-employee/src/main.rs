@@ -24,6 +24,8 @@ use tower_http::{cors::CorsLayer, trace::TraceLayer};
 
 use kabipay_employee::{resolvers, services};
 mod http_prejoining;
+mod http_finance;
+mod finance_worker;
 
 use resolvers::{MutationRoot, QueryRoot};
 
@@ -78,8 +80,10 @@ async fn main() -> anyhow::Result<()> {
         fallback,
     });
 
+    tokio::spawn(finance_worker::run(st.clone()));
     let app = Router::new()
         .merge(http_prejoining::routes())
+        .merge(http_finance::routes())
         .route("/healthz", get(|| async { "ok" }))
         .route("/graphql", get(graphql_playground).post(employee_graphql))
         .route("/files/employee-document", get(employee_file_download))

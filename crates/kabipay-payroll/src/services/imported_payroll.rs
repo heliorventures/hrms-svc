@@ -26,7 +26,8 @@ pub(crate) async fn persist_reviewed<C: ConnectionTrait + Send + Sync>(
     employee: &employee::Model,
     date: NaiveDate,
     prepared: super::automatic_payroll::PreparedEmployeePayroll,
-) -> KabiPayResult<()> {
+    loan_snapshot: Option<&super::loan_recovery::PayslipLoanSnapshot>,
+) -> KabiPayResult<Uuid> {
     let period = super::payroll_period_input::find(
         db,
         tenant,
@@ -123,6 +124,10 @@ pub(crate) async fn persist_reviewed<C: ConnectionTrait + Send + Sync>(
     statement["contribution_policy"] = serde_json::to_value(&prepared.contribution_policy)
         .map_err(|_| KabiPayError::Internal("contribution policy serialization failed".into()))?;
     statement["payroll_engine_version"] = serde_json::json!("effective-payroll-v2");
+    if let Some(snapshot) = loan_snapshot {
+        statement["loans"] = serde_json::to_value(snapshot)
+            .map_err(|_| KabiPayError::Internal("Loan statement serialization failed".into()))?;
+    }
     payslip_statement::ActiveModel {
         payslip_id: Set(id),
         tenant_id: Set(tenant),
@@ -140,5 +145,5 @@ pub(crate) async fn persist_reviewed<C: ConnectionTrait + Send + Sync>(
         cycle,
     )
     .await?;
-    Ok(())
+    Ok(id)
 }

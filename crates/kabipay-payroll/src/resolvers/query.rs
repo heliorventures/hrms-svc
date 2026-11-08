@@ -119,10 +119,10 @@ where
     load(target_employee_id).await
 }
 
-pub struct QueryRoot;
+pub struct PayrollQueryRoot;
 
 #[Object]
-impl QueryRoot {
+impl PayrollQueryRoot {
     async fn payroll_draft(
         &self,
         ctx: &Context<'_>,
@@ -889,7 +889,7 @@ mod tests {
 
     async fn execute_query(claims: ClientClaims, query: &str) -> async_graphql::Response {
         let tenant_id = claims.tenant_id;
-        Schema::build(QueryRoot, EmptyMutation, EmptySubscription)
+        Schema::build(PayrollQueryRoot, EmptyMutation, EmptySubscription)
             .data(TenantId(tenant_id))
             .data(claims)
             .finish()
@@ -917,7 +917,7 @@ mod tests {
 
     #[test]
     fn payroll_schema_exposes_period_metadata_and_self_salary_target_is_optional() {
-        let schema = Schema::build(QueryRoot, EmptyMutation, EmptySubscription)
+        let schema = Schema::build(PayrollQueryRoot, EmptyMutation, EmptySubscription)
             .finish()
             .sdl();
 

@@ -13,6 +13,7 @@ use uuid::Uuid;
 struct SettingsProxy {
     responses: Mutex<VecDeque<Vec<ProxyRow>>>,
     queries: Arc<Mutex<Vec<String>>>,
+    statements: Arc<Mutex<Vec<Statement>>>,
     fail: bool,
 }
 
@@ -20,6 +21,7 @@ struct SettingsProxy {
 impl ProxyDatabaseTrait for SettingsProxy {
     async fn query(&self, statement: Statement) -> Result<Vec<ProxyRow>, DbErr> {
         self.queries.lock().unwrap().push(statement.to_string());
+        self.statements.lock().unwrap().push(statement);
         if self.fail {
             return Err(DbErr::Custom("settings unavailable".into()));
         }
@@ -76,18 +78,28 @@ pub(super) async fn connection(
     responses: Vec<Vec<ProxyRow>>,
     fail: bool,
 ) -> (sea_orm::DatabaseConnection, Arc<Mutex<Vec<String>>>) {
+    let (db, queries, _) = connection_with_statements(responses, fail).await;
+    (db, queries)
+}
+
+async fn connection_with_statements(
+    responses: Vec<Vec<ProxyRow>>,
+    fail: bool,
+) -> (sea_orm::DatabaseConnection, Arc<Mutex<Vec<String>>>, Arc<Mutex<Vec<Statement>>>) {
     let queries = Arc::new(Mutex::new(Vec::new()));
+    let statements = Arc::new(Mutex::new(Vec::new()));
     let db = Database::connect_proxy(
         DbBackend::Postgres,
         Arc::new(Box::new(SettingsProxy {
             responses: Mutex::new(responses.into()),
             queries: Arc::clone(&queries),
+            statements: Arc::clone(&statements),
             fail,
         })),
     )
     .await
     .unwrap();
-    (db, queries)
+    (db, queries, statements)
 }
 
 #[tokio::test]
@@ -233,7 +245,7 @@ async fn payslip_company_address_insert_and_update_are_normalized_and_tenant_sco
         } else {
             vec![]
         };
-        let (db, queries) = connection(vec![initial, vec![saved]], false).await;
+        let (db, queries, statements) = connection_with_statements(vec![initial, vec![saved]], false).await;
         let result = upsert_payroll_compliance_setting(
             &db,
             tenant,
@@ -255,7 +267,11 @@ async fn payslip_company_address_insert_and_update_are_normalized_and_tenant_sco
         assert!(queries[0].contains(&format!("\"tenant_id\" = '{}'", tenant)));
         let write = &queries[1];
         assert!(write.contains("payslip_company_address"));
-        assert!(write.contains(address));
+        // Inspect the bound value: SQL display escapes newlines for diagnostics.
+        let statements = statements.lock().unwrap();
+        assert!(statements[1].values.as_ref().unwrap().0.contains(
+            &sea_orm::Value::String(Some(Box::new(address.to_owned())))
+        ));
         if !existing {
             assert!(write.contains(&tenant.to_string()));
         }

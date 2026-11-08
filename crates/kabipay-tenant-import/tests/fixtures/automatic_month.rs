@@ -5,6 +5,7 @@ use sea_orm::{DatabaseConnection, TransactionTrait};
 use uuid::Uuid;
 
 pub async fn verify(db: &DatabaseConnection, tenant: Uuid, actor: Uuid, employee: Uuid) {
+    let claims = super::payroll_claims(tenant, actor);
     assert!(payroll_period_input::find(db, tenant, employee, 2026, 12)
         .await
         .unwrap()
@@ -19,7 +20,7 @@ pub async fn verify(db: &DatabaseConnection, tenant: Uuid, actor: Uuid, employee
     )
     .await
     .unwrap();
-    let blocked = payroll_draft::calculate_payroll_cycle(db, tenant, actor, cycle.id, None)
+    let blocked = payroll_draft::calculate_payroll_cycle(db, tenant, &claims, cycle.id, None)
         .await
         .unwrap();
     assert!(!blocked.can_finalize);
@@ -41,7 +42,7 @@ pub async fn verify(db: &DatabaseConnection, tenant: Uuid, actor: Uuid, employee
         .unwrap();
     tx.commit().await.unwrap();
     let initial =
-        payroll_draft::calculate_payroll_cycle(db, tenant, actor, cycle.id, Some(blocked.revision))
+        payroll_draft::calculate_payroll_cycle(db, tenant, &claims, cycle.id, Some(blocked.revision))
             .await
             .unwrap();
     assert!(initial.can_finalize, "{:?}", initial.employees);
@@ -83,7 +84,7 @@ pub async fn verify(db: &DatabaseConnection, tenant: Uuid, actor: Uuid, employee
     .unwrap();
     tx.commit().await.unwrap();
     let draft =
-        payroll_draft::calculate_payroll_cycle(db, tenant, actor, cycle.id, Some(initial.revision))
+        payroll_draft::calculate_payroll_cycle(db, tenant, &claims, cycle.id, Some(initial.revision))
             .await
             .unwrap();
     let prepared = draft
@@ -117,7 +118,7 @@ pub async fn verify(db: &DatabaseConnection, tenant: Uuid, actor: Uuid, employee
     payroll_finalize::finalize_payroll_cycle(
         db,
         tenant,
-        actor,
+        &claims,
         cycle.id,
         draft.revision,
         &draft.fingerprint,
@@ -128,7 +129,7 @@ pub async fn verify(db: &DatabaseConnection, tenant: Uuid, actor: Uuid, employee
     assert!(payroll_draft::calculate_payroll_cycle(
         db,
         tenant,
-        actor,
+        &claims,
         cycle.id,
         Some(draft.revision)
     )

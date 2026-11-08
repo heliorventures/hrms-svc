@@ -100,6 +100,15 @@ pub async fn load<C: ConnectionTrait>(
         }
     }
     if let Some(value) = &mut statement {
+        if let Some(amount) = value["loans"]["total"].as_str() {
+            display.push(PayslipDisplayLine {
+                id: "ledger-loan-recovery".into(),
+                code: "LOAN_RECOVERY".into(),
+                name: "Loan recovery".into(),
+                component_type: "DEDUCTION".into(),
+                amount: amount.into(),
+            });
+        }
         if let Some(incentive) = value["incentive"].as_str() {
             add_line(
                 &mut display,

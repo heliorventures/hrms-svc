@@ -9,7 +9,7 @@ async fn eligibility_and_automatic_preview_require_management_scope_before_datab
                 "sub":uuid::Uuid::nil(),"iss":"test","exp":9999999999i64,"iat":0,
                 "tenant_id":uuid::Uuid::nil(),"permissions":[permission],"permission_scopes":{permission:scope}
             })).unwrap();
-            let schema = Schema::build(QueryRoot, MutationRoot, EmptySubscription).data(claims).finish();
+            let schema = Schema::build(QueryRoot::default(), MutationRoot::default(), EmptySubscription).data(claims).finish();
             for operation in [
                 r#"{employeePayrollEligibility(employeeId:"00000000-0000-0000-0000-000000000001",asOf:"2026-10-01")}"#,
                 r#"{payrollPeriodInput(employeeId:"00000000-0000-0000-0000-000000000001",year:2026,month:10)}"#,

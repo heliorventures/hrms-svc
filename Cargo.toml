@@ -9,6 +9,8 @@ members = [
     "crates/kabipay-leave",
     "crates/kabipay-attendance",
     "crates/kabipay-payroll",
+    "crates/kabipay-loans-domain",
+    "crates/kabipay-loans",
     "crates/kabipay-tenant-import",
     "crates/kabipay-tax",
     "crates/kabipay-benefits",

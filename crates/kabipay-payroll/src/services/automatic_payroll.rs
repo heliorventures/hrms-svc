@@ -39,6 +39,8 @@ pub struct EmployeePayrollInput {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PreparedEmployeePayroll {
     #[serde(default)]
+    pub loan_recovery: Option<super::loan_recovery::ReviewedLoanRecovery>,
+    #[serde(default)]
     pub arrears: Vec<super::reviewed_arrears::ReviewedArrear>,
     pub input: PeriodInput,
     pub calculation: CalculatedPeriod,
@@ -180,6 +182,7 @@ pub(crate) fn calculate_with_arrears(
     .collect();
     let calculation = calculate_period(&period)?;
     Ok(PreparedEmployeePayroll {
+        loan_recovery: None,
         arrears: Vec::new(),
         input: period,
         calculation,

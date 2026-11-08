@@ -20,8 +20,8 @@ fn variables() -> Variables {
 #[tokio::test]
 async fn projection_and_draft_ui_documents_match_the_actual_schemas() {
     let payroll = Schema::build(
-        kabipay_payroll::resolvers::QueryRoot,
-        kabipay_payroll::resolvers::MutationRoot,
+        kabipay_payroll::resolvers::QueryRoot::default(),
+        kabipay_payroll::resolvers::MutationRoot::default(),
         EmptySubscription,
     )
     .finish();
@@ -65,8 +65,8 @@ async fn projection_and_draft_ui_documents_match_the_actual_schemas() {
 #[tokio::test]
 async fn payroll_documents_match_the_actual_service_contract_and_require_authority() {
     let schema = Schema::build(
-        kabipay_payroll::resolvers::QueryRoot,
-        kabipay_payroll::resolvers::MutationRoot,
+        kabipay_payroll::resolvers::QueryRoot::default(),
+        kabipay_payroll::resolvers::MutationRoot::default(),
         EmptySubscription,
     )
     .finish();

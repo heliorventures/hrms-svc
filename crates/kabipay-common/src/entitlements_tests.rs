@@ -1,5 +1,36 @@
 use super::*;
 
+#[test]
+fn loan_permissions_have_their_own_entitlement() {
+    assert_eq!(permission_module("loan:read"),"LOANS");
+    assert_eq!(permission_module("loan:approve"),"LOANS");
+    assert_eq!(permission_module("payroll:manage"),"PAYROLL");
+}
+
+#[tokio::test]
+async fn payroll_host_enforces_loans_independently_including_nested_fields_and_aliases() {
+    use async_graphql::{EmptyMutation,EmptySubscription,Object,Request,Schema,SimpleObject};
+    #[derive(SimpleObject)] struct LoanAccount {id:String}
+    struct Query;
+    #[Object] impl Query {
+        async fn my_loans(&self)->LoanAccount{LoanAccount{id:"test-only".into()}}
+        async fn payroll_cycles(&self)->bool{true}
+    }
+    let schema=Schema::build(Query,EmptyMutation,EmptySubscription).extension(crate::entitlement_graphql::ModuleEntitlement("PAYROLL")).finish();
+    let mut state=snapshot(false);
+    state.modules.insert("LOANS".into(),ModuleAccess{id:Uuid::new_v4(),active:true,core:true,disabled:false,subscription:None});
+    state.modules.insert("PAYROLL".into(),ModuleAccess{id:Uuid::new_v4(),active:true,core:false,disabled:false,subscription:None});
+    let claims=ClientClaims{sub:Uuid::new_v4(),tenant_id:state.tenant_id,iss:crate::context::CLIENT_JWT_ISSUER.into(),exp:0,iat:0,email:String::new(),employee_id:None,must_change_password:false,roles:vec![],permissions:vec![],permission_scopes:HashMap::new(),resource_scopes:HashMap::new()};
+    let request=|document:&str,state:Entitlements|Request::new(document).data(claims.clone()).data(crate::subgraph::TenantId(state.tenant_id)).data(state);
+    let result=schema.execute(request("{ aliased: myLoans { id } }",state.clone())).await;
+    assert!(result.errors.is_empty(),"{:?}",result.errors);
+    assert!(!schema.execute(request("{ payrollCycles }",state.clone())).await.errors.is_empty());
+    state.modules.get_mut("LOANS").unwrap().disabled=true;
+    state.modules.get_mut("PAYROLL").unwrap().core=true;
+    assert!(!schema.execute(request("{ payrollCycles: myLoans { id } }",state.clone())).await.errors.is_empty());
+    assert!(schema.execute(request("{ payrollCycles }",state)).await.errors.is_empty());
+}
+
 #[tokio::test]
 async fn control_plane_load_is_tenant_scoped_and_fail_closed() {
     use sea_orm::entity::prelude::async_trait;

@@ -19,7 +19,7 @@ use crate::resolvers::types::{
     EmployeeAadhaarRecordDto,
     EmployeeBankAccountDto, EmployeeDocumentDto, EmployeeDto, EmployeePanRecordDto,
     EmployeeEducationDto, EmployeeProfileChangeRequestDto, EmployeeWorkExperienceDto,
-    EmploymentHistoryRecordDto, FnfSettlementDto, MyGuidanceStateDto, OnboardingChecklistItemDto,
+    EmploymentHistoryRecordDto, MyGuidanceStateDto, OnboardingChecklistItemDto,
     PermissionScopeAssignmentInput, ProvisionEmployeeLoginInput, ResetEmployeePasswordInput,
     SeparationDto, SetEmployeeCompensationInput, SubmitEmployeeProfileChangeInput,
     SubmitSeparationInput, UpdateEmployeeInput, UpdateEmployeePersonalProfileInput,
@@ -27,7 +27,7 @@ use crate::resolvers::types::{
     UploadCompanyDocumentFileInput, UploadEmployeeDocumentInput, UploadTenantFileInput,
     UploadedTenantFileDto, UpsertEmployeePrimaryAadhaarInput, UpsertEmployeePrimaryBankInput,
     UpsertEmployeeEducationInput, UpsertEmployeePrimaryPanInput,
-    UpsertEmployeeWorkExperienceInput, UpsertFnfSettlementInput,
+    UpsertEmployeeWorkExperienceInput,
 };
 use crate::services::company_document_service;
 use crate::services::document_file_service;
@@ -1434,6 +1434,7 @@ impl MutationRoot {
         &self,
         ctx: &Context<'_>,
         separation_id: ID,
+        finance_review_id: Option<ID>,
     ) -> Result<SeparationDto> {
         require_offboarding_hr_mutation(ctx)?;
         let claims = require_client_claims(ctx)?;
@@ -1444,17 +1445,33 @@ impl MutationRoot {
             .map_err(KabiPayError::into_graphql)?
             .now_date();
         let sid = parse_uuid(&separation_id, "separationId")?;
-        let m = separation_service::resolve_separation(
+        let review_id = finance_review_id.as_ref().map(|id| parse_uuid(id, "financeReviewId")).transpose()?;
+        let m = crate::services::exit_approval::approve(
             &db,
             tenant_id,
             sid,
-            true,
-            claims.sub,
+            claims,
+            review_id,
             business_date,
         )
         .await
         .map_err(KabiPayError::into_graphql)?;
         Ok(SeparationDto::from(m))
+    }
+
+    /// Reject a pending separation (HR / directory roles).
+    async fn cancel_exit_approval(&self, ctx: &Context<'_>, operation_id: ID) -> Result<bool> {
+        require_offboarding_hr_mutation(ctx)?;
+        let claims = require_client_claims(ctx)?;
+        if kabipay_common::client_data_scope::data_scope_from_claims(Some(claims), "onboarding:manage")
+            .map_err(KabiPayError::into_graphql)? != kabipay_common::context::ScopeType::All {
+            return Err(KabiPayError::Forbidden("Exit approval cancellation requires ALL HR scope".into()).into_graphql());
+        }
+        let tenant = require_tenant_id(ctx)?;
+        let db = tenant_db(ctx, tenant).await?;
+        crate::services::finance_operation::cancel(&db, tenant, parse_uuid(&operation_id, "operationId")?)
+            .await.map_err(KabiPayError::into_graphql)?;
+        Ok(true)
     }
 
     /// Reject a pending separation (HR / directory roles).
@@ -1481,47 +1498,6 @@ impl MutationRoot {
         Ok(SeparationDto::from(m))
     }
 
-    /// HR: fill FNF component amounts (while status is DRAFT). Net payable is recalculated.
-    async fn upsert_fnf_settlement(
-        &self,
-        ctx: &Context<'_>,
-        input: UpsertFnfSettlementInput,
-    ) -> Result<FnfSettlementDto> {
-        require_offboarding_hr_mutation(ctx)?;
-        let tenant_id = require_tenant_id(ctx)?;
-        let db = tenant_db(ctx, tenant_id).await?;
-        let sid = parse_uuid(&input.separation_id, "separationId")?;
-        let m = offboarding_fnf_service::upsert_fnf_settlement(
-            &db,
-            tenant_id,
-            sid,
-            &input.leave_encashment,
-            &input.gratuity_amount,
-            &input.bonus_payable,
-            &input.recovery_amount,
-        )
-        .await
-        .map_err(KabiPayError::into_graphql)?;
-        Ok(FnfSettlementDto::from(m))
-    }
-
-    /// HR: mark FNF as PROCESSED (no further amount edits).
-    async fn finalize_fnf_settlement(
-        &self,
-        ctx: &Context<'_>,
-        separation_id: ID,
-    ) -> Result<FnfSettlementDto> {
-        require_offboarding_hr_mutation(ctx)?;
-        let claims = require_client_claims(ctx)?;
-        let tenant_id = require_tenant_id(ctx)?;
-        let db = tenant_db(ctx, tenant_id).await?;
-        let sid = parse_uuid(&separation_id, "separationId")?;
-        let m = offboarding_fnf_service::finalize_fnf_settlement(&db, tenant_id, sid, claims.sub)
-            .await
-            .map_err(KabiPayError::into_graphql)?;
-        Ok(FnfSettlementDto::from(m))
-    }
-
     /// HR: create DRAFT FNF + default clearance for an `APPROVED` separation (e.g. legacy row before auto-seed).
     async fn ensure_separation_offboarding_artifacts(
         &self,
@@ -1532,7 +1508,7 @@ impl MutationRoot {
         let tenant_id = require_tenant_id(ctx)?;
         let db = tenant_db(ctx, tenant_id).await?;
         let sid = parse_uuid(&separation_id, "separationId")?;
-        offboarding_fnf_service::backfill_approved_artifacts(&db, tenant_id, sid)
+        offboarding_fnf_service::backfill_approved_artifacts(&db, tenant_id, sid, require_client_claims(ctx)?)
             .await
             .map_err(KabiPayError::into_graphql)?;
         Ok(true)

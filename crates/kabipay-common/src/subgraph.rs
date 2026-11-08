@@ -285,6 +285,36 @@ where
     M: ObjectType + 'static,
     S: SubscriptionType + 'static,
 {
+    serve_subgraph_with_routes(cfg, schema_builder, Router::new()).await
+}
+
+/// Mount internal endpoints while retaining the existing tenant GraphQL boundary.
+pub async fn serve_subgraph_with_routes<Q, M, S>(
+    cfg: SubgraphConfig<'_>,
+    schema_builder: async_graphql::SchemaBuilder<Q, M, S>,
+    extra_routes: Router<Arc<Schema<Q, M, S>>>,
+) -> anyhow::Result<()>
+where
+    Q: ObjectType + 'static,
+    M: ObjectType + 'static,
+    S: SubscriptionType + 'static,
+{
+    serve_subgraph_with_startup(cfg, schema_builder, extra_routes, |_| {}).await
+}
+
+/// Start service-owned private workers with the same initialized schema data.
+pub async fn serve_subgraph_with_startup<Q, M, S, F>(
+    cfg: SubgraphConfig<'_>,
+    schema_builder: async_graphql::SchemaBuilder<Q, M, S>,
+    extra_routes: Router<Arc<Schema<Q, M, S>>>,
+    startup: F,
+) -> anyhow::Result<()>
+where
+    Q: ObjectType + 'static,
+    M: ObjectType + 'static,
+    S: SubscriptionType + 'static,
+    F: FnOnce(Arc<Schema<Q, M, S>>),
+{
     crate::env_file::load_dotenv();
     init_tracing(cfg.service_name);
 
@@ -317,8 +347,10 @@ where
     };
 
     let state: Arc<Schema<Q, M, S>> = Arc::new(schema);
+    startup(state.clone());
 
     let app = Router::new()
+        .merge(extra_routes)
         .route("/healthz", get(|| async { "ok" }))
         .route(
             "/graphql",
@@ -389,7 +421,7 @@ where
 /// mutable security state. Performing this check at the shared subgraph boundary
 /// makes employee deactivation effective immediately for both gateway and direct
 /// subgraph traffic instead of waiting for access-token expiry.
-async fn ensure_active_client_user<Q, M, S>(
+pub async fn ensure_active_client_user<Q, M, S>(
     schema: &Schema<Q, M, S>,
     tenant_id: Uuid,
     user_id: Uuid,

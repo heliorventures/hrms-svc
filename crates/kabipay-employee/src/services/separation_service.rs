@@ -1,7 +1,6 @@
 //! Employee separation / offboarding (domain 0017).
 
 use chrono::NaiveDate;
-use kabipay_common::due_offboarding::offboard_approved_separation_in_transaction;
 use kabipay_common::{KabiPayError, KabiPayResult};
 use kabipay_db_entities::tenant::d0017_onboarding_offboarding::separation;
 use sea_orm::{
@@ -9,8 +8,6 @@ use sea_orm::{
     QuerySelect, Set, TransactionTrait,
 };
 use uuid::Uuid;
-
-use crate::services::offboarding_fnf_service;
 
 pub async fn list_for_tenant(
     db: &DatabaseConnection,
@@ -41,7 +38,9 @@ pub async fn insert_separation(
 ) -> KabiPayResult<separation::Model> {
     let t = separation_type.trim();
     if t.is_empty() {
-        return Err(KabiPayError::Validation("separationType is required".into()));
+        return Err(KabiPayError::Validation(
+            "separationType is required".into(),
+        ));
     }
     let id = Uuid::new_v4();
     let now = chrono::Utc::now();
@@ -69,7 +68,11 @@ pub async fn insert_separation(
         created_at: Set(now),
         updated_at: Set(now),
     };
-    am.insert(db).await?;
+    // Serialize submission with the funding status check and financial posting.
+    let tx = db.begin().await?;
+    kabipay_common::financial_lock::acquire(&tx, tenant_id).await?;
+    am.insert(&tx).await?;
+    tx.commit().await?;
     separation::Entity::find_by_id(id)
         .one(db)
         .await?
@@ -83,9 +86,14 @@ pub async fn resolve_separation(
     separation_id: Uuid,
     approved: bool,
     approver_user_id: Uuid,
-    business_date: NaiveDate,
+    _business_date: NaiveDate,
 ) -> KabiPayResult<separation::Model> {
     let txn = db.begin().await.map_err(KabiPayError::from)?;
+    if approved {
+        return Err(KabiPayError::Forbidden(
+            "Separation approval requires a verified Finance authorization".into(),
+        ));
+    }
     let row = separation::Entity::find_by_id(separation_id)
         .filter(separation::Column::TenantId.eq(tenant_id))
         .lock_exclusive()
@@ -101,24 +109,19 @@ pub async fn resolve_separation(
             row.status
         )));
     }
-    let new_status = if approved { "APPROVED" } else { "REJECTED" };
+    let new_status = "REJECTED";
     let now = chrono::Utc::now();
     let mut am: separation::ActiveModel = row.into();
     am.status = Set(new_status.to_string());
     am.approved_by = Set(Some(approver_user_id));
     am.updated_at = Set(now);
     am.update(&txn).await?;
-    if approved {
-        offboarding_fnf_service::ensure_artifacts_on_approval(&txn, tenant_id, separation_id).await?;
-        offboard_approved_separation_in_transaction(
-            &txn,
-            tenant_id,
-            separation_id,
-            business_date,
-            now,
-        )
-        .await?;
-    }
+    crate::services::finance_operation::cancel_registered_for_separation(
+        &txn,
+        tenant_id,
+        separation_id,
+    )
+    .await?;
     txn.commit().await?;
     separation::Entity::find_by_id(separation_id)
         .one(db)

@@ -15,8 +15,9 @@ fn approval_permission(entity: &str) -> KabiPayResult<&'static str> {
         "EXPENSE" => Ok("expense:approve"),
         "TRAVEL_REQUEST" => Ok("travel:approve"),
         "TIMESHEET_WEEK_BATCH" => Ok("timesheet:approve"),
+        "LOAN_REQUEST" => Ok("loan:approve"),
         _ => Err(KabiPayError::Validation(
-            "Choose Leave, Expenses, Travel, or Timesheets for approval.".into(),
+            "Choose Leave, Expenses, Travel, Timesheets, or Loans for approval.".into(),
         )),
     }
 }
@@ -188,6 +189,7 @@ pub async fn create_workflow_step(
         "EXPENSE" => Some("expense:approve"),
         "TRAVEL_REQUEST" => Some("travel:approve"),
         "TIMESHEET_WEEK_BATCH" => Some("timesheet:approve"),
+        "LOAN_REQUEST" => Some("loan:approve"),
         _ => None,
     };
     let approver_permission = approver_permission
@@ -386,6 +388,7 @@ mod tests {
 
     #[test]
     fn supported_request_types_map_to_their_exact_approval_permission() {
+        assert_eq!(approval_permission("LOAN_REQUEST").unwrap(),"loan:approve");
         assert_eq!(approval_permission("LEAVE_REQUEST").unwrap(), "leave:approve");
         assert_eq!(approval_permission("EXPENSE").unwrap(), "expense:approve");
         assert_eq!(approval_permission("TRAVEL_REQUEST").unwrap(), "travel:approve");
