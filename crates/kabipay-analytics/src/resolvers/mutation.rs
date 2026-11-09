@@ -2,7 +2,7 @@
 
 use async_graphql::{Context, Object, Result, ID};
 use kabipay_common::{
-    subgraph::{require_client_claims, require_tenant_id, tenant_db},
+    subgraph::{ops_db, require_client_claims, require_tenant_id, tenant_db},
     KabiPayError,
 };
 use uuid::Uuid;
@@ -65,7 +65,7 @@ impl MutationRoot {
         let tenant_id = require_tenant_id(ctx)?;
         let db = tenant_db(ctx, tenant_id).await?;
         let cid = parse_uuid(&connector_id, "connectorId")?;
-        let m = analytics_service::connect_tenant_integration(&db, tenant_id, cid)
+        let m = crate::services::integration_connections::connect(ops_db(ctx)?, &db, tenant_id, cid)
             .await
             .map_err(KabiPayError::into_graphql)?;
         Ok(TenantIntegrationDto::from(m))

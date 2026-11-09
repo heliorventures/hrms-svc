@@ -539,48 +539,6 @@ fn hash_optional_webhook_secret(secret: Option<&str>) -> Option<String> {
     })
 }
 
-pub async fn connect_tenant_integration(
-    db: &DatabaseConnection,
-    tenant_id: Uuid,
-    connector_id: Uuid,
-) -> KabiPayResult<tenant_integration::Model> {
-    let now = chrono::Utc::now();
-    if let Some(ex) = tenant_integration::Entity::find()
-        .filter(tenant_integration::Column::TenantId.eq(tenant_id))
-        .filter(tenant_integration::Column::IntegrationConnectorId.eq(connector_id))
-        .one(db)
-        .await?
-    {
-        let row_id = ex.id;
-        let mut am: tenant_integration::ActiveModel = ex.into();
-        am.is_active = Set(true);
-        am.connected_at = Set(Some(now));
-        am.updated_at = Set(now);
-        am.update(db).await.map_err(KabiPayError::from)?;
-        return tenant_integration::Entity::find_by_id(row_id)
-            .one(db)
-            .await?
-            .ok_or_else(|| KabiPayError::Internal("tenant_integration race".into()));
-    }
-    let id = Uuid::new_v4();
-    let am = tenant_integration::ActiveModel {
-        id: Set(id),
-        tenant_id: Set(tenant_id),
-        integration_connector_id: Set(connector_id),
-        credentials_encrypted: Set(None),
-        config_json: Set(None),
-        is_active: Set(true),
-        connected_at: Set(Some(now)),
-        created_at: Set(now),
-        updated_at: Set(now),
-    };
-    am.insert(db).await.map_err(KabiPayError::from)?;
-    tenant_integration::Entity::find_by_id(id)
-        .one(db)
-        .await?
-        .ok_or_else(|| KabiPayError::Internal("tenant_integration insert missing".into()))
-}
-
 pub async fn register_webhook_subscription(
     db: &DatabaseConnection,
     tenant_id: Uuid,
