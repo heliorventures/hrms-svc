@@ -4,6 +4,7 @@ use crate::{KabiPayError, KabiPayResult};
 use std::sync::Arc;
 use uuid::Uuid;
 
+#[derive(Clone)]
 pub struct BoundTenantDatabase {
     pub(super) tenant_id: Uuid,
     pub(super) options: sqlx::postgres::PgConnectOptions,

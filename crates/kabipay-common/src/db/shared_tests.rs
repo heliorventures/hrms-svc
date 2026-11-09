@@ -119,7 +119,9 @@ struct Registry {
 impl ProxyDatabaseTrait for Registry {
     async fn query(&self, sql: Statement) -> Result<Vec<ProxyRow>, DbErr> {
         let sql = sql.to_string();
-        assert!(sql.contains(&self.tenant.to_string()));
+        if !sql.contains("tenant_database") {
+            assert!(sql.contains(&self.tenant.to_string()));
+        }
         let now = chrono::Utc::now();
         let mut fields = BTreeMap::from([
             ("id".into(), self.tenant.into()),
@@ -224,4 +226,67 @@ async fn unknown_company_is_rejected_before_any_registry_or_database_access() {
             .await,
         Err(KabiPayError::TenantDatabaseUnavailable(_))
     ));
+}
+
+fn registry_cache() -> TenantDbCache {
+    let mut companies = vec![company(1), company(2)];
+    for company in &mut companies {
+        company.as_object_mut().unwrap().remove("database_url");
+        company.as_object_mut().unwrap().remove("schema");
+    }
+    let database = RegistryDatabase::parse(&serde_json::to_vec(&serde_json::json!({
+        "version":1,"server_url":"postgres://service:synthetic@localhost:1/postgres?sslmode=verify-full","database_prefix":"company_"
+    })).unwrap()).unwrap();
+    let config = SharedCompanies::parse_with_registry(
+        &serde_json::to_vec(&serde_json::json!({"version":2,"companies":companies})).unwrap(),
+        2,
+        1,
+        Some(database),
+    )
+    .unwrap();
+    let mut cache = cache();
+    cache.shared = Some(Arc::new(config));
+    cache
+}
+
+#[tokio::test]
+async fn registry_mode_resolves_two_databases_with_one_service_login_and_pins_mapping() {
+    let cache = registry_cache();
+    for n in [1, 2] {
+        let name = if n == 1 { "company_1" } else { "company_2" };
+        let handle = cache
+            .resolve_shared(Uuid::from_u128(n), &registry(n, "ACTIVE", name).await)
+            .await
+            .unwrap();
+        assert_eq!(handle.db_name, name);
+    }
+    for _ in 0..2 {
+        assert!(cache
+            .resolve_shared(
+                Uuid::from_u128(1),
+                &registry(1, "ACTIVE", "company_new").await
+            )
+            .await
+            .is_err());
+        assert!(!cache.inner.contains_key(&Uuid::from_u128(1)));
+    }
+    assert!(cache
+        .resolve_shared(
+            Uuid::from_u128(2),
+            &registry(2, "SUSPENDED", "company_2").await
+        )
+        .await
+        .is_err());
+    assert!(!cache.inner.contains_key(&Uuid::from_u128(2)));
+}
+
+#[test]
+fn registry_mode_rejects_credential_overrides_and_missing_service_configuration() {
+    let bytes =
+        serde_json::to_vec(&serde_json::json!({"version":2,"companies":[company(1)]})).unwrap();
+    assert!(SharedCompanies::parse(&bytes, 1, 1).is_err());
+    let database = RegistryDatabase::parse(&serde_json::to_vec(&serde_json::json!({
+        "version":1,"server_url":"postgres://service:synthetic@localhost:1/postgres?sslmode=verify-full","database_prefix":"company_"
+    })).unwrap()).unwrap();
+    assert!(SharedCompanies::parse_with_registry(&bytes, 1, 1, Some(database)).is_err());
 }

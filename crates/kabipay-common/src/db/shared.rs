@@ -1,7 +1,10 @@
 //! Immutable deployment allowlist for shared company application processes.
 //! Database secrets never come from request headers or registry values.
 use super::{
-    bound::BoundTenantDatabase, connect_tenant_pool_with_options, TenantDbCache, TenantDbHandle,
+    bound::BoundTenantDatabase,
+    connect_tenant_pool_with_options,
+    registry::{Mapping, RegistryDatabase},
+    TenantDbCache, TenantDbHandle,
 };
 use crate::{KabiPayError, KabiPayResult};
 use serde::Deserialize;
@@ -23,20 +26,22 @@ struct Config {
 #[serde(deny_unknown_fields)]
 struct CompanyConfig {
     tenant_id: Uuid,
-    database_url: String,
-    schema: String,
+    database_url: Option<String>,
+    schema: Option<String>,
     public_origin: String,
     #[serde(default)]
     settings: BTreeMap<String, String>,
 }
 pub(super) struct Company {
-    pub(super) binding: BoundTenantDatabase,
+    binding: Option<BoundTenantDatabase>,
+    pinned: OnceLock<Mapping>,
     initialization: tokio::sync::Mutex<()>,
     origin: String,
     settings: BTreeMap<String, String>,
 }
 pub(super) struct SharedCompanies {
     companies: BTreeMap<Uuid, Company>,
+    registry: Option<RegistryDatabase>,
 }
 fn invalid() -> KabiPayError {
     KabiPayError::Internal("invalid shared company configuration".into())
@@ -56,9 +61,21 @@ fn allowed_setting(name: &str) -> bool {
     )
 }
 impl SharedCompanies {
+    #[cfg(test)]
     fn parse(bytes: &[u8], budget: u32, per_company: u32) -> KabiPayResult<Self> {
+        Self::parse_with_registry(bytes, budget, per_company, None)
+    }
+    fn parse_with_registry(
+        bytes: &[u8],
+        budget: u32,
+        per_company: u32,
+        registry: Option<RegistryDatabase>,
+    ) -> KabiPayResult<Self> {
         let config: Config = serde_json::from_slice(bytes).map_err(|_| invalid())?;
-        if config.version != 1 || config.companies.is_empty() || config.companies.len() > 100 {
+        if !matches!((config.version, registry.is_some()), (1, false) | (2, true))
+            || config.companies.is_empty()
+            || config.companies.len() > 100
+        {
             return Err(invalid());
         }
         if per_company == 0
@@ -72,41 +89,53 @@ impl SharedCompanies {
         let mut databases = HashSet::new();
         let mut users = HashSet::new();
         for company in config.companies {
-            let url = reqwest::Url::parse(&company.database_url).map_err(|_| invalid())?;
-            if url.password().is_none()
-                || !url
-                    .query_pairs()
-                    .any(|(key, value)| key == "sslmode" && value == "verify-full")
-            {
+            if company.tenant_id.is_nil() {
                 return Err(invalid());
             }
-            let binding = BoundTenantDatabase::from_values(
-                Some(&company.tenant_id.to_string()),
-                Some(&company.database_url),
-                Some(&company.schema),
-            )?
-            .ok_or_else(invalid)?;
-            if !matches!(
-                binding.options.get_ssl_mode(),
-                sqlx::postgres::PgSslMode::VerifyFull
-            ) {
-                return Err(invalid());
-            }
-            // Two company schemas in one database are not this deployment model.
-            if !databases.insert((
-                binding.host.clone(),
-                binding.options.get_port(),
-                binding.database.clone(),
-            )) {
-                return Err(invalid());
-            }
-            if !users.insert((
-                binding.host.clone(),
-                binding.options.get_port(),
-                binding.options.get_username().to_owned(),
-            )) {
-                return Err(invalid());
-            }
+            let binding = if config.version == 2 {
+                if company.database_url.is_some() || company.schema.is_some() {
+                    return Err(invalid());
+                }
+                None
+            } else {
+                let database_url = company.database_url.as_deref().ok_or_else(invalid)?;
+                let url = reqwest::Url::parse(database_url).map_err(|_| invalid())?;
+                if url.password().is_none()
+                    || !url
+                        .query_pairs()
+                        .any(|(key, value)| key == "sslmode" && value == "verify-full")
+                {
+                    return Err(invalid());
+                }
+                let binding = BoundTenantDatabase::from_values(
+                    Some(&company.tenant_id.to_string()),
+                    Some(database_url),
+                    company.schema.as_deref(),
+                )?
+                .ok_or_else(invalid)?;
+                if !matches!(
+                    binding.options.get_ssl_mode(),
+                    sqlx::postgres::PgSslMode::VerifyFull
+                ) {
+                    return Err(invalid());
+                }
+                // Two company schemas in one database are not this deployment model.
+                if !databases.insert((
+                    binding.host.clone(),
+                    binding.options.get_port(),
+                    binding.database.clone(),
+                )) {
+                    return Err(invalid());
+                }
+                if !users.insert((
+                    binding.host.clone(),
+                    binding.options.get_port(),
+                    binding.options.get_username().to_owned(),
+                )) {
+                    return Err(invalid());
+                }
+                Some(binding)
+            };
             let origin = reqwest::Url::parse(&company.public_origin).map_err(|_| invalid())?;
             if origin.scheme() != "https"
                 || origin.host_str().is_none()
@@ -136,6 +165,7 @@ impl SharedCompanies {
                     company.tenant_id,
                     Company {
                         binding,
+                        pinned: OnceLock::new(),
                         initialization: tokio::sync::Mutex::new(()),
                         origin: company.public_origin.trim_end_matches('/').to_owned(),
                         settings: company.settings,
@@ -146,7 +176,10 @@ impl SharedCompanies {
                 return Err(invalid());
             }
         }
-        Ok(Self { companies })
+        Ok(Self {
+            companies,
+            registry,
+        })
     }
 }
 static CONFIG: OnceLock<Result<Option<Arc<SharedCompanies>>, ()>> = OnceLock::new();
@@ -154,6 +187,9 @@ pub(super) fn configured() -> KabiPayResult<Option<Arc<SharedCompanies>>> {
     CONFIG
         .get_or_init(|| {
             let Some(path) = std::env::var_os("KABIPAY_COMPANY_CONFIG_FILE") else {
+                if std::env::var_os("KABIPAY_COMPANY_DATABASE_FILE").is_some() {
+                    return Err(());
+                }
                 return Ok(None);
             };
             let read = || -> KabiPayResult<Arc<SharedCompanies>> {
@@ -175,10 +211,14 @@ pub(super) fn configured() -> KabiPayResult<Option<Arc<SharedCompanies>>> {
                     .map_err(|_| invalid())?
                     .parse()
                     .map_err(|_| invalid())?;
-                Ok(Arc::new(SharedCompanies::parse(
+                let registry = std::env::var_os("KABIPAY_COMPANY_DATABASE_FILE")
+                    .map(|path| RegistryDatabase::from_file(Path::new(&path)))
+                    .transpose()?;
+                Ok(Arc::new(SharedCompanies::parse_with_registry(
                     &bytes,
                     budget,
                     super::tenant_pool_max_connections(),
+                    registry,
                 )?))
             };
             read().map(Some).map_err(|_| ())
@@ -186,6 +226,29 @@ pub(super) fn configured() -> KabiPayResult<Option<Arc<SharedCompanies>>> {
         .as_ref()
         .map(Clone::clone)
         .map_err(|_| invalid())
+}
+
+impl Company {
+    async fn database(
+        &self,
+        tenant: Uuid,
+        registry: Option<&RegistryDatabase>,
+        ops: &sea_orm::DatabaseConnection,
+    ) -> KabiPayResult<BoundTenantDatabase> {
+        if let Some(binding) = &self.binding {
+            binding.validate_registration(ops).await?;
+            return Ok(binding.clone());
+        }
+        let binding = registry.ok_or_else(invalid)?.resolve(tenant, ops).await?;
+        let mapping = Mapping {
+            database: binding.database.clone(),
+            schema: binding.schema.clone(),
+        };
+        if self.pinned.get_or_init(|| mapping.clone()) != &mapping {
+            return Err(KabiPayError::TenantDatabaseUnavailable(tenant));
+        }
+        Ok(binding)
+    }
 }
 
 #[cfg(test)]
@@ -264,8 +327,10 @@ impl TenantDbCache {
         ops: &sea_orm::DatabaseConnection,
     ) -> KabiPayResult<()> {
         if let Some(config) = &self.shared {
-            for company in config.companies.values() {
-                company.binding.validate_registration(ops).await?;
+            for (tenant, company) in &config.companies {
+                company
+                    .database(*tenant, config.registry.as_ref(), ops)
+                    .await?;
             }
         }
         Ok(())
@@ -288,20 +353,39 @@ impl TenantDbCache {
             .one(ops)
             .await?
             .is_some_and(|row| row.status == "ACTIVE" && !row.is_deleted);
-        if !active || company.binding.validate_registration(ops).await.is_err() {
-            if let Some((_, handle)) = self.inner.remove(&tenant) {
-                // Existing in-flight work must drain without holding the cache
-                // creation lock, which that work may itself need for another DB.
-                tokio::spawn(async move {
-                    let _ = handle.conn.close().await;
-                });
+        let binding = if active {
+            company
+                .database(
+                    tenant,
+                    self.shared.as_ref().and_then(|c| c.registry.as_ref()),
+                    ops,
+                )
+                .await
+        } else {
+            Err(KabiPayError::TenantDatabaseUnavailable(tenant))
+        };
+        let binding = match binding {
+            Ok(binding) => binding,
+            Err(_) => {
+                if let Some((_, handle)) = self.inner.remove(&tenant) {
+                    // Existing in-flight work must drain without holding the cache
+                    // creation lock, which that work may itself need for another DB.
+                    tokio::spawn(async move {
+                        let _ = handle.conn.close().await;
+                    });
+                }
+                return Err(KabiPayError::TenantDatabaseUnavailable(tenant));
+            }
+        };
+        if let Some(handle) = self.inner.get(&tenant) {
+            if handle.db_host == binding.host
+                && handle.db_name == binding.database
+                && handle.schema_name == binding.schema
+            {
+                return Ok(handle.clone());
             }
             return Err(KabiPayError::TenantDatabaseUnavailable(tenant));
         }
-        if let Some(handle) = self.inner.get(&tenant) {
-            return Ok(handle.clone());
-        }
-        let binding = &company.binding;
         let conn = connect_tenant_pool_with_options(binding.options.clone(), &binding.schema)
             .await
             .map_err(|_| KabiPayError::TenantDatabaseUnavailable(tenant))?;

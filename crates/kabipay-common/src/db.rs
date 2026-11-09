@@ -28,6 +28,7 @@ use std::time::Duration;
 use uuid::Uuid;
 
 mod bound;
+mod registry;
 mod shared;
 pub use bound::BoundTenantDatabase;
 pub use shared::{company_public_origin, company_setting, shared_company_ids};
