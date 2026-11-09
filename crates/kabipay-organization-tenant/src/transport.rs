@@ -176,6 +176,31 @@ pub async fn fixed_database(
     Ok((tenant, db))
 }
 
+/// Authenticate the exact delegated target before opening a shared source pool.
+pub async fn command_database(
+    service: &str, headers: &HeaderMap, body: &[u8], cache: &TenantDbCache,
+    ops: &DatabaseConnection, fallback: &TenantDbConfig,
+) -> KabiPayResult<(Uuid, DatabaseConnection)> {
+    let tenant = cache.requested_tenant(headers)?;
+    let command = crate::parse_command(body)?;
+    let query = parse_receipt_query(&command)?;
+    let operation = query.as_ref().map(|q| q.original_operation).unwrap_or(command.operation);
+    if operation.service() != service { return Err(unavailable()); }
+    let token = headers.get("authorization").and_then(|v| v.to_str().ok())
+        .and_then(|s| s.strip_prefix("Bearer ")).ok_or(KabiPayError::Unauthorised)?;
+    let capability = Capability::parse(operation.capability()).map_err(|_| unavailable())?;
+    let version = ResourceVersion::try_from(command.expected_version as u64).map_err(|_| unavailable())?;
+    security::delegation_verifier_from_env(tenant, service).map_err(|_| unavailable())?
+        .verify(token, &CommandExpectation {
+            capability: &capability,
+            resource_type: if query.is_some() { "organization_command" } else { operation.resource_type() },
+            resource_id: command.resource_id, expected_resource_version: version,
+            command_id: command.command_id, request_hash: &security::command_body_hash(body),
+        }).map_err(|_| KabiPayError::Unauthorised)?;
+    let db = resolve_required_tenant_db(tenant, ops, cache, fallback).await?;
+    Ok((tenant, db))
+}
+
 pub async fn handle<A: SourceAdapter>(
     adapter: A,
     tenant: Uuid,

@@ -143,6 +143,9 @@ pub async fn delete_blob_if_unreferenced(
 }
 
 async fn read_local_blob(row: &file_storage::Model) -> KabiPayResult<Vec<u8>> {
+    if !row.storage_path.starts_with(&format!("tenants/{}/", row.tenant_id)) {
+        return Err(KabiPayError::Validation("invalid file path".into()));
+    }
     if row
         .storage_path
         .as_str()
@@ -159,16 +162,27 @@ async fn read_local_blob(row: &file_storage::Model) -> KabiPayResult<Vec<u8>> {
         return Err(KabiPayError::Validation("invalid file path".into()));
     }
     let file_root = local_file_root();
-    let full = file_root.join(&row.storage_path);
+    let company_root = tokio::fs::canonicalize(file_root.join(format!("tenants/{}", row.tenant_id)))
+        .await.map_err(local_read_error)?;
+    let full = tokio::fs::canonicalize(file_root.join(&row.storage_path))
+        .await.map_err(local_read_error)?;
+    if !full.starts_with(&company_root) {
+        return Err(KabiPayError::Validation("invalid file path".into()));
+    }
     match tokio::fs::read(&full).await {
         Ok(bytes) => Ok(bytes),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            Err(KabiPayError::NotFound {
-                entity: "announcementAttachment",
-                id: "requested".into(),
-            })
+        Err(error) => Err(local_read_error(error)),
+    }
+}
+
+fn local_read_error(error: std::io::Error) -> KabiPayError {
+    if error.kind() == std::io::ErrorKind::NotFound {
+        KabiPayError::NotFound {
+            entity: "announcementAttachment",
+            id: "requested".into(),
         }
-        Err(error) => Err(KabiPayError::Internal(format!("read local file: {error}"))),
+    } else {
+        KabiPayError::Internal("announcement attachment could not be read".into())
     }
 }
 

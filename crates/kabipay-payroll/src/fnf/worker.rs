@@ -83,8 +83,8 @@ async fn sweep(schema: &PayrollSchema) -> KabiPayResult<()> {
     loop {
         let mut query = tenant_database::Entity::find()
             .filter(tenant_database::Column::IsActive.eq(true));
-        if let Some(tenant_id) = cache.bound_tenant_id() {
-            query = query.filter(tenant_database::Column::TenantId.eq(tenant_id));
+        if cache.is_company_runtime() {
+            query = query.filter(tenant_database::Column::TenantId.is_in(cache.configured_tenant_ids()));
         }
         let rows = query
             .order_by_asc(tenant_database::Column::Id)

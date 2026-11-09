@@ -5,11 +5,11 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 pub struct BoundTenantDatabase {
-    tenant_id: Uuid,
-    options: sqlx::postgres::PgConnectOptions,
-    schema: String,
-    host: String,
-    database: String,
+    pub(super) tenant_id: Uuid,
+    pub(super) options: sqlx::postgres::PgConnectOptions,
+    pub(super) schema: String,
+    pub(super) host: String,
+    pub(super) database: String,
 }
 impl std::fmt::Debug for BoundTenantDatabase {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -97,16 +97,14 @@ impl BoundTenantDatabase {
 fn configuration_error() -> KabiPayError {
     KabiPayError::Internal("invalid bound database configuration".into())
 }
-impl TenantDbCache {
-    pub async fn validate_binding_registration(
+impl BoundTenantDatabase {
+    pub(super) async fn validate_registration(
         &self,
         ops: &sea_orm::DatabaseConnection,
     ) -> KabiPayResult<()> {
         use kabipay_db_entities::ops::tenant_database;
         use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
-        let Some(binding) = &self.binding else {
-            return Ok(());
-        };
+        let binding = self;
         let rows = tenant_database::Entity::find()
             .filter(tenant_database::Column::TenantId.eq(binding.tenant_id))
             .filter(tenant_database::Column::IsActive.eq(true))
@@ -120,6 +118,13 @@ impl TenantDbCache {
         {
             return Err(KabiPayError::TenantDatabaseUnavailable(binding.tenant_id));
         }
+        Ok(())
+    }
+}
+impl TenantDbCache {
+    pub async fn validate_binding_registration(&self, ops: &sea_orm::DatabaseConnection) -> KabiPayResult<()> {
+        self.validate_shared_registration(ops).await?;
+        if let Some(binding) = &self.binding { binding.validate_registration(ops).await?; }
         Ok(())
     }
     pub fn with_binding(binding: BoundTenantDatabase) -> Self {
@@ -142,6 +147,13 @@ impl TenantDbCache {
         });
         let [tenant, url, schema] = values;
         let (tenant, url, schema) = (tenant?, url?, schema?);
+        if let Some(shared) = super::shared::configured()? {
+            if tenant.is_some() || url.is_some() || schema.is_some()
+                || std::env::var("KABIPAY_CLIENT_JWT_MODE").as_deref() != Ok("rs256") {
+                return Err(configuration_error());
+            }
+            return Ok(Self { shared: Some(shared), ..Self::default() });
+        }
         Ok(
             match BoundTenantDatabase::from_values(
                 tenant.as_deref(),
@@ -157,7 +169,7 @@ impl TenantDbCache {
         self.binding.as_ref().map(|b| b.tenant_id)
     }
     pub fn require_tenant(&self, tenant: Uuid) -> KabiPayResult<()> {
-        if self
+        if !self.shared_contains(tenant) || self
             .bound_tenant_id()
             .is_some_and(|expected| expected != tenant)
         {

@@ -1,7 +1,7 @@
 //! Source-only signed HTTPS history transport and transactional pending overlay.
 //! No shared worker receives source PostgreSQL credentials or source key material.
 use super::{
-    configured_keyring,
+    configured_company_keyring,
     crypto::{source_hash, Envelope},
     AuditHistoryFilter, AuditHistoryPage, AuditRecordInput,
 };
@@ -113,15 +113,17 @@ pub(super) fn binding_for_path(
     Ok((url, key))
 }
 fn configured_binding(tenant: Uuid) -> KabiPayResult<(reqwest::Url, Vec<u8>)> {
-    let path = std::env::var_os("KABIPAY_PRIVATE_HISTORY_CLIENT_FILE").ok_or_else(unavailable)?;
+    let path = crate::db::company_setting(tenant, "KABIPAY_PRIVATE_HISTORY_CLIENT_FILE")?;
     let mut bytes = Vec::new();
     std::fs::File::open(path)
         .and_then(|f| f.take(65537).read_to_end(&mut bytes))
         .map_err(|_| unavailable())?;
     binding(&bytes, tenant)
 }
-fn configured_pem(name: &str) -> KabiPayResult<Vec<u8>> {
-    let path = std::env::var_os(name).ok_or_else(unavailable)?;
+fn configured_pem(name: &str, tenant: Uuid) -> KabiPayResult<Vec<u8>> {
+    let path = if name == "KABIPAY_ORGANIZATION_HTTP_CA_FILE" {
+        std::env::var(name).map_err(|_| unavailable())?
+    } else { crate::db::company_setting(tenant, name)? };
     let path = std::path::Path::new(&path);
     if !path.is_absolute() {
         return Err(unavailable());
@@ -139,10 +141,10 @@ fn configured_pem(name: &str) -> KabiPayResult<Vec<u8>> {
     }
     Ok(bytes)
 }
-pub(super) fn history_http_client() -> KabiPayResult<reqwest::Client> {
-    let mut pem = configured_pem("KABIPAY_PRIVATE_HISTORY_CLIENT_CERT_FILE")?;
+pub(super) fn history_http_client(tenant: Uuid) -> KabiPayResult<reqwest::Client> {
+    let mut pem = configured_pem("KABIPAY_PRIVATE_HISTORY_CLIENT_CERT_FILE", tenant)?;
     pem.push(b'\n');
-    pem.extend(configured_pem("KABIPAY_PRIVATE_HISTORY_CLIENT_KEY_FILE")?);
+    pem.extend(configured_pem("KABIPAY_PRIVATE_HISTORY_CLIENT_KEY_FILE", tenant)?);
     let identity = reqwest::Identity::from_pem(&pem).map_err(|_| unavailable())?;
     let mut builder = reqwest::Client::builder()
         .https_only(true)
@@ -152,7 +154,7 @@ pub(super) fn history_http_client() -> KabiPayResult<reqwest::Client> {
         .connect_timeout(Duration::from_secs(3))
         .timeout(Duration::from_secs(8));
     if std::env::var_os("KABIPAY_ORGANIZATION_HTTP_CA_FILE").is_some() {
-        let bytes = configured_pem("KABIPAY_ORGANIZATION_HTTP_CA_FILE")?;
+        let bytes = configured_pem("KABIPAY_ORGANIZATION_HTTP_CA_FILE", tenant)?;
         let roots = reqwest::Certificate::from_pem_bundle(&bytes).map_err(|_| unavailable())?;
         if roots.is_empty() || roots.len() > 32 {
             return Err(unavailable());
@@ -272,7 +274,7 @@ async fn read_inner<C: ConnectionTrait + TransactionTrait>(
     let generation: i64 = row.try_get("", "producer_generation")?;
     let coverage: Uuid = row.try_get("", "coverage_id")?;
     let coverage_hash: String = row.try_get("", "source_sha256")?;
-    let keys = configured_keyring()?;
+    let keys = configured_company_keyring(filter.tenant_id)?;
     let mut frames: BTreeMap<Uuid, Vec<Envelope>> = BTreeMap::new();
     let mut cursor = Uuid::nil();
     let mut bytes = 0usize;
@@ -328,7 +330,7 @@ async fn read_inner<C: ConnectionTrait + TransactionTrait>(
         }
     }
     tx.commit().await?;
-    let client = history_http_client()?;
+    let client = history_http_client(filter.tenant_id)?;
     let remote_filter = filter.clone();
     {
         let request = Request {

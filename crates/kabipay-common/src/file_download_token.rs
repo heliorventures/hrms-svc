@@ -117,7 +117,10 @@ pub fn public_employee_file_download_base_from_env() -> KabiPayResult<String> {
 
 /// Full URL for `GET /files/employee-document?token=...` on **kabipay-employee**.
 pub fn public_employee_file_download_url(claims: &FileDownloadClaims) -> KabiPayResult<String> {
-    let base = public_employee_file_download_base_from_env()?;
+    let base = match crate::db::company_public_origin(claims.tenant_id)? {
+        Some(origin) => origin,
+        None => public_employee_file_download_base_from_env()?,
+    };
     let token = sign_download_token(claims);
     let encoded = urlencoding::encode(&token);
     Ok(format!("{base}/files/employee-document?token={encoded}"))

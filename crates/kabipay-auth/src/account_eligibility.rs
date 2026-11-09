@@ -34,10 +34,7 @@ pub async fn account_eligibility(
 ) -> Result<impl IntoResponse, KabiPayError> {
     if std::env::var("KABIPAY_CLIENT_JWT_MODE").as_deref()!=Ok("rs256"){return Err(KabiPayError::Unauthorised)}
     let verifier = proof.ok_or(KabiPayError::Unauthorised)?;
-    let target = state
-        .tenant_cache
-        .bound_tenant_id()
-        .ok_or(KabiPayError::Unauthorised)?;
+    let target = state.tenant_cache.requested_tenant(&headers)?;
     let bearer = headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
@@ -97,10 +94,7 @@ pub async fn employment_eligibility(
 ) -> Result<impl IntoResponse, KabiPayError> {
     if std::env::var("KABIPAY_CLIENT_JWT_MODE").as_deref()!=Ok("rs256"){return Err(KabiPayError::Unauthorised)}
     let verifier = proof.ok_or(KabiPayError::Unauthorised)?;
-    let target = state
-        .tenant_cache
-        .bound_tenant_id()
-        .ok_or(KabiPayError::Unauthorised)?;
+    let target = state.tenant_cache.requested_tenant(&headers)?;
     let bearer = headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())

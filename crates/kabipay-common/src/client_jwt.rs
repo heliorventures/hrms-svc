@@ -192,13 +192,16 @@ fn verifier_from_env() -> KabiPayResult<ClientJwtVerifier> {
             .collect::<KabiPayResult<Vec<_>>>()?,
     )
 }
-fn issuer_from_env() -> KabiPayResult<ClientJwtIssuer> {
-    let kid = std::env::var("KABIPAY_CLIENT_JWT_KEY_ID").map_err(|_| invalid())?;
-    let file = std::env::var("KABIPAY_CLIENT_JWT_PRIVATE_KEY_FILE").map_err(|_| invalid())?;
-    let tenant = std::env::var("KABIPAY_BOUND_TENANT_ID")
+fn issuer_from_env(requested: Option<Uuid>) -> KabiPayResult<ClientJwtIssuer> {
+    let shared = crate::db::shared_company_ids()?;
+    let tenant = if let Some(companies) = shared {
+        requested.filter(|id| companies.contains(id)).ok_or_else(invalid)?
+    } else { std::env::var("KABIPAY_BOUND_TENANT_ID")
         .ok()
         .and_then(|v| Uuid::parse_str(&v).ok())
-        .ok_or_else(invalid)?;
+        .ok_or_else(invalid)? };
+    let kid = crate::db::company_setting(tenant, "KABIPAY_CLIENT_JWT_KEY_ID")?;
+    let file = crate::db::company_setting(tenant, "KABIPAY_CLIENT_JWT_PRIVATE_KEY_FILE")?;
     ClientJwtIssuer::new(&kid, tenant, &read_pem(&file)?)
 }
 pub fn verify_client_token(token: &str, legacy_secret: &[u8]) -> KabiPayResult<ClientClaims> {
@@ -210,7 +213,7 @@ pub fn verify_client_token(token: &str, legacy_secret: &[u8]) -> KabiPayResult<C
 }
 pub fn issue_client_token(claims: &ClientClaims, legacy_secret: &[u8]) -> KabiPayResult<String> {
     if mode()? {
-        issuer_from_env()?.issue(claims)
+        issuer_from_env(Some(claims.tenant_id))?.issue(claims)
     } else {
         crate::jwt::encode_client_jwt(claims, legacy_secret)
     }
@@ -219,7 +222,17 @@ pub fn validate_client_token_configuration(signing: bool) -> KabiPayResult<()> {
     if mode()? {
         verifier_from_env()?;
         if signing {
-            issuer_from_env()?;
+            if let Some(companies) = crate::db::shared_company_ids()? {
+                let verifier = verifier_from_env()?;
+                for tenant in companies {
+                    let issuer = issuer_from_env(Some(tenant))?;
+                    // A configured signer must belong to the exact same company
+                    // in the verification allowlist (no shared company key).
+                    if !verifier.keys.get(&issuer.kid).is_some_and(|key| key.tenants.contains(&tenant)) {
+                        return Err(invalid());
+                    }
+                }
+            } else { issuer_from_env(None)?; }
         }
     } else if std::env::var_os("KABIPAY_ORGANIZATION_POLICY_URL").is_some() {
         return Err(KabiPayError::Internal(

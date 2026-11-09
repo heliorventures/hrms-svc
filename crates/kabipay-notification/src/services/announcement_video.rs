@@ -111,7 +111,10 @@ pub fn verify_ticket(token:&str,purpose:&str)->KabiPayResult<MediaTicket>{
     verify().ok_or(KabiPayError::Unauthorised)
 }
 fn media_url(ticket:&MediaTicket,action:&str)->KabiPayResult<String>{
-    let base=std::env::var("KABIPAY_NOTIFICATION_PUBLIC_BASE").map_err(|_|invalid("KABIPAY_NOTIFICATION_PUBLIC_BASE must be configured"))?;
+    let base=match kabipay_common::db::company_public_origin(ticket.tenant)? {
+        Some(origin) => origin,
+        None => std::env::var("KABIPAY_NOTIFICATION_PUBLIC_BASE").map_err(|_|invalid("KABIPAY_NOTIFICATION_PUBLIC_BASE must be configured"))?,
+    };
     let base=validate_link(&base)?;
     let mut url=reqwest::Url::parse(&base).map_err(|_|invalid("invalid public base"))?;
     if url.query().is_some() || url.fragment().is_some() || url.path()!="/" {

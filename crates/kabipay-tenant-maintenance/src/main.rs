@@ -32,13 +32,11 @@ fn poll_interval() -> Duration {
 }
 async fn active_tenant_ids(
     ops: &DatabaseConnection,
-    bound_tenant: Option<Uuid>,
+    cache: &TenantDbCache,
 ) -> anyhow::Result<Vec<Uuid>> {
     let mut query =
         tenant_database::Entity::find().filter(tenant_database::Column::IsActive.eq(true));
-    if let Some(tenant_id) = bound_tenant {
-        query = query.filter(tenant_database::Column::TenantId.eq(tenant_id));
-    }
+    query = query.filter(tenant_database::Column::TenantId.is_in(cache.configured_tenant_ids()));
     let rows = query.all(ops).await.context("list tenant_database")?;
     let mut seen = HashSet::new();
     let mut out = Vec::new();
@@ -56,9 +54,7 @@ async fn main() -> anyhow::Result<()> {
     init_tracing("kabipay-tenant-maintenance");
 
     let cache = TenantDbCache::from_env()?;
-    let bound_tenant = cache
-        .bound_tenant_id()
-        .context("Tenant maintenance requires a bound company source")?;
+    anyhow::ensure!(cache.is_company_runtime(), "Tenant maintenance requires configured company sources");
     let dsn = ops_dsn_from_env();
     let ops_db = connect_ops_db(&dsn)
         .await
@@ -67,6 +63,10 @@ async fn main() -> anyhow::Result<()> {
     let fallback: TenantDbConfig = tenant_db_config_from_env();
     let args: Vec<String> = std::env::args().skip(1).collect();
     if !args.is_empty() {
+        // Destructive/one-off handoff tooling stays an explicit single-company
+        // invocation; the shared daemon never fans an operator command out.
+        let bound_tenant = cache.bound_tenant_id()
+            .context("Operator maintenance requires an explicit fixed company binding")?;
         let db = resolve_required_tenant_db(bound_tenant, &ops_db, &cache, &fallback).await?;
         match args.as_slice() {
             [mode, path] if mode == "--migrate-delivery" => {
@@ -87,7 +87,7 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!(poll_ms = interval.as_millis(), "tenant maintenance started");
 
     loop {
-        match active_tenant_ids(&ops_db, Some(bound_tenant)).await {
+        match active_tenant_ids(&ops_db, &cache).await {
             Ok(tenants) => {
                 for tid in tenants {
                     match resolve_required_tenant_db(tid, &ops_db, &cache, &fallback).await {

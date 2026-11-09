@@ -28,7 +28,9 @@ use std::time::Duration;
 use uuid::Uuid;
 
 mod bound;
+mod shared;
 pub use bound::BoundTenantDatabase;
+pub use shared::{company_public_origin, company_setting, shared_company_ids};
 
 fn pool_max_connections(fallback: u32) -> u32 {
     std::env::var("KABIPAY_DB_POOL_MAX")
@@ -92,6 +94,7 @@ pub struct TenantDbHandle {
 pub struct TenantDbCache {
     inner: Arc<DashMap<Uuid, TenantDbHandle>>,
     binding: Option<Arc<BoundTenantDatabase>>,
+    shared: Option<Arc<shared::SharedCompanies>>,
     bound_initialization: Arc<tokio::sync::Mutex<()>>,
 }
 
@@ -306,6 +309,9 @@ async fn resolve_tenant_handle_with_policy(
     fallback_cfg: &TenantDbConfig,
     policy: MissingTenantDbPolicy,
 ) -> KabiPayResult<TenantDbHandle> {
+    if cache.shared.is_some() {
+        return cache.resolve_shared(tenant_id, ops_db).await;
+    }
     if cache.binding.is_some() {
         return cache.resolve_bound(tenant_id).await;
     }

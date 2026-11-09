@@ -13,6 +13,9 @@ use uuid::Uuid;
 
 /// Load only the operator configured key file. Runtime input cannot select its path.
 pub fn configured_keyring() -> KabiPayResult<Keyring> {
+    if crate::db::shared_company_ids()?.is_some() {
+        return Err(KabiPayError::Internal("shared private event access requires a company".into()));
+    }
     let path = std::env::var_os("KABIPAY_PRIVATE_EVENT_KEYS_FILE")
         .ok_or_else(|| KabiPayError::Internal("private event keys are not configured".into()))?;
     let mut bytes = Vec::new();
@@ -21,6 +24,14 @@ pub fn configured_keyring() -> KabiPayResult<Keyring> {
         .map_err(|_| {
             KabiPayError::Internal("private event key configuration unavailable".into())
         })?;
+    Keyring::from_json(&bytes)
+}
+
+pub fn configured_company_keyring(tenant: Uuid) -> KabiPayResult<Keyring> {
+    let path = crate::db::company_setting(tenant, "KABIPAY_PRIVATE_EVENT_KEYS_FILE")?;
+    let mut bytes = Vec::new();
+    std::fs::File::open(path).and_then(|f| f.take(65537).read_to_end(&mut bytes))
+        .map_err(|_| KabiPayError::Internal("private event key configuration unavailable".into()))?;
     Keyring::from_json(&bytes)
 }
 
@@ -93,7 +104,7 @@ pub async fn append_audit<C: ConnectionTrait>(
     db: &C,
     input: &AuditRecordInput,
 ) -> KabiPayResult<Uuid> {
-    append_audit_with_keyring(db, input, &configured_keyring()?).await
+    append_audit_with_keyring(db, input, &configured_company_keyring(input.tenant_id)?).await
 }
 pub async fn append_audit_with_keyring<C: ConnectionTrait>(
     db: &C,
@@ -128,7 +139,7 @@ pub async fn enqueue_delivery<C: ConnectionTrait>(
     db: &C,
     input: &DeliveryIntentInput,
 ) -> KabiPayResult<Uuid> {
-    enqueue_delivery_with_keyring(db, input, &configured_keyring()?).await
+    enqueue_delivery_with_keyring(db, input, &configured_company_keyring(input.tenant_id)?).await
 }
 pub async fn enqueue_delivery_with_keyring<C: ConnectionTrait>(
     db: &C,

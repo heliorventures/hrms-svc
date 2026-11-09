@@ -68,7 +68,8 @@ async fn read_file_bytes(
             });
     }
     if row.provider == PROVIDER_LOCAL {
-        if row.storage_path.contains('\\')
+        if !row.storage_path.starts_with(&format!("tenants/{}/", row.tenant_id))
+            || row.storage_path.contains('\\')
             || Path::new(&row.storage_path).components().any(|part| {
                 matches!(
                     part,
@@ -84,7 +85,9 @@ async fn read_file_bytes(
         let full = tokio::fs::canonicalize(root.join(&row.storage_path))
             .await
             .map_err(read_error)?;
-        if !full.starts_with(&root) {
+        let company_root = tokio::fs::canonicalize(root.join(format!("tenants/{}", row.tenant_id)))
+            .await.map_err(read_error)?;
+        if !company_root.starts_with(&root) || !full.starts_with(&company_root) {
             return Err(KabiPayError::Validation("invalid file path".into()));
         }
         let file = tokio::fs::File::open(full).await.map_err(read_error)?;
@@ -162,13 +165,16 @@ mod tests {
                 Err(KabiPayError::Validation(_))
             ));
         }
+        let mut missing = file_row("");
+        missing.storage_path = format!("tenants/{}/evidence.pdf", missing.tenant_id);
         let error = read_stored_file_bytes(
             &db,
             Path::new("a-nonexistent-private-directory"),
-            &file_row("evidence.pdf"),
+            &missing,
         )
         .await
         .unwrap_err();
+        assert!(matches!(error, KabiPayError::NotFound { .. }));
         assert!(!error
             .to_string()
             .contains("a-nonexistent-private-directory"));
@@ -177,21 +183,30 @@ mod tests {
     #[tokio::test]
     async fn private_file_reader_bounds_actual_content_and_rejects_unknown_provider() {
         let root = std::env::temp_dir().join(format!("hrms-reader-{}", Uuid::new_v4()));
-        tokio::fs::create_dir(&root).await.unwrap();
-        let path = root.join("evidence.pdf");
+        let mut row = file_row("");
+        row.storage_path = format!("tenants/{}/evidence.pdf", row.tenant_id);
+        let company_root = root.join(format!("tenants/{}", row.tenant_id));
+        tokio::fs::create_dir_all(&company_root).await.unwrap();
+        let path = root.join(&row.storage_path);
         let db = DatabaseConnection::Disconnected;
         tokio::fs::write(&path, b"pdf").await.unwrap();
         assert_eq!(
-            read_stored_file_bytes(&db, &root, &file_row("evidence.pdf"))
+            read_stored_file_bytes(&db, &root, &row)
                 .await
                 .unwrap(),
             b"pdf"
         );
+        let mut wrong_company = row.clone();
+        wrong_company.tenant_id = Uuid::new_v4();
+        assert!(matches!(
+            read_stored_file_bytes(&db, &root, &wrong_company).await,
+            Err(KabiPayError::Validation(_))
+        ));
         tokio::fs::write(&path, vec![0; MAX_FILE_BYTES as usize + 2])
             .await
             .unwrap();
         assert!(matches!(
-            read_stored_file_bytes(&db, &root, &file_row("evidence.pdf")).await,
+            read_stored_file_bytes(&db, &root, &row).await,
             Err(KabiPayError::Validation(_))
         ));
         let mut unsupported = file_row("evidence.pdf");
@@ -201,6 +216,8 @@ mod tests {
             Err(KabiPayError::Validation(_))
         ));
         tokio::fs::remove_file(path).await.unwrap();
+        tokio::fs::remove_dir(company_root).await.unwrap();
+        tokio::fs::remove_dir(root.join("tenants")).await.unwrap();
         tokio::fs::remove_dir(root).await.unwrap();
     }
 }

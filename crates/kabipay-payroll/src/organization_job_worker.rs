@@ -33,20 +33,26 @@ pub fn start(schema: Arc<PayrollSchema>) {
     });
 }
 async fn sweep(schema: &PayrollSchema) -> KabiPayResult<()> {
-    // Organization commands are accepted only by a fixed-company deployment.
+    // Each company retains its own job claims, source transaction and outcome.
     let ops = schema
         .data::<DatabaseConnection>()
         .ok_or_else(unavailable)?;
     let cache = schema.data::<TenantDbCache>().ok_or_else(unavailable)?;
-    if cache.bound_tenant_id().is_none() {
+    if !cache.is_company_runtime() {
         return Ok(());
     }
     let fallback = schema.data::<TenantDbConfig>().ok_or_else(unavailable)?;
-    let (tenant, db) = kabipay_organization_tenant::fixed_database(cache, ops, fallback).await?;
+    for tenant in cache.configured_tenant_ids() {
+    let result = async {
+    let db = kabipay_common::db::resolve_required_tenant_db(tenant, ops, cache, fallback).await?;
     for _ in 0..5 {
         if !run_one(&db, ops, tenant).await? {
             break;
         }
+    }
+    Ok::<_, KabiPayError>(())
+    }.await;
+    if let Err(error) = result { tracing::warn!(%tenant,code=error.code(),"Organization payroll company sweep deferred"); }
     }
     Ok(())
 }

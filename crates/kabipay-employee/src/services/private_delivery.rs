@@ -105,7 +105,7 @@ fn key(encoded: &str) -> KabiPayResult<Vec<u8>> {
     Ok(bytes)
 }
 fn configured_binding(tenant: Uuid) -> KabiPayResult<Binding> {
-    let path = std::env::var_os("KABIPAY_PRIVATE_DELIVERY_ADAPTER_FILE").ok_or_else(unavailable)?;
+    let path = kabipay_common::db::company_setting(tenant, "KABIPAY_PRIVATE_DELIVERY_ADAPTER_FILE")?;
     let mut bytes = Vec::new();
     std::fs::File::open(path)
         .and_then(|file| file.take(65537).read_to_end(&mut bytes))
@@ -271,7 +271,7 @@ async fn load_intent<C: ConnectionTrait>(
     {
         return Err(rejected());
     }
-    let bytes = private_events::configured_keyring()?.decrypt_frames(
+    let bytes = private_events::configured_company_keyring(request.tenant_id)?.decrypt_frames(
         &frames,
         request.tenant_id,
         "delivery",

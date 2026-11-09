@@ -111,7 +111,7 @@ pub fn verify_request(
 }
 pub fn authorize(envelope: &SignedOwnershipRequest) -> KabiPayResult<()> {
     let (generation, key) = super::private_delivery::ownership_secret(envelope.request.tenant_id)?;
-    let owner = std::env::var("KABIPAY_PRIVATE_DELIVERY_BROKER_OWNER_ID")
+    let owner = kabipay_common::db::company_setting(envelope.request.tenant_id, "KABIPAY_PRIVATE_DELIVERY_BROKER_OWNER_ID")
         .ok()
         .and_then(|s| s.parse().ok())
         .ok_or_else(denied)?;

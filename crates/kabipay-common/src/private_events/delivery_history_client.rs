@@ -1,6 +1,6 @@
 //! Source scoped delivery history and source authorized broker replay.
 use super::{
-    configured_keyring,
+    configured_company_keyring,
     crypto::{source_hash, Envelope, SourceHead},
     history_client::{binding_for_path, history_http_client, sign, verify, Proof},
     AuditRecordInput, DeliveryIntentInput,
@@ -320,7 +320,7 @@ async fn read_inner<C: ConnectionTrait + TransactionTrait>(
     filter: &DeliveryHistoryFilter,
 ) -> KabiPayResult<Vec<DeliveryHistoryRecord>> {
     let path =
-        std::env::var_os("KABIPAY_PRIVATE_DELIVERY_HISTORY_CLIENT_FILE").ok_or_else(unavailable)?;
+        crate::db::company_setting(tenant, "KABIPAY_PRIVATE_DELIVERY_HISTORY_CLIENT_FILE")?;
     let mut config = Vec::new();
     std::fs::File::open(path)
         .and_then(|f| f.take(65537).read_to_end(&mut config))
@@ -343,7 +343,7 @@ async fn read_inner<C: ConnectionTrait + TransactionTrait>(
             sha256: row.try_get("", "source_sha256")?,
         });
     }
-    let keys = configured_keyring()?;
+    let keys = configured_company_keyring(tenant)?;
     let mut frames: BTreeMap<Uuid, Vec<Envelope>> = BTreeMap::new();
     let mut cursor = Uuid::nil();
     let mut size = 0usize;
@@ -403,7 +403,7 @@ async fn read_inner<C: ConnectionTrait + TransactionTrait>(
         };
         let raw = serde_json::to_vec(&request)?;
         let proof = sign(&raw, &key, "kabipay-private-delivery-history-request-v1")?;
-        let mut response = history_http_client()?
+        let mut response = history_http_client(tenant)?
             .post(url.clone())
             .header("content-type", "application/json")
             .body(serde_json::to_vec(&proof)?)
@@ -476,7 +476,7 @@ pub async fn append_delivery_replay<C: ConnectionTrait>(
     actor: Uuid,
     intent: &DeliveryIntentInput,
 ) -> KabiPayResult<()> {
-    append_delivery_replay_with_keyring(db, tenant, actor, intent, &configured_keyring()?).await
+    append_delivery_replay_with_keyring(db, tenant, actor, intent, &configured_company_keyring(tenant)?).await
 }
 async fn append_delivery_replay_with_keyring<C: ConnectionTrait>(
     db: &C,

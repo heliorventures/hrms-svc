@@ -1,4 +1,4 @@
-use crate::{fixed_database, handle, SourceAdapter};
+use crate::{command_database, handle, SourceAdapter};
 use async_graphql::{ObjectType, Schema, SubscriptionType};
 use axum::{
     body::Bytes,
@@ -30,13 +30,13 @@ where
                         let fail = || {
                             (
                                 StatusCode::SERVICE_UNAVAILABLE,
-                                "Organization runtime requires a fixed company binding".to_owned(),
+                                "Organization company routing unavailable".to_owned(),
                             )
                         };
                         let cache = schema.data::<TenantDbCache>().ok_or_else(fail)?;
                         let ops = schema.data::<DatabaseConnection>().ok_or_else(fail)?;
                         let fallback = schema.data::<TenantDbConfig>().ok_or_else(fail)?;
-                        let (tenant, db) = fixed_database(cache, ops, fallback)
+                        let (tenant, db) = command_database(adapter.service(), &headers, &body, cache, ops, fallback)
                             .await
                             .map_err(|_| fail())?;
                         handle(adapter, tenant, db, ops, headers, body).await

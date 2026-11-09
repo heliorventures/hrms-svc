@@ -76,9 +76,11 @@ pub fn check_invitation(row: &candidate::Model, token: &str,
     Ok(())
 }
 pub fn private_url(token: &str) -> Result<String> {
-    let raw =
-        std::env::var("KABIPAY_PREJOINING_PUBLIC_ORIGIN").map_err(|_|
-                    Error::Internal("pre-joining public origin is not configured".into()))?;
+    let raw = match kabipay_common::db::company_public_origin(verify_token(token)?.0)? {
+        Some(origin) => origin,
+        None => std::env::var("KABIPAY_PREJOINING_PUBLIC_ORIGIN").map_err(|_|
+            Error::Internal("pre-joining public origin is not configured".into()))?,
+    };
     let url =
         reqwest::Url::parse(&raw).map_err(|_|
                     Error::Internal("invalid pre-joining public origin".into()))?;

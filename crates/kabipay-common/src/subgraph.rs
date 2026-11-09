@@ -318,7 +318,7 @@ where
     crate::env_file::load_dotenv();
     init_tracing(cfg.service_name);
     let cache = TenantDbCache::from_env()?;
-    if cfg.service_name == "kabipay-ops" && cache.bound_tenant_id().is_some() {
+    if cfg.service_name == "kabipay-ops" && cache.is_company_runtime() {
         anyhow::bail!("the ops service cannot use a company database binding");
     }
 
@@ -504,7 +504,7 @@ fn validate_bound_identity(
     cache: Option<&TenantDbCache>,
     identity: &RequestIdentity,
 ) -> KabiPayResult<()> {
-    let Some(cache) = cache.filter(|cache| cache.bound_tenant_id().is_some()) else {
+    let Some(cache) = cache.filter(|cache| cache.is_company_runtime()) else {
         return Ok(());
     };
     match identity {
