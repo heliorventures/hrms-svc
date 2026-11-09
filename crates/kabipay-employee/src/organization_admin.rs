@@ -173,17 +173,7 @@ pub(super) async fn execute(
             .await?;
         }
         Op::EmployeeUpdate | Op::EmployeeEmployment => {
-            let mut patch = employees::EmployeePatch {
-                first_name: None,
-                last_name: None,
-                department_id: None,
-                designation_id: None,
-                reporting_manager_id: None,
-                employment_type: None,
-                status: None,
-                user_id: None,
-                linked_user_email: None,
-            };
+            let mut patch = employees::EmployeePatch::default();
             if c.operation == Op::EmployeeEmployment {
                 let i: EmploymentInput = serde_json::from_value(c.payload.clone())?;
                 let status = kabipay_common::context::canonical_employment_status(&i.status)?;

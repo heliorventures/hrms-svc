@@ -137,15 +137,8 @@ mod employee_status_boundary_tests {
 
     fn status_only_patch(status: &str) -> EmployeePatch {
         EmployeePatch {
-            first_name: None,
-            last_name: None,
-            department_id: None,
-            designation_id: None,
-            reporting_manager_id: None,
-            employment_type: None,
             status: Some(status.into()),
-            user_id: None,
-            linked_user_email: None,
+            ..Default::default()
         }
     }
 
@@ -1054,7 +1047,10 @@ pub async fn create_with_id<C: ConnectionTrait>(db: &C, tenant_id: Uuid, id: Uui
 }
 
 /// Partial update: each `Some` field replaces the column; `None` = leave unchanged.
+#[derive(Default)]
 pub struct EmployeePatch {
+    pub employee_code: Option<String>,
+    pub date_of_joining: Option<NaiveDate>,
     pub first_name: Option<String>,
     pub last_name: Option<String>,
     pub department_id: Option<Uuid>,
@@ -1066,6 +1062,19 @@ pub struct EmployeePatch {
     pub user_id: Option<Uuid>,
     /// Omitted = leave unchanged; Some("") clears the optional linked login email.
     pub linked_user_email: Option<String>,
+}
+
+fn normalize_employee_identity_fields(patch: &mut EmployeePatch) -> KabiPayResult<()> {
+    if let Some(code) = patch.employee_code.as_mut() {
+        let trimmed = code.trim();
+        if trimmed.is_empty() || trimmed.chars().count() > 50 {
+            return Err(KabiPayError::Validation(
+                "employeeCode must contain between 1 and 50 characters".into(),
+            ));
+        }
+        *code = trimmed.to_owned();
+    }
+    Ok(())
 }
 
 pub async fn create_with_login(
@@ -1207,7 +1216,8 @@ pub async fn reset_linked_user_password(
 pub async fn update(db: &DatabaseConnection, tenant_id: Uuid, employee_id: Uuid, patch: EmployeePatch) -> KabiPayResult<employee::Model> {
     update_for_actor(db,tenant_id,employee_id,patch,None).await
 }
-pub async fn update_for_actor(db: &DatabaseConnection, tenant_id: Uuid, employee_id: Uuid, patch: EmployeePatch, actor: Option<Uuid>) -> KabiPayResult<employee::Model> {
+pub async fn update_for_actor(db: &DatabaseConnection, tenant_id: Uuid, employee_id: Uuid, mut patch: EmployeePatch, actor: Option<Uuid>) -> KabiPayResult<employee::Model> {
+    normalize_employee_identity_fields(&mut patch)?;
     if let Some(status) = &patch.status { canonical_employment_status(status)?; }
     let txn = db.begin().await?;
     let result = update_in_transaction(&txn, tenant_id, employee_id, patch, &actor.into_iter().collect::<Vec<_>>()).await?;
@@ -1215,6 +1225,7 @@ pub async fn update_for_actor(db: &DatabaseConnection, tenant_id: Uuid, employee
     Ok(result)
 }
 pub async fn update_in_transaction(txn: &sea_orm::DatabaseTransaction, tenant_id: Uuid, employee_id: Uuid, mut patch: EmployeePatch, actor_target_user_ids: &[Uuid]) -> KabiPayResult<employee::Model> {
+    normalize_employee_identity_fields(&mut patch)?;
     if let Some(status) = patch.status.as_mut() {
         *status = canonical_employment_status(status)?.to_owned();
     }
@@ -1240,6 +1251,12 @@ pub async fn update_in_transaction(txn: &sea_orm::DatabaseTransaction, tenant_id
     }
     let mut final_status = existing.status.clone();
     let mut am: employee::ActiveModel = existing.into();
+    if let Some(code) = patch.employee_code {
+        am.employee_code = Set(code);
+    }
+    if let Some(date) = patch.date_of_joining {
+        am.date_of_joining = Set(date);
+    }
     if let Some(v) = patch.first_name {
         am.first_name = Set(v);
     }
@@ -1273,7 +1290,7 @@ pub async fn update_in_transaction(txn: &sea_orm::DatabaseTransaction, tenant_id
     let linked_user_email = patch.linked_user_email;
     am.user_id = Set(final_user_id);
     am.updated_at = Set(Utc::now());
-    am.update(txn).await?;
+    am.update(txn).await.map_err(map_employee_db_error)?;
     if let Some(email) = linked_user_email {
         update_linked_user_email(txn, tenant_id, final_user_id, Some(email)).await?;
     }

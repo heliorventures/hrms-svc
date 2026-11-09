@@ -410,6 +410,8 @@ impl MutationRoot {
             Some(Some(ref id)) => Some(Some(parse_uuid(id, "reportingManagerId")?)),
         };
         let patch = EmployeePatch {
+            employee_code: input.employee_code,
+            date_of_joining: input.date_of_joining,
             first_name: input.first_name,
             last_name: input.last_name,
             department_id: opt_uuid(&input.department_id, "departmentId")?,

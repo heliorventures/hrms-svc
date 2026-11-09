@@ -529,6 +529,10 @@ pub struct ResetEmployeePasswordInput {
 #[derive(InputObject, Clone, Debug)]
 pub struct UpdateEmployeeInput {
     pub id: ID,
+    /// Omit to leave the tenant-unique employee code unchanged.
+    pub employee_code: Option<String>,
+    /// Omit to leave the joining date unchanged.
+    pub date_of_joining: Option<NaiveDate>,
     pub first_name: Option<String>,
     pub last_name: Option<String>,
     pub department_id: Option<ID>,
