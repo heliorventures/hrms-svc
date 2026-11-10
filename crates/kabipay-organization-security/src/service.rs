@@ -11,6 +11,7 @@ use uuid::Uuid;
 pub const SERVICE_ISSUER: &str = "kabipay-internal-service";
 pub const SERVICE_TOKEN_TYPE: &str = "hrms-service+jwt";
 const MAX_LIFETIME: u64 = 60;
+const MAX_SHARED_COMPANIES: usize = 100;
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServiceCredentialClaims {
@@ -106,7 +107,22 @@ impl ServiceCredentialIssuer {
 }
 impl ServiceCredentialVerifier {
     pub fn new(audience: &str, keys: Vec<ServiceVerificationKey>) -> Result<Self, DelegationError> {
-        if !service_name(audience) || keys.is_empty() {
+        Self::new_with_shared_keys(audience, keys, &[])
+    }
+
+    /// Only operator-reviewed key IDs may use an explicit multi-company scope.
+    /// The default constructor retains the isolated-company restriction.
+    pub fn new_with_shared_keys(
+        audience: &str,
+        keys: Vec<ServiceVerificationKey>,
+        shared_kids: &[&str],
+    ) -> Result<Self, DelegationError> {
+        let shared: HashSet<_> = shared_kids.iter().copied().collect();
+        if !service_name(audience)
+            || keys.is_empty()
+            || shared.len() != shared_kids.len()
+            || shared.iter().any(|kid| !key_id(kid))
+        {
             return Err(DelegationError::Configuration);
         }
         let mut parsed = HashMap::new();
@@ -116,7 +132,10 @@ impl ServiceCredentialVerifier {
             if !key_id(&entry.kid)
                 || !service_name(&entry.service)
                 || tenants.is_empty()
-                || (entry.service != "kabipay-organization" && tenants.len() != 1)
+                || (entry.service != "kabipay-organization"
+                    && tenants.len() != 1
+                    && !shared.contains(entry.kid.as_str()))
+                || (shared.contains(entry.kid.as_str()) && tenants.len() > MAX_SHARED_COMPANIES)
                 || tenants.contains(&Uuid::nil())
                 || tenants.len() != entry.tenant_ids.len()
                 || parsed.contains_key(&entry.kid)
@@ -124,9 +143,17 @@ impl ServiceCredentialVerifier {
             {
                 return Err(DelegationError::Configuration);
             }
-            let material: Vec<u8> = entry.public_pem.iter().copied().filter(|b| !b.is_ascii_whitespace()).collect();
+            let material: Vec<u8> = entry
+                .public_pem
+                .iter()
+                .copied()
+                .filter(|b| !b.is_ascii_whitespace())
+                .collect();
             let identity = (entry.service.clone(), tenants.clone());
-            if identities.get(&material).is_some_and(|existing| existing != &identity) {
+            if identities
+                .get(&material)
+                .is_some_and(|existing| existing != &identity)
+            {
                 return Err(DelegationError::Configuration);
             }
             identities.insert(material, identity);
@@ -139,6 +166,9 @@ impl ServiceCredentialVerifier {
                         .map_err(|_| DelegationError::Configuration)?,
                 },
             );
+        }
+        if shared.iter().any(|kid| !parsed.contains_key(*kid)) {
+            return Err(DelegationError::Configuration);
         }
         Ok(Self {
             audience: audience.into(),

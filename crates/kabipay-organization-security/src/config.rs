@@ -32,16 +32,29 @@ struct TrustedConfig {
     service: String,
     tenant_ids: Vec<Uuid>,
     public_key_file: String,
+    #[serde(default)]
+    shared_runtime: bool,
 }
 pub fn service_verifier_from_env(
     audience: &str,
 ) -> Result<ServiceCredentialVerifier, DelegationError> {
     let input = env("KABIPAY_SERVICE_TRUST_KEYS")?;
+    service_verifier_from_config(audience, &input)
+}
+fn service_verifier_from_config(
+    audience: &str,
+    input: &str,
+) -> Result<ServiceCredentialVerifier, DelegationError> {
     if input.len() > 65536 {
         return Err(DelegationError::Configuration);
     }
     let configs: Vec<TrustedConfig> =
-        serde_json::from_str(&input).map_err(|_| DelegationError::Configuration)?;
+        serde_json::from_str(input).map_err(|_| DelegationError::Configuration)?;
+    let shared: Vec<_> = configs
+        .iter()
+        .filter(|c| c.shared_runtime)
+        .map(|c| c.kid.clone())
+        .collect();
     let keys = configs
         .into_iter()
         .map(|c| {
@@ -53,7 +66,79 @@ pub fn service_verifier_from_env(
             })
         })
         .collect::<Result<Vec<_>, DelegationError>>()?;
-    ServiceCredentialVerifier::new(audience, keys)
+    let shared_refs: Vec<_> = shared.iter().map(String::as_str).collect();
+    ServiceCredentialVerifier::new_with_shared_keys(audience, keys, &shared_refs)
+}
+
+#[cfg(test)]
+mod shared_trust_tests {
+    use super::{service_verifier_from_config, TrustedConfig};
+    use crate::ServiceCredentialIssuer;
+    use uuid::Uuid;
+
+    #[test]
+    fn trusted_configuration_accepts_explicit_shared_runtime_opt_in() {
+        let input = r#"{"kid":"shared-leave-v1","service":"kabipay-leave","tenant_ids":["11111111-1111-4111-8111-111111111111","22222222-2222-4222-8222-222222222222"],"public_key_file":"/run/public-keys/leave.pem","shared_runtime":true}"#;
+        assert!(
+            serde_json::from_str::<TrustedConfig>(input)
+                .unwrap()
+                .shared_runtime
+        );
+    }
+
+    #[test]
+    fn deployment_configuration_requires_opt_in_and_checks_actual_signed_companies() {
+        let public = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/test-a-public.pem");
+        let a = Uuid::from_u128(1);
+        let b = Uuid::from_u128(2);
+        let mut entry = serde_json::json!({"kid":"shared-leave-v1","service":"kabipay-leave","tenant_ids":[a,b],"public_key_file":public});
+        let config = |entry: &serde_json::Value| serde_json::to_string(&vec![entry]).unwrap();
+        assert!(service_verifier_from_config("kabipay-organization", &config(&entry)).is_err());
+        entry["shared_runtime"] = false.into();
+        assert!(service_verifier_from_config("kabipay-organization", &config(&entry)).is_err());
+        entry["shared_runtime"] = true.into();
+        let verifier =
+            service_verifier_from_config("kabipay-organization", &config(&entry)).unwrap();
+        let issuer = ServiceCredentialIssuer::new(
+            "kabipay-leave",
+            "shared-leave-v1",
+            include_bytes!("../tests/fixtures/test-a-private.pem"),
+        )
+        .unwrap();
+        for tenant in [a, b] {
+            let proof = issuer
+                .issue(
+                    "kabipay-organization",
+                    tenant,
+                    "/internal/organization/policy",
+                    b"request",
+                )
+                .unwrap();
+            assert!(verifier
+                .verify(&proof, tenant, "/internal/organization/policy", b"request")
+                .is_ok());
+        }
+        let unlisted = Uuid::from_u128(3);
+        let proof = issuer
+            .issue(
+                "kabipay-organization",
+                unlisted,
+                "/internal/organization/policy",
+                b"request",
+            )
+            .unwrap();
+        assert!(verifier
+            .verify(
+                &proof,
+                unlisted,
+                "/internal/organization/policy",
+                b"request"
+            )
+            .is_err());
+        entry["shared_runtime"] = "true".into();
+        assert!(service_verifier_from_config("kabipay-organization", &config(&entry)).is_err());
+    }
 }
 pub fn delegation_verifier_from_env(
     tenant: Uuid,
