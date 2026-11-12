@@ -35,6 +35,9 @@ use std::{net::SocketAddr, sync::Arc};
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
 use uuid::Uuid;
 
+#[path = "subgraph_discovery.rs"]
+mod schema_discovery;
+
 /// Dev-only HTTP header used to propagate the current tenant id when no
 /// `Authorization: Bearer <jwt>` is present. Production deployments should
 /// NEVER rely on this header; set `KABIPAY_REQUIRE_AUTH=1` to reject
@@ -392,8 +395,14 @@ where
     };
     req = req.data(hints);
     let identity = extract_request_identity(&headers)?;
-    validate_bound_identity(schema.data::<TenantDbCache>(), &identity)
-        .map_err(|error| (error.http_status(), error.to_string()))?;
+    // Gateway composition has no user token. Admit only parsed schema metadata;
+    // malformed credentials and authenticated identities keep their normal checks.
+    let anonymous_discovery = matches!(&identity, RequestIdentity::None)
+        && schema_discovery::is_schema_discovery(&mut req);
+    if !anonymous_discovery {
+        validate_bound_identity(schema.data::<TenantDbCache>(), &identity)
+            .map_err(|error| (error.http_status(), error.to_string()))?;
+    }
     match identity {
         RequestIdentity::Client { tenant_id, claims } => {
             req = req.data(TenantId(tenant_id));
@@ -546,6 +555,10 @@ fn validate_bound_identity(
 #[cfg(test)]
 #[path = "subgraph_bound_tests.rs"]
 mod bound_security_tests;
+
+#[cfg(test)]
+#[path = "subgraph_discovery_tests.rs"]
+mod discovery_tests;
 
 /// Resolve who is calling the subgraph.
 ///
