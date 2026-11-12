@@ -19,3 +19,17 @@ async fn anonymous_schema_discovery_does_not_authorize_business_fields() {
         "unauthorised — invalid or missing token"
     );
 }
+
+#[tokio::test]
+async fn gateway_schema_discovery_fits_the_organization_request_limits() {
+    let schema = build_schema(Store::new(DatabaseConnection::Disconnected));
+    let response = schema
+        .execute(include_str!("fixtures/gateway-introspection.graphql"))
+        .await;
+    assert!(
+        response.errors.is_empty(),
+        "gateway discovery must respect the existing depth and complexity limits: {:?}",
+        response.errors
+    );
+    assert!(response.data.into_json().unwrap()["__schema"].is_object());
+}
