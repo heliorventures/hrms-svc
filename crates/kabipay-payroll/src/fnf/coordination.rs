@@ -113,6 +113,7 @@ mod tests {
 
 pub(crate) async fn apply(
     db: &DatabaseConnection,
+    ops: &DatabaseConnection,
     tenant: Uuid,
     claims: Option<&ClientClaims>,
     action: FinanceAction,
@@ -120,7 +121,7 @@ pub(crate) async fn apply(
 ) -> KabiPayResult<ExitAuthorization> {
     let input = registered(operation);
     let actor = if action == FinanceAction::PrepareExitApproval {
-        Some(validate_prepare(tenant, claims, operation)?)
+        Some(validate_prepare(tenant, claims, operation)?.with_tenant_entitlements(kabipay_common::entitlements::Entitlements::load(ops, tenant).await?).map_err(financial_error)?)
     } else {
         None
     };

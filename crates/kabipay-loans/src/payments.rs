@@ -48,7 +48,7 @@ pub(crate) async fn validate(
     terms.currency.validate_amount(payment.amount)?;
     if payment.amount <= Decimal::ZERO
         || payment.value_date < version.effective_from
-        || payment.value_date > lifecycle::today(tx, actor.tenant_id).await?
+        || payment.value_date > lifecycle::today(actor)?
     {
         return Err(LoanModuleError::InvalidCommand);
     }

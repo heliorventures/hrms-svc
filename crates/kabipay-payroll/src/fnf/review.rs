@@ -14,7 +14,11 @@ use rust_decimal::Decimal;
 use sea_orm::{ColumnTrait, DatabaseTransaction, EntityTrait, QueryFilter};
 use uuid::Uuid;
 
-pub(super) fn actor(claims: &ClientClaims, tenant: Uuid) -> KabiPayResult<LoanActorScope> {
+pub(super) fn actor(
+    claims: &ClientClaims,
+    tenant: Uuid,
+    entitlements: &kabipay_common::entitlements::Entitlements,
+) -> KabiPayResult<LoanActorScope> {
     if kabipay_common::client_data_scope::data_scope_from_claims(Some(claims), "onboarding:manage")?
         != ScopeType::All
     {
@@ -23,6 +27,7 @@ pub(super) fn actor(claims: &ClientClaims, tenant: Uuid) -> KabiPayResult<LoanAc
         ));
     }
     LoanActorScope::from_verified_claims(claims, tenant, LoanPermission::FnfRecovery)
+        .and_then(|actor| actor.with_tenant_entitlements(entitlements.clone()))
         .map_err(financial_error)
 }
 
@@ -81,6 +86,7 @@ pub(super) async fn calculate(
     tx: &DatabaseTransaction,
     tenant: Uuid,
     claims: &ClientClaims,
+    entitlements: &kabipay_common::entitlements::Entitlements,
     subject: &ExitSubject,
     fnf: Uuid,
     revision: i64,
@@ -95,8 +101,8 @@ pub(super) async fn calculate(
             "FNF requires approved separation and reviewed financial inputs".into(),
         ));
     }
-    let actor = actor(claims, tenant)?;
-    let state = kabipay_loans::payroll_loan_state(tx, tenant)
+    let actor = actor(claims, tenant, entitlements)?;
+    let state = kabipay_loans::payroll_loan_state_with_actor(tx, &actor)
         .await
         .map_err(financial_error)?;
     if state.currency.as_deref() != Some(input.currency.code.as_str()) {
@@ -188,7 +194,7 @@ pub(super) async fn calculate(
     }
     // A payout shortfall cannot erase the residual or bypass its repayment arrangement.
     kabipay_loans::validate_exit_decision(&exposure, &actual).map_err(financial_error)?;
-    let fingerprint = kabipay_loans::payroll_loan_state(tx, tenant)
+    let fingerprint = kabipay_loans::payroll_loan_state_with_actor(tx, &actor)
         .await
         .map_err(financial_error)?
         .fingerprint;

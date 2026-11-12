@@ -1,9 +1,7 @@
 //! Payment-date readiness is evaluated again when a draft is read or finalized.
 use super::payroll_draft::PayrollDraft;
 use chrono::NaiveDate;
-use kabipay_common::{tenant_business_clock::TenantBusinessClock, KabiPayError, KabiPayResult};
 use kabipay_db_entities::tenant::d0012_payroll::payroll_cycle;
-use sea_orm::{ConnectionTrait, DbBackend, Statement};
 
 fn date_reason(payment_date: NaiveDate, today: NaiveDate) -> Option<String> {
     (payment_date > today).then(|| format!(
@@ -22,47 +20,23 @@ fn apply_readiness(draft: &mut PayrollDraft, status: &str, reason: Option<String
     draft.finalization_block_reason = reason;
 }
 
-pub(crate) async fn refresh<C: ConnectionTrait>(
-    db: &C,
+/// Readiness consumes the operation date; company storage never resolves tenant metadata.
+pub(crate) fn refresh(
     cycle: &payroll_cycle::Model,
     draft: &mut PayrollDraft,
-) -> KabiPayResult<()> {
-    refresh_with_date(db, cycle, draft, None).await
-}
-
-pub(crate) async fn refresh_with_date<C: ConnectionTrait>(
-    db: &C,
-    cycle: &payroll_cycle::Model,
-    draft: &mut PayrollDraft,
-    current_date: Option<NaiveDate>,
-) -> KabiPayResult<()> {
-    let reason = if let Some(date) = cycle.payment_date {
-        if let Some(today) = current_date {
-            apply_readiness(draft, &cycle.status, date_reason(date, today));
-            return Ok(());
-        }
-        let row = db
-            .query_one(Statement::from_sql_and_values(
-                DbBackend::Postgres,
-                "SELECT timezone FROM kabipay_ops.tenant WHERE id=$1 AND is_deleted=FALSE",
-                [cycle.tenant_id.into()],
-            ))
-            .await?
-            .ok_or_else(|| KabiPayError::TenantNotFound(cycle.tenant_id.to_string()))?;
-        let timezone: Option<String> = row.try_get("", "timezone")?;
-        let clock = TenantBusinessClock::from_configured_name(timezone.as_deref())?;
-        date_reason(date, clock.now_date())
-    } else {
-        None
-    };
+    current_date: NaiveDate,
+) {
+    let reason = cycle
+        .payment_date
+        .and_then(|date| date_reason(date, current_date));
     apply_readiness(draft, &cycle.status, reason);
-    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::super::payroll_draft::DraftEmployee;
     use super::*;
+    use kabipay_common::tenant_business_clock::TenantBusinessClock;
     use uuid::Uuid;
 
     fn date(value: &str) -> NaiveDate {
@@ -139,8 +113,8 @@ mod tests {
         apply_readiness(&mut value, "DRAFT", None);
         assert!(!value.can_finalize);
     }
-    #[tokio::test]
-    async fn current_verified_company_date_needs_no_ops_tables_in_source_database() {
+    #[test]
+    fn current_verified_company_date_needs_no_ops_tables_in_source_database() {
         let mut value = draft("READY");
         let now = chrono::Utc::now();
         let cycle = payroll_cycle::Model {
@@ -156,23 +130,9 @@ mod tests {
             created_at: now,
             updated_at: now,
         };
-        refresh_with_date(
-            &sea_orm::DatabaseConnection::Disconnected,
-            &cycle,
-            &mut value,
-            Some(date("2026-10-09")),
-        )
-        .await
-        .unwrap();
+        refresh(&cycle, &mut value, date("2026-10-09"));
         assert!(!value.can_finalize);
-        refresh_with_date(
-            &sea_orm::DatabaseConnection::Disconnected,
-            &cycle,
-            &mut value,
-            Some(date("2026-10-10")),
-        )
-        .await
-        .unwrap();
+        refresh(&cycle, &mut value, date("2026-10-10"));
         assert!(value.can_finalize);
     }
 }

@@ -130,8 +130,17 @@ impl PayrollQueryRoot {
     ) -> Result<Option<async_graphql::Json<crate::services::payroll_draft::PayrollDraft>>> {
         require_payroll_tenant_all_scope(ctx, PERM_PAYROLL_MANAGE)?;
         let tenant = require_tenant_id(ctx)?;
+        let entitlements = ctx.data::<kabipay_common::entitlements::Entitlements>()?;
+        entitlements
+            .require_tenant(tenant)
+            .map_err(KabiPayError::into_graphql)?;
         let db = tenant_db(ctx, tenant).await?;
-        crate::services::payroll_draft::find(&db, tenant, parse_uuid(&cycle_id, "cycleId")?)
+        crate::services::payroll_draft::find(
+            &db,
+            tenant,
+            entitlements,
+            parse_uuid(&cycle_id, "cycleId")?,
+        )
             .await
             .map(|value| value.map(async_graphql::Json))
             .map_err(KabiPayError::into_graphql)

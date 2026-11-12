@@ -18,8 +18,8 @@ pub struct PayrollFinalization {
     pub payslips: usize,
 }
 
-pub async fn finalize_payroll_cycle(db:&DatabaseConnection,tenant:Uuid,claims:&kabipay_common::context::ClientClaims,id:Uuid,revision:i32,fingerprint:&str,acknowledgement:FinalizeAcknowledgement)->KabiPayResult<PayrollFinalization> {
- let actor=super::payroll_actor::PayrollActor::local(claims,tenant)?;
+pub async fn finalize_payroll_cycle(db:&DatabaseConnection,tenant:Uuid,claims:&kabipay_common::context::ClientClaims,entitlements:&kabipay_common::entitlements::Entitlements,id:Uuid,revision:i32,fingerprint:&str,acknowledgement:FinalizeAcknowledgement)->KabiPayResult<PayrollFinalization> {
+ let actor=super::payroll_actor::PayrollActor::local(claims,tenant,entitlements)?;
  let txn=db.begin().await?;
  let result=finalize_in_transaction(&txn,tenant,&actor,id,revision,fingerprint,acknowledgement).await?;
  txn.commit().await?;Ok(result)

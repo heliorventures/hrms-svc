@@ -141,7 +141,7 @@ pub(crate) async fn project_account(
     proposed: Option<DatedArrangement>,
     override_: Option<kabipay_loans_domain::PeriodOverride>,
 ) -> LoanResult<serde_json::Value> {
-    let today = crate::lifecycle::today(tx, actor.tenant_id).await?;
+    let today = crate::lifecycle::today(actor)?;
     if first.is_some_and(|date| date < today) {
         return Err(LoanModuleError::InvalidCommand);
     }

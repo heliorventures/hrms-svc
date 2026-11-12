@@ -40,7 +40,7 @@ pub struct LoanActorScope {
     pub(crate) tenant_id: Uuid,
     pub(crate) user_id: Option<Uuid>,
     pub(crate) principal_id: Option<Uuid>,
-    pub(crate) organization_entitlements: Option<kabipay_common::entitlements::Entitlements>,
+    pub(crate) tenant_entitlements: Option<kabipay_common::entitlements::Entitlements>,
     pub(crate) permission: LoanPermission,
     pub(crate) scope: ScopeType,
     pub(crate) can_correct_company_payments: bool,
@@ -66,7 +66,7 @@ impl LoanActorScope {
             tenant_id: tenant,
             user_id: Some(claims.sub),
             principal_id: None,
-            organization_entitlements: None,
+            tenant_entitlements: None,
             permission,
             scope,
             can_correct_company_payments: kabipay_common::client_data_scope::data_scope_from_claims(
@@ -88,11 +88,28 @@ impl LoanActorScope {
                 .local_user_id()
                 .is_none()
                 .then(|| proof.principal_id()),
-            organization_entitlements: Some(proof.entitlements().clone()),
+            tenant_entitlements: Some(proof.entitlements().clone()),
             permission: LoanPermission::PayrollRecovery,
             scope: ScopeType::All,
             can_correct_company_payments: false,
         }
+    }
+    /// Bind metadata loaded by the trusted control-plane connection. Never use a
+    /// company data transaction to construct this snapshot.
+    pub fn with_tenant_entitlements(
+        mut self,
+        entitlements: kabipay_common::entitlements::Entitlements,
+    ) -> LoanResult<Self> {
+        entitlements.require_tenant(self.tenant_id)?;
+        self.tenant_entitlements = Some(entitlements);
+        Ok(self)
+    }
+    pub(crate) fn entitlements(&self) -> LoanResult<&kabipay_common::entitlements::Entitlements> {
+        let context = self.tenant_entitlements
+            .as_ref()
+            .ok_or(LoanModuleError::PolicyUnavailable)?;
+        context.require_tenant(self.tenant_id)?;
+        Ok(context)
     }
     pub(crate) fn local_user(&self) -> LoanResult<Uuid> {
         self.user_id.ok_or(LoanModuleError::Forbidden)

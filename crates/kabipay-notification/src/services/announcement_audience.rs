@@ -38,14 +38,52 @@ use kabipay_db_entities::tenant::{
     },d0007_employee_core::employee
 };
 use sea_orm::{
-    ColumnTrait,ConnectionTrait,DatabaseConnection,DbBackend,EntityTrait,QueryFilter,Statement
+    ColumnTrait,ConnectionTrait,DatabaseConnection,DbBackend,EntityTrait,QueryFilter,QuerySelect,Statement
 };
 pub struct Viewer {
     pub roles: Vec<String>, pub department: Option<Uuid>, pub location: Option<Uuid>
 }
+#[cfg(test)]
+mod viewer_projection_tests {
+    use super::{viewer_account_allows_access, viewer_account_query};
+    use sea_orm::{DbBackend, QueryTrait, Values};
+    use uuid::Uuid;
+
+    #[test]
+    fn viewer_reads_only_eligibility_with_exact_tenant_and_owner() {
+        let tenant = Uuid::from_u128(2);
+        let owner = Uuid::from_u128(1);
+        let statement = viewer_account_query(tenant, owner).build(DbBackend::Postgres);
+        assert_eq!(statement.sql, "SELECT \"user\".\"is_active\", \"user\".\"is_deleted\", \"user\".\"must_change_password\" FROM \"user\" WHERE \"user\".\"id\" = $1 AND \"user\".\"tenant_id\" = $2");
+        assert_eq!(statement.values, Some(Values(vec![owner.into(), tenant.into()])));
+    }
+
+    #[test]
+    fn viewer_preserves_all_account_status_denials() {
+        for active in [false, true] {
+            for deleted in [false, true] {
+                for reset in [false, true] {
+                    assert_eq!(viewer_account_allows_access(Some((active, deleted, reset))), active && !deleted && !reset);
+                }
+            }
+        }
+        assert!(!viewer_account_allows_access(None));
+    }
+}
+fn viewer_account_query(tenant: Uuid, owner: Uuid) -> sea_orm::Select<user::Entity> {
+    user::Entity::find_by_id(owner)
+        .select_only()
+        .columns([user::Column::IsActive, user::Column::IsDeleted, user::Column::MustChangePassword])
+        .filter(user::Column::TenantId.eq(tenant))
+}
+
+fn viewer_account_allows_access(state: Option<(bool, bool, bool)>) -> bool {
+    matches!(state, Some((true, false, false)))
+}
+
 pub async fn current_viewer(db:&DatabaseConnection, tenant:Uuid, owner:Uuid) -> KabiPayResult<Viewer> {
-    let account=user::Entity::find_by_id(owner).filter(user::Column::TenantId.eq(tenant)).one(db).await?.ok_or(KabiPayError::Unauthorised)?;
-    if !account.is_active || account.is_deleted || account.must_change_password {
+    let account = viewer_account_query(tenant, owner).into_tuple::<(bool, bool, bool)>().one(db).await?;
+    if !viewer_account_allows_access(account) {
         return Err(KabiPayError::Unauthorised);
     }
     // A scope is effective only when its exact permission is granted by the same active role.

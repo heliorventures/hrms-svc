@@ -38,7 +38,7 @@ pub(crate) async fn calculate_account(
 ) -> LoanResult<AccountProjection> {
     let account = store::account(tx, actor.tenant_id, loan).await?;
     access::employee(tx, actor, account.employee_id).await?;
-    let today = lifecycle::today(tx, actor.tenant_id).await?;
+    let today = lifecycle::today(actor)?;
     let version = store::terms(tx, &account).await?;
     let terms: LoanTerms = serde_json::from_value(version.terms)?;
     let mut overrides = arrangement::overrides(tx, actor.tenant_id, loan).await?;

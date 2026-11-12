@@ -54,7 +54,9 @@ async fn subject(
                 .into_graphql(),
         );
     }
+    let entitlements = ctx.data::<kabipay_common::entitlements::Entitlements>()?.clone();
     let actor = LoanActorScope::from_verified_claims(claims, tenant, LoanPermission::ExitReview)
+        .and_then(|actor| actor.with_tenant_entitlements(entitlements))
         .map_err(super::coordination::financial_error)
         .map_err(KabiPayError::into_graphql)?;
     if separation.is_nil() {

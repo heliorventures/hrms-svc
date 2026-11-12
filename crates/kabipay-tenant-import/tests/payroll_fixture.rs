@@ -438,9 +438,10 @@ async fn reviewed_run(
 {
     use kabipay_payroll::services::{payroll_draft, payroll_finalize};
     let claims = payroll_claims(tenant, actor);
-    let first = payroll_draft::calculate_payroll_cycle(db, tenant, &claims, cycle, None).await?;
+    let metadata = kabipay_common::entitlements::Entitlements::load(db, tenant).await?;
+    let first = payroll_draft::calculate_payroll_cycle(db, tenant, &claims, &metadata,  cycle, None).await?;
     let mut draft =
-        payroll_draft::calculate_payroll_cycle(db, tenant, &claims, cycle, Some(first.revision))
+        payroll_draft::calculate_payroll_cycle(db, tenant, &claims, &metadata,  cycle, Some(first.revision))
             .await?;
     assert_eq!(draft.revision, first.revision + 1);
     let count = db
@@ -490,7 +491,7 @@ async fn reviewed_run(
         payroll_finalize::finalize_payroll_cycle(
             db,
             tenant,
-            &claims,
+            &claims, &metadata,
             cycle,
             draft.revision,
             &draft.fingerprint,
@@ -500,14 +501,14 @@ async fn reviewed_run(
         .is_err(),
         "a declaration edit invalidates the reviewed draft"
     );
-    draft = payroll_draft::calculate_payroll_cycle(db, tenant, &claims, cycle, Some(draft.revision))
+    draft = payroll_draft::calculate_payroll_cycle(db, tenant, &claims, &metadata,  cycle, Some(draft.revision))
         .await?;
     db.execute_unprepared("CREATE FUNCTION fixture_fail_statement() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'fixture rollback'; END $$; CREATE TRIGGER fixture_fail_statement BEFORE INSERT ON payslip_statement FOR EACH ROW EXECUTE FUNCTION fixture_fail_statement()").await?;
     assert!(
         payroll_finalize::finalize_payroll_cycle(
             db,
             tenant,
-            &claims,
+            &claims, &metadata,
             cycle,
             draft.revision,
             &draft.fingerprint,
@@ -555,7 +556,7 @@ async fn reviewed_run(
     let finalize = payroll_finalize::finalize_payroll_cycle(
         db,
         tenant,
-        &claims,
+        &claims, &metadata,
         cycle,
         draft.revision,
         &draft.fingerprint,
@@ -574,7 +575,7 @@ async fn reviewed_run(
         payroll_finalize::finalize_payroll_cycle(
             db,
             tenant,
-            &claims,
+            &claims, &metadata,
             cycle,
             draft.revision,
             &draft.fingerprint,
@@ -587,7 +588,7 @@ async fn reviewed_run(
         "exactly one concurrent finalizer succeeds"
     );
     assert!(
-        payroll_draft::calculate_payroll_cycle(db, tenant, &claims, cycle, Some(draft.revision))
+        payroll_draft::calculate_payroll_cycle(db, tenant, &claims, &metadata,  cycle, Some(draft.revision))
             .await
             .is_err()
     );

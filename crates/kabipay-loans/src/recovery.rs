@@ -115,7 +115,7 @@ async fn authorized(
     access::company(actor)?;
     access::entitled(tx, actor).await?;
     if input.source == RecoverySource::Payroll {
-        if let Some(entitlements)=actor.organization_entitlements.as_ref() {entitlements.require_tenant(actor.tenant_id)?;entitlements.require("PAYROLL")?;}else{kabipay_common::entitlements::Entitlements::load(tx, actor.tenant_id).await?.require("PAYROLL")?;}
+        actor.entitlements()?.require("PAYROLL")?;
     }
     access::employee(tx, actor, input.employee_id).await?;
     store::synchronize(tx, actor.tenant_id).await?;
@@ -428,7 +428,7 @@ async fn post(
     let actor = input.actor;
     let quote = input.quote;
     if quote.input.source != source
-        || quote.input.value_date > lifecycle::today(tx, actor.tenant_id).await?
+        || quote.input.value_date > lifecycle::today(actor)?
     {
         return Err(LoanModuleError::InvalidCommand);
     }

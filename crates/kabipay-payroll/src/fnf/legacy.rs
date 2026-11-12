@@ -32,8 +32,8 @@ pub async fn save(
     db: &DatabaseConnection,
     tenant: Uuid,
     claims: &ClientClaims,
+    entitlements: &kabipay_common::entitlements::Entitlements,
     subject: &ExitSubject,
-    today: chrono::NaiveDate,
     leave: &Option<String>,
     gratuity: &Option<String>,
     bonus: &Option<String>,
@@ -44,7 +44,8 @@ pub async fn save(
             "HR must approve separation before FNF preparation".into(),
         ));
     }
-    let actor = super::review::actor(claims, tenant)?;
+    let actor = super::review::actor(claims, tenant, entitlements)?;
+    let today = entitlements.business_date();
     let tx = db.begin().await?;
     crate::services::loan_recovery::lock(&tx, tenant).await?;
     let row = source::ensure_draft(&tx, tenant, subject.separation_id).await?;

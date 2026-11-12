@@ -62,7 +62,7 @@ pub async fn preview_historical_payment(
     let account = store::account(tx, actor.tenant_id, loan).await?;
     let (_, version, terms, _) =
         payments::validate(tx, actor, loan, account.version, payment, true).await?;
-    let date = lifecycle::today(tx, actor.tenant_id).await?;
+    let date = lifecycle::today(actor)?;
     if !account
         .accrued_through
         .is_some_and(|through| through > payment.value_date && through <= date)

@@ -100,12 +100,13 @@ pub async fn save(
     db: &DatabaseConnection,
     tenant: Uuid,
     claims: &ClientClaims,
+    entitlements: &kabipay_common::entitlements::Entitlements,
     subject: &ExitSubject,
     input: &FinancialInput,
     expected_revision: Option<i64>,
     expected_fingerprint: Option<&str>,
 ) -> KabiPayResult<FinancialReview> {
-    super::review::actor(claims, tenant)?;
+    super::review::actor(claims, tenant, entitlements)?;
     let tx = db.begin().await?;
     crate::services::loan_recovery::lock(&tx, tenant).await?;
     let row = source::ensure_draft(&tx, tenant, subject.separation_id).await?;
@@ -138,7 +139,7 @@ pub async fn save(
         .checked_add(1)
         .ok_or_else(|| KabiPayError::Validation("FNF revision limit reached".into()))?;
     let snapshot =
-        super::review::calculate(&tx, tenant, claims, subject, row.id, revision, input).await?;
+        super::review::calculate(&tx, tenant, claims, entitlements, subject, row.id, revision, input).await?;
     if prior.is_none() {
         verify_legacy(&row, input, &snapshot)?;
     }

@@ -56,7 +56,7 @@ async fn late_receipt_replays_interest_and_preserves_issued_recovery_and_retry()
     let tx = f.db.begin().await.unwrap();
     assert!(preview_historical_payment(
         &tx,
-        &LoanActorScope::from_verified_claims(&claims, f.tenant, LoanPermission::Repay).unwrap(),
+        &LoanActorScope::from_verified_claims(&claims, f.tenant, LoanPermission::Repay).unwrap().with_tenant_entitlements(kabipay_common::entitlements::Entitlements::load(&f.db, f.tenant).await.unwrap()).unwrap(),
         loan,
         HistoricalPaymentKind::Receipt,
         &payment
@@ -69,7 +69,7 @@ async fn late_receipt_replays_interest_and_preserves_issued_recovery_and_retry()
         .permission_scopes
         .insert("loan:correct".into(), "ALL".into());
     let actor =
-        LoanActorScope::from_verified_claims(&claims, f.tenant, LoanPermission::Repay).unwrap();
+        LoanActorScope::from_verified_claims(&claims, f.tenant, LoanPermission::Repay).unwrap().with_tenant_entitlements(kabipay_common::entitlements::Entitlements::load(&f.db, f.tenant).await.unwrap()).unwrap();
     let tx = f.db.begin().await.unwrap();
     let preview =
         preview_historical_payment(&tx, &actor, loan, HistoricalPaymentKind::Receipt, &payment)
@@ -199,7 +199,7 @@ async fn late_funding_keeps_original_date_charges_and_pending_resignation_eviden
         .permission_scopes
         .insert("loan:correct".into(), "ALL".into());
     let actor =
-        LoanActorScope::from_verified_claims(&claims, f.tenant, LoanPermission::Disburse).unwrap();
+        LoanActorScope::from_verified_claims(&claims, f.tenant, LoanPermission::Disburse).unwrap().with_tenant_entitlements(kabipay_common::entitlements::Entitlements::load(&f.db, f.tenant).await.unwrap()).unwrap();
     let tx = f.db.begin().await.unwrap();
     let review = preview_historical_payment(
         &tx,

@@ -59,6 +59,7 @@ impl PayrollMutationRoot {
             &db,
             tenant,
             ctx.data::<ClientClaims>()?,
+            ctx.data::<kabipay_common::entitlements::Entitlements>()?,
             parse_uuid(&cycle_id, "cycleId")?,
             payment_date,
             expected_revision,
@@ -80,6 +81,7 @@ impl PayrollMutationRoot {
             &db,
             tenant,
             ctx.data::<ClientClaims>()?,
+            ctx.data::<kabipay_common::entitlements::Entitlements>()?,
             parse_uuid(&cycle_id, "cycleId")?,
             expected_revision,
         )
@@ -104,6 +106,7 @@ impl PayrollMutationRoot {
             &db,
             tenant,
             ctx.data::<ClientClaims>()?,
+            ctx.data::<kabipay_common::entitlements::Entitlements>()?,
             parse_uuid(&cycle_id, "cycleId")?,
             draft_revision,
             &fingerprint,

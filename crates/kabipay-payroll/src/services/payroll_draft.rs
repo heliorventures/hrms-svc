@@ -83,13 +83,22 @@ pub async fn cycle<C: ConnectionTrait>(
             id: id.to_string(),
         })
 }
-pub async fn find<C:ConnectionTrait>(db:&C,tenant:Uuid,id:Uuid)->KabiPayResult<Option<PayrollDraft>> {find_with_date(db,tenant,id,None).await}
+/// Read a review using a trusted snapshot bound to this company before company reads.
+pub async fn find<C: ConnectionTrait>(
+    db: &C,
+    tenant: Uuid,
+    entitlements: &kabipay_common::entitlements::Entitlements,
+    id: Uuid,
+) -> KabiPayResult<Option<PayrollDraft>> {
+    entitlements.require_tenant(tenant)?;
+    find_with_date(db, tenant, id, entitlements.business_date()).await
+}
 
 pub(crate) async fn find_with_date<C: ConnectionTrait>(
     db: &C,
     tenant: Uuid,
     id: Uuid,
-    current_date:Option<chrono::NaiveDate>,
+    current_date: chrono::NaiveDate,
 ) -> KabiPayResult<Option<PayrollDraft>> {
     let row = db
         .query_one(Statement::from_sql_and_values(
@@ -106,15 +115,23 @@ pub(crate) async fn find_with_date<C: ConnectionTrait>(
         .transpose()?;
     if let Some(draft) = &mut draft {
         let cycle = cycle(db, tenant, id).await?;
-        if current_date.is_some(){super::payroll_payment_date::refresh_with_date(db, &cycle, draft,current_date).await?;}else{super::payroll_payment_date::refresh(db,&cycle,draft).await?;}
+        super::payroll_payment_date::refresh(&cycle, draft, current_date);
     }
     Ok(draft)
 }
-pub async fn calculate_payroll_cycle(db:&DatabaseConnection,tenant:Uuid,claims:&kabipay_common::context::ClientClaims,id:Uuid,expected_revision:Option<i32>)->KabiPayResult<PayrollDraft> {
- let actor=super::payroll_actor::PayrollActor::local(claims,tenant)?;
- let txn=db.begin().await?;
- let draft=calculate_in_transaction(&txn,tenant,&actor,id,expected_revision).await?;
- txn.commit().await?;Ok(draft)
+pub async fn calculate_payroll_cycle(
+    db: &DatabaseConnection,
+    tenant: Uuid,
+    claims: &kabipay_common::context::ClientClaims,
+    entitlements: &kabipay_common::entitlements::Entitlements,
+    id: Uuid,
+    expected_revision: Option<i32>,
+) -> KabiPayResult<PayrollDraft> {
+    let actor = super::payroll_actor::PayrollActor::local(claims, tenant, entitlements)?;
+    let txn = db.begin().await?;
+    let draft = calculate_in_transaction(&txn, tenant, &actor, id, expected_revision).await?;
+    txn.commit().await?;
+    Ok(draft)
 }
 
 pub async fn calculate_in_transaction(
@@ -124,14 +141,23 @@ pub async fn calculate_in_transaction(
     id: Uuid,
     expected_revision: Option<i32>,
 ) -> KabiPayResult<PayrollDraft> {
-    if actor.tenant!=tenant {return Err(KabiPayError::Unauthorised);}
+    if actor.tenant != tenant {
+        return Err(KabiPayError::Unauthorised);
+    }
     super::loan_recovery::lock(txn, tenant).await?;
     super::payroll_fingerprint::lock_inputs(txn).await?;
     let cycle = cycle(txn, tenant, id).await?;
     ensure_draft(&cycle.status)?;
-    let prior = find_with_date(txn, tenant, id,actor.business_date).await?;
+    let prior = find_with_date(txn, tenant, id, actor.business_date).await?;
     let revision = next_revision(prior.map(|d| d.revision), expected_revision)?;
-    let mut employees = super::payroll_preview::employees_with_actor(txn, tenant, actor.local_user, actor.principal, &cycle).await?;
+    let mut employees = super::payroll_preview::employees_with_actor(
+        txn,
+        tenant,
+        actor.local_user,
+        actor.principal,
+        &cycle,
+    )
+    .await?;
     for entry in &mut employees {
         if let Some(prepared) = &mut entry.prepared {
             if let Err(error) = super::loan_recovery::prepare_with_actor(
@@ -153,12 +179,13 @@ pub async fn calculate_in_transaction(
     let mut draft = PayrollDraft {
         cycle_id: id,
         revision,
-        fingerprint: super::loan_recovery::fingerprint_with_actor(txn, tenant, &actor.loans).await?,
+        fingerprint: super::loan_recovery::fingerprint_with_actor(txn, tenant, &actor.loans)
+            .await?,
         employees,
         can_finalize: false,
         finalization_block_reason: None,
     };
-    super::payroll_payment_date::refresh_with_date(txn, &cycle, &mut draft,actor.business_date).await?;
+    super::payroll_payment_date::refresh(&cycle, &mut draft, actor.business_date);
     let value = serde_json::to_value(&draft)
         .map_err(|_| KabiPayError::Internal("payroll review serialization failed".into()))?;
     txn.execute(Statement::from_sql_and_values(DbBackend::Postgres,
@@ -172,21 +199,24 @@ pub async fn set_payment_date(
     db: &DatabaseConnection,
     tenant: Uuid,
     claims: &kabipay_common::context::ClientClaims,
+    entitlements: &kabipay_common::entitlements::Entitlements,
     id: Uuid,
     date: chrono::NaiveDate,
     expected_revision: Option<i32>,
 ) -> KabiPayResult<()> {
-    super::loan_recovery::actor(claims, tenant)?;
+    let actor = super::payroll_actor::PayrollActor::local(claims, tenant, entitlements)?;
     let tx = db.begin().await?;
     super::loan_recovery::lock(&tx, tenant).await?;
     super::payroll_fingerprint::lock_inputs(&tx).await?;
     let cycle = cycle(&tx, tenant, id).await?;
     ensure_draft(&cycle.status)?;
-    let prior = find(&tx, tenant, id).await?.ok_or_else(|| {
-        KabiPayError::Validation("Calculate a draft before changing its payment date".into())
-    })?;
+    let prior = find_with_date(&tx, tenant, id, actor.business_date)
+        .await?
+        .ok_or_else(|| {
+            KabiPayError::Validation("Calculate a draft before changing its payment date".into())
+        })?;
     if Some(prior.revision) != expected_revision
-        || super::loan_recovery::fingerprint(&tx, tenant).await? != prior.fingerprint
+        || super::loan_recovery::fingerprint(&tx, tenant, entitlements).await? != prior.fingerprint
     {
         return Err(KabiPayError::Conflict(
             "Payroll review changed; reload before editing its payment date".into(),

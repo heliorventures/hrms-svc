@@ -86,7 +86,7 @@ pub(crate) async fn reverse(
         {
             return Err(LoanModuleError::HistoricalReconciliationRequired);
         }
-        ids.push(posting::post(tx,actor,Posting{loan,terms:target.try_get("","terms_version_id")?,kind:"REVERSAL",source_kind:"EXTERNAL_CORRECTION",source:original_id,revision:expected,date:lifecycle::today(tx,actor.tenant_id).await?,amount:store::decimal(&target,"amount_text")?,principal:-principal,interest:-interest,reversal:Some(original_id),evidence:serde_json::json!({"reason":reason,"reconciliationReference":reference,"occurrenceDate":target.try_get::<chrono::NaiveDate>("","value_date")?,"classification":"EXTERNAL_EVENT_REVERSAL"})}).await?);
+        ids.push(posting::post(tx,actor,Posting{loan,terms:target.try_get("","terms_version_id")?,kind:"REVERSAL",source_kind:"EXTERNAL_CORRECTION",source:original_id,revision:expected,date:lifecycle::today(actor)?,amount:store::decimal(&target,"amount_text")?,principal:-principal,interest:-interest,reversal:Some(original_id),evidence:serde_json::json!({"reason":reason,"reconciliationReference":reference,"occurrenceDate":target.try_get::<chrono::NaiveDate>("","value_date")?,"classification":"EXTERNAL_EVENT_REVERSAL"})}).await?);
         if matches!(
             target.try_get::<String>("", "source_kind")?.as_str(),
             "FUNDING_CHARGE" | "EXTERNAL_DISBURSEMENT"

@@ -103,18 +103,40 @@ fn announcement_role_target(m: &announcement::Model) -> Option<String> {
         .filter(|role| !role.is_empty())
 }
 
+#[cfg(test)]
+mod recipient_projection_tests {
+    use super::active_user_query;
+    use sea_orm::{DbBackend, QueryTrait, Values};
+    use uuid::Uuid;
+
+    #[test]
+    fn recipients_read_only_ids_and_preserve_eligibility_filters() {
+        let tenant = Uuid::from_u128(2);
+        let statement = active_user_query(tenant).build(DbBackend::Postgres);
+        assert_eq!(statement.sql, "SELECT \"user\".\"id\" FROM \"user\" WHERE \"user\".\"tenant_id\" = $1 AND \"user\".\"is_active\" = $2 AND \"user\".\"is_deleted\" = $3");
+        assert_eq!(statement.values, Some(Values(vec![tenant.into(), true.into(), false.into()])));
+    }
+}
+
+fn active_user_query(tenant_id: Uuid) -> sea_orm::Select<user::Entity> {
+    user::Entity::find()
+        .select_only()
+        .column(user::Column::Id)
+        .filter(user::Column::TenantId.eq(tenant_id))
+        .filter(user::Column::IsActive.eq(true))
+        .filter(user::Column::IsDeleted.eq(false))
+}
+
 async fn active_user_ids<C: ConnectionTrait>(
     db: &C,
     tenant_id: Uuid,
 ) -> KabiPayResult<HashSet<Uuid>> {
-    let rows = user::Entity::find()
-        .filter(user::Column::TenantId.eq(tenant_id))
-        .filter(user::Column::IsActive.eq(true))
-        .filter(user::Column::IsDeleted.eq(false))
+    let rows = active_user_query(tenant_id)
+        .into_tuple::<Uuid>()
         .all(db)
         .await
         .map_err(KabiPayError::from)?;
-    Ok(rows.into_iter().map(|row| row.id).collect())
+    Ok(rows.into_iter().collect())
 }
 
 async fn role_target_user_ids(

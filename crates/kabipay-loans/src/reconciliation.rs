@@ -67,7 +67,7 @@ pub async fn preview_loan_reversal(
     {
         return Err(LoanModuleError::HistoricalReconciliationRequired);
     }
-    let date = lifecycle::today(tx, actor.tenant_id).await?;
+    let date = lifecycle::today(actor)?;
     if account.accrued_through.is_some_and(|d| d > date) {
         return Err(LoanModuleError::InvalidCommand);
     }

@@ -12,6 +12,7 @@ use uuid::Uuid;
 
 pub async fn verify(db: &DatabaseConnection, tenant: Uuid, actor: Uuid, employee: Uuid) {
     let claims = super::payroll_claims(tenant, actor);
+    let metadata = kabipay_common::entitlements::Entitlements::load(db, tenant).await.unwrap();
     basic_override(db, tenant, employee).await;
     source_only_component(db, tenant, employee).await;
     for assignment in ["type='DEDUCTION'", "code='RENAMED'", "is_taxable=false"] {
@@ -94,11 +95,11 @@ pub async fn verify(db: &DatabaseConnection, tenant: Uuid, actor: Uuid, employee
     )
     .await
     .unwrap();
-    let first = payroll_draft::calculate_payroll_cycle(db, tenant, &claims, cycle.id, None)
+    let first = payroll_draft::calculate_payroll_cycle(db, tenant, &claims, &metadata,  cycle.id, None)
         .await
         .unwrap();
     let draft =
-        payroll_draft::calculate_payroll_cycle(db, tenant, &claims, cycle.id, Some(first.revision))
+        payroll_draft::calculate_payroll_cycle(db, tenant, &claims, &metadata,  cycle.id, Some(first.revision))
             .await
             .unwrap();
     assert!(draft.can_finalize, "{:?}", draft.employees);
@@ -124,7 +125,7 @@ pub async fn verify(db: &DatabaseConnection, tenant: Uuid, actor: Uuid, employee
     payroll_finalize::finalize_payroll_cycle(
         db,
         tenant,
-        &claims,
+        &claims, &metadata,
         cycle.id,
         draft.revision,
         &draft.fingerprint,
@@ -141,7 +142,7 @@ pub async fn verify(db: &DatabaseConnection, tenant: Uuid, actor: Uuid, employee
     assert!(payroll_finalize::finalize_payroll_cycle(
         db,
         tenant,
-        &claims,
+        &claims, &metadata,
         cycle.id,
         draft.revision,
         &draft.fingerprint,

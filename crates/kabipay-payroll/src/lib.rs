@@ -10,3 +10,6 @@ pub mod organization;
 pub mod organization_jobs;
 pub mod organization_job_state;
 pub mod organization_job_worker;
+
+#[cfg(test)]
+mod metadata_test_support;

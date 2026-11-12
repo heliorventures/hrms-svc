@@ -515,7 +515,11 @@ async fn append_delivery_replay_with_keyring<C: ConnectionTrait>(
     // A terminal receipt may outlive its source payload. Restore only the exact
     // authenticated immutable intent before reauthorizing it; the broker never
     // supplies replacement payloads, endpoints or credentials.
-    let source_rows=db.query_all(Statement::from_sql_and_values(DbBackend::Postgres,"SELECT event_envelope FROM company_event_outbox WHERE source_tenant_id=$1 AND event_stream='delivery' AND event_envelope->>'record_id'=$2 ORDER BY id LIMIT 65 FOR SHARE",[tenant.into(),intent.id.to_string().into()])).await?;
+    // The receipt UPDATE lock above fences cleanup, whose candidate selection and
+    // delete guard both take receipt SHARE locks before deleting private frames.
+    // Frames are immutable. If cleanup committed first, the exact intent is
+    // restored below; locking the outbox would require forbidden UPDATE rights.
+    let source_rows=db.query_all(Statement::from_sql_and_values(DbBackend::Postgres,"SELECT event_envelope FROM company_event_outbox WHERE source_tenant_id=$1 AND event_stream='delivery' AND event_envelope->>'record_id'=$2 ORDER BY id LIMIT 65",[tenant.into(),intent.id.to_string().into()])).await?;
     if source_rows.is_empty() {
         let frames = keys.encrypt_frames(
             &serde_json::to_vec(intent)?,

@@ -165,6 +165,7 @@ async fn handle(
         serde_json::to_value(
             super::coordination::apply(
                 &db,
+                ops,
                 message.tenant_id,
                 message.client_claims.as_ref(),
                 message.action,

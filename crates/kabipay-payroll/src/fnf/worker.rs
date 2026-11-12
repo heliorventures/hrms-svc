@@ -20,7 +20,7 @@ pub fn start(schema: Arc<PayrollSchema>) {
     tokio::spawn(run(schema));
 }
 
-async fn reconcile_due(db: &DatabaseConnection, tenant: Uuid) -> KabiPayResult<()> {
+async fn reconcile_due(db: &DatabaseConnection, ops: &DatabaseConnection, tenant: Uuid) -> KabiPayResult<()> {
     let tx = db.begin().await?;
     let pending = kabipay_loans::pending_exit_approvals(&tx, tenant, 5)
         .await
@@ -39,6 +39,7 @@ async fn reconcile_due(db: &DatabaseConnection, tenant: Uuid) -> KabiPayResult<(
             Some(operation) if coordination::registered(&operation) == expected => {
                 coordination::apply(
                     db,
+                    ops,
                     tenant,
                     None,
                     FinanceAction::ConfirmExitApproval,
@@ -103,7 +104,7 @@ async fn sweep(schema: &PayrollSchema) -> KabiPayResult<()> {
                         tracing::warn!("Loan financial reconciliation requires review");
                     }
                     if kabipay_common::finance_contract::service_secret().is_ok()
-                        && reconcile_due(&db, row.tenant_id).await.is_err()
+                        && reconcile_due(&db, ops, row.tenant_id).await.is_err()
                     {
                         tracing::warn!("A private exit approval remains pending reconciliation");
                     }

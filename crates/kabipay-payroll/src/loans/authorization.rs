@@ -83,6 +83,8 @@ pub(super) async fn transaction(
         .data::<ClientClaims>()
         .map_err(|_| KabiPayError::Unauthorised.into_graphql())?;
     let actor = LoanActorScope::from_verified_claims(claims, tenant, permission)
+        .map_err(financial_error)?
+        .with_tenant_entitlements(ctx.data::<kabipay_common::entitlements::Entitlements>()?.clone())
         .map_err(financial_error)?;
     let db = tenant_db(ctx, tenant).await?;
     let tx = db

@@ -4,7 +4,6 @@ use kabipay_common::{
     context::ScopeType,
     finance_contract::{ExitSubject, FinanceAction},
     subgraph::{require_client_claims, require_tenant_id, tenant_db},
-    tenant_business_clock::TenantBusinessClock,
     KabiPayError,
 };
 use uuid::Uuid;
@@ -49,15 +48,6 @@ async fn subject(ctx: &Context<'_>, sep: Uuid) -> Result<ExitSubject> {
     }
     Ok(subject)
 }
-async fn today(ctx: &Context<'_>, tenant: Uuid) -> Result<chrono::NaiveDate> {
-    let ops = ctx.data::<sea_orm::DatabaseConnection>().map_err(|_| {
-        KabiPayError::Internal("Finance clock configuration unavailable".into()).into_graphql()
-    })?;
-    Ok(TenantBusinessClock::load(ops, tenant)
-        .await
-        .map_err(KabiPayError::into_graphql)?
-        .now_date())
-}
 
 pub struct FnfQuery;
 #[Object]
@@ -75,12 +65,12 @@ impl FnfQuery {
         if subject.status != "APPROVED" {
             return Err(KabiPayError::Conflict("FNF review requires an approved separation".into()).into_graphql());
         }
-        let actor = super::review::actor(require_client_claims(ctx)?, tenant).map_err(KabiPayError::into_graphql)?;
+        let actor = super::review::actor(require_client_claims(ctx)?, tenant, ctx.data::<kabipay_common::entitlements::Entitlements>()?).map_err(KabiPayError::into_graphql)?;
         let db = tenant_db(ctx, tenant).await?;
         let tx = db.begin().await.map_err(KabiPayError::from).map_err(KabiPayError::into_graphql)?;
         let exposure = kabipay_loans::preview_exit_exposure(&tx, &actor, subject.employee_id, settlement_date).await
             .map_err(super::coordination::financial_error).map_err(KabiPayError::into_graphql)?;
-        let state = kabipay_loans::payroll_loan_state(&tx, tenant).await
+        let state = kabipay_loans::payroll_loan_state_with_actor(&tx, &actor).await
             .map_err(super::coordination::financial_error).map_err(KabiPayError::into_graphql)?;
         let payroll_context = super::payroll_context::read(&tx, tenant, subject.employee_id).await.map_err(KabiPayError::into_graphql)?;
         tx.commit().await.map_err(KabiPayError::from).map_err(KabiPayError::into_graphql)?;
@@ -211,8 +201,8 @@ impl FnfMutation {
             &db,
             tenant,
             require_client_claims(ctx)?,
+            ctx.data::<kabipay_common::entitlements::Entitlements>()?,
             &subject,
-            today(ctx, tenant).await?,
             &input.leave_encashment,
             &input.gratuity_amount,
             &input.bonus_payable,
@@ -238,6 +228,7 @@ impl FnfMutation {
             &db,
             tenant,
             require_client_claims(ctx)?,
+            ctx.data::<kabipay_common::entitlements::Entitlements>()?,
             &subject,
             &financial,
             input.expected_revision,
@@ -273,10 +264,10 @@ impl FnfMutation {
             &db,
             tenant,
             require_client_claims(ctx)?,
+            ctx.data::<kabipay_common::entitlements::Entitlements>()?,
             &subject,
             revision,
             &fingerprint,
-            today(ctx, tenant).await?,
         )
         .await
         .map_err(KabiPayError::into_graphql)?;

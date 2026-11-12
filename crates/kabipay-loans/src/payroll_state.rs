@@ -13,21 +13,15 @@ pub struct PayrollLoanState {
 pub async fn payroll_loan_state(
     tx: &DatabaseTransaction,
     tenant: Uuid,
+    entitlements: &Entitlements,
 ) -> LoanResult<PayrollLoanState> {
     if tenant.is_nil() {
         return Err(LoanModuleError::Forbidden);
     }
-    let enabled = Entitlements::load(tx, tenant).await?.allows("LOANS");
-    check_disabled(tx,tenant,enabled).await?;
-    let config = store::one(
-        tx,
-        "SELECT currency FROM kabipay_ops.tenant WHERE id=$1",
-        vec![tenant.into()],
-    )
-    .await?
-    .ok_or(LoanModuleError::PolicyUnavailable)?;
-    let currency: Option<String> = config.try_get("", "currency")?;
-    state(tx,tenant,enabled,currency).await
+    entitlements.require_tenant(tenant)?;
+    let enabled = entitlements.allows("LOANS");
+    check_disabled(tx, tenant, enabled).await?;
+    state(tx, tenant, enabled, entitlements.currency().map(str::to_owned)).await
 }
 
 async fn check_disabled(tx:&DatabaseTransaction,tenant:Uuid,enabled:bool)->LoanResult<()> {
@@ -67,11 +61,6 @@ async fn state(tx:&DatabaseTransaction,tenant:Uuid,enabled:bool,currency:Option<
 
 /// The foreign payroll path uses only the private current source-runtime proof;
 /// company loan rows remain in their separate source database.
-pub async fn payroll_loan_state_with_actor(tx:&DatabaseTransaction,actor:&crate::LoanActorScope)->LoanResult<PayrollLoanState> {
- if let Some(entitlements)=actor.organization_entitlements.as_ref() {
-  entitlements.require_tenant(actor.tenant_id)?;
-  let enabled=entitlements.allows("LOANS");
-  check_disabled(tx,actor.tenant_id,enabled).await?;
-  state(tx,actor.tenant_id,enabled,entitlements.currency().map(str::to_owned)).await
- }else{payroll_loan_state(tx,actor.tenant_id).await}
+pub async fn payroll_loan_state_with_actor(tx: &DatabaseTransaction, actor: &crate::LoanActorScope) -> LoanResult<PayrollLoanState> {
+    payroll_loan_state(tx, actor.tenant_id, actor.entitlements()?).await
 }

@@ -59,7 +59,7 @@ impl SourceAdapter for PayrollAdapter {
                         tx,
                         p.tenant_id,
                         id,
-                        Some(p.payroll_business_date()?),
+                        p.payroll_business_date()?,
                     )
                     .await?;
                     return Ok(

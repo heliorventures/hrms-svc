@@ -1,7 +1,6 @@
 //! Backward-compatible HR approval proves that the employee has no Loan exposure.
 use kabipay_common::{
-    context::ClientClaims, finance_contract::ExitSubject,
-    tenant_business_clock::TenantBusinessClock, KabiPayError, KabiPayResult,
+    context::ClientClaims, finance_contract::ExitSubject, KabiPayError, KabiPayResult,
 };
 use kabipay_loans::{ExitFinancialDecision, LoanActorScope, LoanPermission, SaveExitReview};
 use sea_orm::{DatabaseConnection, TransactionTrait};
@@ -14,12 +13,11 @@ pub(super) async fn prepare(
     claims: &ClientClaims,
     subject: &ExitSubject,
 ) -> KabiPayResult<serde_json::Value> {
+    let entitlements = kabipay_common::entitlements::Entitlements::load(ops, tenant).await?;
+    let date = entitlements.business_date().max(subject.last_working_date);
     let actor = LoanActorScope::from_verified_claims(claims, tenant, LoanPermission::FnfRecovery)
+        .and_then(|actor| actor.with_tenant_entitlements(entitlements))
         .map_err(super::coordination::financial_error)?;
-    let date = TenantBusinessClock::load(ops, tenant)
-        .await?
-        .now_date()
-        .max(subject.last_working_date);
     let tx = db.begin().await?;
     let exposure = kabipay_loans::preview_exit_exposure(&tx, &actor, subject.employee_id, date)
         .await

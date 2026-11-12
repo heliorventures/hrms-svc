@@ -96,11 +96,11 @@ pub async fn preview_exit_exposure(
     if actor.permission == LoanPermission::FnfRecovery {
         // HR's existing FNF flow remains available without Loans only when no
         // outstanding Loan account or employee credit is being hidden.
-        crate::payroll_loan_state(tx, actor.tenant_id).await?;
+        crate::payroll_loan_state_with_actor(tx, actor).await?;
     } else {
         access::entitled(tx, actor).await?;
     }
-    let today = lifecycle::today(tx, actor.tenant_id).await?;
+    let today = lifecycle::today(actor)?;
     if settlement < today && actor.permission != LoanPermission::FnfRecovery {
         return Err(LoanModuleError::InvalidCommand);
     }

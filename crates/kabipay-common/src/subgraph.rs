@@ -30,7 +30,7 @@ use axum::{
     Router,
 };
 use kabipay_db_entities::tenant::{d0005_auth_rbac::user, d0007_employee_core::employee};
-use sea_orm::{ColumnTrait, ConnectionTrait, DatabaseConnection, EntityTrait, QueryFilter};
+use sea_orm::{ColumnTrait, ConnectionTrait, DatabaseConnection, EntityTrait, QueryFilter, QuerySelect};
 use std::{net::SocketAddr, sync::Arc};
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
 use uuid::Uuid;
@@ -453,17 +453,24 @@ where
             KabiPayError::Internal("TenantDbConfig missing from schema data".into())
         })?;
     let db = resolve_required_tenant_db(tenant_id, ops_db, cache, fallback).await?;
-    let row = user::Entity::find_by_id(user_id)
-        .filter(user::Column::TenantId.eq(tenant_id))
+    let row = active_client_user_query(tenant_id, user_id)
+        .into_tuple::<(bool, bool)>()
         .one(&db)
         .await
         .map_err(|error| KabiPayError::from_tenant_db(tenant_id, error))?;
 
-    if account_allows_client_access(row.map(|found| (found.is_active, found.is_deleted))) {
+    if account_allows_client_access(row) {
         Ok(())
     } else {
         Err(KabiPayError::Unauthorised)
     }
+}
+
+fn active_client_user_query(tenant_id: Uuid, user_id: Uuid) -> sea_orm::Select<user::Entity> {
+    user::Entity::find_by_id(user_id)
+        .select_only()
+        .columns([user::Column::IsActive, user::Column::IsDeleted])
+        .filter(user::Column::TenantId.eq(tenant_id))
 }
 
 fn account_allows_client_access(account_state: Option<(bool, bool)>) -> bool {
@@ -472,7 +479,24 @@ fn account_allows_client_access(account_state: Option<(bool, bool)>) -> bool {
 
 #[cfg(test)]
 mod active_client_tests {
-    use super::account_allows_client_access;
+    use super::{account_allows_client_access, active_client_user_query};
+    use sea_orm::{DbBackend, QueryTrait};
+    use uuid::Uuid;
+
+    #[test]
+    fn active_client_query_reads_only_status_with_user_and_tenant_predicates() {
+        let user_id = Uuid::from_u128(1);
+        let tenant_id = Uuid::from_u128(2);
+        let statement = active_client_user_query(tenant_id, user_id).build(DbBackend::Postgres);
+        assert_eq!(
+            statement.sql,
+            "SELECT \"user\".\"is_active\", \"user\".\"is_deleted\" FROM \"user\" WHERE \"user\".\"id\" = $1 AND \"user\".\"tenant_id\" = $2"
+        );
+        assert_eq!(
+            statement.values,
+            Some(sea_orm::Values(vec![user_id.into(), tenant_id.into()]))
+        );
+    }
 
     #[test]
     fn only_active_non_deleted_users_keep_client_access() {

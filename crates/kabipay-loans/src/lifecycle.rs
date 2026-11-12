@@ -36,23 +36,9 @@ pub(crate) fn text(value: &str, max: usize) -> LoanResult<()> {
     }
     Ok(())
 }
-pub(crate) async fn today(tx: &DatabaseTransaction, tenant: Uuid) -> LoanResult<NaiveDate> {
-    let row = store::one(
-        tx,
-        "SELECT timezone FROM kabipay_ops.tenant WHERE id=$1 AND is_deleted=FALSE",
-        vec![tenant.into()],
-    )
-    .await?
-    .ok_or(LoanModuleError::NotFound)?;
-    let timezone: Option<String> = row.try_get("", "timezone")?;
-    Ok(
-        kabipay_common::tenant_business_clock::TenantBusinessClock::from_configured_name(
-            timezone.as_deref(),
-        )?
-        .now_date(),
-    )
+pub(crate) fn today(actor: &LoanActorScope) -> LoanResult<NaiveDate> {
+    Ok(actor.entitlements()?.business_date())
 }
-#[allow(clippy::too_many_arguments)]
 pub(crate) async fn publish(
     tx: &DatabaseTransaction,
     actor: &LoanActorScope,
@@ -70,15 +56,7 @@ pub(crate) async fn publish(
     if to.is_some_and(|to| to <= from) {
         return Err(LoanModuleError::InvalidCommand);
     }
-    let row = store::one(
-        tx,
-        "SELECT currency FROM kabipay_ops.tenant WHERE id=$1",
-        vec![actor.tenant_id.into()],
-    )
-    .await?
-    .ok_or(LoanModuleError::NotFound)?;
-    let company_currency: Option<String> = row.try_get("", "currency")?;
-    if company_currency.as_deref() != Some(currency.code.as_str()) {
+    if actor.entitlements()?.currency() != Some(currency.code.as_str()) {
         return Err(LoanModuleError::PolicyUnavailable);
     }
     let workflow_id = rules
@@ -199,7 +177,7 @@ pub(crate) async fn submit(
         }
     };
     access::employee(tx, actor, employee).await?;
-    let date = today(tx, actor.tenant_id).await?;
+    let date = today(actor)?;
     let (currency, rules) = selected_policy(tx, actor.tenant_id, policy_id, date).await?;
     eligible(tx, actor.tenant_id, employee, date, &rules).await?;
     currency.validate_amount(amount)?;
@@ -303,7 +281,7 @@ pub(crate) async fn decide(
         let terms = terms.ok_or(LoanModuleError::InvalidCommand)?;
         let from = from.ok_or(LoanModuleError::InvalidCommand)?;
         let first = first_due.ok_or(LoanModuleError::InvalidCommand)?;
-        if from < today(tx, actor.tenant_id).await?
+        if from < today(actor)?
             || first < from
             || terms.approved_principal > record.requested_amount
             || terms.currency.code != record.currency

@@ -123,7 +123,9 @@ pub async fn install(
         .into()],
     ))
     .await?;
-    if let Some(receipt)=tx.query_one(statement("SELECT membership_id,organization_id,version,desired_status,configuration_hash FROM organization_membership_lifecycle_receipt WHERE tenant_id=$1 AND command_id=$2 FOR UPDATE",vec![value.tenant_id.into(),command_id.into()])).await? {
+    // Company and tenant-command advisory transaction locks serialize every receipt writer.
+    // Receipts are immutable; the actual membership installation keeps its row locks.
+    if let Some(receipt)=tx.query_one(statement("SELECT membership_id,organization_id,version,desired_status,configuration_hash FROM organization_membership_lifecycle_receipt WHERE tenant_id=$1 AND command_id=$2",vec![value.tenant_id.into(),command_id.into()])).await? {
         if receipt.try_get::<Uuid>("","membership_id")?!=value.membership_id || receipt.try_get::<Uuid>("","organization_id")?!=value.organization_id || receipt.try_get::<i64>("","version")?!=value.version || receipt.try_get::<String>("","desired_status")?!=value.status || receipt.try_get::<String>("","configuration_hash")?!=value.configuration_hash {return Err(conflict());}
     }
     let existing=tx.query_one(statement("SELECT organization_id,status,desired_status,version,configuration_hash FROM organization_membership_installation WHERE tenant_id=$1 AND membership_id=$2 FOR UPDATE",vec![value.tenant_id.into(),value.membership_id.into()])).await?;
@@ -222,6 +224,10 @@ async fn retire(tx: &DatabaseTransaction, value: &MembershipInstallation) -> Kab
     .await?;
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "membership_lifecycle_permissions.rs"]
+mod permission_tests;
 
 #[cfg(test)]
 mod tests {

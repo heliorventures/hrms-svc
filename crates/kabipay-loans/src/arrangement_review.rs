@@ -39,7 +39,7 @@ pub(crate) async fn validate_change(
     let account = store::account(tx, actor.tenant_id, loan).await?;
     lifecycle::checked_version(account.version, expected)?;
     access::employee(tx, actor, account.employee_id).await?;
-    let today = lifecycle::today(tx, actor.tenant_id).await?;
+    let today = lifecycle::today(actor)?;
     let version = store::terms(tx, &account).await?;
     let mut terms: LoanTerms = serde_json::from_value(version.terms)?;
     let policy = store::policy(tx, actor.tenant_id, version.policy_version_id).await?;

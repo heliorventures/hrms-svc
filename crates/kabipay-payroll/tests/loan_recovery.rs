@@ -121,10 +121,10 @@ async fn financial_reconciliation_holds_orphan_recovery_and_clears_only_after_so
     let claims = f.claims(f.manager, "ALL", LoanPermission::PayrollRecovery);
     let tx = f.db.begin().await.unwrap();
     let mut value = prepared(&f);
-    loan_recovery::prepare(&tx, &claims, &cycle, 1, f.employee, &mut value)
+    loan_recovery::prepare(&tx, &claims, &kabipay_common::entitlements::Entitlements::load(&f.db, f.tenant).await.unwrap(), &cycle, 1, f.employee, &mut value)
         .await
         .unwrap();
-    let snapshot = loan_recovery::post(&tx, &claims, value.loan_recovery.as_ref().unwrap())
+    let snapshot = loan_recovery::post(&tx, &claims, &kabipay_common::entitlements::Entitlements::load(&f.db, f.tenant).await.unwrap(), value.loan_recovery.as_ref().unwrap())
         .await
         .unwrap();
     tx.commit().await.unwrap();
@@ -168,7 +168,7 @@ async fn financial_reconciliation_holds_orphan_recovery_and_clears_only_after_so
     let tx = f.db.begin().await.unwrap();
     let mut next = prepared(&f);
     assert!(
-        loan_recovery::prepare(&tx, &claims, &cycle, 2, f.employee, &mut next)
+        loan_recovery::prepare(&tx, &claims, &kabipay_common::entitlements::Entitlements::load(&f.db, f.tenant).await.unwrap(), &cycle, 2, f.employee, &mut next)
             .await
             .is_err()
     );
@@ -266,10 +266,10 @@ async fn financial_reconciliation_detects_issued_allocation_without_a_loan_posti
     let claims = f.claims(f.manager, "ALL", LoanPermission::PayrollRecovery);
     let tx = f.db.begin().await.unwrap();
     let mut value = prepared(&f);
-    loan_recovery::prepare(&tx, &claims, &cycle, 1, f.employee, &mut value)
+    loan_recovery::prepare(&tx, &claims, &kabipay_common::entitlements::Entitlements::load(&f.db, f.tenant).await.unwrap(), &cycle, 1, f.employee, &mut value)
         .await
         .unwrap();
-    let snapshot = loan_recovery::post(&tx, &claims, value.loan_recovery.as_ref().unwrap())
+    let snapshot = loan_recovery::post(&tx, &claims, &kabipay_common::entitlements::Entitlements::load(&f.db, f.tenant).await.unwrap(), value.loan_recovery.as_ref().unwrap())
         .await
         .unwrap();
     tx.rollback().await.unwrap();
@@ -337,7 +337,7 @@ async fn payroll_quote_is_read_only_and_payment_changes_require_new_review() {
     let claims = f.claims(f.manager, "ALL", LoanPermission::PayrollRecovery);
     let tx = f.db.begin().await.unwrap();
     let mut value = prepared(&f);
-    loan_recovery::prepare(&tx, &claims, &cycle, 1, f.employee, &mut value)
+    loan_recovery::prepare(&tx, &claims, &kabipay_common::entitlements::Entitlements::load(&f.db, f.tenant).await.unwrap(), &cycle, 1, f.employee, &mut value)
         .await
         .unwrap();
     assert_eq!(value.calculation.loan_recovery, Decimal::from(500));
@@ -360,15 +360,15 @@ async fn payroll_quote_is_read_only_and_payment_changes_require_new_review() {
     .await
     .unwrap();
     let tx = f.db.begin().await.unwrap();
-    assert!(loan_recovery::post(&tx, &claims, &reviewed).await.is_err());
+    assert!(loan_recovery::post(&tx, &claims, &kabipay_common::entitlements::Entitlements::load(&f.db, f.tenant).await.unwrap(), &reviewed).await.is_err());
     tx.rollback().await.unwrap();
     let tx = f.db.begin().await.unwrap();
     let mut current = prepared(&f);
-    loan_recovery::prepare(&tx, &claims, &cycle, 2, f.employee, &mut current)
+    loan_recovery::prepare(&tx, &claims, &kabipay_common::entitlements::Entitlements::load(&f.db, f.tenant).await.unwrap(), &cycle, 2, f.employee, &mut current)
         .await
         .unwrap();
     assert_eq!(current.calculation.loan_recovery, Decimal::from(100));
-    let snapshot = loan_recovery::post(&tx, &claims, current.loan_recovery.as_ref().unwrap())
+    let snapshot = loan_recovery::post(&tx, &claims, &kabipay_common::entitlements::Entitlements::load(&f.db, f.tenant).await.unwrap(), current.loan_recovery.as_ref().unwrap())
         .await
         .unwrap();
     assert_eq!(
@@ -392,11 +392,11 @@ async fn no_loan_review_is_invalidated_by_new_loan_and_missing_payment_date_bloc
     let mut cycle = cycle(&f).await;
     let claims = f.claims(f.manager, "ALL", LoanPermission::PayrollRecovery);
     let tx = f.db.begin().await.unwrap();
-    let before = loan_recovery::fingerprint(&tx, f.tenant).await.unwrap();
+    let before = loan_recovery::fingerprint(&tx, f.tenant, &kabipay_common::entitlements::Entitlements::load(&f.db, f.tenant).await.unwrap()).await.unwrap();
     let mut value = prepared(&f);
     cycle.payment_date = None;
     assert!(
-        loan_recovery::prepare(&tx, &claims, &cycle, 1, f.employee, &mut value)
+        loan_recovery::prepare(&tx, &claims, &kabipay_common::entitlements::Entitlements::load(&f.db, f.tenant).await.unwrap(), &cycle, 1, f.employee, &mut value)
             .await
             .is_err()
     );
@@ -405,7 +405,7 @@ async fn no_loan_review_is_invalidated_by_new_loan_and_missing_payment_date_bloc
     let tx = f.db.begin().await.unwrap();
     assert_ne!(
         before,
-        loan_recovery::fingerprint(&tx, f.tenant).await.unwrap()
+        loan_recovery::fingerprint(&tx, f.tenant, &kabipay_common::entitlements::Entitlements::load(&f.db, f.tenant).await.unwrap()).await.unwrap()
     );
     tx.rollback().await.unwrap();
 }
@@ -571,7 +571,7 @@ async fn fnf_recovers_twelve_thousand_with_zero_cash_and_eight_thousand_debt_rem
     let mut f = fixture::Fixture::new(100000).await;
     let (loan, subject, input) = fnf_input(&mut f).await;
     let claims = f.claims(f.manager, "ALL", LoanPermission::FnfRecovery);
-    let review = draft::save(&f.db, f.tenant, &claims, &subject, &input, None, None)
+    let review = draft::save(&f.db, f.tenant, &claims, &kabipay_common::entitlements::Entitlements::load(&f.db, f.tenant).await.unwrap(), &subject, &input, None, None)
         .await
         .unwrap();
     assert_eq!(review.snapshot.loan_recovered, 12000.into());
@@ -581,11 +581,10 @@ async fn fnf_recovers_twelve_thousand_with_zero_cash_and_eight_thousand_debt_rem
     let issued = finalize::finalize(
         &f.db,
         f.tenant,
-        &claims,
+        &claims, &kabipay_common::entitlements::Entitlements::load(&f.db, f.tenant).await.unwrap(),
         &subject,
         review.revision,
         &review.fingerprint,
-        f.today,
     )
     .await
     .unwrap();
@@ -595,11 +594,10 @@ async fn fnf_recovers_twelve_thousand_with_zero_cash_and_eight_thousand_debt_rem
         finalize::finalize(
             &f.db,
             f.tenant,
-            &claims,
+            &claims, &kabipay_common::entitlements::Entitlements::load(&f.db, f.tenant).await.unwrap(),
             &subject,
             review.revision,
             &review.fingerprint,
-            f.today
         )
         .await
         .unwrap()
@@ -640,7 +638,7 @@ async fn fnf_rejects_stale_repayment_and_rolls_back_a_failed_evidence_seal() {
     let mut f = fixture::Fixture::new(100000).await;
     let (loan, subject, input) = fnf_input(&mut f).await;
     let claims = f.claims(f.manager, "ALL", LoanPermission::FnfRecovery);
-    let review = draft::save(&f.db, f.tenant, &claims, &subject, &input, None, None)
+    let review = draft::save(&f.db, f.tenant, &claims, &kabipay_common::entitlements::Entitlements::load(&f.db, f.tenant).await.unwrap(), &subject, &input, None, None)
         .await
         .unwrap();
     f.apply(
@@ -658,11 +656,10 @@ async fn fnf_rejects_stale_repayment_and_rolls_back_a_failed_evidence_seal() {
     assert!(finalize::finalize(
         &f.db,
         f.tenant,
-        &claims,
+        &claims, &kabipay_common::entitlements::Entitlements::load(&f.db, f.tenant).await.unwrap(),
         &subject,
         review.revision,
         &review.fingerprint,
-        f.today
     )
     .await
     .is_err());
@@ -670,7 +667,7 @@ async fn fnf_rejects_stale_repayment_and_rolls_back_a_failed_evidence_seal() {
     let review = draft::save(
         &f.db,
         f.tenant,
-        &claims,
+        &claims, &kabipay_common::entitlements::Entitlements::load(&f.db, f.tenant).await.unwrap(),
         &subject,
         &input,
         Some(review.revision),
@@ -683,11 +680,10 @@ async fn fnf_rejects_stale_repayment_and_rolls_back_a_failed_evidence_seal() {
     assert!(finalize::finalize(
         &f.db,
         f.tenant,
-        &claims,
+        &claims, &kabipay_common::entitlements::Entitlements::load(&f.db, f.tenant).await.unwrap(),
         &subject,
         review.revision,
         &review.fingerprint,
-        f.today
     )
     .await
     .is_err());
@@ -714,11 +710,10 @@ async fn fnf_rejects_stale_repayment_and_rolls_back_a_failed_evidence_seal() {
     let issued = finalize::finalize(
         &f.db,
         f.tenant,
-        &claims,
+        &claims, &kabipay_common::entitlements::Entitlements::load(&f.db, f.tenant).await.unwrap(),
         &subject,
         review.revision,
         &review.fingerprint,
-        f.today,
     )
     .await
     .unwrap();
@@ -740,7 +735,7 @@ async fn hr_no_loan_review_works_without_loans_but_never_hides_existing_exposure
     let claims = f.claims(f.manager, "ALL", LoanPermission::FnfRecovery);
     let actor =
         LoanActorScope::from_verified_claims(&claims, f.tenant, LoanPermission::FnfRecovery)
-            .unwrap();
+            .unwrap().with_tenant_entitlements(kabipay_common::entitlements::Entitlements::load(&f.db, f.tenant).await.unwrap()).unwrap();
     let tx = f.db.begin().await.unwrap();
     let exposure = preview_exit_exposure(&tx, &actor, f.employee, f.today)
         .await
@@ -803,7 +798,7 @@ async fn exit_authorization_is_idempotent_and_releases_only_for_terminal_hr_stat
     let claims = f.claims(f.manager, "ALL", LoanPermission::ExitReview);
     let reviewer =
         LoanActorScope::from_verified_claims(&claims, f.tenant, LoanPermission::ExitReview)
-            .unwrap();
+            .unwrap().with_tenant_entitlements(kabipay_common::entitlements::Entitlements::load(&f.db, f.tenant).await.unwrap()).unwrap();
     let tx = f.db.begin().await.unwrap();
     let exposure = preview_exit_exposure(&tx, &reviewer, f.employee, f.today)
         .await
@@ -841,7 +836,7 @@ async fn exit_authorization_is_idempotent_and_releases_only_for_terminal_hr_stat
     let claims = f.claims(f.manager, "ALL", LoanPermission::FnfRecovery);
     let actor =
         LoanActorScope::from_verified_claims(&claims, f.tenant, LoanPermission::FnfRecovery)
-            .unwrap();
+            .unwrap().with_tenant_entitlements(kabipay_common::entitlements::Entitlements::load(&f.db, f.tenant).await.unwrap()).unwrap();
     let operation = RegisteredHrApproval {
         operation_id: Uuid::new_v4(),
         separation_id: separation,
@@ -950,7 +945,7 @@ async fn exit_exposure_is_read_only_and_requires_explicit_residual_decision() {
     let loan = funded(&f).await;
     let claims = f.claims(f.manager, "ALL", LoanPermission::ExitReview);
     let actor = LoanActorScope::from_verified_claims(&claims, f.tenant, LoanPermission::ExitReview)
-        .unwrap();
+        .unwrap().with_tenant_entitlements(kabipay_common::entitlements::Entitlements::load(&f.db, f.tenant).await.unwrap()).unwrap();
     let tx = f.db.begin().await.unwrap();
     let exposure = preview_exit_exposure(&tx, &actor, f.employee, f.today)
         .await
@@ -1092,7 +1087,7 @@ async fn future_payment_date_allows_preview_but_blocks_finalization_without_fina
     .await;
     let claims = f.claims(f.manager, "ALL", LoanPermission::PayrollRecovery);
     let draft = kabipay_payroll::services::payroll_draft::calculate_payroll_cycle(
-        &f.db, f.tenant, &claims, cycle.id, None,
+        &f.db, f.tenant, &claims, &kabipay_common::entitlements::Entitlements::load(&f.db, f.tenant).await.unwrap(), cycle.id, None,
     )
     .await
     .unwrap();
@@ -1113,7 +1108,7 @@ async fn future_payment_date_allows_preview_but_blocks_finalization_without_fina
     let error = kabipay_payroll::services::payroll_finalize::finalize_payroll_cycle(
         &f.db,
         f.tenant,
-        &claims,
+        &claims, &kabipay_common::entitlements::Entitlements::load(&f.db, f.tenant).await.unwrap(),
         cycle.id,
         draft.revision,
         &draft.fingerprint,
@@ -1125,7 +1120,7 @@ async fn future_payment_date_allows_preview_but_blocks_finalization_without_fina
         error.to_string().contains(&payment_date.to_string()),
         "{error}"
     );
-    let reloaded = kabipay_payroll::services::payroll_draft::find(&f.db, f.tenant, cycle.id)
+    let reloaded = kabipay_payroll::services::payroll_draft::find(&f.db, f.tenant, &kabipay_common::entitlements::Entitlements::load(&f.db, f.tenant).await.unwrap(), cycle.id)
         .await
         .unwrap()
         .unwrap();
@@ -1152,7 +1147,7 @@ async fn future_payment_date_allows_preview_but_blocks_finalization_without_fina
     kabipay_payroll::services::payroll_draft::set_payment_date(
         &f.db,
         f.tenant,
-        &claims,
+        &claims, &kabipay_common::entitlements::Entitlements::load(&f.db, f.tenant).await.unwrap(),
         cycle.id,
         f.today,
         Some(draft.revision),
@@ -1162,7 +1157,7 @@ async fn future_payment_date_allows_preview_but_blocks_finalization_without_fina
     let current = kabipay_payroll::services::payroll_draft::calculate_payroll_cycle(
         &f.db,
         f.tenant,
-        &claims,
+        &claims, &kabipay_common::entitlements::Entitlements::load(&f.db, f.tenant).await.unwrap(),
         cycle.id,
         Some(draft.revision),
     )
@@ -1172,7 +1167,7 @@ async fn future_payment_date_allows_preview_but_blocks_finalization_without_fina
     kabipay_payroll::services::payroll_finalize::finalize_payroll_cycle(
         &f.db,
         f.tenant,
-        &claims,
+        &claims, &kabipay_common::entitlements::Entitlements::load(&f.db, f.tenant).await.unwrap(),
         cycle.id,
         current.revision,
         &current.fingerprint,
@@ -1195,7 +1190,7 @@ async fn finalization_commits_loan_payslip_and_cycle_atomically_and_snapshots_ar
     monthly_input(&f).await;
     let claims = f.claims(f.manager, "ALL", LoanPermission::PayrollRecovery);
     let draft = kabipay_payroll::services::payroll_draft::calculate_payroll_cycle(
-        &f.db, f.tenant, &claims, cycle.id, None,
+        &f.db, f.tenant, &claims, &kabipay_common::entitlements::Entitlements::load(&f.db, f.tenant).await.unwrap(), cycle.id, None,
     )
     .await
     .unwrap();
@@ -1203,7 +1198,7 @@ async fn finalization_commits_loan_payslip_and_cycle_atomically_and_snapshots_ar
     let outcome = kabipay_payroll::services::payroll_finalize::finalize_payroll_cycle(
         &f.db,
         f.tenant,
-        &claims,
+        &claims, &kabipay_common::entitlements::Entitlements::load(&f.db, f.tenant).await.unwrap(),
         cycle.id,
         draft.revision,
         &draft.fingerprint,
@@ -1276,7 +1271,7 @@ async fn finalization_commits_loan_payslip_and_cycle_atomically_and_snapshots_ar
         kabipay_payroll::services::payroll_finalize::finalize_payroll_cycle(
             &f.db,
             f.tenant,
-            &claims,
+            &claims, &kabipay_common::entitlements::Entitlements::load(&f.db, f.tenant).await.unwrap(),
             cycle.id,
             draft.revision,
             &draft.fingerprint,
@@ -1296,7 +1291,7 @@ async fn posting_failure_rolls_back_the_payslip_and_preserves_draft_and_loan() {
     monthly_input(&f).await;
     let claims = f.claims(f.manager, "ALL", LoanPermission::PayrollRecovery);
     let draft = kabipay_payroll::services::payroll_draft::calculate_payroll_cycle(
-        &f.db, f.tenant, &claims, cycle.id, None,
+        &f.db, f.tenant, &claims, &kabipay_common::entitlements::Entitlements::load(&f.db, f.tenant).await.unwrap(), cycle.id, None,
     )
     .await
     .unwrap();
@@ -1307,7 +1302,7 @@ async fn posting_failure_rolls_back_the_payslip_and_preserves_draft_and_loan() {
     let result = kabipay_payroll::services::payroll_finalize::finalize_payroll_cycle(
         &f.db,
         f.tenant,
-        &claims,
+        &claims, &kabipay_common::entitlements::Entitlements::load(&f.db, f.tenant).await.unwrap(),
         cycle.id,
         draft.revision,
         &draft.fingerprint,
@@ -1353,7 +1348,7 @@ async fn concurrent_receipt_wins_financial_lock_and_stale_payroll_posts_nothing(
     monthly_input(&f).await;
     let claims = f.claims(f.manager, "ALL", LoanPermission::PayrollRecovery);
     let draft = kabipay_payroll::services::payroll_draft::calculate_payroll_cycle(
-        &f.db, f.tenant, &claims, cycle.id, None,
+        &f.db, f.tenant, &claims, &kabipay_common::entitlements::Entitlements::load(&f.db, f.tenant).await.unwrap(), cycle.id, None,
     )
     .await
     .unwrap();
@@ -1375,11 +1370,12 @@ async fn concurrent_receipt_wins_financial_lock_and_stale_payroll_posts_nothing(
     .unwrap();
     let connection = f.db.clone();
     let tenant = f.tenant;
+    let metadata = kabipay_common::entitlements::Entitlements::load(&f.db, tenant).await.unwrap();
     let mut finalize = tokio::spawn(async move {
         kabipay_payroll::services::payroll_finalize::finalize_payroll_cycle(
             &connection,
             tenant,
-            &claims,
+            &claims, &metadata,
             cycle.id,
             draft.revision,
             &draft.fingerprint,
@@ -1424,7 +1420,7 @@ async fn loan_recovery_defers_when_salary_is_paid_or_only_a_small_cash_balance_r
         value.input.advance_already_paid = Some((10000 - cash).to_string());
         value.calculation =
             kabipay_payroll::services::payroll_rules::calculate_period(&value.input).unwrap();
-        loan_recovery::prepare(&tx, &claims, &cycle, 1, f.employee, &mut value)
+        loan_recovery::prepare(&tx, &claims, &kabipay_common::entitlements::Entitlements::load(&f.db, f.tenant).await.unwrap(), &cycle, 1, f.employee, &mut value)
             .await
             .unwrap();
         let expected = if cash == 0 { 0 } else { 200 };
@@ -1466,7 +1462,7 @@ async fn earlier_salary_cannot_be_spent_again_by_a_supplementary_recovery_quote(
         kabipay_payroll::services::payroll_rules::calculate_period(&value.input).unwrap();
     let tx = f.db.begin().await.unwrap();
     let claims = f.claims(f.manager, "ALL", LoanPermission::PayrollRecovery);
-    loan_recovery::prepare(&tx, &claims, &current, 1, f.employee, &mut value)
+    loan_recovery::prepare(&tx, &claims, &kabipay_common::entitlements::Entitlements::load(&f.db, f.tenant).await.unwrap(), &current, 1, f.employee, &mut value)
         .await
         .unwrap();
     assert_eq!(value.calculation.loan_recovery, Decimal::from(100));
@@ -1487,20 +1483,20 @@ async fn setting_draft_payment_date_requires_latest_review_and_invalidates_old_f
     monthly_input(&f).await;
     let claims = f.claims(f.manager, "ALL", LoanPermission::PayrollRecovery);
     let draft = kabipay_payroll::services::payroll_draft::calculate_payroll_cycle(
-        &f.db, f.tenant, &claims, cycle.id, None,
+        &f.db, f.tenant, &claims, &kabipay_common::entitlements::Entitlements::load(&f.db, f.tenant).await.unwrap(), cycle.id, None,
     )
     .await
     .unwrap();
     let date = f.today + chrono::Duration::days(1);
     assert!(kabipay_payroll::services::payroll_draft::set_payment_date(
-        &f.db, f.tenant, &claims, cycle.id, date, None
+        &f.db, f.tenant, &claims, &kabipay_common::entitlements::Entitlements::load(&f.db, f.tenant).await.unwrap(), cycle.id, date, None
     )
     .await
     .is_err());
     kabipay_payroll::services::payroll_draft::set_payment_date(
         &f.db,
         f.tenant,
-        &claims,
+        &claims, &kabipay_common::entitlements::Entitlements::load(&f.db, f.tenant).await.unwrap(),
         cycle.id,
         date,
         Some(draft.revision),
@@ -1511,7 +1507,7 @@ async fn setting_draft_payment_date_requires_latest_review_and_invalidates_old_f
         kabipay_payroll::services::payroll_finalize::finalize_payroll_cycle(
             &f.db,
             f.tenant,
-            &claims,
+            &claims, &kabipay_common::entitlements::Entitlements::load(&f.db, f.tenant).await.unwrap(),
             cycle.id,
             draft.revision,
             &draft.fingerprint,
@@ -1534,7 +1530,7 @@ async fn setting_draft_payment_date_requires_latest_review_and_invalidates_old_f
     assert!(kabipay_payroll::services::payroll_draft::set_payment_date(
         &f.db,
         f.tenant,
-        &claims,
+        &claims, &kabipay_common::entitlements::Entitlements::load(&f.db, f.tenant).await.unwrap(),
         cycle.id,
         f.today,
         Some(draft.revision)
@@ -1550,7 +1546,7 @@ async fn setting_draft_payment_date_requires_latest_review_and_invalidates_old_f
     assert!(kabipay_payroll::services::payroll_draft::set_payment_date(
         &f.db,
         f.tenant,
-        &claims,
+        &claims, &kabipay_common::entitlements::Entitlements::load(&f.db, f.tenant).await.unwrap(),
         cycle.id,
         f.today,
         Some(draft.revision)

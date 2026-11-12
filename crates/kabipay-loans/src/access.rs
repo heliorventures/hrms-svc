@@ -2,20 +2,12 @@ use crate::{repository as store, LoanActorScope, LoanModuleError, LoanResult};
 use kabipay_common::{
     client_data_scope::{resolve_employee_scope_filter_with_connection, EmployeeScopeFilter},
     context::{ClientViewerEmployee, ScopeType},
-    entitlements::Entitlements,
 };
 use sea_orm::DatabaseTransaction;
 use uuid::Uuid;
 
-pub(crate) async fn entitled(tx: &DatabaseTransaction, actor: &LoanActorScope) -> LoanResult<()> {
-    if let Some(entitlements)=actor.organization_entitlements.as_ref() {
-        entitlements.require_tenant(actor.tenant_id)?;
-        entitlements.require("LOANS")?;
-        return Ok(());
-    }
-    Entitlements::load(tx, actor.tenant_id)
-        .await?
-        .require("LOANS")?;
+pub(crate) async fn entitled(_tx: &DatabaseTransaction, actor: &LoanActorScope) -> LoanResult<()> {
+    actor.entitlements()?.require("LOANS")?;
     Ok(())
 }
 pub(crate) async fn viewer(

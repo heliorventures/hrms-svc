@@ -80,7 +80,7 @@ pub async fn find_exit_review(
     }
     access::company(actor)?;
     if actor.permission == LoanPermission::FnfRecovery {
-        crate::payroll_loan_state(tx, actor.tenant_id).await?;
+        crate::payroll_loan_state_with_actor(tx, actor).await?;
     } else {
         access::entitled(tx, actor).await?;
     }
@@ -155,7 +155,7 @@ pub async fn authorize_exit_approval(
         return Err(LoanModuleError::Forbidden);
     }
     access::company(actor)?;
-    crate::payroll_loan_state(tx, actor.tenant_id).await?;
+    crate::payroll_loan_state_with_actor(tx, actor).await?;
     store::synchronize(tx, actor.tenant_id).await?;
     if let Some(existing) = exit_authorization(tx, actor.tenant_id, input.operation_id).await? {
         if existing.payload_hash != input.payload_hash

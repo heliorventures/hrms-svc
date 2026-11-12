@@ -13,6 +13,7 @@ use uuid::Uuid;
 
 pub struct Fixture {
     pub db: DatabaseConnection,
+    pub entitlements: Option<kabipay_common::entitlements::Entitlements>,
     pub tenant: Uuid,
     pub employee: Uuid,
     pub user: Uuid,
@@ -48,6 +49,7 @@ impl Fixture {
         let db = Database::connect(options).await.unwrap();
         let mut f = Self {
             db,
+            entitlements: None,
             tenant: Uuid::new_v4(),
             employee: Uuid::new_v4(),
             user: Uuid::new_v4(),
@@ -63,6 +65,7 @@ impl Fixture {
         for code in ["LOANS", "PAYROLL"] {
             sql(&f.db,"INSERT INTO kabipay_ops.module(id,code,name,is_active,is_core) VALUES($1,$2,$2,TRUE,TRUE)",vec![Uuid::new_v4().into(),code.into()]).await;
         }
+        f.entitlements = Some(kabipay_common::entitlements::Entitlements::load(&f.db, f.tenant).await.unwrap());
         for (employee, user) in [
             (f.employee, f.user),
             (f.other, f.other_user),
@@ -174,6 +177,8 @@ impl Fixture {
             self.tenant,
             permission,
         )
+        .unwrap()
+        .with_tenant_entitlements(self.entitlements.clone().unwrap())
         .unwrap()
     }
     pub async fn apply(

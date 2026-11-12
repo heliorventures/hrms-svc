@@ -102,9 +102,9 @@ pub(crate) async fn lock(tx: &DatabaseTransaction, tenant: Uuid) -> KabiPayResul
         .map_err(financial_error)
 }
 
-pub async fn fingerprint(tx: &DatabaseTransaction, tenant: Uuid) -> KabiPayResult<String> {
+pub async fn fingerprint(tx: &DatabaseTransaction, tenant: Uuid, entitlements: &kabipay_common::entitlements::Entitlements) -> KabiPayResult<String> {
     let payroll = super::payroll_fingerprint::fingerprint(tx, tenant).await?;
-    let loans = kabipay_loans::payroll_loan_state(tx, tenant)
+    let loans = kabipay_loans::payroll_loan_state(tx, tenant, entitlements)
         .await
         .map_err(financial_error)?;
     kabipay_loans::command_hash(&("payroll-with-loans-v1", payroll, loans.fingerprint))
@@ -325,9 +325,9 @@ pub fn apply_recovery(value: &mut CalculatedPeriod, recovery: Decimal) -> KabiPa
     Ok(())
 }
 
-pub async fn prepare(tx:&DatabaseTransaction,claims:&ClientClaims,cycle:&payroll_cycle::Model,revision:i32,employee:Uuid,prepared:&mut PreparedEmployeePayroll)->KabiPayResult<()> {
- let actor=actor(claims,cycle.tenant_id)?; prepare_with_actor(tx,&actor,cycle,revision,employee,prepared).await
+pub async fn prepare(tx:&DatabaseTransaction,claims:&ClientClaims,entitlements:&kabipay_common::entitlements::Entitlements,cycle:&payroll_cycle::Model,revision:i32,employee:Uuid,prepared:&mut PreparedEmployeePayroll)->KabiPayResult<()> {
+ let actor=actor(claims,cycle.tenant_id)?.with_tenant_entitlements(entitlements.clone()).map_err(financial_error)?; prepare_with_actor(tx,&actor,cycle,revision,employee,prepared).await
 }
-pub async fn post(tx:&DatabaseTransaction,claims:&ClientClaims,reviewed:&ReviewedLoanRecovery)->KabiPayResult<PayslipLoanSnapshot> {
- let actor=actor(claims,claims.tenant_id)?; post_with_actor(tx,&actor,reviewed).await
+pub async fn post(tx:&DatabaseTransaction,claims:&ClientClaims,entitlements:&kabipay_common::entitlements::Entitlements,reviewed:&ReviewedLoanRecovery)->KabiPayResult<PayslipLoanSnapshot> {
+ let actor=actor(claims,claims.tenant_id)?.with_tenant_entitlements(entitlements.clone()).map_err(financial_error)?; post_with_actor(tx,&actor,reviewed).await
 }

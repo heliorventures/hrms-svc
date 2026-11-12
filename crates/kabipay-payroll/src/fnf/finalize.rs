@@ -9,12 +9,12 @@ pub async fn finalize(
     db: &DatabaseConnection,
     tenant: Uuid,
     claims: &ClientClaims,
+    entitlements: &kabipay_common::entitlements::Entitlements,
     subject: &ExitSubject,
     expected_revision: i64,
     expected_fingerprint: &str,
-    company_today: chrono::NaiveDate,
 ) -> KabiPayResult<FinancialReview> {
-    let actor = super::review::actor(claims, tenant)?;
+    let actor = super::review::actor(claims, tenant, entitlements)?;
     let tx = db.begin().await?;
     crate::services::loan_recovery::lock(&tx, tenant).await?;
     let row = source::find(&tx, tenant, subject.separation_id, true)
@@ -45,7 +45,7 @@ pub async fn finalize(
         ));
     }
     super::integrity::verify(&tx, tenant, &row, &reviewed.snapshot).await?;
-    if reviewed.snapshot.input.value_date > company_today {
+    if reviewed.snapshot.input.value_date > entitlements.business_date() {
         return Err(KabiPayError::Validation(format!(
             "FNF can be finalized on or after {} in company time",
             reviewed.snapshot.input.value_date
@@ -55,6 +55,7 @@ pub async fn finalize(
         &tx,
         tenant,
         claims,
+        entitlements,
         subject,
         row.id,
         reviewed.revision,
@@ -77,9 +78,18 @@ pub async fn finalize(
         .await
         .map_err(financial_error)?;
     }
-    kabipay_loans::confirm_fnf_arrangements(&tx, &actor, subject.employee_id, subject.separation_id,
-        row.id, subject.last_working_date, fresh.input.value_date, &fresh.input.loan_decision)
-        .await.map_err(financial_error)?;
+    kabipay_loans::confirm_fnf_arrangements(
+        &tx,
+        &actor,
+        subject.employee_id,
+        subject.separation_id,
+        row.id,
+        subject.last_working_date,
+        fresh.input.value_date,
+        &fresh.input.loan_decision,
+    )
+    .await
+    .map_err(financial_error)?;
     // Seal evidence and mark the settlement in the same financial transaction as Loan set-off.
     tx.execute(Statement::from_sql_and_values(DbBackend::Postgres,
         "UPDATE fnf_financial_review SET finalized_at=NOW(),updated_at=NOW() WHERE tenant_id=$1 AND fnf_id=$2 AND finalized_at IS NULL",
