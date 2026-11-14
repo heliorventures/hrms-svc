@@ -2,7 +2,7 @@
 
 use async_graphql::{Context, Object, Result, ID};
 use kabipay_common::{
-    context::{ClientClaims, PERM_ASSETS_MANAGE, PERM_ASSETS_READ},
+    context::ClientClaims,
     subgraph::{require_client_claims, require_tenant_id, tenant_db},
     KabiPayError,
 };
@@ -36,11 +36,11 @@ fn parse_decimal(value: Option<String>) -> Result<Option<Decimal>> {
 }
 
 pub(super) fn has_explicit_asset_manage_permission(claims: &ClientClaims) -> bool {
-    claims.has_any_permission(&[PERM_ASSETS_MANAGE])
+    claims.can_manage_assets_registry()
 }
 
 pub(super) fn has_explicit_asset_read_permission(claims: &ClientClaims) -> bool {
-    claims.has_any_permission(&[PERM_ASSETS_READ, PERM_ASSETS_MANAGE])
+    claims.can_read_assets_registry()
 }
 
 fn require_asset_manager(ctx: &Context<'_>) -> Result<Uuid> {
@@ -54,6 +54,52 @@ fn require_asset_manager(ctx: &Context<'_>) -> Result<Uuid> {
 }
 
 pub struct MutationRoot;
+
+#[cfg(test)]
+mod scope_tests {
+    use super::*;
+    use kabipay_common::context::{PERM_ASSETS_MANAGE, PERM_ASSETS_READ};
+    use std::collections::HashMap;
+
+    #[test]
+    fn asset_registry_helpers_do_not_promote_narrowed_or_missing_scopes_to_all() {
+        for permission in [PERM_ASSETS_MANAGE, PERM_ASSETS_READ] {
+            for scope in [
+                None,
+                Some("invalid"),
+                Some("SELF"),
+                Some("TEAM"),
+                Some("DEPARTMENT"),
+                Some("ALL"),
+            ] {
+                let claims = ClientClaims {
+                    sub: Uuid::new_v4(),
+                    iss: kabipay_common::context::CLIENT_JWT_ISSUER.into(),
+                    exp: 0,
+                    iat: 0,
+                    tenant_id: Uuid::new_v4(),
+                    email: String::new(),
+                    employee_id: None,
+                    must_change_password: false,
+                    roles: vec![],
+                    permissions: vec![permission.into()],
+                    permission_scopes: scope
+                        .map(|s| HashMap::from([(permission.into(), s.into())]))
+                        .unwrap_or_default(),
+                    resource_scopes: HashMap::new(),
+                };
+                assert_eq!(
+                    has_explicit_asset_manage_permission(&claims),
+                    permission == PERM_ASSETS_MANAGE && scope == Some("ALL")
+                );
+                assert_eq!(
+                    has_explicit_asset_read_permission(&claims),
+                    scope == Some("ALL")
+                );
+            }
+        }
+    }
+}
 
 #[Object]
 impl MutationRoot {
@@ -207,7 +253,9 @@ mod tests {
                 .iter()
                 .map(|permission| (*permission).to_string())
                 .collect(),
-            permission_scopes: HashMap::new(),
+            permission_scopes: permissions.iter()
+                .map(|permission| ((*permission).into(), "ALL".into()))
+                .collect(),
             resource_scopes: HashMap::new(),
         }
     }

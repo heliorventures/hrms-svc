@@ -1,9 +1,29 @@
 //! One-transaction conversion into employee, account and private document records.
 use super::*;
+
+/// Preserve joined replay before credential validation, with fresh admission
+/// before the candidate lookup. Conversion checks again in its write transaction.
+pub async fn find_for_confirmation(db: &DatabaseConnection, tenant: Uuid, id: Uuid, actor: Uuid)
+    -> Result<Option<candidate::Model>> {
+    let tx = db.begin().await?;
+    let result = async {
+        crate::services::rbac_admin_service::require_fresh_direct_rbac_admin(&tx, tenant, actor).await?;
+        find(&tx, tenant, id).await
+    }.await;
+    match result {
+        Ok(row) => { tx.commit().await?; Ok(row) }
+        Err(error) => { tx.rollback().await?; Err(error) }
+    }
+}
+
 pub async fn confirm(db: &DatabaseConnection, tenant: Uuid, id: Uuid,
     revision: i32, actor: Uuid, mut data: NewEmployee,
     mut login: NewLoginAccount) -> Result<candidate::Model> {
     let tx = db.begin().await?;
+    if let Err(error) = crate::services::rbac_admin_service::require_fresh_direct_rbac_admin(&tx, tenant, actor).await {
+        tx.rollback().await?;
+        return Err(error);
+    }
     let row = locked(&tx, tenant, id).await?;
     if row.status == "JOINED" { return Ok(row); }
     check_revision(&row, revision)?;

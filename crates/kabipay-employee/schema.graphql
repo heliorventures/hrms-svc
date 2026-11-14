@@ -528,7 +528,11 @@ type MutationRoot {
 	"""
 	setClearanceItemCleared(clearanceId: ID!, isCleared: Boolean!): ClearanceChecklistItem!
 	"""
-	Replace `role_permission` rows for a role (full matrix row).
+	Replace permissions and exact scopes atomically, preserving administrator availability.
+	"""
+	setRoleAccess(roleId: ID!, permissionIds: [ID!]!, scopes: [PermissionScopeAssignmentInput!]!): Boolean!
+	"""
+	Compatibility endpoint: new grants require scope via setRoleAccess.
 	"""
 	setRolePermissions(roleId: ID!, permissionIds: [ID!]!): Boolean!
 	"""
@@ -917,6 +921,7 @@ type TenantCatalogPermission {
 	resource: String!
 	action: String!
 	description: String
+	supportedScopeTypes: [String!]!
 }
 
 type TenantDirectoryRole {
@@ -952,6 +957,14 @@ type TenantPermissionScopeAssignment {
 
 input UpdateEmployeeInput {
 	id: ID!
+	"""
+	Omit to leave the tenant-unique employee code unchanged.
+	"""
+	employeeCode: String
+	"""
+	Omit to leave the joining date unchanged.
+	"""
+	dateOfJoining: NaiveDate
 	firstName: String
 	lastName: String
 	departmentId: ID

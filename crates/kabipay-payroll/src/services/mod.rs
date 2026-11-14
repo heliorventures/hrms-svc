@@ -1,4 +1,5 @@
 pub mod arrear_service;
+pub(crate) mod directory_projection;
 pub mod component_display;
 pub mod imported_lwp;
 pub mod imported_payroll;

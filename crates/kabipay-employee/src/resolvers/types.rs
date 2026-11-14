@@ -1214,15 +1214,19 @@ pub struct TenantCatalogPermissionDto {
     pub resource: String,
     pub action: String,
     pub description: Option<String>,
+    pub supported_scope_types: Vec<String>,
 }
 
 impl From<permission::Model> for TenantCatalogPermissionDto {
     fn from(m: permission::Model) -> Self {
+        let supported_scope_types = crate::services::rbac_access_policy::supported_scope_types(&m.resource, &m.action)
+            .iter().map(|scope| scope.to_string()).collect();
         Self {
             id: ID(m.id.to_string()),
             resource: m.resource,
             action: m.action,
             description: m.description,
+            supported_scope_types,
         }
     }
 }

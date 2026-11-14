@@ -4,6 +4,7 @@ use std::collections::HashMap;
 
 use chrono::{NaiveDate, Utc};
 use kabipay_common::{KabiPayError, KabiPayResult, PageInfo, PageInput};
+use kabipay_common::client_data_scope::EmployeeScopeFilter;
 use kabipay_db_entities::tenant::d0006_org_hierarchy::location;
 use kabipay_db_entities::tenant::d0007_employee_core::employee;
 use kabipay_db_entities::tenant::d0022_assets::{
@@ -13,7 +14,7 @@ use sea_orm::prelude::Decimal;
 use sea_orm::sea_query::Expr;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, Condition, DatabaseConnection, DbErr, EntityTrait,
-    PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Select, Set, TransactionTrait,
+    PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, QueryTrait, Select, Set, TransactionTrait,
 };
 use uuid::Uuid;
 
@@ -67,7 +68,7 @@ fn search_pattern(search: Option<String>) -> Option<String> {
 }
 
 fn lower_like(expression: &str, pattern: String) -> sea_orm::sea_query::SimpleExpr {
-    Expr::cust_with_values(format!("LOWER({expression}) LIKE ?"), [pattern])
+    Expr::cust(format!("LOWER({expression})")).like(pattern)
 }
 
 fn normalized_status(value: Option<String>, allowed: &[&str], field: &str) -> KabiPayResult<Option<String>> {
@@ -209,13 +210,40 @@ pub async fn list_category_page(
     })
 }
 
+fn scoped_allocation_query(
+    tenant_id: Uuid,
+    scope: &EmployeeScopeFilter,
+) -> Select<asset_allocation::Entity> {
+    let query =
+        asset_allocation::Entity::find().filter(asset_allocation::Column::TenantId.eq(tenant_id));
+    match scope {
+        EmployeeScopeFilter::Unrestricted => query,
+        EmployeeScopeFilter::Empty => query.filter(Expr::cust("1 = 0")),
+        EmployeeScopeFilter::EmployeeIds(ids) => {
+            query.filter(asset_allocation::Column::EmployeeId.is_in(ids.iter().copied()))
+        }
+    }
+}
+
+fn scoped_asset_query(tenant_id: Uuid, scope: &EmployeeScopeFilter) -> Select<asset::Entity> {
+    let query = asset::Entity::find().filter(asset::Column::TenantId.eq(tenant_id));
+    if matches!(scope, EmployeeScopeFilter::Unrestricted) {
+        return query;
+    }
+    let allocation_ids = scoped_allocation_query(tenant_id, scope)
+        .select_only()
+        .column(asset_allocation::Column::AssetId)
+        .into_query();
+    query.filter(asset::Column::Id.in_subquery(allocation_ids))
+}
+
 pub async fn list_assets(
     db: &DatabaseConnection,
     tenant_id: Uuid,
     limit: u64,
+    scope: &EmployeeScopeFilter,
 ) -> KabiPayResult<Vec<asset::Model>> {
-    asset::Entity::find()
-        .filter(asset::Column::TenantId.eq(tenant_id))
+    scoped_asset_query(tenant_id, scope)
         .order_by_desc(asset::Column::CreatedAt)
         .limit(limit.clamp(1, 500))
         .all(db)
@@ -298,6 +326,7 @@ pub async fn list_asset_page(
     search: Option<String>,
     category_id: Option<Uuid>,
     status: Option<String>,
+    scope: &EmployeeScopeFilter,
 ) -> KabiPayResult<AssetPageData> {
     let page = page.clamp();
     let status = normalized_status(
@@ -305,7 +334,7 @@ pub async fn list_asset_page(
         &[ASSET_AVAILABLE, ASSET_ASSIGNED, ASSET_RETIRED],
         "asset status",
     )?;
-    let mut query = asset::Entity::find().filter(asset::Column::TenantId.eq(tenant_id));
+    let mut query = scoped_asset_query(tenant_id, scope);
     if let Some(category_id) = category_id {
         query = query.filter(asset::Column::AssetCategoryId.eq(category_id));
     }
@@ -363,15 +392,11 @@ pub async fn list_asset_page(
 pub async fn list_asset_assignments(
     db: &DatabaseConnection,
     tenant_id: Uuid,
-    employee_id: Option<Uuid>,
+    scope: &EmployeeScopeFilter,
     active_only: bool,
     limit: u64,
 ) -> KabiPayResult<Vec<(asset_allocation::Model, asset::Model)>> {
-    let mut query = asset_allocation::Entity::find()
-        .filter(asset_allocation::Column::TenantId.eq(tenant_id));
-    if let Some(employee_id) = employee_id {
-        query = query.filter(asset_allocation::Column::EmployeeId.eq(employee_id));
-    }
+    let mut query = scoped_allocation_query(tenant_id, scope);
     if active_only {
         query = query.filter(asset_allocation::Column::Status.eq(ALLOCATION_ACTIVE));
     }
@@ -393,7 +418,7 @@ pub async fn list_allocation_page(
     tenant_id: Uuid,
     page: PageInput,
     search: Option<String>,
-    employee_id: Option<Uuid>,
+    scope: &EmployeeScopeFilter,
     status: Option<String>,
 ) -> KabiPayResult<AllocationPageData> {
     let page = page.clamp();
@@ -402,11 +427,7 @@ pub async fn list_allocation_page(
         &[ALLOCATION_ACTIVE, ALLOCATION_RETURNED],
         "allocation status",
     )?;
-    let mut query = asset_allocation::Entity::find()
-        .filter(asset_allocation::Column::TenantId.eq(tenant_id));
-    if let Some(employee_id) = employee_id {
-        query = query.filter(asset_allocation::Column::EmployeeId.eq(employee_id));
-    }
+    let mut query = scoped_allocation_query(tenant_id, scope);
     if let Some(status) = status {
         query = query.filter(asset_allocation::Column::Status.eq(status));
     }
@@ -910,6 +931,52 @@ pub async fn return_asset(
 mod tests {
     use super::*;
     use sea_orm::{DbBackend, QueryTrait};
+
+    #[test]
+    fn asset_and_allocation_scope_predicates_remain_in_sql_before_pagination() {
+        let tenant_id = Uuid::new_v4();
+        let employee_id = Uuid::new_v4();
+        for scope in [
+            EmployeeScopeFilter::Empty,
+            EmployeeScopeFilter::EmployeeIds(vec![employee_id]),
+            EmployeeScopeFilter::Unrestricted,
+        ] {
+            let allocation_sql = scoped_allocation_query(tenant_id, &scope)
+                .limit(25)
+                .build(DbBackend::Postgres)
+                .to_string();
+            let asset_sql = scoped_asset_query(tenant_id, &scope)
+                .limit(25)
+                .build(DbBackend::Postgres)
+                .to_string();
+            for sql in [&allocation_sql, &asset_sql] {
+                assert!(sql.contains(&tenant_id.to_string()), "{sql}");
+                match &scope {
+                    EmployeeScopeFilter::Empty => assert!(sql.contains("1 = 0"), "{sql}"),
+                    EmployeeScopeFilter::EmployeeIds(_) => {
+                        assert!(sql.contains(&employee_id.to_string()), "{sql}");
+                        assert!(
+                            sql.find(&employee_id.to_string()).unwrap()
+                                < sql.find("LIMIT").unwrap(),
+                            "{sql}"
+                        );
+                    }
+                    EmployeeScopeFilter::Unrestricted => assert!(
+                        !sql.split(" WHERE ").nth(1).unwrap().contains("employee_id"),
+                        "{sql}"
+                    ),
+                }
+            }
+            if !matches!(scope, EmployeeScopeFilter::Unrestricted) {
+                assert!(asset_sql.contains("IN (SELECT"), "{asset_sql}");
+                assert_eq!(
+                    asset_sql.matches(&tenant_id.to_string()).count(),
+                    2,
+                    "inventory and allocation subquery must each bind tenant"
+                );
+            }
+        }
+    }
 
     #[test]
     fn asset_status_filter_is_case_normalized() {

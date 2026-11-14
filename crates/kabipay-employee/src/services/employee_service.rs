@@ -24,6 +24,12 @@ use uuid::Uuid;
 use crate::entities::d0007_employee_core::employee;
 use crate::services::rbac_admin_service;
 
+#[path = "employee_login_administration.rs"]
+mod login_administration;
+pub use login_administration::{
+    create_with_login_for_actor, provision_login_for_actor, reset_linked_user_password_for_actor,
+};
+
 async fn assert_local_reporting_ownership<C:ConnectionTrait>(db:&C, tenant:Uuid)->KabiPayResult<()> {
     let row=db.query_one(sea_orm::Statement::from_sql_and_values(sea_orm::DbBackend::Postgres,
         "SELECT 1 AS n WHERE organization_reporting_owned($1)",vec![tenant.into()])).await?;
@@ -1083,15 +1089,7 @@ pub async fn create_with_login(
     data: NewEmployee,
     account: NewLoginAccount,
 ) -> KabiPayResult<employee::Model> {
-    if data.user_id.is_some() {
-        return Err(KabiPayError::Validation("userId cannot be supplied when loginAccount is used".into()));
-    }
-    rbac_admin_service::require_nonempty_role_assignment(&account.role_ids)?;
-    canonical_employment_status(&data.status)?;
-    let txn = db.begin().await?;
-    let created = create_with_login_in_transaction(&txn, tenant_id, data, account).await?;
-    txn.commit().await?;
-    Ok(created)
+    create_with_login_for_actor(db, tenant_id, data, account, None).await
 }
 
 /// Share all account and role validation with atomic candidate conversion.
@@ -1129,11 +1127,7 @@ pub async fn provision_login(
     employee_id: Uuid,
     account: NewLoginAccount,
 ) -> KabiPayResult<employee::Model> {
-    rbac_admin_service::require_nonempty_role_assignment(&account.role_ids)?;
-    let txn = db.begin().await?;
-    let updated = provision_login_in_transaction(&txn, tenant_id, employee_id, account).await?;
-    txn.commit().await?;
-    Ok(updated)
+    provision_login_for_actor(db, tenant_id, employee_id, account, None).await
 }
 
 /// Share employee login validation with tenant imports and other atomic onboarding operations.
@@ -1181,8 +1175,13 @@ pub async fn reset_linked_user_password(
     employee_id: Uuid,
     password_hash: String,
 ) -> KabiPayResult<()> {
-    let txn = db.begin().await?;
-    let employee = find_by_id(&txn, tenant_id, employee_id)
+    reset_linked_user_password_for_actor(db, tenant_id, employee_id, password_hash, None).await
+}
+
+async fn reset_linked_user_password_in_transaction(
+    txn: &sea_orm::DatabaseTransaction, tenant_id: Uuid, employee_id: Uuid, password_hash: String,
+) -> KabiPayResult<()> {
+    let employee = find_by_id(txn, tenant_id, employee_id)
         .await?
         .ok_or_else(|| KabiPayError::NotFound {
             entity: "employee",
@@ -1194,7 +1193,7 @@ pub async fn reset_linked_user_password(
     let user_row = user::Entity::find_by_id(user_id)
         .filter(user::Column::TenantId.eq(tenant_id))
         .filter(user::Column::IsDeleted.eq(false))
-        .one(&txn)
+        .one(txn)
         .await?
         .ok_or_else(|| KabiPayError::NotFound {
             entity: "user",
@@ -1204,12 +1203,11 @@ pub async fn reset_linked_user_password(
     am.password_hash = Set(password_hash);
     am.must_change_password = Set(true);
     am.updated_at = Set(Utc::now());
-    am.update(&txn).await?;
+    am.update(txn).await?;
     user_session::Entity::delete_many()
         .filter(user_session::Column::UserId.eq(user_id))
-        .exec(&txn)
+        .exec(txn)
         .await?;
-    txn.commit().await?;
     Ok(())
 }
 

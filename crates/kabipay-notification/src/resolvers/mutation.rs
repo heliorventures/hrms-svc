@@ -29,8 +29,19 @@ fn parse_uuid(id: &ID, field: &'static str) -> Result<Uuid> {
         .map_err(|e| KabiPayError::Validation(format!("invalid {field}: {e}")).into_graphql())
 }
 
-fn can_edit_announcement(claims: &kabipay_common::context::ClientClaims, row: &kabipay_db_entities::tenant::d0027_communication_audit::announcement::Model) -> bool {
-    claims.can_manage_notifications()
+fn can_edit_announcement(
+    claims: &kabipay_common::context::ClientClaims,
+    row: &kabipay_db_entities::tenant::d0027_communication_audit::announcement::Model,
+) -> bool {
+    claims.can_update_notifications()
+        || (row.post_source == "employee_post" && row.created_by == Some(claims.sub))
+}
+
+fn can_delete_announcement(
+    claims: &kabipay_common::context::ClientClaims,
+    row: &kabipay_db_entities::tenant::d0027_communication_audit::announcement::Model,
+) -> bool {
+    claims.can_delete_notifications()
         || (row.post_source == "employee_post" && row.created_by == Some(claims.sub))
 }
 
@@ -213,6 +224,114 @@ mod tests {
         assert!(!message.to_ascii_lowercase().contains("database"));
     }
 
+    #[test]
+    fn ordinary_employees_keep_own_post_editing_without_authority_over_other_posts() {
+        let claims = claims(PERM_NOTIFICATION_READ, Some("SELF"));
+        let mut row = kabipay_db_entities::tenant::d0027_communication_audit::announcement::Model {
+            id: Uuid::new_v4(),
+            tenant_id: claims.tenant_id,
+            created_by: Some(claims.sub),
+            title: "My post".into(),
+            body: None,
+            target_audience: None,
+            target_department_id: None,
+            target_location_id: None,
+            publish_at: None,
+            expires_at: None,
+            image_file_storage_id: None,
+            document_file_storage_id: None,
+            video_file_storage_id: None,
+            video_link: None,
+            post_source: "employee_post".into(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        assert!(super::can_edit_announcement(&claims, &row));
+        assert!(super::can_delete_announcement(&claims, &row));
+        row.created_by = Some(Uuid::new_v4());
+        assert!(!super::can_edit_announcement(&claims, &row));
+        assert!(!super::can_delete_announcement(&claims, &row));
+        row.created_by = Some(claims.sub);
+        row.post_source = "company".into();
+        assert!(!super::can_edit_announcement(&claims, &row));
+        assert!(!super::can_delete_announcement(&claims, &row));
+        for permission in [
+            PERM_NOTIFICATION_MANAGE,
+            "notification:create",
+            "notification:update",
+            "notification:delete",
+        ] {
+            let admin = self::claims(permission, Some("ALL"));
+            assert_eq!(
+                super::can_edit_announcement(&admin, &row),
+                permission == PERM_NOTIFICATION_MANAGE || permission == "notification:update"
+            );
+            assert_eq!(
+                super::can_delete_announcement(&admin, &row),
+                permission == PERM_NOTIFICATION_MANAGE || permission == "notification:delete"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn employee_posts_cannot_set_raw_audiences_or_company_posts_without_create_authority() {
+        for mutation in [
+            "mutation { createAnnouncement(input: {title: \"Test\", employeePost: true, targetAudience: \"ROLE:HR_ADMIN\"}) { id } }",
+            "mutation { createAnnouncement(input: {title: \"Test\", employeePost: false}) { id } }",
+        ] {
+            let response = execute(claims(PERM_NOTIFICATION_READ, Some("SELF")), mutation).await;
+            assert_eq!(response.errors.len(), 1, "{response:?}");
+            assert!(response.errors[0].message.contains("notification admin"), "{response:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn direct_notification_actions_reject_narrowed_and_sibling_permissions_before_db() {
+        let operations = [
+            ("notification:create", "mutation { createDirectNotifications(input: { userIds: [], kind: \"INFO\", title: \"Test\" }) }"),
+            ("notification:update", "mutation { updateNotificationAdmin(input: { id: \"00000000-0000-0000-0000-000000000001\", title: \"Test\" }) { id } }"),
+            ("notification:delete", "mutation { deleteNotificationAdmin(id: \"00000000-0000-0000-0000-000000000001\") }"),
+        ];
+        for (action, mutation) in operations {
+            for permission in [
+                PERM_NOTIFICATION_MANAGE,
+                "notification:create",
+                "notification:update",
+                "notification:delete",
+            ] {
+                for scope in [
+                    None,
+                    Some("invalid"),
+                    Some("SELF"),
+                    Some("TEAM"),
+                    Some("DEPARTMENT"),
+                    Some("ALL"),
+                ] {
+                    let response = execute(claims(permission, scope), mutation).await;
+                    assert_eq!(response.errors.len(), 1, "{response:?}");
+                    let message = &response.errors[0].message;
+                    if scope == Some("ALL")
+                        && (permission == action || permission == PERM_NOTIFICATION_MANAGE)
+                    {
+                        assert!(
+                            message == "internal server error",
+                            "{action} {permission} {scope:?}: {message}"
+                        );
+                    } else {
+                        assert!(
+                            message.contains("permission"),
+                            "{action} {permission} {scope:?}: {message}"
+                        );
+                        assert!(
+                            message != "internal server error",
+                            "{action} {permission} {scope:?}: {message}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     #[tokio::test]
     async fn automation_settings_mutation_requires_exact_manage_all_before_db_access() {
         let mutation = r#"mutation {
@@ -350,7 +469,6 @@ impl MutationRoot {
     ) -> Result<AnnouncementDto> {
         let tenant_id = require_tenant_id(ctx)?;
         let claims = require_client_claims(ctx)?;
-        let db = tenant_db(ctx, tenant_id).await?;
 
         let title = input.title.trim().to_string();
         if title.is_empty() {
@@ -358,6 +476,7 @@ impl MutationRoot {
         }
 
         let hr_only = !input.employee_post
+            || input.target_audience.as_ref().is_some_and(|audience| !audience.trim().is_empty())
             || input.target_department_id.is_some()
             || input.target_location_id.is_some()
             || input
@@ -367,7 +486,7 @@ impl MutationRoot {
                 .unwrap_or(false)
             || input.publish_at.is_some()
             || input.expires_at.is_some();
-        if hr_only && !claims.can_manage_notifications() {
+        if hr_only && !claims.can_create_notifications() {
             return Err(
                 KabiPayError::Forbidden(
                     "company posts, scheduling, or audience targeting require notification admin"
@@ -377,6 +496,7 @@ impl MutationRoot {
             );
         }
 
+        let db = tenant_db(ctx, tenant_id).await?;
         let post_source = if input.employee_post {
             "employee_post".to_string()
         } else {
@@ -464,12 +584,13 @@ impl MutationRoot {
         if !can_edit_announcement(claims, &existing) {
             return Err(KabiPayError::Forbidden("cannot edit this announcement".into()).into_graphql());
         }
-        let full = claims.can_manage_notifications();
+        let full = claims.can_update_notifications();
         if !full
             && (input.clear_target_department
                 || input.clear_target_location
                 || input.target_department_id.is_some()
                 || input.target_location_id.is_some()
+                || input.target_audience.is_some()
                 || input.target_role_code.as_ref().map(|s| !s.trim().is_empty()).unwrap_or(false)
                 || input.clear_role_audience
                 || input.publish_at.is_some()
@@ -636,7 +757,7 @@ impl MutationRoot {
                 }
                 .into_graphql()
             })?;
-        if !can_edit_announcement(claims, &existing) {
+        if !can_delete_announcement(claims, &existing) {
             return Err(KabiPayError::Forbidden("cannot delete this announcement".into()).into_graphql());
         }
         notification_service::delete_announcement(&db, tenant_id, aid)
@@ -651,9 +772,9 @@ impl MutationRoot {
         input: CreateDirectNotificationsInput,
     ) -> Result<u64> {
         let claims = require_client_claims(ctx)?;
-        if !claims.can_manage_notifications() {
+        if !claims.can_create_notifications() {
             return Err(
-                KabiPayError::Forbidden("notification:manage permission required".into())
+                KabiPayError::Forbidden("notification:create or notification:manage permission requires ALL scope".into())
                     .into_graphql(),
             );
         }
@@ -688,9 +809,9 @@ impl MutationRoot {
         input: UpdateNotificationAdminInput,
     ) -> Result<NotificationDto> {
         let claims = require_client_claims(ctx)?;
-        if !claims.can_manage_notifications() {
+        if !claims.can_update_notifications() {
             return Err(
-                KabiPayError::Forbidden("notification:manage permission required".into())
+                KabiPayError::Forbidden("notification:update or notification:manage permission requires ALL scope".into())
                     .into_graphql(),
             );
         }
@@ -722,9 +843,9 @@ impl MutationRoot {
 
     async fn delete_notification_admin(&self, ctx: &Context<'_>, id: ID) -> Result<bool> {
         let claims = require_client_claims(ctx)?;
-        if !claims.can_manage_notifications() {
+        if !claims.can_delete_notifications() {
             return Err(
-                KabiPayError::Forbidden("notification:manage permission required".into())
+                KabiPayError::Forbidden("notification:delete or notification:manage permission requires ALL scope".into())
                     .into_graphql(),
             );
         }

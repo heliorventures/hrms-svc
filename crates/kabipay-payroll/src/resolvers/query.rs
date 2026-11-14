@@ -15,7 +15,6 @@ use kabipay_common::{
     tenant_business_clock::TenantBusinessClock,
     KabiPayError, KabiPayResult,
 };
-use kabipay_db_entities::tenant::d0029_file_storage::file_storage;
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
 use uuid::Uuid;
 
@@ -568,8 +567,8 @@ impl PayrollQueryRoot {
             )
             .into_graphql());
         }
-        let fs_row = file_storage::Entity::find_by_id(logo_id)
-            .filter(file_storage::Column::TenantId.eq(tenant_id))
+        let mime_type = crate::services::directory_projection::logo_mime(tenant_id, logo_id)
+            .into_tuple::<Option<String>>()
             .one(&db)
             .await
             .map_err(|e: sea_orm::DbErr| KabiPayError::from(e).into_graphql())?
@@ -581,7 +580,7 @@ impl PayrollQueryRoot {
                 .into_graphql()
             })?;
         let ttl = ttl_seconds.clamp(60, 86_400) as i64;
-        let claims = file_download_claims(tenant_id, logo_id, fs_row.mime_type.clone(), ttl);
+        let claims = file_download_claims(tenant_id, logo_id, mime_type, ttl);
         public_employee_file_download_url(&claims).map_err(KabiPayError::into_graphql)
     }
 

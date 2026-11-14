@@ -37,14 +37,14 @@ async fn verify_sources(
     employee: Uuid,
     input: &FinancialInput,
 ) -> KabiPayResult<()> {
-    use kabipay_db_entities::tenant::d0005_auth_rbac::user;
     use kabipay_db_entities::tenant::d0012_payroll::{payroll_cycle, payslip};
     for decision in &input.loan_decision.loans {
         if let Some(continuing) = &decision.continuing {
-            let owner = user::Entity::find_by_id(continuing.follow_up_user_id)
-                .filter(user::Column::TenantId.eq(tenant))
-                .filter(user::Column::IsActive.eq(true))
-                .filter(user::Column::IsDeleted.eq(false))
+            let owner = crate::services::directory_projection::active_owner_id(
+                tenant,
+                continuing.follow_up_user_id,
+            )
+                .into_tuple::<Uuid>()
                 .one(tx)
                 .await?;
             if owner.is_none() {

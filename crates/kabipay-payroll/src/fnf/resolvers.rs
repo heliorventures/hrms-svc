@@ -83,22 +83,22 @@ impl FnfQuery {
         #[graphql(default = 25)] first: u64,
     ) -> Result<FinanceOwnerConnection> {
         use kabipay_db_entities::tenant::d0005_auth_rbac::user;
-        use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect};
+        use sea_orm::{ColumnTrait, QueryFilter, QueryOrder, QuerySelect};
         manage(ctx)?;
         if first == 0 || first > 100 {
             return Err(KabiPayError::Validation("Choose a page size from 1 to 100".into()).into_graphql());
         }
         let tenant = require_tenant_id(ctx)?;
         let db = tenant_db(ctx, tenant).await?;
-        let mut query = user::Entity::find().filter(user::Column::TenantId.eq(tenant))
-            .filter(user::Column::IsActive.eq(true)).filter(user::Column::IsDeleted.eq(false));
+        let mut query = crate::services::directory_projection::active_owners(tenant);
         if let Some(after) = after { query = query.filter(user::Column::Id.gt(after)); }
-        let mut rows = query.order_by_asc(user::Column::Id).limit(first + 1).all(&db).await
+        let mut rows = query.order_by_asc(user::Column::Id).limit(first + 1)
+            .into_tuple::<(Uuid, String)>().all(&db).await
             .map_err(KabiPayError::from).map_err(KabiPayError::into_graphql)?;
         let has_next_page = rows.len() > first as usize;
         rows.truncate(first as usize);
-        let end_cursor = rows.last().map(|row| row.id.to_string());
-        Ok(FinanceOwnerConnection { nodes: rows.into_iter().map(|row| FinanceOwner {id:row.id,name:row.username}).collect(),
+        let end_cursor = rows.last().map(|row| row.0.to_string());
+        Ok(FinanceOwnerConnection { nodes: rows.into_iter().map(|(id,name)| FinanceOwner {id,name}).collect(),
             page_info: FinanceOwnerPageInfo {end_cursor,has_next_page} })
     }
     async fn fnf_settlement(

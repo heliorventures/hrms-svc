@@ -433,7 +433,8 @@ impl ClientClaims {
 
     /// Create/update other users' **employee** rows (not self-service profile edits).
     pub fn can_manage_employee_directory(&self) -> bool {
-        self.has_any_permission(&[PERM_EMPLOYEE_WRITE, PERM_EMPLOYEE_MANAGE])
+        self.has_permission_with_scope(PERM_EMPLOYEE_WRITE, ScopeType::All)
+            || self.has_permission_with_scope(PERM_EMPLOYEE_MANAGE, ScopeType::All)
     }
 
     /// Approve or reject **leave** requests (not the employee's own self-service only path).
@@ -468,7 +469,7 @@ impl ClientClaims {
 
     /// Create or update **workflow** definitions and **steps** (tenant approval graphs).
     pub fn can_manage_workflow_definitions(&self) -> bool {
-        self.has_any_permission(&[PERM_WORKFLOW_MANAGE])
+        self.has_permission_with_scope(PERM_WORKFLOW_MANAGE, ScopeType::All)
     }
 
     /// Configure leave types, policies, employee balances, and (via attendance) holiday calendars.
@@ -537,15 +538,18 @@ impl ClientClaims {
     }
 
     pub fn can_manage_assets_registry(&self) -> bool {
-        self.has_any_permission(&[PERM_ASSETS_MANAGE])
+        self.has_permission_with_scope(PERM_ASSETS_MANAGE, ScopeType::All)
     }
 
     pub fn can_read_assets_registry(&self) -> bool {
-        self.can_manage_assets_registry() || self.has_any_permission(&[PERM_ASSETS_READ])
+        self.can_manage_assets_registry()
+            || self.has_permission_with_scope(PERM_ASSETS_READ, ScopeType::All)
     }
 
     pub fn can_read_own_assets(&self) -> bool {
-        self.can_read_assets_registry() || self.has_any_permission(&[PERM_ASSETS_SELF])
+        self.can_read_assets_registry()
+            || self.has_permission_with_scope(PERM_ASSETS_SELF, ScopeType::Self_)
+            || self.has_permission_with_scope(PERM_ASSETS_READ, ScopeType::Self_)
     }
 
     pub fn can_manage_succession_planning(&self) -> bool {
@@ -557,22 +561,24 @@ impl ClientClaims {
     }
 
     pub fn can_manage_grievance_tenant_cases(&self) -> bool {
-        self.has_any_permission(&[PERM_GRIEVANCE_MANAGE])
+        self.has_permission_with_scope(PERM_GRIEVANCE_MANAGE, ScopeType::All)
     }
 
     /// Submit grievances and view **own** cases (`grievance:self` or `grievance:manage`).
     pub fn can_use_grievance_self_service(&self) -> bool {
-        self.has_any_permission(&[PERM_GRIEVANCE_SELF, PERM_GRIEVANCE_MANAGE])
+        self.can_manage_grievance_tenant_cases()
+            || self.has_permission_with_scope(PERM_GRIEVANCE_SELF, ScopeType::Self_)
     }
 
     /// Tenant-wide onboarding/offboarding lists and HR depth (`onboarding:manage`).
     pub fn can_manage_onboarding_tenant(&self) -> bool {
-        self.has_any_permission(&[PERM_ONBOARDING_MANAGE])
+        self.has_permission_with_scope(PERM_ONBOARDING_MANAGE, ScopeType::All)
     }
 
     /// Join checklist + own separation flows (`onboarding:self` or `onboarding:manage`).
     pub fn can_use_onboarding_self_service(&self) -> bool {
-        self.has_any_permission(&[PERM_ONBOARDING_SELF, PERM_ONBOARDING_MANAGE])
+        self.can_manage_onboarding_tenant()
+            || self.has_permission_with_scope(PERM_ONBOARDING_SELF, ScopeType::Self_)
     }
 
     /// Workforce insights UI (`analytics:read`) — dashboards, report catalog, snapshots.
@@ -600,15 +606,25 @@ impl ClientClaims {
         self.has_any_permission(&[PERM_TIMESHEET_MANAGE])
     }
 
-    /// HR / comms admin: announcements, direct notifications, and related deletes. Also accepts
-    /// split permissions from the RBAC catalog (`notification:*`).
+    /// Tenant-wide notification configuration and communication management.
     pub fn can_manage_notifications(&self) -> bool {
-        self.has_any_permission(&[
-            PERM_NOTIFICATION_MANAGE,
-            "notification:create",
-            "notification:update",
-            "notification:delete",
-        ])
+        self.has_permission_with_scope(PERM_NOTIFICATION_MANAGE, ScopeType::All)
+    }
+
+    /// Split notification grants authorize only their exact action with explicit ALL scope.
+    pub fn can_create_notifications(&self) -> bool {
+        self.can_manage_notifications()
+            || self.has_permission_with_scope("notification:create", ScopeType::All)
+    }
+
+    pub fn can_update_notifications(&self) -> bool {
+        self.can_manage_notifications()
+            || self.has_permission_with_scope("notification:update", ScopeType::All)
+    }
+
+    pub fn can_delete_notifications(&self) -> bool {
+        self.can_manage_notifications()
+            || self.has_permission_with_scope("notification:delete", ScopeType::All)
     }
 
     /// Effective data scope for list/detail filters (`permission_scope` merged at login). Defaults
@@ -811,14 +827,60 @@ mod tests {
 
     #[test]
     fn workplace_configuration_capabilities_require_the_exact_all_scoped_permission() {
-        let capabilities: [(&str, fn(&ClientClaims) -> bool); 6] = [
-            (PERM_BENEFITS_MANAGE, ClientClaims::can_manage_benefits_catalog),
-            (PERM_RECRUITMENT_MANAGE, ClientClaims::can_manage_recruitment),
+        let capabilities: [(&str, fn(&ClientClaims) -> bool); 16] = [
+            (
+                PERM_EMPLOYEE_WRITE,
+                ClientClaims::can_manage_employee_directory,
+            ),
+            (
+                PERM_EMPLOYEE_MANAGE,
+                ClientClaims::can_manage_employee_directory,
+            ),
+            (
+                PERM_WORKFLOW_MANAGE,
+                ClientClaims::can_manage_workflow_definitions,
+            ),
+            (PERM_ASSETS_MANAGE, ClientClaims::can_manage_assets_registry),
+            (
+                PERM_GRIEVANCE_MANAGE,
+                ClientClaims::can_manage_grievance_tenant_cases,
+            ),
+            (
+                PERM_ONBOARDING_MANAGE,
+                ClientClaims::can_manage_onboarding_tenant,
+            ),
+            (
+                PERM_NOTIFICATION_MANAGE,
+                ClientClaims::can_manage_notifications,
+            ),
+            (
+                "notification:create",
+                ClientClaims::can_create_notifications,
+            ),
+            (
+                "notification:update",
+                ClientClaims::can_update_notifications,
+            ),
+            (
+                "notification:delete",
+                ClientClaims::can_delete_notifications,
+            ),
+            (
+                PERM_BENEFITS_MANAGE,
+                ClientClaims::can_manage_benefits_catalog,
+            ),
+            (
+                PERM_RECRUITMENT_MANAGE,
+                ClientClaims::can_manage_recruitment,
+            ),
             (
                 PERM_PERFORMANCE_MANAGE,
                 ClientClaims::can_manage_performance_programs,
             ),
-            (PERM_LEARNING_MANAGE, ClientClaims::can_manage_learning_catalog),
+            (
+                PERM_LEARNING_MANAGE,
+                ClientClaims::can_manage_learning_catalog,
+            ),
             (
                 PERM_SUCCESSION_MANAGE,
                 ClientClaims::can_manage_succession_planning,
@@ -846,6 +908,67 @@ mod tests {
                 .permission_scopes
                 .insert(permission.into(), "ALL".into());
             assert!(capability(&missing_scope), "{permission} with ALL");
+        }
+    }
+
+    #[test]
+    fn domain_self_service_requires_exact_self_or_valid_all_management() {
+        let capabilities: [(&str, &str, fn(&ClientClaims) -> bool); 3] = [
+            (
+                PERM_ASSETS_SELF,
+                PERM_ASSETS_MANAGE,
+                ClientClaims::can_read_own_assets,
+            ),
+            (
+                PERM_GRIEVANCE_SELF,
+                PERM_GRIEVANCE_MANAGE,
+                ClientClaims::can_use_grievance_self_service,
+            ),
+            (
+                PERM_ONBOARDING_SELF,
+                PERM_ONBOARDING_MANAGE,
+                ClientClaims::can_use_onboarding_self_service,
+            ),
+        ];
+        for (permission, manage, capability) in capabilities {
+            for scope in [
+                None,
+                Some("invalid"),
+                Some("TEAM"),
+                Some("DEPARTMENT"),
+                Some("ALL"),
+            ] {
+                let mut claims = client_claims(&[], &[permission]);
+                if let Some(scope) = scope {
+                    claims
+                        .permission_scopes
+                        .insert(permission.into(), scope.into());
+                }
+                assert!(!capability(&claims), "{permission} {scope:?}");
+            }
+            let mut claims = client_claims(&[], &[permission]);
+            claims
+                .permission_scopes
+                .insert(permission.into(), "SELF".into());
+            assert!(capability(&claims), "{permission}");
+            let mut claims = client_claims(&[], &[manage]);
+            claims.permission_scopes.insert(manage.into(), "ALL".into());
+            assert!(capability(&claims), "{manage}");
+        }
+    }
+
+    #[test]
+    fn split_notification_permissions_do_not_confer_general_management() {
+        for permission in [
+            "notification:create",
+            "notification:update",
+            "notification:delete",
+        ] {
+            let mut claims = client_claims(&[], &[permission]);
+            claims
+                .permission_scopes
+                .insert(permission.into(), "ALL".into());
+            assert!(!claims.can_manage_notifications(), "{permission}");
         }
     }
 

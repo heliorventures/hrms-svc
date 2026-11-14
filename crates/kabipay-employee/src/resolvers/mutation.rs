@@ -327,7 +327,7 @@ impl MutationRoot {
                 validate_admin_password(login.initial_password, "initialPassword")?;
             let password_hash = hash_password_async(initial_password).await?;
             let role_ids = parse_role_ids(login.role_ids)?;
-            employee_service::create_with_login(
+            employee_service::create_with_login_for_actor(
                 &db,
                 tenant_id,
                 data,
@@ -337,6 +337,7 @@ impl MutationRoot {
                     password_hash,
                     role_ids,
                 },
+                Some(require_client_claims(ctx)?.sub),
             )
             .await
             .map_err(KabiPayError::into_graphql)?
@@ -361,7 +362,7 @@ impl MutationRoot {
         let initial_password = validate_admin_password(input.initial_password, "initialPassword")?;
         let password_hash = hash_password_async(initial_password).await?;
         let role_ids = parse_role_ids(input.role_ids)?;
-        let m = employee_service::provision_login(
+        let m = employee_service::provision_login_for_actor(
             &db,
             tenant_id,
             employee_id,
@@ -371,6 +372,7 @@ impl MutationRoot {
                 password_hash,
                 role_ids,
             },
+            Some(require_client_claims(ctx)?.sub),
         )
         .await
         .map_err(KabiPayError::into_graphql)?;
@@ -389,7 +391,7 @@ impl MutationRoot {
         let employee_id = parse_uuid(&input.employee_id, "employeeId")?;
         let new_password = validate_admin_password(input.new_password, "newPassword")?;
         let password_hash = hash_password_async(new_password).await?;
-        employee_service::reset_linked_user_password(&db, tenant_id, employee_id, password_hash)
+        employee_service::reset_linked_user_password_for_actor(&db, tenant_id, employee_id, password_hash, Some(require_client_claims(ctx)?.sub))
             .await
             .map_err(KabiPayError::into_graphql)?;
         Ok(true)
@@ -1539,7 +1541,24 @@ impl MutationRoot {
         Ok(ClearanceChecklistItemDto::from(m))
     }
 
-    /// Replace `role_permission` rows for a role (full matrix row).
+    /// Replace permissions and exact scopes atomically, preserving administrator availability.
+    async fn set_role_access(
+        &self, ctx: &Context<'_>, role_id: ID, permission_ids: Vec<ID>,
+        scopes: Vec<PermissionScopeAssignmentInput>,
+    ) -> Result<bool> {
+        require_tenant_rbac_admin(ctx)?;
+        let tenant_id = require_tenant_id(ctx)?;
+        let db = tenant_db(ctx, tenant_id).await?;
+        let rid = parse_uuid(&role_id, "roleId")?;
+        let pids = permission_ids.iter().map(|id| parse_uuid(id, "permissionId"))
+            .collect::<Result<Vec<_>>>()?;
+        let scopes = scopes.into_iter().map(|s| (s.resource, s.action, s.scope_type)).collect();
+        rbac_admin_service::set_role_access_for_actor(&db, tenant_id, rid, pids, scopes, Some(require_client_claims(ctx)?.sub))
+            .await.map_err(KabiPayError::into_graphql)?;
+        Ok(true)
+    }
+
+    /// Compatibility endpoint: new grants require scope via setRoleAccess.
     async fn set_role_permissions(
         &self,
         ctx: &Context<'_>,

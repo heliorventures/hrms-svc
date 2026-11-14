@@ -7,12 +7,15 @@ use uuid::Uuid;
 
 pub async fn list_tenants(
     db: &DatabaseConnection,
+    allowed_tenants: Option<&[Uuid]>,
     limit: u64,
 ) -> KabiPayResult<Vec<tenant::Model>> {
     let limit = limit.clamp(1, 500);
-    tenant::Entity::find()
-        .filter(tenant::Column::IsDeleted.eq(false))
-        .order_by_asc(tenant::Column::Name)
+    let mut query = tenant::Entity::find().filter(tenant::Column::IsDeleted.eq(false));
+    if let Some(tenants) = allowed_tenants {
+        query = query.filter(tenant::Column::Id.is_in(tenants.iter().copied()));
+    }
+    query.order_by_asc(tenant::Column::Name)
         .limit(limit)
         .all(db)
         .await
@@ -38,14 +41,14 @@ pub async fn list_modules(
 
 pub async fn list_subscriptions(
     db: &DatabaseConnection,
-    tenant_id: Option<Uuid>,
+    allowed_tenants: Option<&[Uuid]>,
     limit: u64,
 ) -> KabiPayResult<Vec<tenant_subscription::Model>> {
     let limit = limit.clamp(1, 500);
     let mut q = tenant_subscription::Entity::find()
         .filter(tenant_subscription::Column::IsDeleted.eq(false));
-    if let Some(t) = tenant_id {
-        q = q.filter(tenant_subscription::Column::TenantId.eq(t));
+    if let Some(tenants) = allowed_tenants {
+        q = q.filter(tenant_subscription::Column::TenantId.is_in(tenants.iter().copied()));
     }
     q.order_by_desc(tenant_subscription::Column::CreatedAt)
         .limit(limit)

@@ -73,14 +73,14 @@ created_at: now,
         .filter(employee::Column::IsDeleted.eq(false))
         .one(conn).await?.and_then(|row| row.user_id)
     {
-        notification::ActiveModel {
+        notification::Entity::insert(notification::ActiveModel {
             id: Set(Uuid::new_v4()), tenant_id: Set(tenant_id), user_id: Set(user_id),
             r#type: Set(Some("EMPLOYEE_PROFILE_EVIDENCE".into())),
             title: Set(Some(format!("{} evidence {}", if entity_type == "employee_education" { "Education" } else { "Work experience" }, action))),
             message: Set(Some(format!("Your profile evidence was {action}."))),
             action_url: Set(Some(format!("/organization/employees/{employee_id}"))),
             is_read: Set(false), read_at: Set(None), created_at: Set(now), updated_at: Set(now),
-        }.insert(conn).await?;
+        }).exec_without_returning(conn).await?;
     }
     Ok(())
 }

@@ -58,6 +58,7 @@ fn candidate_proxy(row: &candidate::Model) -> ProxyRow {
 #[derive(Debug)]
 struct ConversionProxy {
     fail_employee: bool,
+    current_admin: bool,
     row: candidate::Model,
     role: Uuid,
     user: Uuid,
@@ -135,6 +136,11 @@ impl ProxyDatabaseTrait for ConversionProxy {
         -> std::result::Result<Vec<ProxyRow>, DbErr> {
         let sql = statement.to_string();
         self.event(sql.clone());
+        if sql.contains(" AS n,COALESCE") {
+            return Ok(vec![ProxyRow::new(BTreeMap::from([
+                ("n".into(), 1_i64.into()), ("own".into(), self.current_admin.into()),
+            ]))]);
+        }
         if sql.contains("FROM \"prejoining_candidate\"") {
             return Ok(vec![candidate_proxy(&self.row)]);
         }
@@ -187,18 +193,72 @@ async fn database(row: candidate::Model)
 }
 async fn database_with_failure(row: candidate::Model, fail_employee: bool)
     -> (DatabaseConnection, Uuid, Arc<Mutex<Vec<String>>>) {
+    database_with_authority(row, fail_employee, true).await
+}
+async fn database_with_authority(row: candidate::Model, fail_employee: bool, current_admin: bool)
+    -> (DatabaseConnection, Uuid, Arc<Mutex<Vec<String>>>) {
     let events = Arc::new(Mutex::new(vec![]));
     let role = Uuid::new_v4();
     let db =
         Database::connect_proxy(DbBackend::Postgres,
                     Arc::new(Box::new(ConversionProxy {
                                 fail_employee,
+                                current_admin,
                                 row,
                                 role,
                                 user: Uuid::new_v4(),
                                 events: events.clone(),
                             }))).await.unwrap();
     (db, role, events)
+}
+
+#[tokio::test]
+async fn revoked_login_admin_cannot_confirm_prejoining_before_target_reads() {
+    let row = candidate_row(Uuid::new_v4(), Uuid::new_v4(), "APPROVED");
+    let (db, role, events) = database_with_authority(row.clone(), false, false).await;
+    let error = confirm(&db, row.tenant_id, row.id, row.revision, Uuid::new_v4(), employee(), login(role))
+        .await.expect_err("revoked direct administrator cannot create a linked account");
+    assert_eq!(error.code(), "FORBIDDEN");
+    let events = events.lock().unwrap();
+    assert!(events.iter().any(|sql| sql.contains("pg_advisory_xact_lock")));
+    assert!(!events.iter().any(|sql| sql.contains("FROM \"prejoining_candidate\"") || sql.starts_with("INSERT") || sql.starts_with("UPDATE") || sql == "COMMIT"), "{events:?}");
+    assert_eq!(events.last().map(String::as_str), Some("ROLLBACK"));
+}
+
+#[tokio::test]
+async fn revoked_login_admin_cannot_skip_admission_on_joined_prejoining_replay() {
+    let row = candidate_row(Uuid::new_v4(), Uuid::new_v4(), "JOINED");
+    let (db, role, events) = database_with_authority(row.clone(), false, false).await;
+    let error = confirm(&db, row.tenant_id, row.id, row.revision, Uuid::new_v4(), employee(), login(role))
+        .await.expect_err("joined replay still requires fresh direct authority");
+    assert_eq!(error.code(), "FORBIDDEN");
+    let events = events.lock().unwrap();
+    assert!(!events.iter().any(|sql| sql.contains("FROM \"prejoining_candidate\"") || sql == "COMMIT"), "{events:?}");
+    assert_eq!(events.last().map(String::as_str), Some("ROLLBACK"));
+}
+
+#[tokio::test]
+async fn revoked_login_admin_cannot_use_the_resolver_replay_lookup() {
+    let row = candidate_row(Uuid::new_v4(), Uuid::new_v4(), "JOINED");
+    let (db, _, events) = database_with_authority(row.clone(), false, false).await;
+    assert_eq!(find_for_confirmation(&db, row.tenant_id, row.id, Uuid::new_v4()).await.unwrap_err().code(), "FORBIDDEN");
+    let events = events.lock().unwrap();
+    assert!(!events.iter().any(|sql| sql.contains("FROM \"prejoining_candidate\"") || sql == "COMMIT"));
+    assert_eq!(events.last().map(String::as_str), Some("ROLLBACK"));
+}
+
+#[tokio::test]
+async fn current_login_admin_preserves_joined_replay_before_credential_validation() {
+    let row = candidate_row(Uuid::new_v4(), Uuid::new_v4(), "JOINED");
+    let (db, _, events) = database_with_authority(row.clone(), false, true).await;
+    let replay = find_for_confirmation(&db, row.tenant_id, row.id, Uuid::new_v4()).await.unwrap().unwrap();
+    assert_eq!(replay.employee_id, row.employee_id);
+    let events = events.lock().unwrap();
+    let authority = events.iter().position(|sql| sql.contains(" AS n,COALESCE")).unwrap();
+    let target = events.iter().position(|sql| sql.contains("FROM \"prejoining_candidate\"")).unwrap();
+    assert!(authority < target);
+    assert_eq!(events.last().map(String::as_str), Some("COMMIT"));
+    assert!(!events.iter().any(|sql| sql.starts_with("INSERT") || sql.starts_with("UPDATE")));
 }
 
 #[tokio::test]

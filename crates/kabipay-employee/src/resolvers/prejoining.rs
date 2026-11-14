@@ -250,7 +250,7 @@ pub async fn confirm(ctx: &Context<'_>, input: ConfirmPrejoiningInput)
     let actor = require_client_claims(ctx)?.sub;
     let candidate_id = id(&input.candidate_id)?;
     let db = tenant_db(ctx, tenant).await?;
-    if let Some(row) = service::find(&db, tenant, candidate_id).await.map_err(KabiPayError::into_graphql)? {
+    if let Some(row) = service::find_for_confirmation(&db, tenant, candidate_id, actor).await.map_err(KabiPayError::into_graphql)? {
         if row.status == "JOINED" {
             return dto(&db, row).await;
         }

@@ -92,7 +92,7 @@ async fn insert_notification<C: ConnectionTrait>(
     action_url: String,
     now: chrono::DateTime<Utc>,
 ) -> KabiPayResult<()> {
-    notification::ActiveModel {
+    notification::Entity::insert(notification::ActiveModel {
         id: Set(Uuid::new_v4()),
         tenant_id: Set(tenant_id),
         user_id: Set(user_id),
@@ -104,8 +104,8 @@ async fn insert_notification<C: ConnectionTrait>(
         read_at: Set(None),
         created_at: Set(now),
         updated_at: Set(now),
-    }
-    .insert(conn)
+    })
+    .exec_without_returning(conn)
     .await?;
     Ok(())
 }

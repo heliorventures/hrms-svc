@@ -122,7 +122,7 @@ pub(crate) async fn decide(
         RequestDecision::Reject => "REJECT",
     };
     let now = Utc::now();
-    workflow_action::ActiveModel {
+    workflow_action::Entity::insert(workflow_action::ActiveModel {
         id: Set(Uuid::new_v4()),
         tenant_id: Set(actor.tenant_id),
         instance_id: Set(instance_id),
@@ -133,8 +133,8 @@ pub(crate) async fn decide(
         acted_at: Set(now),
         created_at: Set(now),
         updated_at: Set(now),
-    }
-    .insert(tx)
+    })
+    .exec_without_returning(tx)
     .await?;
     let mut model: workflow_instance::ActiveModel = instance.into();
     if matches!(decision, RequestDecision::Approve) && !final_approval {

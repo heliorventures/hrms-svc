@@ -8,6 +8,9 @@ mod entities;
 mod resolvers;
 mod services;
 
+#[cfg(test)]
+mod authorization_tests;
+
 use resolvers::{MutationRoot, QueryRoot};
 
 #[tokio::main]

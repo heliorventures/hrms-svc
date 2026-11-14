@@ -27,6 +27,7 @@ pub mod profile_change_service;
 pub mod profile_payload_crypto;
 pub mod profile_record_service;
 pub mod rbac_admin_service;
+pub mod rbac_access_policy;
 pub mod separation_service;
 pub mod finance_operation;
 pub mod private_delivery;

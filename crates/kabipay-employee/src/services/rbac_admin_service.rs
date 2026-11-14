@@ -15,6 +15,10 @@ use uuid::Uuid;
 
 const ACTIVE_LOGIN_ROLE_REQUIRED_CODE: &str = "ACTIVE_LOGIN_ROLE_REQUIRED";
 
+#[path = "rbac_access_configuration.rs"]
+mod access_configuration;
+pub use access_configuration::set_role_access_for_actor;
+
 fn active_login_role_required() -> KabiPayError {
     KabiPayError::BusinessRule {
         code: ACTIVE_LOGIN_ROLE_REQUIRED_CODE,
@@ -222,34 +226,7 @@ pub async fn set_role_permissions(
     set_role_permissions_for_actor(db,tenant_id,role_id,permission_ids,None).await
 }
 pub async fn set_role_permissions_for_actor(db:&DatabaseConnection,tenant_id:Uuid,role_id:Uuid,permission_ids:Vec<Uuid>,actor:Option<Uuid>)->KabiPayResult<()> {
-    ensure_role_in_tenant(db, tenant_id, role_id).await?;
-    let unique: Vec<Uuid> = permission_ids.into_iter().collect::<HashSet<_>>().into_iter().collect();
-    for pid in &unique {
-        permission::Entity::find_by_id(*pid).one(db).await?.ok_or_else(|| KabiPayError::NotFound {
-            entity: "permission",
-            id: pid.to_string(),
-        })?;
-    }
-
-    let txn = db.begin().await?;
-    let before=begin_role_authority_change(&txn,tenant_id,actor).await?;
-    role_permission::Entity::delete_many()
-        .filter(role_permission::Column::RoleId.eq(role_id))
-        .exec(&txn)
-        .await?;
-    let now = Utc::now();
-    for pid in unique {
-        role_permission::ActiveModel {
-            role_id: Set(role_id),
-            permission_id: Set(pid),
-            created_at: Set(now),
-        }
-        .insert(&txn)
-        .await?;
-    }
-    finish_role_authority_change(&txn,tenant_id,actor,before).await?;
-    txn.commit().await?;
-    Ok(())
+    access_configuration::replace_access(db, tenant_id, role_id, Some(permission_ids), None, actor).await
 }
 
 pub async fn set_user_roles(
@@ -263,8 +240,13 @@ pub async fn set_user_roles(
 pub async fn set_user_roles_for_actor(db: &DatabaseConnection, tenant_id: Uuid, user_id: Uuid, role_ids: Vec<Uuid>, actor: Option<Uuid>) -> KabiPayResult<()> {
     require_nonempty_role_assignment(&role_ids)?;
     let txn = db.begin().await?;
-    guard_account_change(&txn,tenant_id,user_id,actor==Some(user_id),Some(&role_ids),None).await?;
-    let replacement = replace_user_roles_in_transaction(&txn, tenant_id, user_id, &role_ids).await;
+    let replacement = async {
+        if let Some(actor_id) = actor {
+            require_fresh_direct_rbac_admin(&txn, tenant_id, actor_id).await?;
+        }
+        guard_account_change(&txn,tenant_id,user_id,actor==Some(user_id),Some(&role_ids),None).await?;
+        replace_user_roles_in_transaction(&txn, tenant_id, user_id, &role_ids).await
+    }.await;
     if let Err(error) = replacement {
         txn.rollback().await?;
         return Err(error);
@@ -383,32 +365,7 @@ pub async fn set_role_permission_scopes(
     set_role_permission_scopes_for_actor(db,tenant_id,role_id,scopes,None).await
 }
 pub async fn set_role_permission_scopes_for_actor(db:&DatabaseConnection,tenant_id:Uuid,role_id:Uuid,scopes:Vec<(String,String,String)>,actor:Option<Uuid>)->KabiPayResult<()> {
-    ensure_role_in_tenant(db, tenant_id, role_id).await?;
-    let txn = db.begin().await?;
-    let before=begin_role_authority_change(&txn,tenant_id,actor).await?;
-    permission_scope::Entity::delete_many()
-        .filter(permission_scope::Column::TenantId.eq(tenant_id))
-        .filter(permission_scope::Column::RoleId.eq(role_id))
-        .exec(&txn)
-        .await?;
-    let now = Utc::now();
-    for (resource, action, scope_type) in scopes {
-        let st = scope_type.trim().to_ascii_uppercase();
-        permission_scope::ActiveModel {
-            id: Set(Uuid::new_v4()),
-            tenant_id: Set(tenant_id),
-            role_id: Set(role_id),
-            resource: Set(resource.trim().to_string()),
-            action: Set(action.trim().to_string()),
-            scope_type: Set(st),
-            created_at: Set(now),
-        }
-        .insert(&txn)
-        .await?;
-    }
-    finish_role_authority_change(&txn,tenant_id,actor,before).await?;
-    txn.commit().await?;
-    Ok(())
+    access_configuration::replace_access(db, tenant_id, role_id, None, Some(scopes), actor).await
 }
 
 async fn admin_authority_state(tx:&DatabaseTransaction,tenant:Uuid,actor:Option<Uuid>)->KabiPayResult<(i64,bool)> {
@@ -418,7 +375,18 @@ async fn admin_authority_state(tx:&DatabaseTransaction,tenant:Uuid,actor:Option<
 
 async fn begin_role_authority_change(tx:&DatabaseTransaction,tenant:Uuid,actor:Option<Uuid>)->KabiPayResult<(i64,bool)> {
     tx.execute(kabipay_organization_tenant::statement("SELECT pg_advisory_xact_lock(hashtextextended($1,0))",vec![format!("company-account-admin:{tenant}").into()])).await?;
-    admin_authority_state(tx,tenant,actor).await
+    let state = admin_authority_state(tx,tenant,actor).await?;
+    if actor.is_some() && !state.1 {
+        return Err(KabiPayError::Forbidden("Current company administration authority is required".into()));
+    }
+    Ok(state)
+}
+
+/// Direct account administration must refresh authority while holding the same
+/// transaction lock used by role revocation. Organization/operator callers use
+/// their separately verified authority rather than this direct-user admission.
+pub(crate) async fn require_fresh_direct_rbac_admin(tx:&DatabaseTransaction,tenant:Uuid,actor:Uuid)->KabiPayResult<()> {
+    begin_role_authority_change(tx, tenant, Some(actor)).await.map(|_| ())
 }
 async fn finish_role_authority_change(tx:&DatabaseTransaction,tenant:Uuid,actor:Option<Uuid>,before:(i64,bool))->KabiPayResult<()> {
     let after=admin_authority_state(tx,tenant,actor).await?;
@@ -452,6 +420,11 @@ mod role_lifecycle_tests {
                 .push(format!("QUERY {statement}"));
             // Existing lifecycle fixtures represent an ordinary employee role.
             // Administration authority itself is exercised by dedicated source/PG cases.
+            if statement.sql.contains(" AS n,COALESCE") {
+                return Ok(vec![ProxyRow::new(BTreeMap::from([
+                    ("n".into(), 1_i64.into()), ("own".into(), false.into()),
+                ]))]);
+            }
             if statement.sql.contains(" AS admin") {
                 return Ok(vec![ProxyRow::new(BTreeMap::from([("admin".into(), false.into())]))]);
             }
@@ -557,6 +530,24 @@ mod role_lifecycle_tests {
             ("role_id".into(), role_id.into()),
             ("assigned_at".into(), Utc::now().into()),
         ]))
+    }
+
+    #[tokio::test]
+    async fn revoked_direct_actor_cannot_restore_authority_by_assigning_roles() {
+        let tenant_id = Uuid::new_v4();
+        let user_id = Uuid::new_v4();
+        let role_id = Uuid::new_v4();
+        let (db, events) = scripted_connection(vec![
+            Ok(vec![user_row(user_id, tenant_id, true)]),
+            Ok(vec![role_row(role_id, tenant_id, false)]),
+            Ok(vec![user_role_row(user_id, role_id)]),
+        ], false).await;
+        let error = set_user_roles_for_actor(&db, tenant_id, user_id, vec![role_id], Some(user_id))
+            .await.expect_err("revoked administrator cannot assign roles through an old bearer");
+        assert_eq!(error.code(), "FORBIDDEN");
+        let events = events.lock().expect("event recorder");
+        assert_eq!(events.last().map(String::as_str), Some("ROLLBACK"));
+        assert!(!events.iter().any(|event| event.contains("DELETE FROM") || event == "COMMIT"));
     }
 
     #[tokio::test]
