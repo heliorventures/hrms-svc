@@ -134,6 +134,10 @@ fn employee_target_access_from_claims(
     })
 }
 
+#[cfg(test)]
+#[path = "role_permission_tests.rs"]
+mod role_permission_tests;
+
 async fn can_view_private_employee_profile(
     ctx: &Context<'_>,
     db: &DatabaseConnection,

@@ -36,7 +36,7 @@ pub async fn finalize_in_transaction(
 ) -> KabiPayResult<PayrollFinalization> {
     if actor.tenant!=tenant {return Err(KabiPayError::Unauthorised);}
     super::loan_recovery::lock(txn, tenant).await?;
-    super::payroll_fingerprint::lock_inputs(txn).await?;
+    super::payroll_fingerprint::lock_inputs(txn, tenant).await?;
     let cycle = payroll_draft::cycle(txn, tenant, id).await?;
     payroll_draft::ensure_draft(&cycle.status)?;
     let draft = payroll_draft::find_with_date(txn, tenant, id,actor.business_date)

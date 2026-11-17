@@ -113,7 +113,7 @@ pub async fn execute_claim(
         // Match local payroll lock ordering; hold authority and input fences until
         // business writes and terminal job state commit together.
         crate::services::loan_recovery::lock(&tx,tenant).await?;
-        crate::services::payroll_fingerprint::lock_inputs(&tx).await?;
+        crate::services::payroll_fingerprint::lock_inputs(&tx,tenant).await?;
         let p=kabipay_organization_tenant::refresh_payroll_job_authority(&tx,ops,tenant,&body,&reference).await?;
         if tx.query_one(statement("SELECT id FROM payroll_cycle WHERE tenant_id=$1 AND id=$2 FOR UPDATE",vec![tenant.into(),command.resource_id.into()])).await?.is_none() {return Err(unavailable());}
         let version=tx.query_one(statement("SELECT version FROM organization_resource_version WHERE tenant_id=$1 AND resource_type='payroll_run' AND resource_id=$2 FOR UPDATE",vec![tenant.into(),command.resource_id.into()])).await?.ok_or_else(unavailable)?.try_get::<i64>("","version")?;

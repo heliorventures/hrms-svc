@@ -59,6 +59,10 @@ fn payroll_read_scope(ctx: &Context<'_>) -> Result<ScopeType> {
         .map_err(KabiPayError::into_graphql)
 }
 
+#[cfg(test)]
+#[path = "role_permission_tests.rs"]
+mod role_permission_tests;
+
 fn require_payroll_target_scope(
     filter: &EmployeeScopeFilter,
     target_employee_id: Uuid,

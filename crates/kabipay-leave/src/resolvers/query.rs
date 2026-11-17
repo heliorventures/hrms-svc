@@ -39,6 +39,14 @@ fn leave_read_scope(ctx: &Context<'_>) -> Result<ScopeType> {
         .map_err(KabiPayError::into_graphql)
 }
 
+fn leave_request_read_scope_from_claims(
+    claims: Option<&ClientClaims>,
+    mine: bool,
+) -> KabiPayResult<ScopeType> {
+    let scope = leave_read_scope_from_claims(claims)?;
+    Ok(if mine { ScopeType::Self_ } else { scope })
+}
+
 pub struct QueryRoot;
 
 #[Object]
@@ -111,6 +119,7 @@ impl QueryRoot {
     }
 
     /// List leave requests for the caller's tenant.
+    /// `mine` restricts the read scope to the authenticated employee before pagination.
     async fn leave_requests(
         &self,
         ctx: &Context<'_>,
@@ -118,9 +127,11 @@ impl QueryRoot {
         #[graphql(default = 0)] offset: u64,
         from_date: Option<NaiveDate>,
         to_date: Option<NaiveDate>,
+        #[graphql(default = false)] mine: bool,
     ) -> Result<Vec<LeaveRequestDto>> {
         let tenant_id = require_tenant_id(ctx)?;
-        let scope = leave_read_scope(ctx)?;
+        let scope = leave_request_read_scope_from_claims(ctx.data_opt::<ClientClaims>(), mine)
+            .map_err(KabiPayError::into_graphql)?;
         let db = tenant_db(ctx, tenant_id).await?;
         let viewer = resolve_viewer_employee(ctx, &db, tenant_id).await?;
         let filter = resolve_employee_scope_filter(&db, tenant_id, scope, viewer)
@@ -319,15 +330,17 @@ impl QueryRoot {
     }
 
     /// Total leave requests visible to the caller for the selected date range.
-    /// This uses the same tenant, deletion, date, and employee-scope filters as `leave_requests`.
+    /// This uses the same tenant, deletion, date, mine, and employee-scope filters as `leave_requests`.
     async fn leave_request_count(
         &self,
         ctx: &Context<'_>,
         from_date: Option<NaiveDate>,
         to_date: Option<NaiveDate>,
+        #[graphql(default = false)] mine: bool,
     ) -> Result<i32> {
         let tenant_id = require_tenant_id(ctx)?;
-        let scope = leave_read_scope(ctx)?;
+        let scope = leave_request_read_scope_from_claims(ctx.data_opt::<ClientClaims>(), mine)
+            .map_err(KabiPayError::into_graphql)?;
         let db = tenant_db(ctx, tenant_id).await?;
         let viewer = resolve_viewer_employee(ctx, &db, tenant_id).await?;
         let filter = resolve_employee_scope_filter(&db, tenant_id, scope, viewer)
@@ -374,8 +387,9 @@ impl QueryRoot {
         #[graphql(default = 0)] offset: u64,
         from_date: Option<NaiveDate>,
         to_date: Option<NaiveDate>,
+        #[graphql(default = false)] mine: bool,
     ) -> Result<Vec<LeaveRequestDto>> {
-        self.leave_requests(ctx, limit, offset, from_date, to_date)
+        self.leave_requests(ctx, limit, offset, from_date, to_date, mine)
             .await
     }
 
@@ -559,6 +573,35 @@ mod tests {
     }
 
     #[test]
+    fn personal_requests_narrow_every_read_scope_without_granting_permission() {
+        for (wire_scope, scope) in [
+            ("SELF", ScopeType::Self_),
+            ("TEAM", ScopeType::Team),
+            ("DEPARTMENT", ScopeType::Department),
+            ("ALL", ScopeType::All),
+        ] {
+            let claims = claims(PERM_LEAVE_READ, Some(wire_scope));
+            assert_eq!(
+                leave_request_read_scope_from_claims(Some(&claims), true).unwrap(),
+                ScopeType::Self_
+            );
+            assert_eq!(
+                leave_request_read_scope_from_claims(Some(&claims), false).unwrap(),
+                scope
+            );
+        }
+        for claims in [
+            claims_without_permissions(),
+            claims(PERM_LEAVE_APPROVE, Some("ALL")),
+            claims(PERM_LEAVE_READ, None),
+            claims(PERM_LEAVE_READ, Some("INVALID")),
+        ] {
+            assert!(leave_request_read_scope_from_claims(Some(&claims), true).is_err());
+        }
+        assert!(leave_request_read_scope_from_claims(None, true).is_err());
+    }
+
+    #[test]
     fn leave_read_gate_accepts_self_recursive_team_and_all_scopes() {
         for (wire_scope, expected) in [
             ("SELF", ScopeType::Self_),
@@ -614,6 +657,9 @@ mod tests {
     async fn every_protected_leave_query_denies_missing_and_sibling_permissions_before_db_access() {
         let leave_request_id = Uuid::new_v4();
         let fields = vec![
+            "{ leaveRequests(mine: true) { __typename } }".to_string(),
+            "{ pagedLeaveRequests(mine: true) { __typename } }".to_string(),
+            "{ leaveRequestCount(mine: true) }".to_string(),
             "{ compOffPolicy { id } }".to_string(),
             "{ compOffBalance { availableUnits } }".to_string(),
             "{ compOffClaims(mine: true) { id } }".to_string(),

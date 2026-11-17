@@ -145,7 +145,7 @@ pub async fn calculate_in_transaction(
         return Err(KabiPayError::Unauthorised);
     }
     super::loan_recovery::lock(txn, tenant).await?;
-    super::payroll_fingerprint::lock_inputs(txn).await?;
+    super::payroll_fingerprint::lock_inputs(txn, tenant).await?;
     let cycle = cycle(txn, tenant, id).await?;
     ensure_draft(&cycle.status)?;
     let prior = find_with_date(txn, tenant, id, actor.business_date).await?;
@@ -207,7 +207,7 @@ pub async fn set_payment_date(
     let actor = super::payroll_actor::PayrollActor::local(claims, tenant, entitlements)?;
     let tx = db.begin().await?;
     super::loan_recovery::lock(&tx, tenant).await?;
-    super::payroll_fingerprint::lock_inputs(&tx).await?;
+    super::payroll_fingerprint::lock_inputs(&tx, tenant).await?;
     let cycle = cycle(&tx, tenant, id).await?;
     ensure_draft(&cycle.status)?;
     let prior = find_with_date(&tx, tenant, id, actor.business_date)

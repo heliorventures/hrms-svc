@@ -30,10 +30,10 @@ impl ProxyDatabaseTrait for SourceOnly {
         if sql.contains("FROM \"payroll_cycle\"") {
             return Ok(vec![self.cycle.clone()]);
         }
-        if sql.starts_with("SELECT COALESCE(jsonb_agg") {
+        if sql.starts_with("SELECT hrms_payroll_input_fingerprint_v1(") {
             return Ok(vec![ProxyRow::new(BTreeMap::from([(
-                "value".into(),
-                "[]".into(),
+                "fingerprint".into(),
+                "a".repeat(64).into(),
             )]))]);
         }
         if sql.starts_with("SELECT employee_id,revision FROM loan_employee_state") {
