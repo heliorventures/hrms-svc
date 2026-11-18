@@ -2,7 +2,7 @@ use super::{payroll_draft::DraftEmployee, payroll_rules::PeriodInput};
 use chrono::NaiveDate;
 use kabipay_common::{KabiPayError, KabiPayResult};
 use kabipay_db_entities::tenant::d0012_payroll::payroll_cycle;
-use sea_orm::{ConnectionTrait, DbBackend, Statement};
+use sea_orm::{ConnectionTrait, DatabaseTransaction, DbBackend, Statement};
 use uuid::Uuid;
 
 fn period_eligibility(
@@ -34,8 +34,8 @@ fn period_eligibility(
     ("ELIGIBLE", None)
 }
 
-pub async fn employees_with_actor<C: ConnectionTrait + Send + Sync>(
-    db: &C,
+pub async fn employees_with_actor(
+    db: &DatabaseTransaction,
     tenant: Uuid,
     actor: Option<Uuid>,
     principal: Option<Uuid>,
@@ -81,7 +81,7 @@ pub async fn employees_with_actor<C: ConnectionTrait + Send + Sync>(
                 employee_id: employee,
                 employee_label,
                 outcome: "REVIEW".into(),
-                reason: Some(review_reason(error)),
+                reason: Some(review_reason(error)?),
                 prepared: None,
             },
         });
@@ -92,6 +92,18 @@ pub async fn employees_with_actor<C: ConnectionTrait + Send + Sync>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn database_and_authorization_failures_are_not_employee_review_outcomes() {
+        for error in [KabiPayError::Database(sea_orm::DbErr::Custom("synthetic denial".into())),
+            KabiPayError::Unauthorised, KabiPayError::Internal("synthetic failure".into())] {
+            assert!(review_reason(error).is_err());
+        }
+    }
+    #[test]
+    fn configuration_and_conflict_failures_remain_reviewable() {
+        assert_eq!(review_reason(KabiPayError::Validation("missing salary assignment".into())).unwrap(), "missing salary assignment");
+        assert_eq!(review_reason(KabiPayError::Conflict("reload monthly inputs".into())).unwrap(), "reload monthly inputs");
+    }
     #[test]
     fn eligibility_uses_employment_dates_and_keeps_uncertain_exits_for_review() {
         let d = |s: &str| s.parse::<NaiveDate>().unwrap();
@@ -120,15 +132,20 @@ mod tests {
     }
 }
 
-pub(crate) fn review_reason(error: KabiPayError) -> String {
+/// Only caller-correctable configuration/state failures belong in a review.
+/// Database failures can abort PostgreSQL's transaction and must escape to its
+/// owner immediately; converting them to a row outcome masks the first failure.
+pub(crate) fn review_reason(error: KabiPayError) -> KabiPayResult<String> {
     match error {
-        KabiPayError::Validation(message) | KabiPayError::Conflict(message) => message,
-        _ => "Unable to calculate this employee. Check configuration and contact support if the issue continues.".into(),
+        KabiPayError::Validation(message) | KabiPayError::Conflict(message)
+        | KabiPayError::BusinessRule { message, .. }
+        | KabiPayError::ConflictRule { message, .. } => Ok(message),
+        other => Err(other),
     }
 }
 
-async fn prepare_employee<C: ConnectionTrait + Send + Sync>(
-    db: &C,
+async fn prepare_employee(
+    db: &DatabaseTransaction,
     tenant: Uuid,
     actor: Option<Uuid>,
     principal: Option<Uuid>,
@@ -176,4 +193,4 @@ async fn prepare_employee<C: ConnectionTrait + Send + Sync>(
     Ok(prepared)
 }
 
-pub async fn employees<C:ConnectionTrait+Send+Sync>(db:&C,tenant:Uuid,actor:Uuid,cycle:&payroll_cycle::Model)->KabiPayResult<Vec<DraftEmployee>> { employees_with_actor(db,tenant,Some(actor),None,cycle).await }
+pub async fn employees(db:&DatabaseTransaction,tenant:Uuid,actor:Uuid,cycle:&payroll_cycle::Model)->KabiPayResult<Vec<DraftEmployee>> { employees_with_actor(db,tenant,Some(actor),None,cycle).await }

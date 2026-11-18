@@ -1,14 +1,14 @@
 //! The bounded database authority owns input locks and the exact v2 digest.
 //! Runtime Payroll receives neither broad input reads nor input-table writes.
 use kabipay_common::{KabiPayError, KabiPayResult};
-use sea_orm::{ConnectionTrait, DbBackend, Statement};
+use sea_orm::{ConnectionTrait, DatabaseTransaction, DbBackend, Statement};
 use uuid::Uuid;
 
 #[cfg(test)]
 #[path = "payroll_fingerprint_tests.rs"]
 mod tests;
 
-pub async fn lock_inputs<C: ConnectionTrait>(db: &C, tenant: Uuid) -> KabiPayResult<()> {
+pub async fn lock_inputs(db: &DatabaseTransaction, tenant: Uuid) -> KabiPayResult<()> {
     if tenant.is_nil() {
         return Err(KabiPayError::Unauthorised);
     }

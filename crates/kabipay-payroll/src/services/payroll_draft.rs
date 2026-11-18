@@ -171,7 +171,7 @@ pub async fn calculate_in_transaction(
             .await
             {
                 entry.outcome = "REVIEW".into();
-                entry.reason = Some(super::payroll_preview::review_reason(error));
+                entry.reason = Some(super::payroll_preview::review_reason(error)?);
                 entry.prepared = None;
             }
         }

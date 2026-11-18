@@ -5,10 +5,14 @@ use kabipay_common::{KabiPayError, KabiPayResult};
 use kabipay_db_entities::tenant::d0012_payroll::{payroll_cycle, payslip};
 use kabipay_db_entities::tenant::d0090_payroll_period_configuration::payroll_period_input;
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, ConnectionTrait, DbBackend, EntityTrait, QueryFilter, Set,
+    ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseTransaction, DbBackend, EntityTrait, QueryFilter, Set,
     Statement,
 };
 use uuid::Uuid;
+
+#[cfg(test)]
+#[path = "payroll_period_input_tests.rs"]
+mod tests;
 
 pub async fn find<C: ConnectionTrait>(
     db: &C,
@@ -28,8 +32,8 @@ pub async fn find<C: ConnectionTrait>(
 
 /// Caller owns the transaction. Reserve the write lock before checking cycle status;
 /// finalization's input-table lock must wait for this whole edit (or finish first).
-pub async fn save_with_actor<C: ConnectionTrait + Send + Sync>(
-    db: &C,
+pub async fn save_with_actor(
+    db: &DatabaseTransaction,
     tenant: Uuid,
     actor: Option<Uuid>,
     principal: Option<Uuid>,
@@ -38,10 +42,11 @@ pub async fn save_with_actor<C: ConnectionTrait + Send + Sync>(
     source_ref: Option<serde_json::Value>,
     expected_revision: Option<i32>,
 ) -> KabiPayResult<payroll_period_input::Model> {
-    if actor.is_some() == principal.is_some() {return Err(KabiPayError::Unauthorised);}
-    db.execute(Statement::from_string(
+    if tenant.is_nil() || actor.is_some() == principal.is_some() {return Err(KabiPayError::Unauthorised);}
+    db.execute(Statement::from_sql_and_values(
         DbBackend::Postgres,
-        "LOCK TABLE payroll_period_input IN ROW EXCLUSIVE MODE",
+        "SELECT hrms_lock_payroll_period_input_v1($1)",
+        [tenant.into()],
     ))
     .await?;
     db.execute(Statement::from_sql_and_values(
@@ -70,14 +75,22 @@ pub async fn save_with_actor<C: ConnectionTrait + Send + Sync>(
             ));
         }
     }
-    let prepared = super::prepare_payroll::prepare(db, tenant, employee, &input).await;
-    let ready = if let Ok(prepared) = &prepared {
-        input.ready
-            && super::imported_lwp::validate(db, tenant, employee, &prepared.input, false)
-                .await
-                .is_ok()
-    } else {
-        false
+    let prepared = match super::prepare_payroll::prepare(db, tenant, employee, &input).await {
+        Ok(value) => Some(value),
+        Err(error) => {
+            super::payroll_preview::review_reason(error)?;
+            None
+        }
+    };
+    let ready = match prepared.as_ref() {
+        Some(prepared) if input.ready => match super::imported_lwp::validate(db, tenant, employee, &prepared.input, false).await {
+            Ok(_) => true,
+            Err(error) => {
+                super::payroll_preview::review_reason(error)?;
+                false
+            }
+        },
+        _ => false,
     };
     // Retain the resolved month used by payroll for read-only locked-period review.
     // Automatic recalculation still resolves effective settings and approved leave afresh.
@@ -154,6 +167,6 @@ pub async fn save_with_actor<C: ConnectionTrait + Send + Sync>(
     Ok(result)
 }
 
-pub async fn save<C:ConnectionTrait+Send+Sync>(db:&C,tenant:Uuid,actor:Uuid,employee:Uuid,input:PeriodInput,source_ref:Option<serde_json::Value>,expected_revision:Option<i32>)->KabiPayResult<payroll_period_input::Model> {
+pub async fn save(db:&DatabaseTransaction,tenant:Uuid,actor:Uuid,employee:Uuid,input:PeriodInput,source_ref:Option<serde_json::Value>,expected_revision:Option<i32>)->KabiPayResult<payroll_period_input::Model> {
  save_with_actor(db,tenant,Some(actor),None,employee,input,source_ref,expected_revision).await
 }

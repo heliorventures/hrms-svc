@@ -1,6 +1,6 @@
 use super::*;
 use sea_orm::entity::prelude::async_trait;
-use sea_orm::{Database, DbErr, ProxyDatabaseTrait, ProxyExecResult, ProxyRow};
+use sea_orm::{Database, DbErr, ProxyDatabaseTrait, ProxyExecResult, ProxyRow, TransactionTrait};
 use std::{
     collections::BTreeMap,
     sync::{Arc, Mutex},
@@ -36,6 +36,7 @@ impl ProxyDatabaseTrait for AuthorityProxy {
     async fn execute(&self, statement: Statement) -> Result<ProxyExecResult, DbErr> {
         self.statements.lock().unwrap().push(statement.clone());
         if statement.sql == "SELECT hrms_lock_payroll_inputs_v1($1)"
+            || statement.sql == "SELECT hrms_lock_payroll_period_input_v1($1)"
             || statement.sql == "SET LOCAL lock_timeout='15s'"
         {
             return Ok(ProxyExecResult {
@@ -50,8 +51,9 @@ impl ProxyDatabaseTrait for AuthorityProxy {
 async fn payroll_snapshot_lock_binds_tenant_and_never_takes_raw_input_locks() {
     let tenant = Uuid::new_v4();
     let (db, calls) = connection(None).await;
-    lock_inputs(&db, tenant).await.unwrap();
-    assert!(lock_inputs(&db, Uuid::nil()).await.is_err());
+    let tx = db.begin().await.unwrap();
+    lock_inputs(&tx, tenant).await.unwrap();
+    assert!(lock_inputs(&tx, Uuid::nil()).await.is_err());
     let calls = calls.lock().unwrap();
     assert_eq!(calls.len(), 2);
     assert_eq!(calls[0].sql, "SET LOCAL lock_timeout='15s'");
@@ -110,4 +112,31 @@ async fn payroll_snapshot_refuses_missing_or_malformed_authority_without_broad_r
         assert!(fingerprint(&db, Uuid::new_v4()).await.is_err());
         assert_eq!(calls.lock().unwrap().len(), 1);
     }
+}
+
+#[tokio::test]
+async fn monthly_input_save_uses_tenant_bound_lock_authority_without_raw_lock_fallback() {
+    let tenant = Uuid::new_v4();
+    let (db, calls) = connection(None).await;
+    let tx = db.begin().await.unwrap();
+    let input = super::super::automatic_period::new_input(2026, 10).unwrap();
+    let result = super::super::payroll_period_input::save_with_actor(
+        &tx, tenant, Some(Uuid::new_v4()), None, Uuid::new_v4(), input, None, None,
+    ).await;
+    assert!(result.is_err()); // Proxy deliberately refuses the next database operation.
+    let calls = calls.lock().unwrap();
+    assert_eq!(calls[0].sql, "SELECT hrms_lock_payroll_period_input_v1($1)");
+    assert_eq!(calls[0].values.as_ref().unwrap().0, vec![tenant.into()]);
+    assert!(!calls.iter().any(|call| call.sql.starts_with("LOCK TABLE")));
+}
+
+#[tokio::test]
+async fn monthly_input_save_rejects_nil_tenant_before_database_access() {
+    let (db, calls) = connection(None).await;
+    let tx = db.begin().await.unwrap();
+    let input = super::super::automatic_period::new_input(2026, 10).unwrap();
+    assert!(super::super::payroll_period_input::save_with_actor(
+        &tx, Uuid::nil(), Some(Uuid::new_v4()), None, Uuid::new_v4(), input, None, None,
+    ).await.is_err());
+    assert!(calls.lock().unwrap().is_empty());
 }
