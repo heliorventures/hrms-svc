@@ -27,7 +27,7 @@ pub fn identity_client_from_env() -> anyhow::Result<IdentityClient> {
         .map_err(|_| anyhow::anyhow!("invalid organization identity endpoint map"))?;
     IdentityClient::new(endpoints).map_err(Into::into)
 }
-pub async fn store_from_env() -> anyhow::Result<Store> {
+pub fn metadata_url_from_env() -> anyhow::Result<String> {
     if std::env::var_os("KABIPAY_BOUND_DATABASE_URL").is_some() {
         anyhow::bail!("organization service must not receive a tenant database binding");
     }
@@ -42,10 +42,25 @@ pub async fn store_from_env() -> anyhow::Result<Store> {
     {
         anyhow::bail!("invalid metadata database URL");
     }
+    Ok(url)
+}
+// Operator commands retain their fail-fast connector.
+pub async fn store_from_env() -> anyhow::Result<Store> {
+    let url = metadata_url_from_env()?;
     let db = kabipay_common::db::connect_ops_db(&url)
         .await
         .map_err(|_| anyhow::anyhow!("organization metadata database connection failed"))?;
     Ok(Store::new(db))
+}
+pub async fn resilient_store(
+    url: &str,
+    config: &kabipay_common::service_lifecycle::LifecycleConfig,
+) -> anyhow::Result<(Store, kabipay_common::service_lifecycle::HealthCheck)> {
+    // Organization has an explicit metadata URL, never company routing configuration.
+    let cache = kabipay_common::db::TenantDbCache::new();
+    let db = kabipay_common::db::availability::connect_validated(url, &cache, config).await?;
+    let check = kabipay_common::db::availability::database_check(db.clone(), cache);
+    Ok((Store::new(db), check))
 }
 pub fn router(store: Store, identities: IdentityClient) -> Router {
     router_with_execution(store, identities, None)

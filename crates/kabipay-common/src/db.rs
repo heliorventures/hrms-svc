@@ -30,6 +30,7 @@ use uuid::Uuid;
 mod bound;
 mod registry;
 mod shared;
+pub mod availability;
 pub use bound::BoundTenantDatabase;
 pub use shared::{company_public_origin, company_setting, shared_company_ids};
 
@@ -455,6 +456,12 @@ pub async fn connect_ops_db(dsn: &str) -> KabiPayResult<DatabaseConnection> {
         preflight_ops_session(dsn).await?;
     }
 
+    Database::connect(ops_connect_options(dsn)).await.map_err(|e| {
+        KabiPayError::Internal(format!("ORM pool open failed after login succeeded: {e}"))
+    })
+}
+
+fn ops_connect_options(dsn: &str) -> ConnectOptions {
     let mut opts = ConnectOptions::new(dsn.to_string());
     // Default 2 per process so 18-20 local subgraphs stay below a 100-connection DB cap.
     // Raise KABIPAY_DB_POOL_MAX only for consolidated or independently scaled services.
@@ -466,11 +473,7 @@ pub async fn connect_ops_db(dsn: &str) -> KabiPayResult<DatabaseConnection> {
         .sqlx_logging(false)
         .set_schema_search_path("kabipay_ops,public");
 
-    Database::connect(opts).await.map_err(|e| {
-        KabiPayError::Internal(format!(
-            "ORM pool open failed after login succeeded (try KABIPAY_DB_POOL_MAX or fewer running services): {e}"
-        ))
-    })
+    opts
 }
 
 #[cfg(test)]

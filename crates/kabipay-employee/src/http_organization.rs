@@ -50,6 +50,7 @@ pub(super) async fn bootstrap_worker(st: Arc<EmployeeState>) {
     let mut capture_at = std::time::Instant::now();
     loop {
         interval.tick().await;
+        if !st.schema.data::<kabipay_common::service_lifecycle::Readiness>().is_some_and(|state| state.is_ready()) { continue; }
         let capture_due = std::time::Instant::now() >= capture_at;
         for tenant in st.cache.configured_tenant_ids() {
         let result = async {

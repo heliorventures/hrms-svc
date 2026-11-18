@@ -14,7 +14,7 @@
 
 use crate::context::{ClientClaims, ClientRequestHints, OperatorClaims, OperatorContext};
 use crate::db::{
-    apply_postgres_ssl_mode_to_url, connect_ops_db, resolve_required_tenant_db, TenantDbCache,
+    apply_postgres_ssl_mode_to_url, resolve_required_tenant_db, TenantDbCache,
     TenantDbConfig,
 };
 use crate::error::{KabiPayError, KabiPayResult};
@@ -276,7 +276,7 @@ pub struct SubgraphConfig<'a> {
 /// - `POST /graphql` with tenant header extraction and schema execution
 /// - CORS + structured-trace layers
 ///
-/// If `cfg.needs_db` is true, [`connect_ops_db`] is called and
+/// If `cfg.needs_db` is true, [`crate::db::availability::connect_validated`] is called and
 /// `DatabaseConnection`, `TenantDbCache`, `TenantDbConfig` are attached to
 /// the schema data so tenant-plane resolvers can call [`tenant_db`].
 pub async fn serve_subgraph<Q, M, S>(
@@ -335,45 +335,50 @@ where
         .and_then(|v| v.parse().ok())
         .unwrap_or(cfg.default_port);
 
-    let schema = if cfg.needs_db {
-        let dsn = ops_dsn_from_env();
-        let ops_db = connect_ops_db(&dsn).await.map_err(|e| {
-            anyhow::anyhow!(
-                "{}: failed to connect to ops DB: {e} (check Postgres reachability, TLS/sslmode, and KABIPAY_DB_POOL_MAX when running many services)",
-                cfg.service_name
+    let lifecycle = crate::service_lifecycle::LifecycleConfig::from_env()?;
+    let listener = tokio::net::TcpListener::bind(SocketAddr::from(([0, 0, 0, 0], port))).await?;
+    let initialization = lifecycle.clone();
+    crate::service_lifecycle::serve(listener, lifecycle, move |readiness| async move {
+        let (schema_builder, check) = if cfg.needs_db {
+            let ops_db = crate::db::availability::connect_validated(
+                &ops_dsn_from_env(),
+                &cache,
+                &initialization,
             )
-        })?;
-        cache.validate_binding_registration(&ops_db).await?;
-        schema_builder
-            .enable_federation()
-            .data(ops_db)
-            .data(cache)
-            .data(tenant_db_config_from_env())
-            .finish()
-    } else {
-        schema_builder.enable_federation().data(cache).finish()
-    };
-
-    let state: Arc<Schema<Q, M, S>> = Arc::new(schema);
-    startup(state.clone());
-
-    let app = Router::new()
-        .merge(extra_routes)
-        .route("/healthz", get(|| async { "ok" }))
-        .route(
-            "/graphql",
-            get(graphql_playground).post(tenant_graphql_post::<Q, M, S>),
-        )
-        .with_state(state)
-        .layer(CorsLayer::permissive())
-        .layer(TraceLayer::new_for_http());
-
-    let addr = SocketAddr::from(([0, 0, 0, 0], port));
-    tracing::info!(%addr, service = cfg.service_name, "subgraph listening");
-
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app).await?;
-    Ok(())
+            .await?;
+            let check = crate::db::availability::database_check(ops_db.clone(), cache.clone());
+            (
+                schema_builder
+                    .data(ops_db)
+                    .data(tenant_db_config_from_env()),
+                check,
+            )
+        } else {
+            let check: crate::service_lifecycle::HealthCheck =
+                Arc::new(|| Box::pin(async { Ok(()) }));
+            (schema_builder, check)
+        };
+        let state = Arc::new(
+            schema_builder
+                .enable_federation()
+                .data(cache)
+                .data(readiness)
+                .finish(),
+        );
+        // This closure runs once, after dependencies and identity are validated.
+        startup(state.clone());
+        let app = Router::new()
+            .merge(extra_routes)
+            .route(
+                "/graphql",
+                get(graphql_playground).post(tenant_graphql_post::<Q, M, S>),
+            )
+            .with_state(state)
+            .layer(CorsLayer::permissive())
+            .layer(TraceLayer::new_for_http());
+        Ok(crate::service_lifecycle::PreparedService { router: app, check })
+    })
+    .await
 }
 
 /// `POST /graphql` handler for a tenant subgraph. Exposed so binaries can mount

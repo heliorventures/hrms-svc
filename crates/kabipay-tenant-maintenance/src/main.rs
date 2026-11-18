@@ -56,12 +56,16 @@ async fn main() -> anyhow::Result<()> {
     let cache = TenantDbCache::from_env()?;
     anyhow::ensure!(cache.is_company_runtime(), "Tenant maintenance requires configured company sources");
     let dsn = ops_dsn_from_env();
-    let ops_db = connect_ops_db(&dsn)
-        .await
-        .map_err(|e| anyhow::anyhow!("ops database connection failed: {e}"))?;
-    cache.validate_binding_registration(&ops_db).await?;
-    let fallback: TenantDbConfig = tenant_db_config_from_env();
     let args: Vec<String> = std::env::args().skip(1).collect();
+    let lifecycle = kabipay_common::service_lifecycle::LifecycleConfig::from_env()?;
+    let ops_db = if args.is_empty() {
+        kabipay_common::db::availability::connect_validated(&dsn, &cache, &lifecycle).await?
+    } else {
+        let db = connect_ops_db(&dsn).await?;
+        cache.validate_binding_registration(&db).await?;
+        db
+    };
+    let fallback: TenantDbConfig = tenant_db_config_from_env();
     if !args.is_empty() {
         // Destructive/one-off handoff tooling stays an explicit single-company
         // invocation; the shared daemon never fans an operator command out.
@@ -86,7 +90,14 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!(poll_ms = interval.as_millis(), "tenant maintenance started");
 
+    let check = kabipay_common::db::availability::database_check(ops_db.clone(), cache.clone());
     loop {
+        let checked = tokio::time::timeout(lifecycle.operation_timeout, check()).await;
+        match checked {
+            Ok(Ok(())) => {},
+            Ok(Err(error)) if !error.retryable() => return Err(error.into()),
+            _ => { tokio::time::sleep(lifecycle.probe_interval).await; continue; }
+        }
         match active_tenant_ids(&ops_db, &cache).await {
             Ok(tenants) => {
                 for tid in tenants {

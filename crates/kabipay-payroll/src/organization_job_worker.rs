@@ -26,6 +26,7 @@ pub fn start(schema: Arc<PayrollSchema>) {
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             interval.tick().await;
+            if !schema.data::<kabipay_common::service_lifecycle::Readiness>().is_some_and(|state| state.is_ready()) { continue; }
             if sweep(&schema).await.is_err() {
                 tracing::warn!("Organization payroll job sweep unavailable");
             }

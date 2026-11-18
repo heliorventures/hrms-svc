@@ -38,6 +38,7 @@ pub mod private_file_cleanup;
 pub mod private_file_reader;
 pub mod private_events;
 pub mod subgraph;
+pub mod service_lifecycle;
 pub mod telemetry;
 pub mod tenant_business_clock;
 pub mod tenant_seed;

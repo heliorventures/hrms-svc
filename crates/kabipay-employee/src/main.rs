@@ -12,7 +12,7 @@ use axum::extract::{Query, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::routing::get;
 use axum::Router;
-use kabipay_common::db::{connect_ops_db, resolve_required_tenant_db, TenantDbCache, TenantDbConfig};
+use kabipay_common::db::{resolve_required_tenant_db, TenantDbCache, TenantDbConfig};
 use kabipay_common::error::KabiPayError;
 use kabipay_common::load_dotenv;
 use kabipay_common::subgraph::{graphql_playground, tenant_graphql_post};
@@ -59,47 +59,54 @@ async fn main() -> anyhow::Result<()> {
 
     let cache = TenantDbCache::from_env()?;
     let dsn = ops_dsn_from_env();
-    let ops = connect_ops_db(&dsn).await?;
-    cache.validate_binding_registration(&ops).await?;
-    let fallback = tenant_db_config_from_env();
-    let file_root = document_file_service::local_file_root();
-    let _ = tokio::fs::create_dir_all(&file_root).await;
+    let lifecycle = kabipay_common::service_lifecycle::LifecycleConfig::from_env()?;
+    let listener = tokio::net::TcpListener::bind(SocketAddr::from(([0, 0, 0, 0], port))).await?;
+    let initialization = lifecycle.clone();
+    kabipay_common::service_lifecycle::serve(listener, lifecycle, move |readiness| async move {
+        let ops =
+            kabipay_common::db::availability::connect_validated(&dsn, &cache, &initialization)
+                .await?;
+        let check = kabipay_common::db::availability::database_check(ops.clone(), cache.clone());
+        let fallback = tenant_db_config_from_env();
+        let file_root = document_file_service::local_file_root();
+        let _ = tokio::fs::create_dir_all(&file_root).await;
 
-    let schema = Schema::build(QueryRoot, MutationRoot, EmptySubscription)
-        .extension(kabipay_common::entitlement_graphql::ModuleEntitlement("EMPLOYEE"))
-        .enable_federation()
-        .data(ops.clone())
-        .data(cache.clone())
-        .data(fallback.clone())
-        .finish();
-    let schema = Arc::new(schema);
+        let schema = Schema::build(QueryRoot, MutationRoot, EmptySubscription)
+            .extension(kabipay_common::entitlement_graphql::ModuleEntitlement(
+                "EMPLOYEE",
+            ))
+            .enable_federation()
+            .data(readiness)
+            .data(ops.clone())
+            .data(cache.clone())
+            .data(fallback.clone())
+            .finish();
+        let schema = Arc::new(schema);
 
-    let st = Arc::new(EmployeeState {
-        schema: schema.clone(),
-        file_root,
-        ops,
-        cache,
-        fallback,
-    });
+        let st = Arc::new(EmployeeState {
+            schema: schema.clone(),
+            file_root,
+            ops,
+            cache,
+            fallback,
+        });
 
-    tokio::spawn(http_organization::bootstrap_worker(st.clone()));
-    let app = Router::new()
-        .merge(http_organization::routes())
-        .merge(http_prejoining::routes())
-        .merge(http_finance::routes())
-        .merge(http_private_delivery::routes())
-        .route("/healthz", get(|| async { "ok" }))
-        .route("/graphql", get(graphql_playground).post(employee_graphql))
-        .route("/files/employee-document", get(employee_file_download))
-        .with_state(st)
-        .layer(CorsLayer::permissive())
-        .layer(TraceLayer::new_for_http());
+        tokio::spawn(http_organization::bootstrap_worker(st.clone()));
+        let app = Router::new()
+            .merge(http_organization::routes())
+            .merge(http_prejoining::routes())
+            .merge(http_finance::routes())
+            .merge(http_private_delivery::routes())
+            .route("/healthz", get(|| async { "ok" }))
+            .route("/graphql", get(graphql_playground).post(employee_graphql))
+            .route("/files/employee-document", get(employee_file_download))
+            .with_state(st)
+            .layer(CorsLayer::permissive())
+            .layer(TraceLayer::new_for_http());
 
-    let addr = SocketAddr::from(([0, 0, 0, 0], port));
-    tracing::info!(%addr, service = "kabipay-employee", "listening (graphql + file download)");
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app).await?;
-    Ok(())
+        Ok(kabipay_common::service_lifecycle::PreparedService { router: app, check })
+    })
+    .await
 }
 
 async fn employee_graphql(
