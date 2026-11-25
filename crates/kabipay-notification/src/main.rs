@@ -36,7 +36,14 @@ async fn main() -> anyhow::Result<()> {
     let lifecycle = kabipay_common::service_lifecycle::LifecycleConfig::from_env()?;
     let listener = tokio::net::TcpListener::bind(SocketAddr::from(([0, 0, 0, 0], port))).await?;
     let initialization = lifecycle.clone();
-    kabipay_common::service_lifecycle::serve(listener, lifecycle, move |readiness| async move {
+    let (worker_context, context_ready) = tokio::sync::oneshot::channel();
+    let (worker_stop, worker_shutdown) = tokio::sync::watch::channel(false);
+    let mut email_worker = tokio::spawn(async move {
+        if let Ok(context) = context_ready.await {
+            kabipay_notification::email::worker::run_email_worker(context, worker_shutdown).await;
+        }
+    });
+    let service_result = kabipay_common::service_lifecycle::serve(listener, lifecycle, move |readiness| async move {
         let ops = kabipay_common::db::availability::connect_validated(
             &ops_dsn_from_env(),
             &cache,
@@ -58,9 +65,9 @@ async fn main() -> anyhow::Result<()> {
                 .finish(),
         );
         let media = Arc::new(MediaState {
-            ops,
-            cache,
-            fallback,
+            ops:ops.clone(),
+            cache:cache.clone(),
+            fallback:fallback.clone(),
         });
         let app = Router::new()
             .route("/healthz", get(|| async { "ok" }))
@@ -78,8 +85,19 @@ async fn main() -> anyhow::Result<()> {
                     .layer(axum::middleware::from_fn(http_media::response_headers)),
             )
             .layer(tower_http::cors::CorsLayer::permissive());
+        // Email owns no readiness probe and cannot terminate the API service.
+        let _ = worker_context.send(kabipay_notification::email::worker::WorkerContext {
+            ops,cache,fallback,
+        });
         // Signed media query tokens remain outside HTTP trace spans.
         Ok(kabipay_common::service_lifecycle::PreparedService { router: app, check })
     })
-    .await
+    .await;
+    let _ = worker_stop.send(true);
+    if tokio::time::timeout(std::time::Duration::from_secs(5), &mut email_worker).await.is_err() {
+        // Any in-flight body retains its durable Submitting fence and becomes
+        // Uncertain on lease expiry; shutdown never silently resets it as unsent.
+        email_worker.abort();
+    }
+    service_result
 }

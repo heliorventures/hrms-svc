@@ -653,6 +653,14 @@ mod tests {
 
 #[Object]
 impl QueryRoot {
+    async fn email_settings(&self, ctx: &Context<'_>) -> Result<crate::email::settings::EmailSettingsPublic> {
+        crate::email::api::read(ctx).await
+    }
+
+    async fn email_settings_test(&self, ctx: &Context<'_>, id: Uuid) -> Result<crate::email::test_queue::EmailTestStatus> {
+        crate::email::api::test_status(ctx, id).await
+    }
+
     async fn notification_health(&self) -> &'static str {
         "ok"
     }

@@ -4,6 +4,7 @@ use std::collections::HashSet;
 
 pub fn supported_scope_types(resource: &str, action: &str) -> &'static [&'static str] {
     match (resource, action) {
+        ("email_settings", "read" | "manage" | "test") => &["ALL"],
         (
             "employee" | "attendance" | "timesheet" | "leave" | "expense" | "travel" | "payroll"
             | "tax" | "notification" | "assets" | "loan",
@@ -69,6 +70,18 @@ pub fn validate_access(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn email_settings_actions_are_independently_assignable_only_at_all_scope() {
+        for action in ["read", "manage", "test"] {
+            assert_eq!(supported_scope_types("email_settings", action), &["ALL"]);
+            let selected=keys(&[&format!("email_settings:{action}")]);
+            assert!(validate_access(&selected,&[scope("email_settings",action,"ALL")],&HashSet::new()).is_ok());
+            for invalid in ["SELF","TEAM","DEPARTMENT",""] {
+                assert!(validate_access(&selected,&[scope("email_settings",action,invalid)],&HashSet::new()).is_err());
+            }
+        }
+        assert!(supported_scope_types("email_settings","write").is_empty());
+    }
     fn keys(values: &[&str]) -> HashSet<String> {
         values.iter().map(|value| value.to_string()).collect()
     }

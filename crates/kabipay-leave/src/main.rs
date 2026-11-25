@@ -21,7 +21,8 @@ async fn main() -> anyhow::Result<()> {
             needs_db: true,
         },
         schema,
-        kabipay_organization_tenant::routes(kabipay_leave::organization::LeaveAdapter),
+        kabipay_organization_tenant::routes(kabipay_leave::organization::LeaveAdapter)
+            .merge(kabipay_organization_tenant::email_routes::email_routes(kabipay_leave::email_alerts::LeaveEmailAdapter)),
     )
     .await
 }

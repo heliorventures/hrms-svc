@@ -787,6 +787,8 @@ impl MutationRoot {
         if participants == 0 {
             return Err(KabiPayError::Validation("No active employee-linked accounts matched this cycle's launch policy".into()).into_graphql());
         }
+        crate::email_emit::emit_performance_cycle(&txn,kabipay_common::subgraph::ops_db(ctx)?,tenant_id,cycle_id,
+            Some(kabipay_common::important_email::EmailActorRef::LocalUser{user_id:claims.sub})).await.map_err(KabiPayError::into_graphql)?;
         txn.commit().await.map_err(KabiPayError::from).map_err(KabiPayError::into_graphql)?;
         review_cycle::Entity::find_by_id(cycle_id).filter(review_cycle::Column::TenantId.eq(tenant_id))
             .one(&db).await.map_err(KabiPayError::from).map_err(KabiPayError::into_graphql)?
@@ -820,6 +822,8 @@ impl MutationRoot {
             description: Set(description), weightage: Set(Some(weight)), status: Set("PROPOSED".into()),
             visibility: Set(Some("EMPLOYEE_MANAGER".into())), created_at: Set(now), updated_at: Set(now),
         }.insert(&txn).await.map_err(KabiPayError::from).map_err(KabiPayError::into_graphql)?;
+        crate::email_emit::emit_performance_participant(&txn,kabipay_common::subgraph::ops_db(ctx)?,tenant_id,participant_id,
+            Some(kabipay_common::important_email::EmailActorRef::LocalUser{user_id:claims.sub}),&[],crate::email_emit::PerformanceEmailChange::Action).await.map_err(KabiPayError::into_graphql)?;
         txn.commit().await.map_err(KabiPayError::from).map_err(KabiPayError::into_graphql)?;
         Ok(saved.into())
     }
@@ -856,6 +860,8 @@ impl MutationRoot {
         model.title = Set(title); model.description = Set(description); model.weightage = Set(Some(weight));
         model.status = Set("PROPOSED".into()); model.updated_at = Set(chrono::Utc::now());
         let saved = model.update(&txn).await.map_err(KabiPayError::from).map_err(KabiPayError::into_graphql)?;
+        crate::email_emit::emit_performance_participant(&txn,kabipay_common::subgraph::ops_db(ctx)?,tenant_id,participant_id,
+            Some(kabipay_common::important_email::EmailActorRef::LocalUser{user_id:claims.sub}),&[],crate::email_emit::PerformanceEmailChange::Action).await.map_err(KabiPayError::into_graphql)?;
         txn.commit().await.map_err(KabiPayError::from).map_err(KabiPayError::into_graphql)?;
         Ok(saved.into())
     }
@@ -886,6 +892,8 @@ impl MutationRoot {
             .col_expr(goal::Column::UpdatedAt, Expr::value(chrono::Utc::now()))
             .filter(goal::Column::TenantId.eq(tenant_id)).filter(goal::Column::ReviewCycleId.eq(participant.review_cycle_id))
             .filter(goal::Column::EmployeeId.eq(participant.employee_id)).exec(&txn).await.map_err(KabiPayError::from).map_err(KabiPayError::into_graphql)?;
+        crate::email_emit::emit_performance_participant(&txn,kabipay_common::subgraph::ops_db(ctx)?,tenant_id,participant_id,
+            Some(kabipay_common::important_email::EmailActorRef::LocalUser{user_id:claims.sub}),&[],crate::email_emit::PerformanceEmailChange::Action).await.map_err(KabiPayError::into_graphql)?;
         txn.commit().await.map_err(KabiPayError::from).map_err(KabiPayError::into_graphql)?;
         Ok(true)
     }
@@ -913,6 +921,7 @@ impl MutationRoot {
             .filter(goal::Column::TenantId.eq(tenant_id))
             .filter(goal::Column::ReviewCycleId.eq(participant.review_cycle_id))
             .filter(goal::Column::EmployeeId.eq(participant.employee_id))
+            .order_by_asc(goal::Column::CreatedAt)
             .all(&txn).await.map_err(KabiPayError::from).map_err(KabiPayError::into_graphql)?;
         if goals.iter().any(|goal| goal.weightage.is_none()) {
             return Err(KabiPayError::Validation("Every goal must have a weight before approval".into()).into_graphql());
@@ -920,6 +929,12 @@ impl MutationRoot {
         let weights: Vec<Decimal> = goals.iter().filter_map(|goal| goal.weightage).collect();
         performance_lifecycle::validate_goal_weight_total(&weights)
             .map_err(|message| KabiPayError::Validation(message).into_graphql())?;
+        // Replaying the same approval must keep its original metadata/version.
+        // A new goal edit already resets the affected set to PROPOSED.
+        if goals.iter().all(|goal|goal.status=="APPROVED") {
+            txn.commit().await.map_err(KabiPayError::from).map_err(KabiPayError::into_graphql)?;
+            return Ok(goals.into_iter().map(Into::into).collect());
+        }
         for goal in goals {
             let mut model = goal.into_active_model();
             model.status = Set("APPROVED".into());
@@ -932,6 +947,8 @@ impl MutationRoot {
             .filter(goal::Column::EmployeeId.eq(participant.employee_id))
             .order_by_asc(goal::Column::CreatedAt)
             .all(&txn).await.map_err(KabiPayError::from).map_err(KabiPayError::into_graphql)?;
+        crate::email_emit::emit_performance_participant(&txn,kabipay_common::subgraph::ops_db(ctx)?,tenant_id,participant_id,
+            Some(kabipay_common::important_email::EmailActorRef::LocalUser{user_id:claims.sub}),&[],crate::email_emit::PerformanceEmailChange::GoalsOutcome).await.map_err(KabiPayError::into_graphql)?;
         txn.commit().await.map_err(KabiPayError::from).map_err(KabiPayError::into_graphql)?;
         Ok(approved.into_iter().map(Into::into).collect())
     }
@@ -989,7 +1006,7 @@ impl MutationRoot {
         let cycle_id = parse_id(&review_cycle_id)?;
         let db = tenant_db(ctx, tenant_id).await?;
         let txn = db.begin().await.map_err(KabiPayError::from).map_err(KabiPayError::into_graphql)?;
-        let next = performance_administration::advance_cycle_with_context(&txn, tenant_id, cycle_id, "", Some(claims.sub), "MANUAL").await.map_err(KabiPayError::into_graphql)?;
+        let next = performance_administration::advance_cycle_with_context(&txn, kabipay_common::subgraph::ops_db(ctx)?, tenant_id, cycle_id, "", Some(claims.sub), "MANUAL").await.map_err(KabiPayError::into_graphql)?;
         txn.commit().await.map_err(KabiPayError::from).map_err(KabiPayError::into_graphql)?;
         if next == "BLOCKED" {
             return Err(KabiPayError::Validation("Performance cycle has unresolved prerequisites; review actionable exceptions".into()).into_graphql());
@@ -1037,6 +1054,8 @@ impl MutationRoot {
         model.status = Set("SELF_SUBMITTED".into());
         let participant = model.update(&txn).await.map_err(KabiPayError::from).map_err(KabiPayError::into_graphql)?;
         performance_administration::snapshot_revision(&txn, tenant_id, participant.id).await.map_err(KabiPayError::into_graphql)?;
+        crate::email_emit::emit_performance_participant(&txn,kabipay_common::subgraph::ops_db(ctx)?,tenant_id,participant_id,
+            Some(kabipay_common::important_email::EmailActorRef::LocalUser{user_id:claims.sub}),&[],crate::email_emit::PerformanceEmailChange::Action).await.map_err(KabiPayError::into_graphql)?;
         txn.commit().await.map_err(KabiPayError::from).map_err(KabiPayError::into_graphql)?;
         performance_workflow::load_review_detail(&db, tenant_id, participant).await.map_err(KabiPayError::into_graphql)
     }
@@ -1096,6 +1115,8 @@ impl MutationRoot {
         model.status = Set("MANAGER_SUBMITTED".into());
         let participant = model.update(&txn).await.map_err(KabiPayError::from).map_err(KabiPayError::into_graphql)?;
         performance_administration::snapshot_revision(&txn, tenant_id, participant.id).await.map_err(KabiPayError::into_graphql)?;
+        crate::email_emit::emit_performance_participant(&txn,kabipay_common::subgraph::ops_db(ctx)?,tenant_id,participant_id,
+            Some(kabipay_common::important_email::EmailActorRef::LocalUser{user_id:claims.sub}),&[],crate::email_emit::PerformanceEmailChange::ReviewOutcome).await.map_err(KabiPayError::into_graphql)?;
         txn.commit().await.map_err(KabiPayError::from).map_err(KabiPayError::into_graphql)?;
         performance_workflow::load_review_detail(&db, tenant_id, participant).await.map_err(KabiPayError::into_graphql)
     }
@@ -1139,6 +1160,8 @@ impl MutationRoot {
         model.updated_at = Set(chrono::Utc::now());
         let participant = model.update(&txn).await.map_err(KabiPayError::from).map_err(KabiPayError::into_graphql)?;
         performance_administration::snapshot_revision(&txn, tenant_id, participant.id).await.map_err(KabiPayError::into_graphql)?;
+        crate::email_emit::emit_performance_participant(&txn,kabipay_common::subgraph::ops_db(ctx)?,tenant_id,participant_id,
+            Some(kabipay_common::important_email::EmailActorRef::LocalUser{user_id:claims.sub}),&[],crate::email_emit::PerformanceEmailChange::Action).await.map_err(KabiPayError::into_graphql)?;
         txn.commit().await.map_err(KabiPayError::from).map_err(KabiPayError::into_graphql)?;
         performance_workflow::load_review_detail(&db, tenant_id, participant).await.map_err(KabiPayError::into_graphql)
     }

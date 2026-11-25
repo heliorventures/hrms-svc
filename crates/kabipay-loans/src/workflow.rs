@@ -12,8 +12,8 @@ use sea_orm::{
 };
 use uuid::Uuid;
 
-pub(crate) async fn configured(
-    tx: &DatabaseTransaction,
+pub async fn configured<C: sea_orm::ConnectionTrait>(
+    tx: &C,
     tenant: Uuid,
     id: Uuid,
 ) -> LoanResult<workflow_step::Model> {

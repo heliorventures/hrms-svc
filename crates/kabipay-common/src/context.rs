@@ -403,6 +403,9 @@ pub const PERM_TIMESHEET_MANAGE: &str = "timesheet:manage";
 /// Create or edit **tenant announcements**, send **direct in-app notifications**, and remove broadcasts.
 pub const PERM_NOTIFICATION_MANAGE: &str = "notification:manage";
 pub const PERM_NOTIFICATION_READ: &str = "notification:read";
+pub const PERM_EMAIL_SETTINGS_READ: &str = "email_settings:read";
+pub const PERM_EMAIL_SETTINGS_MANAGE: &str = "email_settings:manage";
+pub const PERM_EMAIL_SETTINGS_TEST: &str = "email_settings:test";
 pub const PERM_TRAVEL_READ: &str = "travel:read";
 pub const PERM_TRAVEL_SUBMIT: &str = "travel:submit";
 pub const PERM_TRAVEL_APPROVE: &str = "travel:approve";

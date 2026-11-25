@@ -27,6 +27,7 @@ pub mod finance_transport;
 pub mod financial_lock;
 pub mod funding_exception;
 pub mod ids;
+pub mod important_email;
 pub mod jwt;
 pub mod client_jwt;
 pub mod middleware;
@@ -48,6 +49,7 @@ pub mod workflow_inbox;
 pub mod working_calendar;
 
 pub use context::{
+    PERM_EMAIL_SETTINGS_MANAGE, PERM_EMAIL_SETTINGS_READ, PERM_EMAIL_SETTINGS_TEST,
     ClientContext, ClientRequestHints, ClientViewerEmployee, OperatorContext, ScopeType,
     PERM_ATTENDANCE_PUNCH_POLICY, PERM_ATTENDANCE_PUNCH_SELF, PERM_ATTENDANCE_READ,
     PERM_ATTENDANCE_REGULARIZE, PERM_EMPLOYEE_DIRECTORY_READ, PERM_EMPLOYEE_MANAGE,

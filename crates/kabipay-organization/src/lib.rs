@@ -22,6 +22,7 @@ mod archive;
 mod roles;
 pub mod runtime;
 mod runtime_policy;
+pub mod email_policy;
 mod source_transport;
 pub mod store;
 mod workspace;

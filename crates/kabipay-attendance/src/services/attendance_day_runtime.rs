@@ -95,6 +95,7 @@ pub(crate) async fn expire_employee(
             after_state: Some(serde_json::json!({"status":"INCOMPLETE","reason":"MISSED_PUNCH_OUT","work_date":row.work_date,"ends_at":window.ends_at})),
             ip_address: None, user_agent: None, created_at: now,
         }).await?;
+        emit_missed_punch_email(txn,tenant_id,employee_id,row.id,window.ends_at,now).await?;
         expired += 1;
     }
     Ok(expired)
@@ -193,3 +194,32 @@ mod tests {
 #[cfg(test)]
 #[path = "attendance_day_runtime_tests.rs"]
 mod integration_tests;
+
+fn missed_punch_transition(tenant:Uuid,id:Uuid,expired_at:DateTime<Utc>,written_at:DateTime<Utc>)->kabipay_common::important_email::EmailTransition {
+ use kabipay_common::important_email::*;
+ EmailTransition{tenant_id:tenant,resource_type:EmailResourceType::Attendance,resource_id:id,
+ resource_version:email_timestamp_version("MISSED_PUNCH_OUT",written_at),occurred_at:expired_at,actor_ref:None,actor_target_user_ids:vec![]}
+}
+async fn emit_missed_punch_email(tx:&DatabaseTransaction,tenant:Uuid,employee:Uuid,id:Uuid,expired_at:DateTime<Utc>,written_at:DateTime<Utc>)->KabiPayResult<usize>{
+ use kabipay_common::important_email::*;
+ let transition=missed_punch_transition(tenant,id,expired_at,written_at);
+ let key=transition.resource_version.clone();
+ kabipay_organization_tenant::email_emission::emit_employee_event(tx,transition,employee,key,EmailEventKind::MissedPunchOut).await
+}
+
+#[cfg(test)]
+mod email_moment_tests {
+    use super::*;
+    use kabipay_common::important_email::*;
+    #[test]
+    fn delayed_expiry_does_not_turn_an_old_missed_window_into_a_fresh_alert() {
+        let expired:DateTime<Utc>="2026-03-08T10:00:00Z".parse().unwrap();
+        let written=expired+chrono::Duration::days(14);
+        let transition=missed_punch_transition(Uuid::new_v4(),Uuid::new_v4(),expired,written);
+        let reviewer=local_transition_reviewer(&transition,Uuid::new_v4(),"missed_punch_out");
+        let event=transition.event(EmailEventKind::MissedPunchOut,reviewer).unwrap().unwrap();
+        assert_eq!(event.occurred_at,expired);
+        assert!(event.expires_at<written);
+        assert_eq!(event.resource_version,email_timestamp_version("MISSED_PUNCH_OUT",written));
+    }
+}

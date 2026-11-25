@@ -2,3 +2,6 @@
 pub mod domain;
 pub mod resolvers;
 pub mod services;
+pub mod email_alerts;
+
+mod email_emit;

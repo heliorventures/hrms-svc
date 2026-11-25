@@ -47,6 +47,7 @@ impl SourceAdapter for LeaveAdapter {
                     .now_date();
                 crate::services::leave_service::decide_organization_leave(
                     tx,
+                    ops,
                     p,
                     c.resource_id,
                     date,

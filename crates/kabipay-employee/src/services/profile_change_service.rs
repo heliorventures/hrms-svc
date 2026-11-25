@@ -566,6 +566,7 @@ pub async fn submit_request(
             .await?;
         }
     }
+    crate::email_emit::emit_profile_email(&txn,tenant_id,id,employee_id,requested_by,requested_by,"PENDING",now).await?;
     txn.commit().await?;
 
     employee_profile_change_request::Entity::find_by_id(id)
@@ -855,6 +856,7 @@ pub async fn resolve_request(
         now,
     )
     .await?;
+    crate::email_emit::emit_profile_email(&txn,tenant_id,request_id,employee_id,requester_user_id,reviewer_user_id,status,now).await?;
     txn.commit().await?;
 
     employee_profile_change_request::Entity::find_by_id(request_id)

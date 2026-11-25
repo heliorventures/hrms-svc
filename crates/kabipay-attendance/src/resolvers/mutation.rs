@@ -486,7 +486,7 @@ impl MutationRoot {
             .await
             .map_err(KabiPayError::into_graphql)?;
         let m =
-            timesheet_batch_service::submit_timesheet_week(&db, tenant_id, employee_id, week_start_date)
+            timesheet_batch_service::submit_timesheet_week(&db, ops_db(ctx)?, tenant_id, employee_id, week_start_date)
                 .await
                 .map_err(KabiPayError::into_graphql)?;
         Ok(TimesheetWeekBatchDto::from(m))
@@ -513,6 +513,7 @@ impl MutationRoot {
             parse_uuid(&expected_workflow_step_id, "expectedWorkflowStepId")?;
         let m = timesheet_batch_service::approve_timesheet_week_batch(
             &db,
+            ops_db(ctx)?,
             tenant_id,
             bid,
             expected_step_id,

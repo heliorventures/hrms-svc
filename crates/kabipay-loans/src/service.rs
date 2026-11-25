@@ -222,6 +222,7 @@ pub async fn execute_with_funding_context(
     if let Some(employee) = result.employee_id {
         store::advance_revision(tx, actor.tenant_id, employee, action).await?;
     }
+    crate::email_emit::emit_loan_email(tx, actor, input, &result).await?;
     let reason = payload
         .get("reason")
         .or_else(|| {

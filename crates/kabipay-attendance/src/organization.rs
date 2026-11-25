@@ -29,7 +29,7 @@ impl SourceAdapter for AttendanceAdapter {
     async fn execute(
         &self,
         tx: &DatabaseTransaction,
-        _: &DatabaseConnection,
+        metadata: &DatabaseConnection,
         p: &kabipay_organization_tenant::VerifiedRuntimeAuthorization,
         c: &OrganizationCommand,
     ) -> KabiPayResult<serde_json::Value> {
@@ -50,6 +50,7 @@ impl SourceAdapter for AttendanceAdapter {
                 }
                 crate::services::timesheet_batch_service::decide_organization_timesheet(
                     tx,
+                    metadata,
                     p,
                     c.resource_id,
                     input,

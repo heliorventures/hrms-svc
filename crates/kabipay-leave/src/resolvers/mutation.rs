@@ -104,6 +104,7 @@ impl MutationRoot {
             .transpose()?;
         let m = leave_service::submit_leave_request(
             &db,
+            ops_db(ctx)?,
             tenant_id,
             business_date,
             claims.sub,
@@ -138,6 +139,7 @@ impl MutationRoot {
         let expected_step_id = parse_uuid(&expected_workflow_step_id, "expectedWorkflowStepId")?;
         let m = leave_service::approve_leave_request(
             &db,
+            ops_db(ctx)?,
             tenant_id,
             business_date,
             id,

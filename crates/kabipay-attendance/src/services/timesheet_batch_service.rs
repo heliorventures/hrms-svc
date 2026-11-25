@@ -289,6 +289,7 @@ async fn lock_current_timesheet_workflow(
 /// Employee submits all draft rows Mon-Sun `week_start`; starts workflow when configured.
 pub async fn submit_timesheet_week(
     db: &DatabaseConnection,
+    metadata: &DatabaseConnection,
     tenant_id: Uuid,
     employee_id: Uuid,
     week_start: NaiveDate,
@@ -392,6 +393,7 @@ pub async fn submit_timesheet_week(
         am.update(&txn).await?;
     }
 
+    crate::timesheet_email::emit_active_step(&txn,metadata,tenant_id,batch_id,None,now).await?;
     txn.commit().await?;
 
     timesheet_week_batch::Entity::find_by_id(batch_id)
@@ -440,6 +442,7 @@ async fn finalize_batch_approved(
 /// finalization as local approvals, with logical principal attribution.
 pub async fn decide_organization_timesheet(
     txn:&sea_orm::DatabaseTransaction,
+    metadata:&DatabaseConnection,
     authority:&kabipay_organization_tenant::VerifiedRuntimeAuthorization,
     batch_id:Uuid,
     input:kabipay_organization_tenant::WorkflowDecision,
@@ -450,24 +453,28 @@ pub async fn decide_organization_timesheet(
     if authority.employee_id!=Some(batch.employee_id){return Err(unavailable());}
     let (instance,step)=lock_current_timesheet_workflow(txn,tenant_id,&batch,input.expected_workflow_step_id).await?;
     assert_workflow_actor(txn,authority,batch.employee_id,step.approver_type.as_deref(),step.approver_permission.as_deref()).await?;
+    let email_actor=Some(authority.local_user_id().map(|user_id|kabipay_common::important_email::EmailActorRef::LocalUser{user_id})
+        .unwrap_or(kabipay_common::important_email::EmailActorRef::OrganizationPrincipal{principal_id:authority.principal_id}));
     let now=Utc::now();let approved=matches!(input.decision,Decision::Approve);
     let reason=input.rejection_reason.map(|v|v.trim().to_owned()).filter(|v|!v.is_empty());
     let action=workflow_action::ActiveModel{id:Set(Uuid::new_v4()),tenant_id:Set(tenant_id),instance_id:Set(instance.id),workflow_step_id:Set(step.id),performed_by:Set(authority.local_user_id()),action:Set(if approved {WF_ACTION_APPROVE}else{WF_ACTION_REJECT}.into()),remarks:Set(reason.clone()),acted_at:Set(now),created_at:Set(now),updated_at:Set(now)}.insert(txn).await?;
     txn.execute(statement("INSERT INTO organization_business_actor(tenant_id,resource_type,resource_id,principal_id,command_id,action) VALUES($1,'workflow_action',$2,$3,$4,$5)",vec![tenant_id.into(),action.id.into(),authority.principal_id.into(),authority.command_id().into(),action.action.into()])).await?;
     let next=if approved {workflow_step::Entity::find().filter(workflow_step::Column::TenantId.eq(tenant_id)).filter(workflow_step::Column::WorkflowId.eq(instance.workflow_id)).filter(workflow_step::Column::SequenceOrder.gt(step.sequence_order)).order_by_asc(workflow_step::Column::SequenceOrder).one(txn).await?}else{None};
     let mut active:workflow_instance::ActiveModel=instance.into();
-    if let Some(next)=next {active.current_step_id=Set(Some(next.id));active.updated_at=Set(now);active.update(txn).await?;let mut b:timesheet_week_batch::ActiveModel=batch.into();b.updated_at=Set(now);b.update(txn).await?;return Ok(());}
+    if let Some(next)=next {active.current_step_id=Set(Some(next.id));active.updated_at=Set(now);active.update(txn).await?;let mut b:timesheet_week_batch::ActiveModel=batch.into();b.updated_at=Set(now);b.update(txn).await?;crate::timesheet_email::emit_active_step_with_aliases(txn,metadata,tenant_id,batch_id,email_actor,&authority.actor_target_user_ids,now).await?;return Ok(());}
     active.status=Set(if approved {WF_STATUS_COMPLETED}else{WF_STATUS_CANCELLED}.into());active.current_step_id=Set(None);active.completed_at=Set(Some(now));active.updated_at=Set(now);active.update(txn).await?;
     if approved {finalize_batch_approved(txn,tenant_id,batch_id,now).await?;}else{
         let rows=timesheet_entry::Entity::find().filter(timesheet_entry::Column::TenantId.eq(tenant_id)).filter(timesheet_entry::Column::BatchId.eq(batch_id)).filter(timesheet_entry::Column::IsDeleted.eq(false)).all(txn).await?;
         for row in rows {let mut r:timesheet_entry::ActiveModel=row.into();r.batch_id=Set(None);r.status=Set(ENTRY_DRAFT.into());r.updated_at=Set(now);r.update(txn).await?;}
         let mut b:timesheet_week_batch::ActiveModel=batch.into();b.status=Set(BATCH_REJECTED.into());b.rejection_reason=Set(reason);b.updated_at=Set(now);b.update(txn).await?;
     }
+    crate::timesheet_email::emit_outcome(txn,tenant_id,batch_id,email_actor,Some(action.id),now).await?;
     Ok(())
 }
 
 pub async fn approve_timesheet_week_batch(
     db: &DatabaseConnection,
+    metadata: &DatabaseConnection,
     tenant_id: Uuid,
     batch_id: Uuid,
     expected_workflow_step_id: Uuid,
@@ -519,7 +526,7 @@ pub async fn approve_timesheet_week_batch(
     )
     .await?;
 
-    workflow_action::ActiveModel {
+    let email_action = workflow_action::ActiveModel {
         id: Set(Uuid::new_v4()),
         tenant_id: Set(tenant_id),
         instance_id: Set(instance.id),
@@ -555,6 +562,9 @@ pub async fn approve_timesheet_week_batch(
         active_instance.update(&txn).await?;
         finalize_batch_approved(&txn, tenant_id, batch_id, now).await?;
     }
+    crate::timesheet_email::emit_active_step(&txn,metadata,tenant_id,batch_id,Some(kabipay_common::important_email::EmailActorRef::LocalUser{user_id:approver_user_id}),now).await?;
+    let email_final = timesheet_week_batch::Entity::find_by_id(batch_id).filter(timesheet_week_batch::Column::TenantId.eq(tenant_id)).one(&txn).await?.ok_or_else(timesheet_decision_not_actionable)?;
+    if email_final.status==BATCH_APPROVED {crate::timesheet_email::emit_outcome(&txn,tenant_id,batch_id,Some(kabipay_common::important_email::EmailActorRef::LocalUser{user_id:approver_user_id}),Some(email_action.id),now).await?;}
     txn.commit().await?;
 
     timesheet_week_batch::Entity::find_by_id(batch_id)
@@ -620,7 +630,7 @@ pub async fn reject_timesheet_week_batch(
         &validated_authority,
     )
     .await?;
-    workflow_action::ActiveModel {
+    let email_action = workflow_action::ActiveModel {
         id: Set(Uuid::new_v4()),
         tenant_id: Set(tenant_id),
         instance_id: Set(instance.id),
@@ -665,6 +675,7 @@ pub async fn reject_timesheet_week_batch(
     am_batch.updated_at = Set(now);
     am_batch.update(&txn).await?;
 
+    crate::timesheet_email::emit_outcome(&txn,tenant_id,batch_id,Some(kabipay_common::important_email::EmailActorRef::LocalUser{user_id:rejector_user_id}),Some(email_action.id),now).await?;
     txn.commit().await?;
 
     crate::services::timesheet_notification_service::notify_employee_timesheet_rejected(
@@ -1107,3 +1118,7 @@ mod decision_contract_tests {
         assert!(step_sql.contains(&workflow_id.to_string()));
     }
 }
+
+#[cfg(test)]
+#[path="timesheet_email_owned_tests.rs"]
+mod email_owned_tests;

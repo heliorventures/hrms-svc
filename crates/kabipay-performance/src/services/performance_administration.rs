@@ -149,6 +149,7 @@ pub async fn set_calibration(
 
 pub async fn reopen_revision(
     txn: &DatabaseTransaction,
+    metadata: &sea_orm::DatabaseConnection,
     tenant_id: Uuid,
     participant_id: Uuid,
     expected_revision: i32,
@@ -195,6 +196,8 @@ pub async fn reopen_revision(
     txn.execute(Statement::from_sql_and_values(DatabaseBackend::Postgres,
         "UPDATE review_cycle SET current_stage=$3,status='ACTIVE',updated_at=$4 WHERE tenant_id=$1 AND id=$2", [tenant_id.into(), cycle_id.into(), correction_stage.into(), now.into()])).await?;
     audit_event(txn, tenant_id, Some(cycle_id), Some(participant_id), "REVIEW_REOPENED", Some(reason), Some(actor_id)).await?;
+    crate::email_emit::emit_performance_participant(txn,metadata,tenant_id,participant_id,
+        Some(kabipay_common::important_email::EmailActorRef::LocalUser{user_id:actor_id}),&[],crate::email_emit::PerformanceEmailChange::Action).await?;
     Ok(next_revision)
 }
 
@@ -268,6 +271,7 @@ fn exception_code_for_stage(stage: &str) -> Option<&'static str> {
 /// later stage; callers read the persisted row after commit to report its real resolution state.
 pub async fn retry_exception(
     txn: &DatabaseTransaction,
+    metadata: &sea_orm::DatabaseConnection,
     tenant_id: Uuid,
     exception_id: Uuid,
     actor_id: Uuid,
@@ -290,6 +294,7 @@ pub async fn retry_exception(
     if exception_code == NO_ELIGIBLE_PARTICIPANTS {
         advance_cycle_with_context(
             txn,
+            metadata,
             tenant_id,
             cycle_id,
             &exception_code,
@@ -311,40 +316,43 @@ pub async fn retry_exception(
     if exception_code_for_stage(&stage) != Some(exception_code.as_str()) {
         return Err(value_error("This performance exception is stale and cannot advance the current stage"));
     }
-    advance_cycle_with_context(txn, tenant_id, cycle_id, &exception_code, Some(actor_id), "RETRY").await?;
+    advance_cycle_with_context(txn, metadata, tenant_id, cycle_id, &exception_code, Some(actor_id), "RETRY").await?;
     Ok(())
 }
 
 /// Advance exactly one stage after locking the cycle. Manual requests, deadline sweeps and
 /// exception retry all call this operation so their prerequisite and deduplication behavior is identical.
-pub async fn advance_cycle(txn: &DatabaseTransaction, tenant_id: Uuid, cycle_id: Uuid) -> KabiPayResult<String> {
-    advance_cycle_with_context(txn, tenant_id, cycle_id, "", None, "MANUAL").await
+pub async fn advance_cycle(txn: &DatabaseTransaction, metadata: &sea_orm::DatabaseConnection, tenant_id: Uuid, cycle_id: Uuid) -> KabiPayResult<String> {
+    advance_cycle_with_context(txn, metadata, tenant_id, cycle_id, "", None, "MANUAL").await
 }
 
 pub async fn advance_cycle_with_context(
     txn: &DatabaseTransaction,
+    metadata: &sea_orm::DatabaseConnection,
     tenant_id: Uuid,
     cycle_id: Uuid,
     expected_exception_code: &str,
     actor_id: Option<Uuid>,
     source: &str,
 ) -> KabiPayResult<String> {
-    advance_cycle_with_due_date(txn, tenant_id, cycle_id, expected_exception_code, actor_id, source, None).await
+    advance_cycle_with_due_date(txn, metadata, tenant_id, cycle_id, expected_exception_code, actor_id, source, None).await
 }
 
 /// Scheduler callers provide `business_date`; it is checked after taking the cycle lock so a
 /// concurrent poll cannot advance the newly-entered stage using a stale pre-lock selection.
 pub async fn advance_due_cycle(
     txn: &DatabaseTransaction,
+    metadata: &sea_orm::DatabaseConnection,
     tenant_id: Uuid,
     cycle_id: Uuid,
     business_date: NaiveDate,
 ) -> KabiPayResult<String> {
-    advance_cycle_with_due_date(txn, tenant_id, cycle_id, "", None, "SCHEDULER", Some(business_date)).await
+    advance_cycle_with_due_date(txn, metadata, tenant_id, cycle_id, "", None, "SCHEDULER", Some(business_date)).await
 }
 
 async fn advance_cycle_with_due_date(
     txn: &DatabaseTransaction,
+    metadata: &sea_orm::DatabaseConnection,
     tenant_id: Uuid,
     cycle_id: Uuid,
     expected_exception_code: &str,
@@ -403,5 +411,7 @@ async fn advance_cycle_with_due_date(
     txn.execute(Statement::from_sql_and_values(DatabaseBackend::Postgres,"UPDATE performance_participant SET status=$3,updated_at=NOW() WHERE tenant_id=$1 AND review_cycle_id=$2 AND NOT is_excluded",[tenant_id.into(),cycle_id.into(),next.into()])).await?;
     audit_cycle_transition(txn, tenant_id, cycle_id, &stage, next, actor_id, source).await?;
     let key=format!("{cycle_id}:{code}"); txn.execute(Statement::from_sql_and_values(DatabaseBackend::Postgres,"UPDATE performance_admin_exception SET resolved_at=NOW() WHERE tenant_id=$1 AND dedup_key=$2 AND resolved_at IS NULL",[tenant_id.into(),key.into()])).await?;
+    crate::email_emit::emit_performance_cycle(txn,metadata,tenant_id,cycle_id,
+        actor_id.map(|user_id|kabipay_common::important_email::EmailActorRef::LocalUser{user_id})).await?;
     Ok(next.into())
 }

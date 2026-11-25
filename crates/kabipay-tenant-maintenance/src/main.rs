@@ -190,6 +190,7 @@ async fn main() -> anyhow::Result<()> {
                                         }
                                         match process_due_performance_cycles(
                                             &tdb,
+                                            &ops_db,
                                             tid,
                                             business_date,
                                         )
@@ -212,6 +213,7 @@ async fn main() -> anyhow::Result<()> {
                                         }
                                         match process_due_performance_stage_deadlines(
                                             &tdb,
+                                            &ops_db,
                                             tid,
                                             business_date,
                                         )

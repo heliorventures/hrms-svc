@@ -228,6 +228,7 @@ pub async fn submit_expense(
 
     try_attach_expense_workflow(&txn, tenant_id, id, now).await?;
 
+    crate::email_emit::emit_active_step(&txn,tenant_id,id,kabipay_common::important_email::EmailResourceType::Expense,logged_in_user_id,now).await?;
     txn.commit().await?;
 
     expense::Entity::find_by_id(id)
@@ -697,7 +698,7 @@ pub async fn approve_expense(
         &txn, tenant_id, model.employee_id, &current_step, &action_authority,
     )
     .await?;
-    workflow_action::ActiveModel {
+    let action = workflow_action::ActiveModel {
         id: Set(Uuid::new_v4()),
         tenant_id: Set(tenant_id),
         instance_id: Set(instance.id),
@@ -729,6 +730,7 @@ pub async fn approve_expense(
         active_instance.current_step_id = Set(Some(next.id));
         active_instance.updated_at = Set(now);
         active_instance.update(&txn).await?;
+        crate::email_emit::emit_active_step(&txn,tenant_id,expense_id,kabipay_common::important_email::EmailResourceType::Expense,authority.actor_user_id,now).await?;
         txn.commit().await?;
         return expense::Entity::find_by_id(expense_id)
             .one(db)
@@ -746,6 +748,7 @@ pub async fn approve_expense(
         &txn, tenant_id, expense_id, authority.actor_user_id, approved_financial, now,
     )
     .await?;
+    crate::email_emit::emit_outcome(&txn,tenant_id,expense_id,kabipay_common::important_email::EmailResourceType::Expense,authority.actor_user_id,action.id,now).await?;
     after_successful_commit(txn.commit(), || async {
         let out = expense::Entity::find_by_id(expense_id)
             .one(db)
@@ -803,7 +806,7 @@ pub async fn reject_expense(
     )
     .await?;
     let now = Utc::now();
-    workflow_action::ActiveModel {
+    let action = workflow_action::ActiveModel {
         id: Set(Uuid::new_v4()),
         tenant_id: Set(tenant_id),
         instance_id: Set(instance.id),
@@ -837,6 +840,7 @@ pub async fn reject_expense(
         .one(&txn)
         .await?
         .ok_or_else(|| KabiPayError::Internal("updated expense not found".into()))?;
+    crate::email_emit::emit_outcome(&txn,tenant_id,expense_id,kabipay_common::important_email::EmailResourceType::Expense,authority.actor_user_id,action.id,now).await?;
     after_successful_commit(txn.commit(), || async {
         let msg = format!(
             "Your expense claim \"{}\" was rejected.{}",

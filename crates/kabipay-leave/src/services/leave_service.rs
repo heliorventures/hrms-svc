@@ -325,6 +325,7 @@ async fn move_locked_leave_balance<C: ConnectionTrait + Sync>(
 /// with status `PENDING`, and increase `pending_days` on the balance.
 pub async fn submit_leave_request(
     db: &DatabaseConnection,
+    metadata: &DatabaseConnection,
     tenant_id: Uuid,
     business_date: NaiveDate,
     actor_user_id: Uuid,
@@ -523,6 +524,8 @@ pub async fn submit_leave_request(
         .await?
         .ok_or_else(|| KabiPayError::Internal("inserted leave_request not found".into()))?;
 
+    crate::email_emit::emit_active_step(&txn, metadata, tenant_id, req_id,
+        kabipay_common::important_email::EmailActorRef::LocalUser{user_id:actor_user_id}, now).await?;
     txn.commit().await?;
     Ok(model)
 }
@@ -1123,6 +1126,7 @@ async fn finalize_leave_approval(
 /// performs balance movement and emits destination delivery intents in the same transaction.
 pub async fn approve_leave_request(
     db: &DatabaseConnection,
+    metadata: &DatabaseConnection,
     tenant_id: Uuid,
     business_date: NaiveDate,
     request_id: Uuid,
@@ -1224,7 +1228,7 @@ pub async fn approve_leave_request(
         created_at: Set(now),
         updated_at: Set(now),
     };
-    act.insert(&txn).await?;
+    let action = act.insert(&txn).await?;
 
     let next_step = workflow_step::Entity::find()
         .filter(workflow_step::Column::TenantId.eq(tenant_id))
@@ -1240,6 +1244,8 @@ pub async fn approve_leave_request(
         am_inst.current_step_id = Set(Some(next.id));
         am_inst.updated_at = Set(now);
         am_inst.update(&txn).await?;
+        crate::email_emit::emit_active_step(&txn, metadata, tenant_id, request_id,
+            kabipay_common::important_email::EmailActorRef::LocalUser{user_id:actor_user_id}, now).await?;
         txn.commit().await?;
         return leave_request::Entity::find_by_id(request_id)
             .one(db)
@@ -1280,6 +1286,8 @@ pub async fn approve_leave_request(
     )
     .await?;
 
+    crate::email_emit::emit_outcome(&txn, tenant_id, request_id,
+        kabipay_common::important_email::EmailActorRef::LocalUser{user_id:actor_user_id}, Some(action.id), now).await?;
     txn.commit().await?;
     let out = leave_request::Entity::find_by_id(request_id)
         .one(db)
@@ -1302,6 +1310,7 @@ pub async fn approve_leave_request(
 /// local decisions; foreign principals never become tenant users/employees.
 pub async fn decide_organization_leave(
     txn:&sea_orm::DatabaseTransaction,
+    metadata:&DatabaseConnection,
     authority:&kabipay_organization_tenant::VerifiedRuntimeAuthorization,
     request_id:Uuid,
     business_date:NaiveDate,
@@ -1319,6 +1328,8 @@ pub async fn decide_organization_leave(
     let (instance,step)=lock_current_leave_workflow(txn,tenant_id,&model,input.expected_workflow_step_id).await?;
     assert_workflow_actor(txn,authority,model.employee_id,step.approver_type.as_deref(),step.approver_permission.as_deref()).await?;
     let now=Utc::now();
+    let email_actor=authority.local_user_id().map(|user_id|kabipay_common::important_email::EmailActorRef::LocalUser{user_id})
+        .unwrap_or(kabipay_common::important_email::EmailActorRef::OrganizationPrincipal{principal_id:authority.principal_id});
     let approved=matches!(input.decision,Decision::Approve);
     let action=workflow_action::ActiveModel {
         id:Set(Uuid::new_v4()),tenant_id:Set(tenant_id),instance_id:Set(instance.id),workflow_step_id:Set(step.id),performed_by:Set(authority.local_user_id()),
@@ -1332,6 +1343,7 @@ pub async fn decide_organization_leave(
         // Workflow progress is part of the versioned leave resource even when
         // the request remains pending for the next approver.
         let mut request:leave_request::ActiveModel=model.into();request.updated_at=Set(now);request.update(txn).await?;
+        crate::email_emit::emit_active_step_with_aliases(txn,metadata,tenant_id,request_id,email_actor,&authority.actor_target_user_ids,now).await?;
         return Ok(());
     }
     active.status=Set(if approved {WF_STATUS_COMPLETED}else{WF_STATUS_REJECTED}.into());active.current_step_id=Set(None);active.completed_at=Set(Some(now));active.updated_at=Set(now);active.update(txn).await?;
@@ -1343,6 +1355,7 @@ pub async fn decide_organization_leave(
     if approved {finalize_leave_approval(txn,tenant_id,&model,authority.local_user_id(),now,request_id).await?;}else{
         let mut request:leave_request::ActiveModel=model.into();request.status=Set(STATUS_REJECTED.into());request.rejection_reason=Set(input.rejection_reason);request.approved_by=Set(None);request.updated_at=Set(now);request.update(txn).await?;
     }
+    crate::email_emit::emit_outcome(txn,tenant_id,request_id,email_actor,Some(action.id),now).await?;
     Ok(())
 }
 
@@ -1435,7 +1448,7 @@ pub async fn reject_leave_request(
         &authority,
     )
     .await?;
-    workflow_action::ActiveModel {
+    let action = workflow_action::ActiveModel {
         id: Set(Uuid::new_v4()),
         tenant_id: Set(tenant_id),
         instance_id: Set(inst.id),
@@ -1484,6 +1497,8 @@ pub async fn reject_leave_request(
         .one(&txn)
         .await?
         .ok_or_else(|| KabiPayError::Internal("updated leave_request not found".into()))?;
+    crate::email_emit::emit_outcome(&txn,tenant_id,request_id,
+        kabipay_common::important_email::EmailActorRef::LocalUser{user_id:actor_user_id},Some(action.id),now).await?;
     txn.commit().await?;
     let msg = match &out.rejection_reason {
         Some(s) if !s.is_empty() => format!("Your leave was rejected. Reason: {s}"),
@@ -1569,6 +1584,8 @@ pub async fn cancel_leave_request(
         .one(&txn)
         .await?
         .ok_or_else(|| KabiPayError::Internal("updated leave_request not found".into()))?;
+    crate::email_emit::emit_outcome(&txn,tenant_id,request_id,
+        kabipay_common::important_email::EmailActorRef::LocalUser{user_id:actor_user_id},None,now).await?;
     txn.commit().await?;
     leave_notify_employee(
         db,
@@ -1665,6 +1682,8 @@ pub async fn cancel_approved_comp_off_leave(
         },
     )
     .await?;
+    crate::email_emit::emit_outcome(&txn,tenant_id,request_id,
+        kabipay_common::important_email::EmailActorRef::LocalUser{user_id:actor_user_id},None,now).await?;
     txn.commit().await?;
     leave_notify_employee(db, tenant_id, out.employee_id, "Approved comp-off leave cancelled", "HR cancelled your approved future comp-off leave.").await;
     Ok(out)

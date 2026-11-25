@@ -98,3 +98,7 @@ impl From<sea_orm::DbErr> for LoanModuleError {
         }
     }
 }
+
+mod email_emit;
+/// Read-only definition check shared by business decisions and mail eligibility.
+pub use workflow::configured as configured_loan_approval_step;

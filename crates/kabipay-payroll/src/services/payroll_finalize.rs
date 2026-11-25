@@ -136,6 +136,9 @@ pub async fn finalize_in_transaction(
     txn.execute(Statement::from_sql_and_values(DbBackend::Postgres,
         "UPDATE payroll_draft_calculation SET finalized_at=NOW(),finalized_by=$3,finalized_by_principal_id=$5,acknowledgement=$4 WHERE tenant_id=$1 AND cycle_id=$2",
         [tenant.into(),id.into(),actor.local_user.into(),ack.into(),actor.principal.into()])).await?;
+    let email_actor=actor.local_user.map(|user_id|kabipay_common::important_email::EmailActorRef::LocalUser{user_id})
+        .or_else(||actor.principal.map(|principal_id|kabipay_common::important_email::EmailActorRef::OrganizationPrincipal{principal_id}));
+    crate::email_emit::emit_finalized_payslip_emails(txn,tenant,id,email_actor).await?;
     Ok(PayrollFinalization {
         cycle_id: id,
         revision,

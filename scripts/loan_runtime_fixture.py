@@ -5,6 +5,7 @@ only supply upstream tables needed by module integration tests, not deployment S
 """
 from pathlib import Path
 import re
+import argparse
 ROOT=Path(__file__).resolve().parents[1]
 TYPES={'Uuid':('UUID','gen_random_uuid()'),'String':('TEXT',"''"),'bool':('BOOLEAN','FALSE'),'i32':('INT','0'),'i64':('BIGINT','0'),'i16':('SMALLINT','0'),'Decimal':('NUMERIC','0'),'DateTimeUtc':('TIMESTAMPTZ','NOW()'),'NaiveDate':('DATE','CURRENT_DATE'),'Json':('JSONB',"'{}'::jsonb")}
 def fields(source):
@@ -13,11 +14,19 @@ def fields(source):
         optional=kind.startswith('Option<');kind=kind[7:-1] if optional else kind
         sql,default=TYPES[kind]
         yield name,sql+('' if optional else ' NOT NULL DEFAULT '+default)
-print('\\set ON_ERROR_STOP on\nBEGIN;\nCREATE SCHEMA kabipay_ops;')
-for name in ('tenant','module','tenant_subscription','feature_flag'):
-    source=(ROOT/f'crates/kabipay-db-entities/src/ops/{name}.rs').read_text(encoding='utf-8')
-    print(f'CREATE TABLE kabipay_ops.{name} ('+', '.join(f'"{key}" {declaration}' for key,declaration in fields(source))+');')
-print('CREATE TABLE kabipay_ops.module_dependency(module_id UUID NOT NULL,depends_on_module_id UUID NOT NULL);')
+parser=argparse.ArgumentParser()
+parser.add_argument('--part',choices=('all','company','metadata'),default='all')
+part=parser.parse_args().part
+print('\\set ON_ERROR_STOP on\nBEGIN;')
+if part!='company':
+    print('CREATE SCHEMA kabipay_ops;')
+    for name in ('tenant','module','tenant_subscription','feature_flag'):
+        source=(ROOT/f'crates/kabipay-db-entities/src/ops/{name}.rs').read_text(encoding='utf-8')
+        print(f'CREATE TABLE kabipay_ops.{name} ('+', '.join(f'"{key}" {declaration}' for key,declaration in fields(source))+');')
+    print('CREATE TABLE kabipay_ops.module_dependency(module_id UUID NOT NULL,depends_on_module_id UUID NOT NULL);')
+if part=='metadata':
+    print('COMMIT;')
+    raise SystemExit(0)
 source=(ROOT/'crates/kabipay-db-entities/src/tenant/d0007_employee_core.rs').read_text(encoding='utf-8')
 for name,declaration in fields(source):
     if name not in ('id','tenant_id'): print(f'ALTER TABLE loan_test.employee ADD COLUMN "{name}" {declaration};')

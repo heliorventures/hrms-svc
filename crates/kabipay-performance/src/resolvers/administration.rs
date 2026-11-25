@@ -146,7 +146,7 @@ impl AdministrationMutationRoot {
         let claims = require_client_claims(ctx)?; require_manage(claims)?; let tenant_id = require_tenant_id(ctx)?; let participant_id = parse_id(&input.participant_id)?;
         let reason = validate_text(&input.reason, 4000)?; let stage = input.correction_stage.trim().to_ascii_uppercase(); let db = tenant_db(ctx, tenant_id).await?;
         let txn = db.begin().await.map_err(KabiPayError::from).map_err(KabiPayError::into_graphql)?;
-        performance_administration::reopen_revision(&txn, tenant_id, participant_id, input.expected_revision, &stage, &reason, claims.sub).await.map_err(KabiPayError::into_graphql)?;
+        performance_administration::reopen_revision(&txn, kabipay_common::subgraph::ops_db(ctx)?, tenant_id, participant_id, input.expected_revision, &stage, &reason, claims.sub).await.map_err(KabiPayError::into_graphql)?;
         txn.commit().await.map_err(KabiPayError::from).map_err(KabiPayError::into_graphql)?; load_admin_participant(&db, tenant_id, participant_id).await
     }
 
@@ -252,7 +252,7 @@ impl AdministrationMutationRoot {
         let exception_id = parse_id(&exception_id)?;
         let db = tenant_db(ctx, tenant_id).await?;
         let txn = db.begin().await.map_err(KabiPayError::from).map_err(KabiPayError::into_graphql)?;
-        performance_administration::retry_exception(&txn, tenant_id, exception_id, claims.sub)
+        performance_administration::retry_exception(&txn, kabipay_common::subgraph::ops_db(ctx)?, tenant_id, exception_id, claims.sub)
             .await
             .map_err(KabiPayError::into_graphql)?;
         txn.commit().await.map_err(KabiPayError::from).map_err(KabiPayError::into_graphql)?;

@@ -33,12 +33,12 @@ pub struct PerformanceCycleSweepResult {
 }
 
 pub async fn process_due_performance_stage_deadlines(
-    db: &DatabaseConnection, tenant_id: Uuid, business_date: NaiveDate,
+    db: &DatabaseConnection, metadata: &DatabaseConnection, tenant_id: Uuid, business_date: NaiveDate,
 ) -> KabiPayResult<PerformanceCycleSweepResult> {
     let rows = db.query_all(Statement::from_sql_and_values(DatabaseBackend::Postgres,
         "SELECT id FROM review_cycle WHERE tenant_id=$1 AND status='ACTIVE' AND performance_program_id IS NOT NULL AND CASE current_stage WHEN 'GOAL_SETTING' THEN goal_setting_due_date WHEN 'SELF_REVIEW' THEN self_review_due_date WHEN 'MANAGER_REVIEW' THEN manager_review_due_date WHEN 'HR_CALIBRATION' THEN calibration_due_date WHEN 'EMPLOYEE_ACKNOWLEDGEMENT' THEN acknowledgement_due_date ELSE NULL END <= $2 ORDER BY id", [tenant_id.into(),business_date.into()])).await?;
     let mut result=PerformanceCycleSweepResult::default();
-    for row in rows { let cycle_id:Uuid=row.try_get("","id")?; let txn=db.begin().await?; match performance_administration::advance_due_cycle(&txn,tenant_id,cycle_id,business_date).await { Ok(outcome) => { txn.commit().await?; if outcome == "BLOCKED" { result.stages_blocked += 1; } else if outcome != "NOT_DUE" { result.stages_advanced += 1; } }, Err(_) => { txn.rollback().await?; result.stages_blocked += 1; } } }
+    for row in rows { let cycle_id:Uuid=row.try_get("","id")?; let txn=db.begin().await?; match performance_administration::advance_due_cycle(&txn,metadata,tenant_id,cycle_id,business_date).await { Ok(outcome) => { txn.commit().await?; if outcome == "BLOCKED" { result.stages_blocked += 1; } else if outcome != "NOT_DUE" { result.stages_advanced += 1; } }, Err(_) => { txn.rollback().await?; result.stages_blocked += 1; } } }
     Ok(result)
 }
 
@@ -54,6 +54,7 @@ fn cadence(value: &str) -> Option<Cadence> {
 
 pub async fn process_due_performance_cycles(
     db: &DatabaseConnection,
+    metadata: &DatabaseConnection,
     tenant_id: Uuid,
     business_date: NaiveDate,
 ) -> KabiPayResult<PerformanceCycleSweepResult> {
@@ -122,6 +123,7 @@ pub async fn process_due_performance_cycles(
                 [Uuid::new_v4().into(), tenant_id.into(), program.id.into(), cycle_id.into(), now.into()],
             )).await?;
         }
+        crate::email_emit::emit_performance_cycle(&txn,metadata,tenant_id,cycle_id,None).await?;
         txn.commit().await?;
         result.cycles_created += 1;
         result.participants_created += participants_created;

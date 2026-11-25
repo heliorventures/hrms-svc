@@ -1,4 +1,5 @@
 //! Resolver SQL-boundary tests; these do not simulate PostgreSQL lock scheduling.
+mod email_owned_tests;
 
 use std::{collections::{BTreeMap, HashMap}, env, sync::{Arc, Mutex}, time::{Duration, Instant}};
 use async_graphql::{Context, EmptySubscription, Schema};
@@ -118,7 +119,7 @@ impl Fixture {
             permission_scopes: self.permission_scopes.clone(), resource_scopes: HashMap::new(),
         };
         Schema::build(QueryRoot::default(), MutationRoot::default(), EmptySubscription)
-            .data(TestTenantDb(self.tenant, db)).data(TenantId(self.tenant)).data(claims)
+            .data(TestTenantDb(self.tenant, db)).data(DatabaseConnection::Disconnected).data(TenantId(self.tenant)).data(claims)
             .finish().execute(operation
                 .replace("$PARTICIPANT", &self.participant_id.to_string())
                 .replace("$CYCLE", &self.cycle_id.to_string())
@@ -193,6 +194,31 @@ impl ProxyDatabaseTrait for Fixture {
     async fn query(&self, statement: Statement) -> Result<Vec<ProxyRow>, DbErr> {
         let sql = statement.to_string();
         self.record(&sql);
+        // These lock-boundary fixtures seed no account grants, recipient links
+        // or organization installations. Actual email writes are exercised by
+        // the separate owned transaction rehearsals, not by these proxies.
+        if sql.trim_start().starts_with("SELECT DISTINCT u.id AS user_id")
+            || sql.starts_with("SELECT e.user_id FROM employee e JOIN")
+            || sql.contains("FROM organization_grant_installation g")
+            || sql.starts_with("SELECT p.id FROM performance_participant p JOIN review_cycle c")
+        { return Ok(vec![]); }
+        if sql.starts_with("SELECT p.id,p.employee_id,p.review_cycle_id") {
+            if self.is_excluded {return Ok(vec![]);}
+            let now=Utc::now();
+            return Ok(vec![ProxyRow::new(BTreeMap::from([
+                ("id".into(),self.participant_id.into()),("employee_id".into(),self.employee_id.into()),
+                ("review_cycle_id".into(),self.cycle_id.into()),("manager_employee_id".into(),self.manager_employee_id.into()),
+                ("response_revision".into(),1_i32.into()),("updated_at".into(),now.into()),("cycle_updated_at".into(),now.into()),
+                ("self_submitted".into(),false.into()),("manager_submitted".into(),false.into()),
+                ("manager_submitted_at".into(),Option::<chrono::DateTime<Utc>>::None.into()),
+                ("current_stage".into(),self.stage_after_lock.into()),("cycle_status".into(),"ACTIVE".into()),
+                ("requester_user_id".into(),Option::<Uuid>::None.into()),
+            ]))]);
+        }
+        if sql.starts_with("SELECT id,status,weightage,updated_at FROM goal") {
+            let approved=self.initial_goals_approved || self.events().iter().any(|e|e.starts_with("UPDATE \"goal\""));
+            return Ok(vec![self.goal(approved)]);
+        }
         if sql.starts_with("SELECT manager_employee_id FROM management_assignment") {return Ok(self.canonical_primary_manager.map(|manager|vec![ProxyRow::new(BTreeMap::from([("manager_employee_id".into(),manager.into())]))]).unwrap_or_default());}
         if sql.starts_with("SELECT a.manager_employee_id FROM management_assignment a") {
             return Ok(self.installed_manager.map(|manager|vec![ProxyRow::new(BTreeMap::from([("manager_employee_id".into(),manager.into())]))]).unwrap_or_default());
@@ -735,4 +761,12 @@ async fn ended_or_expired_canonical_manager_uses_real_legacy_authority() {
     fixture.claim_employee_id=Some(legacy);
     let allowed=fixture.run(PROPOSE).await;
     assert!(allowed.errors.is_empty(),"actual legacy manager must regain authority: {:?}",allowed.errors);
+}
+
+#[tokio::test]
+async fn repeated_goal_approval_keeps_the_existing_revision_and_email_transition() {
+    let mut fixture=Fixture::new();fixture.initial_goals_approved=true;
+    let result=fixture.run(APPROVE).await;
+    assert!(result.errors.is_empty(),"{:?}",result.errors);
+    assert!(!fixture.events().iter().any(|sql|sql.starts_with("UPDATE \"goal\"")),"an unchanged approved goal set must not manufacture another transition");
 }

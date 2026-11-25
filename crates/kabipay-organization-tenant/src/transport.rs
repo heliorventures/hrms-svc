@@ -133,6 +133,13 @@ pub fn unavailable() -> KabiPayError {
 
 /// Preserve the configured workflow relationship for a verified foreign actor.
 /// A general company grant does not turn its holder into a reporting manager.
+pub(crate) const WORKFLOW_MANAGER_ASSIGNMENT_SQL:&str=r#"SELECT 1 AS n FROM management_assignment a JOIN assignment_capability c ON c.tenant_id=a.tenant_id AND c.assignment_id=a.id WHERE a.tenant_id=$1 AND a.subject_employee_id=$2 AND a.manager_principal_id=$3 AND a.organization_id=$4 AND a.relationship_type='PRIMARY' AND a.status='ACTIVE' AND a.effective_from<=clock_timestamp() AND (a.effective_to IS NULL OR a.effective_to>clock_timestamp()) AND c.capability_code=$5"#;
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn workflow_reporting_manager_current<C:ConnectionTrait>(db:&C,tenant:Uuid,subject:Uuid,principal:Uuid,organization:Uuid,capability:&str,lock:bool)->KabiPayResult<bool>{
+ let query=format!("{}{}",WORKFLOW_MANAGER_ASSIGNMENT_SQL,if lock{" FOR SHARE OF a"}else{""});
+ Ok(db.query_one(statement(&query,vec![tenant.into(),subject.into(),principal.into(),organization.into(),capability.into()])).await?.is_some())
+}
+
 pub async fn assert_workflow_actor(
     tx: &DatabaseTransaction,
     p: &RuntimeAuthorization,
@@ -145,7 +152,7 @@ pub async fn assert_workflow_actor(
     }
     if tx.query_one(statement("SELECT 1 AS n FROM employee WHERE tenant_id=$1 AND id=$2 AND NOT is_deleted AND status IN ('ACTIVE','PROBATION','ON_LEAVE') AND ($3<>tenant_id OR user_id IS DISTINCT FROM $4) FOR SHARE",vec![p.tenant_id.into(),subject.into(),p.source_tenant_id.into(),p.source_user_id.into()])).await?.is_none(){return Err(unavailable());}
     if tx.query_one(statement("SELECT 1 AS n FROM management_assignment WHERE tenant_id=$1 AND subject_employee_id=$2 AND subject_principal_id=$3",vec![p.tenant_id.into(),subject.into(),p.principal_id.into()])).await?.is_some(){return Err(unavailable());}
-    let manager=tx.query_one(statement("SELECT 1 AS n FROM management_assignment a JOIN assignment_capability c ON c.tenant_id=a.tenant_id AND c.assignment_id=a.id WHERE a.tenant_id=$1 AND a.subject_employee_id=$2 AND a.manager_principal_id=$3 AND a.organization_id=$4 AND a.relationship_type='PRIMARY' AND a.status='ACTIVE' AND a.effective_from<=clock_timestamp() AND (a.effective_to IS NULL OR a.effective_to>clock_timestamp()) AND c.capability_code=$5 FOR SHARE OF a",vec![p.tenant_id.into(),subject.into(),p.principal_id.into(),p.organization_id.into(),p.capability.clone().into()])).await?.is_some();
+    let manager=workflow_reporting_manager_current(tx,p.tenant_id,subject,p.principal_id,p.organization_id,&p.capability,true).await?;
     let allowed_permission = permission.is_some_and(|v| v.eq_ignore_ascii_case(&p.capability));
     let allowed = match approver_type
         .unwrap_or("REPORTING_MANAGER")

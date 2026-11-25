@@ -10,9 +10,14 @@ authors.workspace = true
 name = "kabipay-notification"
 path = "src/main.rs"
 
+[[bin]]
+name = "kabipay-email-key-rotation"
+path = "src/bin/email_key_rotation.rs"
+
 [dependencies]
 kabipay-common.workspace = true
 kabipay-db-entities.workspace = true
+kabipay-organization-security = { path = "../kabipay-organization-security" }
 async-graphql.workspace = true
 async-graphql-axum.workspace = true
 axum.workspace = true
@@ -35,4 +40,14 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 reqsign = { version = "0.16.5", default-features = false, features = ["reqwest_request", "services-aws", "rustls"] }
 hmac.workspace = true
 sha2.workspace = true
+aes-gcm.workspace = true
 futures-util = "0.3"
+lettre = { version = "=0.11.23", default-features = false, features = ["builder", "smtp-transport", "tokio1-rustls", "ring", "webpki-roots"] }
+
+[dev-dependencies]
+kabipay-leave = { path = "../kabipay-leave" }
+kabipay-organization-protocol = { path = "../kabipay-organization-protocol" }
+kabipay-organization-tenant = { path = "../kabipay-organization-tenant" }
+sea-orm = { workspace = true, features = ["proxy"] }
+tokio = { workspace = true, features = ["test-util"] }
+tokio-rustls = { version = "=0.26.4", default-features = false, features = ["ring", "tls12"] }

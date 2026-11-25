@@ -51,11 +51,7 @@ async fn manager(
     if p.authority_kind == AuthorityKind::OrganizationGrant && p.employee_scope == "ALL" {
         return Ok(());
     }
-    let row=tx.query_one(statement("SELECT 1 AS n FROM organization_review_manager s WHERE s.tenant_id=$1 AND s.participant_id=$2 AND s.principal_id=$3 AND s.assignment_id=$4 AND s.assignment_version=$5 AND s.assignment_id=(SELECT a.id FROM management_assignment a WHERE a.tenant_id=$1 AND a.subject_employee_id=$6 AND a.status='ACTIVE' AND a.relationship_type IN ('PRIMARY','REVIEWER') AND a.effective_from<=clock_timestamp() AND (a.effective_to IS NULL OR a.effective_to>clock_timestamp()) AND EXISTS(SELECT 1 FROM assignment_capability c WHERE c.tenant_id=a.tenant_id AND c.assignment_id=a.id AND c.capability_code='performance:evaluate') ORDER BY CASE WHEN a.relationship_type='PRIMARY' THEN 0 ELSE 1 END,a.graph_version DESC,a.id LIMIT 1) FOR SHARE OF s",vec![p.tenant_id.into(),participant.into(),p.principal_id.into(),p.authority_id.into(),p.authority_version.into(),p.employee_id.into()])).await?;
-    if row.is_none() {
-        return Err(unavailable());
-    }
-    Ok(())
+    crate::services::performance_management::assert_current_review_assignment(tx,p.tenant_id,participant,p.principal_id,p.authority_id,p.authority_version,p.employee_id.ok_or_else(unavailable)?,true).await
 }
 impl SourceAdapter for PerformanceAdapter {
     fn service(&self) -> &'static str {
@@ -115,7 +111,7 @@ impl SourceAdapter for PerformanceAdapter {
     async fn execute(
         &self,
         tx: &DatabaseTransaction,
-        _: &DatabaseConnection,
+        metadata: &DatabaseConnection,
         p: &kabipay_organization_tenant::VerifiedRuntimeAuthorization,
         c: &OrganizationCommand,
     ) -> KabiPayResult<serde_json::Value> {
@@ -218,6 +214,10 @@ impl SourceAdapter for PerformanceAdapter {
                 let participant = model.update(tx).await?;
                 performance_administration::snapshot_revision(tx, p.tenant_id, participant.id)
                     .await?;
+                let email_actor=p.local_user_id().map(|user_id|kabipay_common::important_email::EmailActorRef::LocalUser{user_id})
+                    .unwrap_or(kabipay_common::important_email::EmailActorRef::OrganizationPrincipal{principal_id:p.principal_id});
+                crate::email_emit::emit_performance_participant(tx,metadata,p.tenant_id,participant.id,Some(email_actor),&p.actor_target_user_ids,
+                    crate::email_emit::PerformanceEmailChange::ReviewOutcome).await?;
                 Ok(
                     serde_json::json!({"id":participant.id,"status":participant.status,"response_revision":participant.response_revision}),
                 )

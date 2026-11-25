@@ -12,7 +12,17 @@ pub async fn manager<C: ConnectionTrait + Sync>(
     subject: Uuid,
     legacy: Option<Uuid>,
 ) -> KabiPayResult<Option<Uuid>> {
-    let row=db.query_one(Statement::from_sql_and_values(DbBackend::Postgres,"SELECT manager_employee_id FROM management_assignment WHERE tenant_id=$1 AND subject_employee_id=$2 AND relationship_type='PRIMARY' AND status='ACTIVE' AND effective_from<=clock_timestamp() AND (effective_to IS NULL OR effective_to>clock_timestamp()) FOR SHARE",[tenant.into(),subject.into()])).await?;
+    manager_with_lock(db,tenant,subject,legacy,true).await
+}
+
+/// Eligibility reads take a bounded snapshot; they neither mutate a workflow
+/// nor require UPDATE privileges merely to read the canonical relationship.
+pub async fn manager_snapshot<C:ConnectionTrait+Sync>(db:&C,tenant:Uuid,subject:Uuid,legacy:Option<Uuid>)->KabiPayResult<Option<Uuid>>{
+    manager_with_lock(db,tenant,subject,legacy,false).await
+}
+async fn manager_with_lock<C:ConnectionTrait+Sync>(db:&C,tenant:Uuid,subject:Uuid,legacy:Option<Uuid>,lock:bool)->KabiPayResult<Option<Uuid>>{
+    let query=format!("SELECT manager_employee_id FROM management_assignment WHERE tenant_id=$1 AND subject_employee_id=$2 AND relationship_type='PRIMARY' AND status='ACTIVE' AND effective_from<=clock_timestamp() AND (effective_to IS NULL OR effective_to>clock_timestamp()){}",if lock{" FOR SHARE"}else{""});
+    let row=db.query_one(Statement::from_sql_and_values(DbBackend::Postgres,query,[tenant.into(),subject.into()])).await?;
     row.map(|r| r.try_get::<Option<Uuid>>("", "manager_employee_id"))
         .transpose()
         .map(|r| r.unwrap_or(legacy))

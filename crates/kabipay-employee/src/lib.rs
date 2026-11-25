@@ -6,3 +6,6 @@ pub mod organization;
 
 mod organization_admin;
 mod organization_offboarding;
+pub mod email_alerts;
+
+mod email_emit;

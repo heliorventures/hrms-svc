@@ -381,6 +381,16 @@ mod tests {
 
 #[Object]
 impl MutationRoot {
+    async fn save_email_settings(&self, ctx: &Context<'_>, #[graphql(secret)] input: crate::email::api::SaveEmailSettingsInput)
+        -> Result<crate::email::settings::EmailSettingsPublic> {
+        crate::email::api::save(ctx, input).await
+    }
+
+    async fn send_email_settings_test(&self, ctx: &Context<'_>, expected_version: i64)
+        -> Result<crate::email::test_queue::EmailTestStatus> {
+        crate::email::api::queue_test(ctx, expected_version).await
+    }
+
     /// Admin / HR: save tenant-wide automated employee-event settings.
     async fn save_notification_automation_settings(
         &self,

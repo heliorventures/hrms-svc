@@ -61,3 +61,4 @@ pub mod d0106_loan_exit_coordination;
 pub mod d0107_loan_reconciliation;
 
 pub mod d0094_payroll_draft_calculation;
+pub mod d0132_tenant_email;

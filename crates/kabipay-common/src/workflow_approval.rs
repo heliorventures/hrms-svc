@@ -4,7 +4,7 @@
 //! effective permission and scope carried by the request, plus reporting-manager relationships
 //! configured by the workflow step.
 
-use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter};
+use sea_orm::{ColumnTrait, ConnectionTrait, EntityTrait, FromQueryResult, QueryFilter, QuerySelect};
 use uuid::Uuid;
 
 use kabipay_db_entities::tenant::d0007_employee_core::employee;
@@ -90,7 +90,7 @@ fn normalize_approver_type(raw: &Option<String>) -> String {
 
 fn step_requires_authority_permission(
     step: &workflow_step::Model,
-    authority: &WorkflowApprovalAuthority,
+    permission: &str,
 ) -> KabiPayResult<()> {
     let configured = step
         .approver_permission
@@ -103,7 +103,7 @@ fn step_requires_authority_permission(
                     .into(),
             )
         })?;
-    if configured.eq_ignore_ascii_case(authority.permission) {
+    if configured.eq_ignore_ascii_case(permission) {
         Ok(())
     } else {
         Err(KabiPayError::Forbidden(
@@ -113,14 +113,24 @@ fn step_requires_authority_permission(
     }
 }
 
+#[derive(FromQueryResult)]
+struct WorkflowEmployeeRecord {
+    id: Uuid,
+    reporting_manager_id: Option<Uuid>,
+    user_id: Option<Uuid>,
+}
+
 async fn load_subject_employee(
     conn: &impl ConnectionTrait,
     tenant_id: Uuid,
     subject_employee_id: Uuid,
-) -> KabiPayResult<employee::Model> {
+) -> KabiPayResult<WorkflowEmployeeRecord> {
     employee::Entity::find_by_id(subject_employee_id)
+        .select_only()
+        .columns([employee::Column::Id, employee::Column::ReportingManagerId, employee::Column::UserId])
         .filter(employee::Column::TenantId.eq(tenant_id))
         .filter(employee::Column::IsDeleted.eq(false))
+        .into_model::<WorkflowEmployeeRecord>()
         .one(conn)
         .await?
         .ok_or_else(|| KabiPayError::NotFound {
@@ -157,9 +167,14 @@ async fn assert_is_reporting_manager_user(
     tenant_id: Uuid,
     authority: &WorkflowApprovalAuthority,
     subject_employee_id: Uuid,
+    lock_manager: bool,
 ) -> KabiPayResult<()> {
     let mut subject = load_subject_employee(conn, tenant_id, subject_employee_id).await?;
-    subject.reporting_manager_id=crate::canonical_reporting::manager(conn,tenant_id,subject.id,subject.reporting_manager_id).await?;
+    subject.reporting_manager_id=if lock_manager {
+        crate::canonical_reporting::manager(conn,tenant_id,subject.id,subject.reporting_manager_id).await?
+    } else {
+        crate::canonical_reporting::manager_snapshot(conn,tenant_id,subject.id,subject.reporting_manager_id).await?
+    };
     let manager_employee_id = subject.reporting_manager_id.ok_or_else(|| {
         KabiPayError::Validation(
             "employee has no reporting manager; assign a manager before this workflow step can be completed"
@@ -167,14 +182,17 @@ async fn assert_is_reporting_manager_user(
         )
     })?;
     let manager = employee::Entity::find_by_id(manager_employee_id)
+        .select_only()
+        .columns([employee::Column::Id, employee::Column::ReportingManagerId, employee::Column::UserId])
         .filter(employee::Column::TenantId.eq(tenant_id))
         .filter(employee::Column::IsDeleted.eq(false))
+        .into_model::<WorkflowEmployeeRecord>()
         .one(conn)
         .await?
         .ok_or_else(|| {
             KabiPayError::Validation("reporting manager employee record not found".into())
         })?;
-    assert_reporting_manager_record(authority, &subject, Some(&manager))
+    assert_reporting_manager_identity(authority, subject.reporting_manager_id, Some((manager.id, manager.user_id)))
 }
 
 fn assert_reporting_manager_record(
@@ -182,15 +200,23 @@ fn assert_reporting_manager_record(
     subject: &employee::Model,
     manager: Option<&employee::Model>,
 ) -> KabiPayResult<()> {
-    let manager_id = subject.reporting_manager_id.ok_or_else(|| {
+    assert_reporting_manager_identity(authority, subject.reporting_manager_id, manager.map(|row| (row.id, row.user_id)))
+}
+
+fn assert_reporting_manager_identity(
+    authority: &WorkflowApprovalAuthority,
+    reporting_manager_id: Option<Uuid>,
+    manager: Option<(Uuid, Option<Uuid>)>,
+) -> KabiPayResult<()> {
+    let manager_id = reporting_manager_id.ok_or_else(|| {
         KabiPayError::Validation(
             "employee has no reporting manager; assign a manager before this workflow step can be completed".into(),
         )
     })?;
-    let manager = manager.filter(|row| row.id == manager_id).ok_or_else(|| {
+    let (_, manager_user) = manager.filter(|row| row.0 == manager_id).ok_or_else(|| {
         KabiPayError::Validation("reporting manager employee record not found".into())
     })?;
-    match manager.user_id {
+    match manager_user {
         Some(user_id) if user_id == authority.actor_user_id => Ok(()),
         Some(_) => Err(KabiPayError::Forbidden(
             "only the employee's reporting manager can act at this workflow step".into(),
@@ -210,13 +236,28 @@ pub async fn assert_workflow_step_actor(
     step: &workflow_step::Model,
     authority: &WorkflowApprovalAuthority,
 ) -> KabiPayResult<()> {
+    assert_workflow_step_actor_with_manager_lock(conn,tenant_id,subject_employee_id,step,authority,true).await
+}
+
+/// Read-only eligibility entrypoint. Reuses exact subject/scope/self/step rules;
+/// business decision callers retain the locking entrypoint above.
+pub async fn assert_workflow_step_actor_read_only(
+    conn:&(impl ConnectionTrait+Sync),tenant_id:Uuid,subject_employee_id:Uuid,
+    step:&workflow_step::Model,authority:&WorkflowApprovalAuthority,
+)->KabiPayResult<()>{
+    assert_workflow_step_actor_with_manager_lock(conn,tenant_id,subject_employee_id,step,authority,false).await
+}
+async fn assert_workflow_step_actor_with_manager_lock(
+    conn:&(impl ConnectionTrait+Sync),tenant_id:Uuid,subject_employee_id:Uuid,
+    step:&workflow_step::Model,authority:&WorkflowApprovalAuthority,lock_manager:bool,
+)->KabiPayResult<()>{
     assert_subject_in_approval_scope(conn, tenant_id, subject_employee_id, authority).await?;
     let manager_result = if matches!(
         normalize_approver_type(&step.approver_type).as_str(),
         "REPORTING_MANAGER" | "MANAGER" | "LINE_MANAGER"
             | "REPORTING_MANAGER_OR_PERMISSION" | "MANAGER_OR_PERMISSION"
     ) {
-        assert_is_reporting_manager_user(conn, tenant_id, authority, subject_employee_id).await
+        assert_is_reporting_manager_user(conn, tenant_id, authority, subject_employee_id, lock_manager).await
     } else {
         Ok(())
     };
@@ -230,14 +271,23 @@ fn assert_workflow_step_relationship(
     authority: &WorkflowApprovalAuthority,
     manager_result: KabiPayResult<()>,
 ) -> KabiPayResult<()> {
+    assert_workflow_step_relationship_for_permission(step, authority.permission, manager_result)
+}
+
+/// Same relationship decision for a mail recipient whose exact permission and
+/// subject scope have already been freshly verified. This helper alone never
+/// grants permission and must not be used in place of those preceding checks.
+pub fn assert_workflow_step_relationship_for_permission(
+    step: &workflow_step::Model, permission: &str, manager_result: KabiPayResult<()>,
+) -> KabiPayResult<()> {
     match normalize_approver_type(&step.approver_type).as_str() {
         "REPORTING_MANAGER" | "MANAGER" | "LINE_MANAGER" => manager_result,
-        "PERMISSION" => step_requires_authority_permission(step, authority),
+        "PERMISSION" => step_requires_authority_permission(step, permission),
         "REPORTING_MANAGER_OR_PERMISSION" | "MANAGER_OR_PERMISSION" => {
             if manager_result.is_ok() {
                 Ok(())
             } else {
-                step_requires_authority_permission(step, authority)
+                step_requires_authority_permission(step, permission)
             }
         }
         "ROLE" | "REPORTING_MANAGER_OR_ROLE" | "MANAGER_OR_ROLE" => Err(KabiPayError::Validation(
@@ -328,15 +378,15 @@ mod tests {
         let auth = authority("leave:approve");
         assert!(step_requires_authority_permission(
             &step("PERMISSION", Some("leave:approve")),
-            &auth
+            auth.permission
         )
         .is_ok());
         assert!(step_requires_authority_permission(
             &step("PERMISSION", Some("expense:approve")),
-            &auth
+            auth.permission
         )
         .is_err());
-        assert!(step_requires_authority_permission(&step("PERMISSION", None), &auth).is_err());
+        assert!(step_requires_authority_permission(&step("PERMISSION", None), auth.permission).is_err());
     }
 
     #[test]

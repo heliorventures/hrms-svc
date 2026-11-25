@@ -27,6 +27,7 @@ mod http_prejoining;
 mod http_finance;
 mod http_private_delivery;
 mod http_organization;
+mod http_email;
 
 use resolvers::{MutationRoot, QueryRoot};
 
@@ -94,6 +95,7 @@ async fn main() -> anyhow::Result<()> {
         tokio::spawn(http_organization::bootstrap_worker(st.clone()));
         let app = Router::new()
             .merge(http_organization::routes())
+            .merge(http_email::routes())
             .merge(http_prejoining::routes())
             .merge(http_finance::routes())
             .merge(http_private_delivery::routes())

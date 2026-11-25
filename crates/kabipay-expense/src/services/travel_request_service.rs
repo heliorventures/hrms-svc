@@ -119,6 +119,7 @@ pub async fn submit_travel_request(
     am.insert(&txn).await?;
     try_attach_travel_workflow(&txn, tenant_id, id, now).await?;
 
+    crate::email_emit::emit_active_step(&txn,tenant_id,id,kabipay_common::important_email::EmailResourceType::Travel,logged_in_user_id,now).await?;
     txn.commit().await?;
 
     travel_request::Entity::find_by_id(id)
@@ -247,7 +248,7 @@ pub async fn approve_travel_request(
         &txn, tenant_id, model.employee_id, &current_step, &action_authority,
     )
     .await?;
-    workflow_action::ActiveModel {
+    let action = workflow_action::ActiveModel {
         id: Set(Uuid::new_v4()),
         tenant_id: Set(tenant_id),
         instance_id: Set(instance.id),
@@ -274,6 +275,7 @@ pub async fn approve_travel_request(
         active_instance.current_step_id = Set(Some(next.id));
         active_instance.updated_at = Set(now);
         active_instance.update(&txn).await?;
+        crate::email_emit::emit_active_step(&txn,tenant_id,travel_request_id,kabipay_common::important_email::EmailResourceType::Travel,authority.actor_user_id,now).await?;
         txn.commit().await?;
         return travel_request::Entity::find_by_id(travel_request_id)
             .one(db)
@@ -296,6 +298,7 @@ pub async fn approve_travel_request(
         now,
     )
     .await?;
+    crate::email_emit::emit_outcome(&txn,tenant_id,travel_request_id,kabipay_common::important_email::EmailResourceType::Travel,authority.actor_user_id,action.id,now).await?;
     after_successful_commit(txn.commit(), || async {
         let out = travel_request::Entity::find_by_id(travel_request_id)
             .one(db)
@@ -343,7 +346,7 @@ pub async fn reject_travel_request(
     )
     .await?;
     let now = Utc::now();
-    workflow_action::ActiveModel {
+    let action = workflow_action::ActiveModel {
         id: Set(Uuid::new_v4()),
         tenant_id: Set(tenant_id),
         instance_id: Set(instance.id),
@@ -374,6 +377,7 @@ pub async fn reject_travel_request(
         .one(&txn)
         .await?
         .ok_or_else(|| KabiPayError::Internal("updated travel_request not found".into()))?;
+    crate::email_emit::emit_outcome(&txn,tenant_id,travel_request_id,kabipay_common::important_email::EmailResourceType::Travel,authority.actor_user_id,action.id,now).await?;
     after_successful_commit(txn.commit(), || async {
         let msg = format!(
             "Your travel request was rejected.{}",

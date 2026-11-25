@@ -86,6 +86,7 @@ pub fn router_with_execution(
         .with_state(state);
     if let Some(engine) = execution {
         let internal = Router::new()
+            .route("/internal/email/organization-policy", post(crate::email_policy::policy))
             .route(
                 "/internal/organization/payroll-jobs/authorize",
                 post(crate::payroll_job_policy::authorize),

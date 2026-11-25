@@ -251,6 +251,19 @@ pub async fn submit_tax_proof_line<C: ConnectionTrait + TransactionTrait>(
         .one(db)
         .await?;
 
+    // A retried, unchanged pending submission is not a new business transition.
+    // Keep its persisted revision (and pending alert) instead of manufacturing
+    // another event or making the earlier event obsolete.
+    if let Some(row) = &existing {
+        if row.status == PROOF_PENDING && row.declared_amount == declared_amount
+            && row.actual_amount == actual_amount && row.file_storage_id == Some(file_storage_id)
+            && row.fiscal_year == fiscal_year && row.approved_by.is_none() && row.rejection_reason.is_none()
+        {
+            let out = row.clone();
+            transaction.commit().await?;
+            return Ok(out);
+        }
+    }
     let now = Utc::now();
     let out = if let Some(row) = existing {
         let id = row.id;
@@ -262,6 +275,7 @@ pub async fn submit_tax_proof_line<C: ConnectionTrait + TransactionTrait>(
         am.rejection_reason = Set(None);
         am.approved_by = Set(None);
         am.submitted_at = Set(now);
+        am.updated_at = Set(now);
         am.fiscal_year = Set(fiscal_year);
         am.update(db).await?;
         tax_proof_line::Entity::find_by_id(id)
@@ -304,6 +318,7 @@ pub async fn submit_tax_proof_line<C: ConnectionTrait + TransactionTrait>(
     )
     .await?;
 
+    crate::email_emit::emit_tax_email(&transaction, &out, submitting_user_id).await?;
     transaction.commit().await?;
     Ok(out)
 }
@@ -408,6 +423,7 @@ pub async fn approve_tax_proof_line(
         am.status = Set(PROOF_APPROVED.into());
         am.rejection_reason = Set(None);
         am.approved_by = Set(Some(approver_user_id));
+        am.updated_at = Set(Utc::now());
         am.update(&txn).await?;
         let out = tax_proof_line::Entity::find_by_id(line_id)
             .filter(tax_proof_line::Column::TenantId.eq(tenant_id))
@@ -423,6 +439,7 @@ pub async fn approve_tax_proof_line(
             approver_user_id,
         )
         .await?;
+        crate::email_emit::emit_tax_email(&txn, &out, approver_user_id).await?;
         Ok::<_, KabiPayError>(out)
     }
     .await;
@@ -526,6 +543,7 @@ pub async fn reject_tax_proof_line(
         am.status = Set(PROOF_REJECTED.into());
         am.rejection_reason = Set(rejection_reason);
         am.approved_by = Set(None);
+        am.updated_at = Set(Utc::now());
         am.update(&txn).await?;
         let out = tax_proof_line::Entity::find_by_id(line_id)
             .filter(tax_proof_line::Column::TenantId.eq(tenant_id))
@@ -539,6 +557,7 @@ pub async fn reject_tax_proof_line(
         })?;
         recompute_total_deductions_from_approved_proofs(&txn, tenant_id, eid, tid, fy, actor)
             .await?;
+        crate::email_emit::emit_tax_email(&txn, &out, actor).await?;
         Ok::<_, KabiPayError>(out)
     }
     .await;

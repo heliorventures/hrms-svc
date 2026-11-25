@@ -75,61 +75,7 @@ impl Fixture {
         }
         sql(&f.db,"INSERT INTO workflow(id,tenant_id,name,entity_type,is_active) VALUES($1,$2,'Loan test','LOAN_REQUEST',TRUE)",vec![f.workflow.into(),f.tenant.into()]).await;
         sql(&f.db,"INSERT INTO workflow_step(id,tenant_id,workflow_id,sequence_order,step_name,approver_type,approver_permission,can_skip) VALUES($1,$2,$3,1,'Finance approval','PERMISSION','loan:approve',FALSE)",vec![f.step.into(),f.tenant.into(),f.workflow.into()]).await;
-        let rules = LoanPolicy {
-            eligibility: EligibilityPolicy {
-                employment_types: vec!["FULL_TIME".into()],
-                minimum_service_days: 30,
-            },
-            exposure: ExposurePolicy {
-                per_loan: Decimal::from(10000),
-                per_employee: Decimal::from(10000),
-                per_company: Decimal::from(company_limit),
-            },
-            interest: InterestPolicy {
-                methods: vec![
-                    InterestKind::InterestFree,
-                    InterestKind::OneTimePercentage,
-                    InterestKind::OneTimeFixed,
-                    InterestKind::ReducingBalance,
-                ],
-                maximum_rate: Decimal::from(20),
-                maximum_fixed_charge: Decimal::from(1000),
-            },
-            recovery: RecoveryPolicy {
-                modes: vec![
-                    RecoveryMode::Payroll,
-                    RecoveryMode::External,
-                    RecoveryMode::Mixed,
-                ],
-                priority: RecoveryPriority::OldestApprovedFirst,
-                minimum_monthly_amount: Decimal::from(100),
-                max_instalments: 24,
-                allow_residual: false,
-                allow_overrides: true,
-                allow_skips: true,
-                allow_accrual_pause: true,
-                minimum_net_pay: Decimal::from(1000),
-                maximum_net_pay_percentage: Decimal::from(50),
-            },
-            short_salary: ShortSalaryPolicy::CapAndCarry,
-            allocation: AllocationOrder::InterestFirst,
-            excess_credit: ExcessCreditPolicy::HoldForReview,
-            early_settlement: EarlySettlementPolicy::KeepAssessedCharge,
-            exit_recovery: ExitRecoveryPolicy {
-                allow_fnf: true,
-                allow_continuing: true,
-                review_reference: "fixture-reviewed-setoff".into(),
-            },
-            tax_treatment: TaxTreatmentPolicy {
-                jurisdiction: "fixture-only".into(),
-                review_reference: "fixture-reviewed-tax".into(),
-                external_assessment_required: true,
-            },
-            approval: ApprovalPolicy {
-                workflow_id: f.workflow.to_string(),
-                acknowledgement_required: true,
-            },
-        };
+        let rules = fixture_policy_rules(f.workflow, company_limit);
         f.policy = f
             .apply(
                 f.manager,
@@ -308,3 +254,62 @@ impl Fixture {
     }
 }
 use chrono::Datelike;
+
+/// Shared synthetic policy used by both existing and owned-loopback rehearsals.
+pub fn fixture_policy_rules(workflow:Uuid,company_limit:i64)->LoanPolicy {
+LoanPolicy {
+            eligibility: EligibilityPolicy {
+                employment_types: vec!["FULL_TIME".into()],
+                minimum_service_days: 30,
+            },
+            exposure: ExposurePolicy {
+                per_loan: Decimal::from(10000),
+                per_employee: Decimal::from(10000),
+                per_company: Decimal::from(company_limit),
+            },
+            interest: InterestPolicy {
+                methods: vec![
+                    InterestKind::InterestFree,
+                    InterestKind::OneTimePercentage,
+                    InterestKind::OneTimeFixed,
+                    InterestKind::ReducingBalance,
+                ],
+                maximum_rate: Decimal::from(20),
+                maximum_fixed_charge: Decimal::from(1000),
+            },
+            recovery: RecoveryPolicy {
+                modes: vec![
+                    RecoveryMode::Payroll,
+                    RecoveryMode::External,
+                    RecoveryMode::Mixed,
+                ],
+                priority: RecoveryPriority::OldestApprovedFirst,
+                minimum_monthly_amount: Decimal::from(100),
+                max_instalments: 24,
+                allow_residual: false,
+                allow_overrides: true,
+                allow_skips: true,
+                allow_accrual_pause: true,
+                minimum_net_pay: Decimal::from(1000),
+                maximum_net_pay_percentage: Decimal::from(50),
+            },
+            short_salary: ShortSalaryPolicy::CapAndCarry,
+            allocation: AllocationOrder::InterestFirst,
+            excess_credit: ExcessCreditPolicy::HoldForReview,
+            early_settlement: EarlySettlementPolicy::KeepAssessedCharge,
+            exit_recovery: ExitRecoveryPolicy {
+                allow_fnf: true,
+                allow_continuing: true,
+                review_reference: "fixture-reviewed-setoff".into(),
+            },
+            tax_treatment: TaxTreatmentPolicy {
+                jurisdiction: "fixture-only".into(),
+                review_reference: "fixture-reviewed-tax".into(),
+                external_assessment_required: true,
+            },
+            approval: ApprovalPolicy {
+                workflow_id: workflow.to_string(),
+                acknowledgement_required: true,
+            },
+        }
+}
