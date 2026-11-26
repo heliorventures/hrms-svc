@@ -1,5 +1,7 @@
 //! Source-owned business maintenance, independently deployed from transport delivery.
 mod migrate_legacy;
+mod notification_failure;
+mod notification_schedule;
 use anyhow::Context;
 use chrono::Utc;
 use kabipay_common::db::{
@@ -21,7 +23,10 @@ use kabipay_performance::services::performance_workflow::{
 };
 use kabipay_survey::services::survey_lifecycle::process_due_surveys;
 use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter};
-use std::{collections::HashSet, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    time::{Duration, Instant},
+};
 use uuid::Uuid;
 fn poll_interval() -> Duration {
     let milliseconds = std::env::var("KABIPAY_TENANT_MAINTENANCE_POLL_MS")
@@ -87,8 +92,19 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
     let interval = poll_interval();
+    let notification_interval = notification_schedule::interval(
+        std::env::var("KABIPAY_NOTIFICATION_SWEEP_SECONDS")
+            .ok()
+            .as_deref(),
+    )
+    .map_err(anyhow::Error::msg)?;
+    let mut notification_sweeps = HashMap::new();
 
-    tracing::info!(poll_ms = interval.as_millis(), "tenant maintenance started");
+    tracing::info!(
+        poll_ms = interval.as_millis(),
+        notification_sweep_seconds = notification_interval.as_secs(),
+        "tenant maintenance started"
+    );
 
     let check = kabipay_common::db::availability::database_check(ops_db.clone(), cache.clone());
     loop {
@@ -100,6 +116,7 @@ async fn main() -> anyhow::Result<()> {
         }
         match active_tenant_ids(&ops_db, &cache).await {
             Ok(tenants) => {
+                notification_sweeps.retain(|tenant, _| tenants.contains(tenant));
                 for tid in tenants {
                     match resolve_required_tenant_db(tid, &ops_db, &cache, &fallback).await {
                         Ok(tdb) => {
@@ -107,7 +124,6 @@ async fn main() -> anyhow::Result<()> {
                                 Ok(clock) => {
                                     let now = Utc::now();
                                     let business_date = clock.business_date(now);
-                                    let business_time = clock.local_time(now);
                                     match process_due_separations(&tdb, tid, business_date).await {
                                         Ok(result) if result.processed > 0 => {
                                             tracing::info!(%tid, processed = result.processed, "due employee offboarding completed");
@@ -164,29 +180,59 @@ async fn main() -> anyhow::Result<()> {
                                                 tracing::error!(%tid, code = error.code(), "scheduled survey sweep failed")
                                             }
                                         }
-                                        match process_due_celebrations(
-                                            &tdb,
-                                            tid,
-                                            business_date,
-                                            business_time,
-                                        )
-                                        .await
-                                        {
-                                            Ok(result) if result.notifications_created > 0 => {
-                                                tracing::info!(
+                                        let notification_sweep =
+                                            notification_sweeps.entry(tid).or_insert_with(|| {
+                                                notification_schedule::NotificationSchedule::new(
+                                                    notification_interval,
+                                                )
+                                            });
+                                        if notification_sweep.ready(Instant::now()) {
+                                            // Observe immediately before this job, independently of
+                                            // the time spent in earlier maintenance operations.
+                                            let observed = Instant::now();
+                                            let notification_now = Utc::now();
+                                            let notification_result = process_due_celebrations(
+                                                &tdb,
+                                                tid,
+                                                clock.business_date(notification_now),
+                                                clock.local_time(notification_now),
+                                            )
+                                            .await;
+                                            match notification_result {
+                                                Ok(result) => {
+                                                    if let Some(remaining) =
+                                                        result.time_until_delivery
+                                                    {
+                                                        notification_sweep.before_delivery(
+                                                            observed,
+                                                            remaining,
+                                                            Instant::now(),
+                                                        );
+                                                    } else {
+                                                        notification_sweep
+                                                            .succeeded(Instant::now());
+                                                    }
+                                                    if result.notifications_created > 0 {
+                                                        tracing::info!(
+                                                            %tid,
+                                                            eligible_events = result.eligible_events,
+                                                            notifications_created = result.notifications_created,
+                                                            duplicates_skipped = result.duplicates_skipped,
+                                                            "automated employee notification sweep completed"
+                                                        );
+                                                    }
+                                                }
+                                                Err(error) => {
+                                                    let held = notification_failure::permanent_database_fault(&error);
+                                                    notification_sweep.failed(Instant::now(), held);
+                                                    tracing::error!(
                                                     %tid,
-                                                    eligible_events = result.eligible_events,
-                                                    notifications_created = result.notifications_created,
-                                                    duplicates_skipped = result.duplicates_skipped,
-                                                    "automated employee notification sweep completed"
-                                                );
+                                                    code = error.code(),
+                                                    held_until_restart = held,
+                                                    "automated employee notification sweep failed"
+                                                    );
+                                                }
                                             }
-                                            Ok(_) => {}
-                                            Err(error) => tracing::error!(
-                                                %tid,
-                                                code = error.code(),
-                                                "automated employee notification sweep failed"
-                                            ),
                                         }
                                         match process_due_performance_cycles(
                                             &tdb,

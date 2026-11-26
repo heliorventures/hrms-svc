@@ -45,6 +45,8 @@ pub struct CelebrationSweepResult {
     pub notifications_created: u64,
     pub duplicates_skipped: u64,
     pub before_delivery_time: bool,
+    /// Remaining wall-clock time at the caller's observation, before settings I/O.
+    pub time_until_delivery: Option<std::time::Duration>,
 }
 
 #[derive(Debug)]
@@ -443,6 +445,7 @@ pub async fn process_due_celebrations(
     if !delivery_time_reached(current_local_time, settings.delivery_local_time) {
         return Ok(CelebrationSweepResult {
             before_delivery_time: true,
+            time_until_delivery: (settings.delivery_local_time - current_local_time).to_std().ok(),
             ..Default::default()
         });
     }
